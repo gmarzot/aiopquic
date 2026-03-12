@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+*.dylib
+
+# Cython generated
+src/aiopquic/_binding/*.c
+src/aiopquic/_binding/*.cpp
+!src/aiopquic/_binding/c/*.c
+!src/aiopquic/_binding/c/*.h
+
+# Virtual environments
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Build artifacts
+third_party/picoquic/build/
+*.o
+*.a
+
+# OS
+.DS_Store

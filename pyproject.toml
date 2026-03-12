@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=75.0", "cython>=3.1.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aiopquic"
+version = "0.1.0"
+description = "High-performance QUIC/HTTP3 library — picoquic-backed, aioquic-compatible"
+requires-python = ">=3.14"
+license = "BSD-3-Clause"
+dependencies = [
+    "pylsqpack>=0.3.3,<0.4.0",
+    "certifi",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "pytest-xdist",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
