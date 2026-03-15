@@ -27,6 +27,7 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_TX_STREAM_RESET
         SPSC_EVT_TX_STOP_SENDING
         SPSC_EVT_TX_MARK_ACTIVE
+        SPSC_EVT_TX_CONNECT
 
     ctypedef struct spsc_entry_t:
         uint64_t    stream_id

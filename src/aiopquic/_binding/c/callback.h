@@ -15,10 +15,25 @@
 #include <picoquic.h>
 #include <picoquic_packet_loop.h>
 
+#include <string.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 #ifdef __linux__
 #include <sys/eventfd.h>
 #include <unistd.h>
 #endif
+
+/*
+ * Packed struct for SPSC_EVT_TX_CONNECT data payload.
+ * Stored in the ring arena as the data for a CONNECT entry.
+ */
+typedef struct {
+    struct sockaddr_in addr;      /* destination address (IPv4) */
+    uint16_t sni_len;             /* length of SNI string */
+    uint16_t alpn_len;            /* length of ALPN string */
+    /* followed by: sni_len bytes of SNI, then alpn_len bytes of ALPN */
+} aiopquic_connect_params_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -218,6 +233,59 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                 if (!entry) break;
 
                 picoquic_cnx_t* cnx = (picoquic_cnx_t*)entry->cnx;
+
+                /* CONNECT doesn't have a cnx yet */
+                if (entry->event_type == SPSC_EVT_TX_CONNECT) {
+                    const uint8_t* raw = spsc_ring_entry_data(
+                        ctx->tx_ring, entry);
+                    if (raw && entry->data_length >=
+                            sizeof(aiopquic_connect_params_t)) {
+                        const aiopquic_connect_params_t* p =
+                            (const aiopquic_connect_params_t*)raw;
+                        const char* sni_ptr = NULL;
+                        const char* alpn_ptr = NULL;
+                        char sni_buf[256];
+                        char alpn_buf[64];
+                        size_t offset = sizeof(aiopquic_connect_params_t);
+
+                        if (p->sni_len > 0 && p->sni_len < sizeof(sni_buf) &&
+                            offset + p->sni_len <= entry->data_length) {
+                            memcpy(sni_buf, raw + offset, p->sni_len);
+                            sni_buf[p->sni_len] = '\0';
+                            sni_ptr = sni_buf;
+                            offset += p->sni_len;
+                        }
+                        if (p->alpn_len > 0 && p->alpn_len < sizeof(alpn_buf) &&
+                            offset + p->alpn_len <= entry->data_length) {
+                            memcpy(alpn_buf, raw + offset, p->alpn_len);
+                            alpn_buf[p->alpn_len] = '\0';
+                            alpn_ptr = alpn_buf;
+                        }
+
+                        picoquic_cnx_t* new_cnx = picoquic_create_client_cnx(
+                            quic,
+                            (struct sockaddr*)&p->addr,
+                            picoquic_current_time(),
+                            0,  /* preferred version */
+                            sni_ptr, alpn_ptr,
+                            aiopquic_stream_cb,
+                            (void*)ctx);
+                        if (new_cnx) {
+                            /* picoquic_create_client_cnx already calls
+                             * picoquic_start_client_cnx internally.
+                             * Notify Python with cnx ptr. */
+                            spsc_entry_t resp = {0};
+                            resp.event_type = SPSC_EVT_ALMOST_READY;
+                            resp.cnx = new_cnx;
+                            spsc_ring_push(ctx->rx_ring, &resp,
+                                           NULL, 0);
+                            aiopquic_notify_rx(ctx);
+                        }
+                    }
+                    spsc_ring_pop(ctx->tx_ring);
+                    continue;
+                }
+
                 if (!cnx) {
                     spsc_ring_pop(ctx->tx_ring);
                     continue;
@@ -232,7 +300,6 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     }
                     case SPSC_EVT_TX_STREAM_DATA:
                     case SPSC_EVT_TX_STREAM_FIN: {
-                        /* For the non-active-stream path: queue data directly */
                         const uint8_t* data = spsc_ring_entry_data(ctx->tx_ring, entry);
                         int is_fin = (entry->event_type == SPSC_EVT_TX_STREAM_FIN);
                         picoquic_add_to_stream(cnx, entry->stream_id,

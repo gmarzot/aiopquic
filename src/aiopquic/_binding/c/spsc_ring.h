@@ -54,6 +54,7 @@ typedef enum {
     SPSC_EVT_TX_STREAM_RESET = 132,
     SPSC_EVT_TX_STOP_SENDING = 133,
     SPSC_EVT_TX_MARK_ACTIVE = 134,
+    SPSC_EVT_TX_CONNECT = 135,      /* create client connection */
 } spsc_event_type_t;
 
 /* Ring entry — fixed-size descriptor for each event */

@@ -23,8 +23,109 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_DATAGRAM,
     SPSC_EVT_TX_STREAM_DATA, SPSC_EVT_TX_STREAM_FIN,
     SPSC_EVT_TX_DATAGRAM, SPSC_EVT_TX_CLOSE,
-    SPSC_EVT_TX_MARK_ACTIVE,
+    SPSC_EVT_TX_MARK_ACTIVE, SPSC_EVT_TX_CONNECT,
 )
+
+# Socket address helpers (needed by picoquic declarations)
+cdef extern from "<sys/socket.h>":
+    enum: AF_INET
+    cdef struct sockaddr:
+        unsigned short sa_family
+
+cdef extern from "<netinet/in.h>":
+    cdef struct sockaddr_in:
+        unsigned short sin_family
+        unsigned short sin_port
+        unsigned int sin_addr
+    unsigned short htons(unsigned short hostshort)
+
+cdef extern from "<arpa/inet.h>":
+    int inet_pton(int af, const char* src, void* dst)
+
+# picoquic declarations
+cdef extern from "picoquic.h":
+    ctypedef struct picoquic_quic_t:
+        pass
+    ctypedef struct picoquic_cnx_t:
+        pass
+
+    ctypedef int (*picoquic_stream_data_cb_fn)(
+        picoquic_cnx_t* cnx, uint64_t stream_id,
+        uint8_t* bytes, size_t length,
+        int fin_or_event, void* callback_ctx, void* stream_ctx)
+
+    ctypedef void (*picoquic_connection_id_cb_fn)(
+        picoquic_quic_t* quic, void* cnx_id_local,
+        void* cnx_id_remote, void* cnx_id_cb_data,
+        void* cnx_id_returned)
+
+    picoquic_quic_t* picoquic_create(
+        uint32_t max_nb_connections,
+        const char* cert_file_name, const char* key_file_name,
+        const char* cert_root_file_name, const char* default_alpn,
+        picoquic_stream_data_cb_fn default_callback_fn,
+        void* default_callback_ctx,
+        picoquic_connection_id_cb_fn cnx_id_callback,
+        void* cnx_id_callback_data,
+        uint8_t* reset_seed, uint64_t current_time,
+        uint64_t* p_simulated_time,
+        const char* ticket_file_name,
+        const uint8_t* ticket_encryption_key,
+        size_t ticket_encryption_key_length)
+
+    void picoquic_free(picoquic_quic_t* quic)
+    uint64_t picoquic_current_time()
+    void picoquic_set_null_verifier(picoquic_quic_t* quic)
+    void picoquic_set_default_idle_timeout(picoquic_quic_t* quic, uint64_t idle_timeout_ms)
+    void picoquic_set_log_level(picoquic_quic_t* quic, int log_level)
+    void picoquic_set_callback(picoquic_cnx_t* cnx,
+        picoquic_stream_data_cb_fn callback_fn, void* callback_ctx)
+
+    ctypedef struct picoquic_connection_id_t:
+        uint8_t id[20]
+        uint8_t id_len
+
+    picoquic_cnx_t* picoquic_create_client_cnx(
+        picoquic_quic_t* quic, sockaddr* addr,
+        uint64_t start_time, uint32_t preferred_version,
+        const char* sni, const char* alpn,
+        picoquic_stream_data_cb_fn callback_fn,
+        void* callback_ctx)
+    int picoquic_start_client_cnx(picoquic_cnx_t* cnx)
+    int picoquic_close(picoquic_cnx_t* cnx, uint64_t reason)
+    int picoquic_get_cnx_state(picoquic_cnx_t* cnx)
+    int picoquic_add_to_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
+                                const uint8_t* data, size_t length, int set_fin)
+
+cdef extern from "picoquic_packet_loop.h":
+    ctypedef struct picoquic_packet_loop_param_t:
+        unsigned short local_port
+        int local_af
+        int dest_if
+        int socket_buffer_size
+        int do_not_use_gso
+        int extra_socket_required
+        int prefer_extra_socket
+
+    ctypedef int (*picoquic_packet_loop_cb_fn)(
+        picoquic_quic_t* quic, int cb_mode,
+        void* callback_ctx, void* callback_argv)
+
+    ctypedef struct picoquic_network_thread_ctx_t:
+        picoquic_quic_t* quic
+        int thread_is_ready
+        int thread_should_close
+        int thread_is_closed
+        int return_code
+
+    picoquic_network_thread_ctx_t* picoquic_start_network_thread(
+        picoquic_quic_t* quic,
+        picoquic_packet_loop_param_t* param,
+        picoquic_packet_loop_cb_fn loop_callback,
+        void* loop_callback_ctx,
+        int* ret)
+    int picoquic_wake_up_network_thread(picoquic_network_thread_ctx_t* thread_ctx)
+    void picoquic_delete_network_thread(picoquic_network_thread_ctx_t* thread_ctx)
 
 # C callback declarations
 cdef extern from "c/callback.h":
@@ -32,23 +133,48 @@ cdef extern from "c/callback.h":
         spsc_ring_t* rx_ring
         spsc_ring_t* tx_ring
         int eventfd
-        void* quic  # picoquic_quic_t*
+        picoquic_quic_t* quic
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity, uint32_t arena_size)
     void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx)
     void aiopquic_clear_rx(aiopquic_ctx_t* ctx)
+    void aiopquic_notify_rx(aiopquic_ctx_t* ctx)
 
-    int aiopquic_stream_cb(void* cnx, uint64_t stream_id,
+    int aiopquic_stream_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
                             uint8_t* bytes, size_t length,
                             int fin_or_event,
                             void* callback_ctx, void* stream_ctx)
-    int aiopquic_loop_cb(void* quic, int cb_mode,
+    int aiopquic_loop_cb(picoquic_quic_t* quic, int cb_mode,
                           void* callback_ctx, void* callback_argv)
 
 
 # Default ring sizing
 DEF DEFAULT_RING_CAPACITY = 4096
 DEF DEFAULT_ARENA_SIZE = 4 * 1024 * 1024  # 4 MB
+
+# Module-level TLS initialization guard
+cdef bint _tls_warmed_up = False
+
+cdef void _ensure_tls_warmup() noexcept:
+    """Force OpenSSL/TLS global initialization before any real context.
+
+    The first picoquic_create() in a process initializes OpenSSL globals.
+    Combined with sockloop.c's wake_up→send gap (wake_up callback and
+    send path are mutually exclusive branches), the first TLS handshake
+    can stall. A throwaway context forces initialization to complete
+    before the network thread starts.
+
+    See: https://github.com/perlinguist/picoquic sockloop.c line ~869
+    """
+    global _tls_warmed_up
+    if _tls_warmed_up:
+        return
+    cdef picoquic_quic_t* dummy = picoquic_create(
+        1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        NULL, picoquic_current_time(), NULL, NULL, NULL, 0)
+    if dummy is not NULL:
+        picoquic_free(dummy)
+    _tls_warmed_up = True
 
 
 cdef class RingBuffer:
@@ -132,19 +258,34 @@ cdef class TransportContext:
     It owns the SPSC rings and the eventfd used for async notification.
     """
     cdef aiopquic_ctx_t* _ctx
+    cdef picoquic_quic_t* _quic
+    cdef picoquic_network_thread_ctx_t* _thread_ctx
     cdef bint _started
 
     def __cinit__(self, uint32_t ring_capacity=DEFAULT_RING_CAPACITY,
                   uint32_t arena_size=DEFAULT_ARENA_SIZE):
         self._ctx = aiopquic_ctx_create(ring_capacity, arena_size)
+        self._quic = NULL
+        self._thread_ctx = NULL
         self._started = False
         if self._ctx is NULL:
             raise MemoryError("Failed to create transport context")
 
     def __dealloc__(self):
+        self._shutdown()
         if self._ctx is not NULL:
             aiopquic_ctx_destroy(self._ctx)
             self._ctx = NULL
+
+    cdef void _shutdown(self):
+        """Stop the network thread and free picoquic context."""
+        if self._thread_ctx is not NULL:
+            picoquic_delete_network_thread(self._thread_ctx)
+            self._thread_ctx = NULL
+        if self._quic is not NULL:
+            picoquic_free(self._quic)
+            self._quic = NULL
+        self._started = False
 
     @property
     def eventfd(self):
@@ -222,3 +363,185 @@ cdef class TransportContext:
         cdef int ret = spsc_ring_push(self._ctx.tx_ring, &entry, data_ptr, data_len)
         if ret != 0:
             raise BufferError("TX ring buffer is full")
+
+    def start(self, int port=0, cert_file=None, key_file=None,
+              alpn=None, bint is_client=True, uint64_t idle_timeout_ms=30000):
+        """
+        Create the picoquic context and start the network thread.
+
+        Args:
+            port: Local UDP port (0 = ephemeral for clients).
+            cert_file: Path to TLS certificate (server mode).
+            key_file: Path to TLS private key (server mode).
+            alpn: Default ALPN string (e.g. "h3", "moq-chat").
+            is_client: If True, skip cert verification.
+            idle_timeout_ms: Idle timeout in milliseconds.
+        """
+        if self._started:
+            raise RuntimeError("Transport already started")
+
+        _ensure_tls_warmup()
+
+        cdef const char* c_cert = NULL
+        cdef const char* c_key = NULL
+        cdef const char* c_alpn = NULL
+        cdef bytes b_cert, b_key, b_alpn
+
+        if cert_file is not None:
+            b_cert = cert_file.encode() if isinstance(cert_file, str) else cert_file
+            c_cert = b_cert
+        if key_file is not None:
+            b_key = key_file.encode() if isinstance(key_file, str) else key_file
+            c_key = b_key
+        if alpn is not None:
+            b_alpn = alpn.encode() if isinstance(alpn, str) else alpn
+            c_alpn = b_alpn
+
+        # Create picoquic context with our stream callback
+        self._quic = picoquic_create(
+            256,            # max connections
+            c_cert, c_key,
+            NULL,           # cert root (use default)
+            c_alpn,
+            aiopquic_stream_cb,
+            <void*>self._ctx,
+            NULL, NULL,     # no cnx_id callback
+            NULL,           # no reset seed
+            picoquic_current_time(),
+            NULL,           # not simulated time
+            NULL, NULL, 0)  # no tickets
+
+        if self._quic is NULL:
+            raise RuntimeError("Failed to create picoquic context")
+
+        self._ctx.quic = self._quic
+
+        if is_client:
+            picoquic_set_null_verifier(self._quic)
+
+        if idle_timeout_ms > 0:
+            picoquic_set_default_idle_timeout(self._quic, idle_timeout_ms)
+
+        # Configure packet loop parameters
+        cdef picoquic_packet_loop_param_t param
+        param.local_port = <unsigned short>port
+        param.local_af = AF_INET
+        param.dest_if = 0
+        param.socket_buffer_size = 0
+        param.do_not_use_gso = 0
+        param.extra_socket_required = 0
+        param.prefer_extra_socket = 0
+
+        # Start the network thread
+        cdef int ret = 0
+        self._thread_ctx = picoquic_start_network_thread(
+            self._quic, &param,
+            aiopquic_loop_cb, <void*>self._ctx,
+            &ret)
+
+        if self._thread_ctx is NULL or ret != 0:
+            picoquic_free(self._quic)
+            self._quic = NULL
+            raise RuntimeError(f"Failed to start network thread (ret={ret})")
+
+        self._started = True
+
+    def stop(self):
+        """Stop the network thread and free the picoquic context."""
+        self._shutdown()
+
+    @property
+    def started(self):
+        """Whether the network thread is running."""
+        return self._started
+
+    @property
+    def thread_ready(self):
+        """Whether the network thread has completed initialization."""
+        if self._thread_ctx is NULL:
+            return False
+        return self._thread_ctx.thread_is_ready != 0
+
+    def wake_up(self):
+        """Signal the network thread to process TX ring entries."""
+        if self._thread_ctx is NULL:
+            raise RuntimeError("Network thread not started")
+        cdef int ret = picoquic_wake_up_network_thread(self._thread_ctx)
+        if ret != 0:
+            raise RuntimeError(f"Failed to wake network thread (ret={ret})")
+
+    def create_client_connection(self, str host, int port,
+                                  str sni=None, str alpn=None):
+        """
+        Create a client QUIC connection (thread-safe).
+
+        Pushes a CONNECT command to the TX ring; the network thread
+        creates the connection and sends back an ALMOST_READY event
+        with the cnx pointer via the RX ring.
+
+        Args:
+            host: Remote IP address (IPv4).
+            port: Remote port.
+            sni: Server Name Indication (defaults to host).
+            alpn: ALPN to negotiate (uses context default if None).
+        """
+        if not self._started:
+            raise RuntimeError("Transport not started")
+
+        # Build sockaddr_in
+        cdef sockaddr_in addr
+        addr.sin_family = AF_INET
+        addr.sin_port = htons(<unsigned short>port)
+
+        cdef bytes b_host = host.encode()
+        if inet_pton(AF_INET, b_host, &addr.sin_addr) != 1:
+            raise ValueError(f"Invalid IPv4 address: {host}")
+
+        # Pack connect params into ring data payload
+        # Layout: sockaddr_in | sni_len(2) | alpn_len(2) | sni | alpn
+        cdef bytes b_sni = (sni or host).encode()
+        cdef bytes b_alpn = alpn.encode() if alpn else b""
+
+        cdef uint32_t sni_len = <uint32_t>len(b_sni)
+        cdef uint32_t alpn_len = <uint32_t>len(b_alpn)
+        cdef uint32_t hdr_size = sizeof(sockaddr_in) + 4
+        cdef uint32_t total = hdr_size + sni_len + alpn_len
+
+        cdef bytearray buf = bytearray(total)
+        cdef uint8_t* p = <uint8_t*><char*>buf
+
+        memcpy(p, &addr, sizeof(sockaddr_in))
+        p += sizeof(sockaddr_in)
+        # sni_len as little-endian uint16
+        p[0] = <uint8_t>(sni_len & 0xFF)
+        p[1] = <uint8_t>((sni_len >> 8) & 0xFF)
+        # alpn_len as little-endian uint16
+        p[2] = <uint8_t>(alpn_len & 0xFF)
+        p[3] = <uint8_t>((alpn_len >> 8) & 0xFF)
+        p += 4
+
+        if sni_len > 0:
+            memcpy(p, <const uint8_t*>b_sni, sni_len)
+            p += sni_len
+        if alpn_len > 0:
+            memcpy(p, <const uint8_t*>b_alpn, alpn_len)
+
+        # Push CONNECT command to TX ring
+        cdef spsc_entry_t entry
+        entry.event_type = SPSC_EVT_TX_CONNECT
+        entry.stream_id = 0
+        entry.is_fin = 0
+        entry.cnx = NULL
+        entry.stream_ctx = NULL
+        entry.error_code = 0
+        entry.data_offset = 0
+        entry.data_length = 0
+
+        cdef bytes payload = bytes(buf)
+        cdef int ret = spsc_ring_push(
+            self._ctx.tx_ring, &entry,
+            <const uint8_t*>payload, <uint32_t>len(payload))
+        if ret != 0:
+            raise BufferError("TX ring buffer is full")
+
+        self.wake_up()
