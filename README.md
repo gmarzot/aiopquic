@@ -1,4 +1,4 @@
-# aiopquic - Async QUIC Transport for Python
+# aiopquic - Async QUIC Transport (picoquic)
 
 `aiopquic` is a Python/Cython binding to [picoquic](https://github.com/perlinguist/picoquic), providing high-performance QUIC transport for `asyncio` applications.
 
