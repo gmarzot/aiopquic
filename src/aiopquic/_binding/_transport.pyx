@@ -152,30 +152,6 @@ cdef extern from "c/callback.h":
 DEF DEFAULT_RING_CAPACITY = 4096
 DEF DEFAULT_ARENA_SIZE = 4 * 1024 * 1024  # 4 MB
 
-# Module-level TLS initialization guard
-cdef bint _tls_warmed_up = False
-
-cdef void _ensure_tls_warmup() noexcept:
-    """Force OpenSSL/TLS global initialization before any real context.
-
-    The first picoquic_create() in a process initializes OpenSSL globals.
-    Combined with sockloop.c's wake_up→send gap (wake_up callback and
-    send path are mutually exclusive branches), the first TLS handshake
-    can stall. A throwaway context forces initialization to complete
-    before the network thread starts.
-
-    See: https://github.com/perlinguist/picoquic sockloop.c line ~869
-    """
-    global _tls_warmed_up
-    if _tls_warmed_up:
-        return
-    cdef picoquic_quic_t* dummy = picoquic_create(
-        1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-        NULL, picoquic_current_time(), NULL, NULL, NULL, 0)
-    if dummy is not NULL:
-        picoquic_free(dummy)
-    _tls_warmed_up = True
-
 
 cdef class RingBuffer:
     """Python wrapper around the SPSC ring buffer for testing/inspection."""
@@ -260,6 +236,7 @@ cdef class TransportContext:
     cdef aiopquic_ctx_t* _ctx
     cdef picoquic_quic_t* _quic
     cdef picoquic_network_thread_ctx_t* _thread_ctx
+    cdef picoquic_packet_loop_param_t _param
     cdef bint _started
 
     def __cinit__(self, uint32_t ring_capacity=DEFAULT_RING_CAPACITY,
@@ -380,8 +357,6 @@ cdef class TransportContext:
         if self._started:
             raise RuntimeError("Transport already started")
 
-        _ensure_tls_warmup()
-
         cdef const char* c_cert = NULL
         cdef const char* c_key = NULL
         cdef const char* c_alpn = NULL
@@ -422,20 +397,19 @@ cdef class TransportContext:
         if idle_timeout_ms > 0:
             picoquic_set_default_idle_timeout(self._quic, idle_timeout_ms)
 
-        # Configure packet loop parameters
-        cdef picoquic_packet_loop_param_t param
-        param.local_port = <unsigned short>port
-        param.local_af = AF_INET
-        param.dest_if = 0
-        param.socket_buffer_size = 0
-        param.do_not_use_gso = 0
-        param.extra_socket_required = 0
-        param.prefer_extra_socket = 0
+        # Configure packet loop parameters (must persist — picoquic stores a pointer)
+        self._param.local_port = <unsigned short>port
+        self._param.local_af = AF_INET
+        self._param.dest_if = 0
+        self._param.socket_buffer_size = 0
+        self._param.do_not_use_gso = 0
+        self._param.extra_socket_required = 0
+        self._param.prefer_extra_socket = 0
 
         # Start the network thread
         cdef int ret = 0
         self._thread_ctx = picoquic_start_network_thread(
-            self._quic, &param,
+            self._quic, &self._param,
             aiopquic_loop_cb, <void*>self._ctx,
             &ret)
 
