@@ -505,3 +505,115 @@ class TestLoopback:
                 client1.stop()
         finally:
             server.stop()
+
+    def test_datagram(self):
+        """Send and receive datagrams."""
+        port = next_port()
+        server = start_server(port)
+        try:
+            client, cnx_ptr = connect_client(port)
+            try:
+                # Wait for server to see connection
+                srv_events, srv_cnx = wait_for_server_cnx(server)
+                assert srv_cnx != 0
+
+                # Client sends datagram
+                payload = b"hello datagram"
+                client.push_tx(
+                    SPSC_EVT_TX_DATAGRAM, 0,
+                    data=payload, cnx_ptr=cnx_ptr,
+                )
+                client.wake_up()
+
+                # Server should receive it
+                deadline = time.monotonic() + 5.0
+                received = b""
+                while time.monotonic() < deadline:
+                    events = server.drain_rx()
+                    for ev in events:
+                        if ev[0] == SPSC_EVT_DATAGRAM and ev[2] is not None:
+                            received = ev[2]
+                    if received:
+                        break
+                    time.sleep(0.02)
+
+                assert received == payload, (
+                    f"Expected {payload!r}, got {received!r}"
+                )
+
+                # Server sends datagram back
+                reply = b"datagram reply"
+                server.push_tx(
+                    SPSC_EVT_TX_DATAGRAM, 0,
+                    data=reply, cnx_ptr=srv_cnx,
+                )
+                server.wake_up()
+
+                # Client should receive it
+                deadline = time.monotonic() + 5.0
+                received = b""
+                while time.monotonic() < deadline:
+                    events = client.drain_rx()
+                    for ev in events:
+                        if ev[0] == SPSC_EVT_DATAGRAM and ev[2] is not None:
+                            received = ev[2]
+                    if received:
+                        break
+                    time.sleep(0.02)
+
+                assert received == reply, (
+                    f"Expected {reply!r}, got {received!r}"
+                )
+            finally:
+                client.stop()
+        finally:
+            server.stop()
+
+    def test_stream_reset(self):
+        """Client resets a stream, server receives reset event."""
+        port = next_port()
+        server = start_server(port)
+        try:
+            client, cnx_ptr = connect_client(port)
+            try:
+                srv_events, srv_cnx = wait_for_server_cnx(server)
+                assert srv_cnx != 0
+
+                # Client sends some data then resets the stream
+                stream_id = 0  # client-initiated bidi
+                client.push_tx(
+                    SPSC_EVT_TX_STREAM_DATA, stream_id,
+                    data=b"before reset", cnx_ptr=cnx_ptr,
+                )
+                client.wake_up()
+                time.sleep(0.1)
+
+                # Reset with error code 42
+                client.push_tx(
+                    SPSC_EVT_TX_STREAM_RESET, stream_id,
+                    error_code=42, cnx_ptr=cnx_ptr,
+                )
+                client.wake_up()
+
+                # Server should receive STREAM_RESET
+                deadline = time.monotonic() + 5.0
+                reset_seen = False
+                reset_code = None
+                while time.monotonic() < deadline:
+                    events = server.drain_rx()
+                    for ev in events:
+                        if ev[0] == SPSC_EVT_STREAM_RESET:
+                            reset_seen = True
+                            reset_code = ev[4]
+                    if reset_seen:
+                        break
+                    time.sleep(0.02)
+
+                assert reset_seen, "Server did not receive stream reset"
+                assert reset_code == 42, (
+                    f"Expected error_code=42, got {reset_code}"
+                )
+            finally:
+                client.stop()
+        finally:
+            server.stop()

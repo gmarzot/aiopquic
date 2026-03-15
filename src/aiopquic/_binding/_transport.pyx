@@ -81,6 +81,31 @@ cdef extern from "picoquic.h":
     void picoquic_set_callback(picoquic_cnx_t* cnx,
         picoquic_stream_data_cb_fn callback_fn, void* callback_ctx)
 
+    ctypedef struct picoquic_tp_t:
+        uint64_t initial_max_stream_data_bidi_local
+        uint64_t initial_max_stream_data_bidi_remote
+        uint64_t initial_max_stream_data_uni
+        uint64_t initial_max_data
+        uint64_t initial_max_stream_id_bidir
+        uint64_t initial_max_stream_id_unidir
+        uint64_t max_idle_timeout
+        uint32_t max_packet_size
+        uint32_t max_ack_delay
+        uint32_t active_connection_id_limit
+        uint8_t ack_delay_exponent
+        unsigned int migration_disabled
+        uint32_t max_datagram_frame_size
+        int enable_loss_bit
+        int enable_time_stamp
+        uint64_t min_ack_delay
+        int do_grease_quic_bit
+        int enable_bdp_frame
+        int is_multipath_enabled
+        uint64_t initial_max_path_id
+
+    int picoquic_set_default_tp(picoquic_quic_t* quic, picoquic_tp_t* tp)
+    const picoquic_tp_t* picoquic_get_default_tp(picoquic_quic_t* quic)
+
     ctypedef struct picoquic_connection_id_t:
         uint8_t id[20]
         uint8_t id_len
@@ -396,6 +421,14 @@ cdef class TransportContext:
 
         if idle_timeout_ms > 0:
             picoquic_set_default_idle_timeout(self._quic, idle_timeout_ms)
+
+        # Enable datagrams via transport parameters
+        cdef picoquic_tp_t tp
+        cdef const picoquic_tp_t* cur_tp = picoquic_get_default_tp(self._quic)
+        if cur_tp != NULL:
+            tp = cur_tp[0]
+            tp.max_datagram_frame_size = 1452
+            picoquic_set_default_tp(self._quic, &tp)
 
         # Configure packet loop parameters (must persist — picoquic stores a pointer)
         self._param.local_port = <unsigned short>port

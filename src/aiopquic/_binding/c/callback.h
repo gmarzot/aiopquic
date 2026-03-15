@@ -194,10 +194,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
 
     if (fin_or_event == picoquic_callback_stream_reset ||
         fin_or_event == picoquic_callback_stop_sending) {
-        /* For reset/stop_sending, the error code is in the first 8 bytes */
-        if (bytes && length >= 8) {
-            entry.error_code = *(uint64_t*)bytes;
-        }
+        entry.error_code = picoquic_get_remote_stream_error(cnx, stream_id);
     }
 
     int ret = spsc_ring_push(ctx->rx_ring, &entry, bytes, (uint32_t)length);
