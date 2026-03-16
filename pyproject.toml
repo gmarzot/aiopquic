@@ -27,3 +27,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "interop: tests against public QUIC/H3 endpoints (needs network)",
+]

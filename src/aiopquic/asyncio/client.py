@@ -1,12 +1,26 @@
 """QUIC client — matches qh3.asyncio.client API."""
 
 import asyncio
+import socket
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Callable
 
 from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.connection import QuicConnection
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
+
+
+def _resolve_host(host: str, port: int) -> str:
+    """Resolve hostname to IP address if needed."""
+    try:
+        socket.inet_aton(host)
+        return host  # already an IP
+    except OSError:
+        pass
+    infos = socket.getaddrinfo(host, port, socket.AF_INET)
+    if not infos:
+        raise OSError(f"Cannot resolve {host}")
+    return infos[0][4][0]
 
 
 @asynccontextmanager
@@ -31,6 +45,8 @@ async def connect(
     if configuration.server_name is None:
         configuration.server_name = host
 
+    addr = _resolve_host(host, port)
+
     quic = QuicConnection(configuration=configuration)
     quic._start_transport(port=local_port)
 
@@ -41,7 +57,7 @@ async def connect(
 
     loop = asyncio.get_event_loop()
     protocol._start(loop)
-    protocol.connect((host, port))
+    protocol.connect((addr, port))
 
     try:
         if wait_connected:

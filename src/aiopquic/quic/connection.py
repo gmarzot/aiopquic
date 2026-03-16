@@ -79,6 +79,11 @@ class QuicConnection:
         self._closed = False
         self._next_bidi_id: int = 0 if configuration.is_client else 1
         self._next_uni_id: int = 2 if configuration.is_client else 3
+        # H3Connection compatibility
+        self._quic_logger = None
+        self._remote_max_datagram_frame_size = (
+            configuration.max_datagram_frame_size
+        )
 
     @property
     def configuration(self) -> QuicConfiguration:
