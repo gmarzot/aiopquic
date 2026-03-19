@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75.0", "cython>=3.1.0"]
+requires = ["setuptools>=75.0", "cython>=3.2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,7 +9,6 @@ description = "High-performance QUIC/HTTP3 library — picoquic-backed, aioquic-
 requires-python = ">=3.14"
 license = "BSD-3-Clause"
 dependencies = [
-    "pylsqpack>=0.3.3,<0.4.0",
     "certifi",
 ]
 
