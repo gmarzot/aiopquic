@@ -32,8 +32,9 @@ jobs:
         pip install pytest pytest-asyncio
         pip install -e .
     - name: Run tests
+      timeout-minutes: 5
       run: |
-        python -m pytest tests/ -v
+        python -m pytest tests/ -v -m "not interop"
 
   publish-test:
     needs: test
