@@ -74,14 +74,13 @@ cmake "${PICOQUIC_DIR}" \
 
 cmake --build . -j "${NPROC}"
 
-# Verify key outputs exist
-if [ ! -f "${BUILD_DIR}/picoquic/libpicoquic-core.a" ]; then
+# Verify key outputs exist (cmake may place in build/ or build/picoquic/)
+PICOQUIC_LIB=$(find "${BUILD_DIR}" -name "libpicoquic-core.a" -print -quit 2>/dev/null)
+if [ -z "${PICOQUIC_LIB}" ]; then
     echo -e "${COLOR_RED}ERROR: libpicoquic-core.a not found${COLOR_OFF}"
     exit 1
 fi
 
 echo -e "${COLOR_GREEN}picoquic build complete.${COLOR_OFF}"
 echo "Libraries:"
-ls -la "${BUILD_DIR}"/picoquic/lib*.a 2>/dev/null || true
-ls -la "${PTLS_BUILD_DIR}"/lib*.a 2>/dev/null || true
-ls -la "${PTLS_INSTALL}"/lib/lib*.a 2>/dev/null || true
+find "${BUILD_DIR}" -name "lib*.a" -exec ls -la {} \; 2>/dev/null || true
