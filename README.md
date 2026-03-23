@@ -23,16 +23,14 @@
 - 0-RTT handshake (inherited from picoquic)
 - Connection management (create, close, idle timeout)
 - qh3-compatible asyncio API (`connect()`, `serve()`, `QuicConnectionProtocol`)
-- qh3-compatible H3 re-export layer (H3Connection, WebTransport events)
 
 ### Test Results
 
-63 tests pass across all layers:
+52 tests pass across all layers:
 
 | Suite | Tests | Coverage |
 |-------|-------|----------|
 | `test_asyncio` | 7 | Async API, stream/datagram exchange (loopback) |
-| `test_h3` | 11 | H3 re-export layer, WebTransport compat, live H3 integration |
 | `test_interop` | 8 | Real QUIC endpoints: nginx, Cloudflare, Google, aiortc |
 | `test_loopback` | 10 | Client/server: streams, datagrams, reset, large data |
 | `test_spsc_ring` | 13 | Lock-free ring buffer (Cython transport layer) |
@@ -105,9 +103,9 @@ python -m pytest tests/ -v
 ## TODO
 
 - Binary wheel distribution (manylinux, via cibuildwheel)
-- CI/CD pipeline (GitHub Actions: build, test, publish)
 - macOS support (pipe-based fallback for eventfd)
-- WebTransport session management in H3 layer
+- Native H3/WebTransport layer (using picoquic's built-in HTTP/3)
+- Relax Python version requirement (test on 3.12/3.13)
 - Performance benchmarks vs qh3/aioquic
 
 ## Resources
