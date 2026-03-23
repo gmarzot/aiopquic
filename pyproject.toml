@@ -5,12 +5,20 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aiopquic"
 version = "0.1.0"
-description = "High-performance QUIC/HTTP3 library — picoquic-backed, aioquic-compatible"
+description = "High-performance QUIC/HTTP3 library — picoquic-backed, qh3-compatible asyncio API"
+readme = "README.md"
 requires-python = ">=3.14"
-license = "BSD-3-Clause"
+license = "MIT"
+authors = [
+    { name = "Giovanni Marzot", email = "gmarzot@marzresearch.net" }
+]
 dependencies = [
     "certifi",
 ]
+
+[project.urls]
+Homepage = "https://github.com/gmarzot/aiopquic"
+Repository = "https://github.com/gmarzot/aiopquic.git"
 
 [project.optional-dependencies]
 dev = [

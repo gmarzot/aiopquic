@@ -28,3 +28,6 @@ third_party/picoquic/build/
 
 # OS
 .DS_Store
+
+# Demo/runtime data
+*.bin
