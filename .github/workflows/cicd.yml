@@ -5,7 +5,7 @@ on:
   push:
     tags:
       - 'v*.*.*'
-    branches: [ master ]
+    branches: [ main ]
 
 jobs:
   test:
