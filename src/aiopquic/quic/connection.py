@@ -102,6 +102,7 @@ class QuicConnection:
             alpn=(cfg.alpn_protocols[0] if cfg.alpn_protocols else None),
             is_client=cfg.is_client,
             idle_timeout_ms=int(cfg.idle_timeout * 1000),
+            max_datagram_frame_size=(cfg.max_datagram_frame_size or 0),
         )
 
     def connect(self, addr: tuple[str, int], now: float = 0.0) -> None:

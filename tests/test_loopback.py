@@ -135,14 +135,15 @@ def has_connection_ready(events):
     return False
 
 
-def connect_client(port):
+def connect_client(port, max_datagram_frame_size=0):
     """Start a client, connect to server, return (client, cnx_ptr).
 
     Waits for ALMOST_READY (connection created) and connection
     READY (handshake complete, cnx != 0).
     """
     client = TransportContext()
-    client.start(port=0, alpn=ALPN, is_client=True)
+    client.start(port=0, alpn=ALPN, is_client=True,
+                 max_datagram_frame_size=max_datagram_frame_size)
     assert wait_for_ready(client), "Client not ready"
 
     client.create_client_connection(
@@ -509,9 +510,13 @@ class TestLoopback:
     def test_datagram(self):
         """Send and receive datagrams."""
         port = next_port()
-        server = start_server(port)
+        # Both sides need max_datagram_frame_size > 0 to enable datagrams
+        server = TransportContext()
+        server.start(port=port, cert_file=CERT_FILE, key_file=KEY_FILE,
+                     alpn=ALPN, is_client=False, max_datagram_frame_size=1200)
+        assert wait_for_ready(server), "Server not ready"
         try:
-            client, cnx_ptr = connect_client(port)
+            client, cnx_ptr = connect_client(port, max_datagram_frame_size=1200)
             try:
                 # Wait for server to see connection
                 srv_events, srv_cnx = wait_for_server_cnx(server)

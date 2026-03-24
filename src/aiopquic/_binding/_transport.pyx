@@ -367,7 +367,8 @@ cdef class TransportContext:
             raise BufferError("TX ring buffer is full")
 
     def start(self, int port=0, cert_file=None, key_file=None,
-              alpn=None, bint is_client=True, uint64_t idle_timeout_ms=30000):
+              alpn=None, bint is_client=True, uint64_t idle_timeout_ms=30000,
+              uint32_t max_datagram_frame_size=0):
         """
         Create the picoquic context and start the network thread.
 
@@ -378,6 +379,7 @@ cdef class TransportContext:
             alpn: Default ALPN string (e.g. "h3", "moq-chat").
             is_client: If True, skip cert verification.
             idle_timeout_ms: Idle timeout in milliseconds.
+            max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
         """
         if self._started:
             raise RuntimeError("Transport already started")
@@ -422,13 +424,15 @@ cdef class TransportContext:
         if idle_timeout_ms > 0:
             picoquic_set_default_idle_timeout(self._quic, idle_timeout_ms)
 
-        # Enable datagrams via transport parameters
+        # Set datagram transport parameter if requested
         cdef picoquic_tp_t tp
-        cdef const picoquic_tp_t* cur_tp = picoquic_get_default_tp(self._quic)
-        if cur_tp != NULL:
-            tp = cur_tp[0]
-            tp.max_datagram_frame_size = 1452
-            picoquic_set_default_tp(self._quic, &tp)
+        cdef const picoquic_tp_t* cur_tp
+        if max_datagram_frame_size > 0:
+            cur_tp = picoquic_get_default_tp(self._quic)
+            if cur_tp != NULL:
+                tp = cur_tp[0]
+                tp.max_datagram_frame_size = max_datagram_frame_size
+                picoquic_set_default_tp(self._quic, &tp)
 
         # Configure packet loop parameters (must persist — picoquic stores a pointer)
         self._param.local_port = <unsigned short>port

@@ -30,14 +30,16 @@ def next_port():
     return _port_counter
 
 
-def server_config(port):
-    cfg = QuicConfiguration(is_client=False, alpn_protocols=["hq-interop"])
+def server_config(port, max_datagram_frame_size=None):
+    cfg = QuicConfiguration(is_client=False, alpn_protocols=["hq-interop"],
+                            max_datagram_frame_size=max_datagram_frame_size)
     cfg.load_cert_chain(CERT_FILE, KEY_FILE)
     return cfg
 
 
-def client_config():
-    return QuicConfiguration(is_client=True, alpn_protocols=["hq-interop"])
+def client_config(max_datagram_frame_size=None):
+    return QuicConfiguration(is_client=True, alpn_protocols=["hq-interop"],
+                             max_datagram_frame_size=max_datagram_frame_size)
 
 
 class TestQuicConnection:
@@ -149,7 +151,7 @@ class TestAsyncConnect:
             def quic_event_received(self, event):
                 server_events.append(event)
 
-        srv_cfg = server_config(port)
+        srv_cfg = server_config(port, max_datagram_frame_size=1200)
         srv_quic = QuicConnection(configuration=srv_cfg)
         srv_quic._start_transport(port=port)
         srv_protocol = ServerProtocol(srv_quic)
@@ -159,7 +161,7 @@ class TestAsyncConnect:
         try:
             async with connect(
                 "127.0.0.1", port,
-                configuration=client_config(),
+                configuration=client_config(max_datagram_frame_size=1200),
             ) as client:
                 client._quic.send_datagram_frame(b"datagram via asyncio")
                 await asyncio.sleep(0.2)
