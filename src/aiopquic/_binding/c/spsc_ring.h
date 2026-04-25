@@ -3,7 +3,14 @@
  *
  * Uses C11 atomics with acquire/release ordering.
  * Cache-line aligned head/tail to avoid false sharing.
- * Includes an inline data arena for variable-length payloads.
+ *
+ * Each entry carries an owned data buffer (data_buf) allocated by the
+ * producer. Ownership transfers to the consumer at pop time; consumer
+ * is responsible for freeing data_buf (or transferring ownership
+ * elsewhere, as drain_rx does to StreamChunk).
+ *
+ * spsc_ring_destroy walks any unread entries and frees their data_buf
+ * to avoid leaks on shutdown.
  *
  * Copyright (c) 2026, aiopquic contributors. BSD-3-Clause license.
  */
@@ -21,14 +28,9 @@
 extern "C" {
 #endif
 
-/* Default sizes */
 #define SPSC_RING_DEFAULT_CAPACITY  4096    /* entries, must be power of 2 */
-#define SPSC_RING_DEFAULT_ARENA_SIZE (4 * 1024 * 1024)  /* 4 MB data arena */
+#define SPSC_CACHELINE              64
 
-/* Cache line size for alignment */
-#define SPSC_CACHELINE 64
-
-/* Event types matching picoquic callback events (subset we care about) */
 typedef enum {
     SPSC_EVT_STREAM_DATA = 0,
     SPSC_EVT_STREAM_FIN = 1,
@@ -46,7 +48,6 @@ typedef enum {
     SPSC_EVT_PATH_DELETED = 13,
     SPSC_EVT_PACING_CHANGED = 14,
 
-    /* TX-specific (asyncio → picoquic) */
     SPSC_EVT_TX_STREAM_DATA = 128,
     SPSC_EVT_TX_STREAM_FIN = 129,
     SPSC_EVT_TX_DATAGRAM = 130,
@@ -54,57 +55,36 @@ typedef enum {
     SPSC_EVT_TX_STREAM_RESET = 132,
     SPSC_EVT_TX_STOP_SENDING = 133,
     SPSC_EVT_TX_MARK_ACTIVE = 134,
-    SPSC_EVT_TX_CONNECT = 135,      /* create client connection */
+    SPSC_EVT_TX_CONNECT = 135,
 } spsc_event_type_t;
 
-/* Ring entry — fixed-size descriptor for each event */
 typedef struct {
     uint64_t    stream_id;
-    uint32_t    event_type;     /* spsc_event_type_t */
-    uint32_t    data_offset;    /* offset into data arena */
-    uint32_t    data_length;    /* bytes of payload */
+    uint32_t    event_type;
+    uint32_t    data_length;
     uint8_t     is_fin;
-    uint8_t     reserved[3];
-    void*       cnx;            /* picoquic_cnx_t* for demuxing */
-    void*       stream_ctx;     /* app stream context */
-    uint64_t    error_code;     /* for reset/close events */
+    uint8_t     reserved[7];
+    void*       data_buf;       /* owned malloc'd payload (NULL if no data) */
+    void*       cnx;
+    void*       stream_ctx;
+    uint64_t    error_code;
 } spsc_entry_t;
 
-/* Ring buffer structure */
 typedef struct {
-    /* Producer (writer) index — on its own cache line */
     _Alignas(SPSC_CACHELINE) _Atomic(uint64_t) tail;
     char _pad_tail[SPSC_CACHELINE - sizeof(_Atomic(uint64_t))];
 
-    /* Consumer (reader) index — on its own cache line */
     _Alignas(SPSC_CACHELINE) _Atomic(uint64_t) head;
     char _pad_head[SPSC_CACHELINE - sizeof(_Atomic(uint64_t))];
 
-    /* Immutable after init */
-    uint32_t    capacity;       /* must be power of 2 */
-    uint32_t    mask;           /* capacity - 1 */
-    spsc_entry_t* entries;      /* ring_entry_t[capacity] */
-
-    /* Data arena for variable-length payloads */
-    uint8_t*    arena;
-    uint32_t    arena_size;
-    uint32_t    arena_mask;     /* arena_size - 1, for wrapping */
-
-    /* Arena write position (producer only — no atomics needed,
-     * single writer guarantees exclusive access) */
-    uint32_t    arena_write_pos;
+    uint32_t    capacity;
+    uint32_t    mask;
+    spsc_entry_t* entries;
 } spsc_ring_t;
 
 
-/*
- * Create a ring buffer.
- * capacity: number of entries (must be power of 2)
- * arena_size: size of data arena in bytes (must be power of 2)
- * Returns NULL on failure.
- */
-static inline spsc_ring_t* spsc_ring_create(uint32_t capacity, uint32_t arena_size) {
-    if ((capacity & (capacity - 1)) != 0) return NULL;  /* not power of 2 */
-    if ((arena_size & (arena_size - 1)) != 0) return NULL;
+static inline spsc_ring_t* spsc_ring_create(uint32_t capacity) {
+    if ((capacity & (capacity - 1)) != 0) return NULL;
 
     spsc_ring_t* ring = (spsc_ring_t*)aligned_alloc(SPSC_CACHELINE, sizeof(spsc_ring_t));
     if (!ring) return NULL;
@@ -112,15 +92,8 @@ static inline spsc_ring_t* spsc_ring_create(uint32_t capacity, uint32_t arena_si
     memset(ring, 0, sizeof(*ring));
     ring->capacity = capacity;
     ring->mask = capacity - 1;
-    ring->arena_size = arena_size;
-    ring->arena_mask = arena_size - 1;
-    ring->arena_write_pos = 0;
-
     ring->entries = (spsc_entry_t*)calloc(capacity, sizeof(spsc_entry_t));
-    ring->arena = (uint8_t*)malloc(arena_size);
-    if (!ring->entries || !ring->arena) {
-        free(ring->entries);
-        free(ring->arena);
+    if (!ring->entries) {
         free(ring);
         return NULL;
     }
@@ -130,36 +103,45 @@ static inline spsc_ring_t* spsc_ring_create(uint32_t capacity, uint32_t arena_si
     return ring;
 }
 
-/* Destroy a ring buffer */
+/* Destroy a ring buffer; frees any pending entries' data_buf. */
 static inline void spsc_ring_destroy(spsc_ring_t* ring) {
-    if (ring) {
-        free(ring->entries);
-        free(ring->arena);
-        free(ring);
+    if (!ring) return;
+    uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
+    uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+    while (head < tail) {
+        spsc_entry_t* e = &ring->entries[head & ring->mask];
+        if (e->data_buf) {
+            free(e->data_buf);
+            e->data_buf = NULL;
+        }
+        head++;
     }
+    free(ring->entries);
+    free(ring);
 }
 
-/* Number of entries available to read */
 static inline uint32_t spsc_ring_count(spsc_ring_t* ring) {
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
     uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
     return (uint32_t)(tail - head);
 }
 
-/* Is the ring full? */
 static inline int spsc_ring_full(spsc_ring_t* ring) {
     return spsc_ring_count(ring) >= ring->capacity;
 }
 
-/* Is the ring empty? */
 static inline int spsc_ring_empty(spsc_ring_t* ring) {
     return spsc_ring_count(ring) == 0;
 }
 
 /*
- * Push an entry with inline data into the ring (PRODUCER only).
- * Copies `data_len` bytes from `data` into the arena.
- * Returns 0 on success, -1 if ring is full or arena is full.
+ * Push an entry with payload data into the ring (PRODUCER only).
+ * If data_len > 0, allocates a fresh buffer, copies data into it,
+ * and stores the buffer pointer in the entry's data_buf. Ownership
+ * transfers to the consumer at pop time.
+ *
+ * Returns 0 on success, -1 if the ring is full (allocated buffer is freed),
+ * -2 on allocation failure.
  */
 static inline int spsc_ring_push(spsc_ring_t* ring, const spsc_entry_t* entry,
                                   const uint8_t* data, uint32_t data_len) {
@@ -167,50 +149,39 @@ static inline int spsc_ring_push(spsc_ring_t* ring, const spsc_entry_t* entry,
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
 
     if (tail - head >= ring->capacity) {
-        return -1;  /* ring full */
+        return -1;
+    }
+
+    void* buf = NULL;
+    if (data && data_len > 0) {
+        buf = malloc(data_len);
+        if (!buf) {
+            return -2;
+        }
+        memcpy(buf, data, data_len);
     }
 
     uint32_t slot = (uint32_t)(tail & ring->mask);
     spsc_entry_t* e = &ring->entries[slot];
     *e = *entry;
+    e->data_buf = buf;
+    e->data_length = (buf ? data_len : 0);
 
-    if (data && data_len > 0) {
-        /* Check arena has space. Simple check: we always have arena_size
-         * bytes total. In worst case we use linear allocation and wrap. */
-        uint32_t wp = ring->arena_write_pos;
-        e->data_offset = wp;
-        e->data_length = data_len;
-
-        /* Copy data — handle wrap-around */
-        uint32_t first = ring->arena_size - (wp & ring->arena_mask);
-        if (first >= data_len) {
-            memcpy(ring->arena + (wp & ring->arena_mask), data, data_len);
-        } else {
-            memcpy(ring->arena + (wp & ring->arena_mask), data, first);
-            memcpy(ring->arena, data + first, data_len - first);
-        }
-        ring->arena_write_pos = wp + data_len;
-    } else {
-        e->data_offset = 0;
-        e->data_length = 0;
-    }
-
-    /* Release: ensure entry + arena writes are visible before tail advances */
+    /* Release: ensure entry + buf writes are visible before tail advances. */
     atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
     return 0;
 }
 
 /*
- * Peek at the next entry to read (CONSUMER only).
- * Returns pointer to entry, or NULL if empty.
- * The entry remains in the ring until spsc_ring_pop() is called.
+ * Peek at the next entry to read (CONSUMER only). Pointer remains
+ * stable until spsc_ring_pop() is called.
  */
 static inline spsc_entry_t* spsc_ring_peek(spsc_ring_t* ring) {
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
     uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
 
     if (head >= tail) {
-        return NULL;  /* empty */
+        return NULL;
     }
 
     return &ring->entries[head & ring->mask];
@@ -218,28 +189,47 @@ static inline spsc_entry_t* spsc_ring_peek(spsc_ring_t* ring) {
 
 /*
  * Get pointer to the data associated with an entry (CONSUMER only).
- * Returns pointer into the arena. Valid until spsc_ring_pop().
- * Caller must NOT free this pointer.
+ * Valid until spsc_ring_pop() (consumer free policy permitting).
  */
 static inline const uint8_t* spsc_ring_entry_data(spsc_ring_t* ring,
                                                     const spsc_entry_t* entry) {
-    if (entry->data_length == 0) return NULL;
-    return ring->arena + (entry->data_offset & ring->arena_mask);
+    (void)ring;
+    return (const uint8_t*)entry->data_buf;
 }
 
 /*
  * Pop (consume) the next entry (CONSUMER only).
- * Must be called after processing an entry obtained via spsc_ring_peek().
+ * Caller takes ownership of entry->data_buf BEFORE calling pop, OR
+ * passes free_data=1 to have the ring free it here. Use free_data=0
+ * (and call spsc_ring_take_data first) when transferring ownership
+ * (e.g., to a Python StreamChunk).
  */
 static inline void spsc_ring_pop(spsc_ring_t* ring) {
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
-    /* Release: ensure consumer is done reading before advancing head */
+    spsc_entry_t* e = &ring->entries[head & ring->mask];
+    /* Default: free any leftover data_buf. Consumers transferring
+     * ownership must NULL the buffer pointer before calling pop. */
+    if (e->data_buf) {
+        free(e->data_buf);
+        e->data_buf = NULL;
+    }
+    /* Release: ensure consumer is done reading before advancing head. */
     atomic_store_explicit(&ring->head, head + 1, memory_order_release);
 }
 
 /*
- * Push a simple event with no data (PRODUCER only).
+ * Take ownership of an entry's data_buf (CONSUMER only).
+ * Returns the pointer and zeros it on the entry so spsc_ring_pop
+ * won't free it. Caller becomes responsible for free().
  */
+static inline void* spsc_ring_take_data(spsc_entry_t* entry) {
+    void* p = entry->data_buf;
+    entry->data_buf = NULL;
+    entry->data_length = 0;
+    return p;
+}
+
+/* Push a simple event with no data (PRODUCER only). */
 static inline int spsc_ring_push_event(spsc_ring_t* ring,
                                         uint32_t event_type,
                                         uint64_t stream_id,
@@ -253,9 +243,6 @@ static inline int spsc_ring_push_event(spsc_ring_t* ring,
     return spsc_ring_push(ring, &entry, NULL, 0);
 }
 
-/*
- * Push stream data (PRODUCER only). Convenience wrapper.
- */
 static inline int spsc_ring_push_stream_data(spsc_ring_t* ring,
                                               uint64_t stream_id,
                                               const uint8_t* data,

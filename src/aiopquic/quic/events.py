@@ -1,6 +1,13 @@
-"""QUIC event classes — matches qh3.quic.events API."""
+"""QUIC event classes.
 
-from dataclasses import dataclass
+`StreamDataReceived.data` and `DatagramFrameReceived.data` are memoryview
+objects backed by aiopquic's internal StreamChunk — the buffer is the same
+memory written by the picoquic callback's mandatory copy-out, with no
+further copy on the way to Python. Consumers parse via memoryview slicing.
+If a real `bytes` is needed, call `bytes(event.data)` at the call site.
+"""
+
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -31,7 +38,7 @@ class ProtocolNegotiated(QuicEvent):
 @dataclass
 class StreamDataReceived(QuicEvent):
     stream_id: int = 0
-    data: bytes = b""
+    data: memoryview = field(default_factory=lambda: memoryview(b""))
     end_stream: bool = False
 
 
@@ -49,7 +56,7 @@ class StopSendingReceived(QuicEvent):
 
 @dataclass
 class DatagramFrameReceived(QuicEvent):
-    data: bytes = b""
+    data: memoryview = field(default_factory=lambda: memoryview(b""))
 
 
 @dataclass

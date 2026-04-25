@@ -133,13 +133,13 @@ class QuicConnection:
             if evt_type == _EVT_STREAM_DATA:
                 self._events.append(StreamDataReceived(
                     stream_id=stream_id,
-                    data=data or b"",
+                    data=data if data is not None else memoryview(b""),
                     end_stream=False,
                 ))
             elif evt_type == _EVT_STREAM_FIN:
                 self._events.append(StreamDataReceived(
                     stream_id=stream_id,
-                    data=data or b"",
+                    data=data if data is not None else memoryview(b""),
                     end_stream=True,
                 ))
             elif evt_type == _EVT_STREAM_RESET:
@@ -180,7 +180,7 @@ class QuicConnection:
                     self._cnx_ptr = cnx_ptr
             elif evt_type == _EVT_DATAGRAM:
                 self._events.append(DatagramFrameReceived(
-                    data=data or b"",
+                    data=data if data is not None else memoryview(b""),
                 ))
 
     def next_event(self) -> QuicEvent | None:

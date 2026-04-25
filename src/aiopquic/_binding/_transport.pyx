@@ -7,14 +7,16 @@ Manages the picoquic context lifecycle, SPSC ring buffers,
 and the dedicated network thread.
 """
 
+from cpython.buffer cimport PyBuffer_FillInfo
 from libc.stdint cimport uint8_t, uint32_t, uint64_t, uintptr_t
-from libc.stdlib cimport malloc, free
+from libc.stdlib cimport free, malloc
 from libc.string cimport memcpy
 
 from aiopquic._binding.spsc_ring cimport (
     spsc_ring_t, spsc_ring_create, spsc_ring_destroy,
     spsc_ring_count, spsc_ring_empty, spsc_ring_peek,
     spsc_ring_entry_data, spsc_ring_pop, spsc_ring_push,
+    spsc_ring_take_data,
     spsc_entry_t,
     SPSC_EVT_STREAM_DATA, SPSC_EVT_STREAM_FIN,
     SPSC_EVT_STREAM_RESET, SPSC_EVT_STOP_SENDING,
@@ -160,7 +162,7 @@ cdef extern from "c/callback.h":
         int eventfd
         picoquic_quic_t* quic
 
-    aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity, uint32_t arena_size)
+    aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity)
     void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx)
     void aiopquic_clear_rx(aiopquic_ctx_t* ctx)
     void aiopquic_notify_rx(aiopquic_ctx_t* ctx)
@@ -175,7 +177,49 @@ cdef extern from "c/callback.h":
 
 # Default ring sizing
 DEF DEFAULT_RING_CAPACITY = 4096
-DEF DEFAULT_ARENA_SIZE = 4 * 1024 * 1024  # 4 MB
+
+
+cdef class StreamChunk:
+    """
+    Owns a malloc'd byte buffer and exposes it via the Python buffer
+    protocol. Built by drain_rx; the underlying buffer is the same
+    memory written by the picoquic callback's mandatory copy-out.
+
+    Ownership transfers from spsc_ring entry → StreamChunk via
+    spsc_ring_take_data(). The buffer is freed in __dealloc__ when
+    the last reference (memoryview or otherwise) is dropped.
+
+    Internal type. Public surface is memoryview(chunk).
+    """
+    cdef void* _buf
+    cdef Py_ssize_t _len
+
+    def __cinit__(self):
+        self._buf = NULL
+        self._len = 0
+
+    @staticmethod
+    cdef StreamChunk _wrap(void* buf, Py_ssize_t length):
+        cdef StreamChunk c = StreamChunk.__new__(StreamChunk)
+        c._buf = buf
+        c._len = length
+        return c
+
+    def __dealloc__(self):
+        if self._buf is not NULL:
+            free(self._buf)
+            self._buf = NULL
+
+    def __len__(self):
+        return self._len
+
+    def __getbuffer__(self, Py_buffer* buffer, int flags):
+        # Read-only 1-D byte view; refcount on self keeps the buffer
+        # alive for the consumer's memoryview lifetime.
+        PyBuffer_FillInfo(buffer, self, self._buf, self._len, 1, flags)
+
+    def __releasebuffer__(self, Py_buffer* buffer):
+        pass
 
 
 cdef class RingBuffer:
@@ -183,9 +227,8 @@ cdef class RingBuffer:
     cdef spsc_ring_t* _ring
     cdef bint _owned
 
-    def __cinit__(self, uint32_t capacity=DEFAULT_RING_CAPACITY,
-                  uint32_t arena_size=DEFAULT_ARENA_SIZE):
-        self._ring = spsc_ring_create(capacity, arena_size)
+    def __cinit__(self, uint32_t capacity=DEFAULT_RING_CAPACITY):
+        self._ring = spsc_ring_create(capacity)
         self._owned = True
         if self._ring is NULL:
             raise MemoryError("Failed to create SPSC ring buffer")
@@ -220,8 +263,6 @@ cdef class RingBuffer:
         entry.cnx = NULL
         entry.stream_ctx = NULL
         entry.error_code = error_code
-        entry.data_offset = 0
-        entry.data_length = 0
 
         if data is not None:
             data_ptr = <const uint8_t*>data
@@ -232,18 +273,22 @@ cdef class RingBuffer:
             raise BufferError("Ring buffer is full")
 
     def pop(self):
-        """Pop the next entry (consumer side). Returns (event_type, stream_id, data, error_code) or None."""
+        """
+        Pop the next entry (consumer side).
+        Returns (event_type, stream_id, data, is_fin, error_code) or None.
+        `data` is a memoryview backed by an internal StreamChunk, or None.
+        """
         cdef spsc_entry_t* entry = spsc_ring_peek(self._ring)
         if entry is NULL:
             return None
 
-        cdef const uint8_t* data_ptr
-        cdef bytes data = None
-
-        if entry.data_length > 0:
-            data_ptr = spsc_ring_entry_data(self._ring, entry)
-            if data_ptr is not NULL:
-                data = data_ptr[:entry.data_length]
+        data = None
+        cdef void* buf
+        cdef Py_ssize_t length
+        if entry.data_length > 0 and entry.data_buf is not NULL:
+            length = entry.data_length
+            buf = spsc_ring_take_data(entry)
+            data = memoryview(StreamChunk._wrap(buf, length))
 
         result = (entry.event_type, entry.stream_id, data,
                   entry.is_fin, entry.error_code)
@@ -264,9 +309,8 @@ cdef class TransportContext:
     cdef picoquic_packet_loop_param_t _param
     cdef bint _started
 
-    def __cinit__(self, uint32_t ring_capacity=DEFAULT_RING_CAPACITY,
-                  uint32_t arena_size=DEFAULT_ARENA_SIZE):
-        self._ctx = aiopquic_ctx_create(ring_capacity, arena_size)
+    def __cinit__(self, uint32_t ring_capacity=DEFAULT_RING_CAPACITY):
+        self._ctx = aiopquic_ctx_create(ring_capacity)
         self._quic = NULL
         self._thread_ctx = NULL
         self._started = False
@@ -303,16 +347,18 @@ cdef class TransportContext:
         """
         Drain events from the RX ring.
 
-        Returns a list of (event_type, stream_id, data_bytes, is_fin, error_code).
-        Called from the asyncio thread after eventfd signals.
+        Returns a list of (event_type, stream_id, data, is_fin, error_code, cnx_ptr).
+        `data` is a memoryview over an internal StreamChunk, or None for events
+        without payload. The chunk owns its buffer; the memoryview keeps it
+        alive via PEP 3118 buffer protocol refcount. No copy after picoquic.
         """
         aiopquic_clear_rx(self._ctx)
 
         events = []
         cdef int i
         cdef spsc_entry_t* entry
-        cdef const uint8_t* data_ptr
-        cdef bytes data
+        cdef void* buf
+        cdef Py_ssize_t length
 
         for i in range(max_events):
             entry = spsc_ring_peek(self._ctx.rx_ring)
@@ -320,10 +366,10 @@ cdef class TransportContext:
                 break
 
             data = None
-            if entry.data_length > 0:
-                data_ptr = spsc_ring_entry_data(self._ctx.rx_ring, entry)
-                if data_ptr is not NULL:
-                    data = data_ptr[:entry.data_length]
+            if entry.data_length > 0 and entry.data_buf is not NULL:
+                length = entry.data_length
+                buf = spsc_ring_take_data(entry)
+                data = memoryview(StreamChunk._wrap(buf, length))
 
             events.append((
                 entry.event_type,
@@ -355,8 +401,6 @@ cdef class TransportContext:
         entry.cnx = <void*>cnx_ptr
         entry.stream_ctx = NULL
         entry.error_code = error_code
-        entry.data_offset = 0
-        entry.data_length = 0
 
         if data is not None:
             data_ptr = <const uint8_t*>data
@@ -545,8 +589,6 @@ cdef class TransportContext:
         entry.cnx = NULL
         entry.stream_ctx = NULL
         entry.error_code = 0
-        entry.data_offset = 0
-        entry.data_length = 0
 
         cdef bytes payload = bytes(buf)
         cdef int ret = spsc_ring_push(

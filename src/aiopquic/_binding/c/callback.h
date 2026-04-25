@@ -5,6 +5,10 @@
  * events from picoquic and writes them into the RX SPSC ring buffer for
  * consumption by the asyncio thread.
  *
+ * Each event with payload owns a malloc'd buffer; ownership transfers to
+ * the consumer at pop time (Python wraps it in a StreamChunk). No arena
+ * memory is involved — the ring is a pure entry table.
+ *
  * Copyright (c) 2026, aiopquic contributors. BSD-3-Clause license.
  */
 
@@ -26,12 +30,12 @@
 
 /*
  * Packed struct for SPSC_EVT_TX_CONNECT data payload.
- * Stored in the ring arena as the data for a CONNECT entry.
+ * Stored in the entry's data_buf as: header + sni + alpn.
  */
 typedef struct {
-    struct sockaddr_in addr;      /* destination address (IPv4) */
-    uint16_t sni_len;             /* length of SNI string */
-    uint16_t alpn_len;            /* length of ALPN string */
+    struct sockaddr_in addr;
+    uint16_t sni_len;
+    uint16_t alpn_len;
     /* followed by: sni_len bytes of SNI, then alpn_len bytes of ALPN */
 } aiopquic_connect_params_t;
 
@@ -39,27 +43,19 @@ typedef struct {
 extern "C" {
 #endif
 
-/*
- * Context passed to the picoquic callback and loop callback.
- * Holds references to both RX and TX rings plus the eventfd.
- */
 typedef struct {
-    spsc_ring_t*    rx_ring;        /* picoquic → asyncio (events + data) */
-    spsc_ring_t*    tx_ring;        /* asyncio → picoquic (send commands) */
-    int             eventfd;        /* notify asyncio of RX events */
-    picoquic_quic_t* quic;          /* back-reference to quic context */
+    spsc_ring_t*    rx_ring;
+    spsc_ring_t*    tx_ring;
+    int             eventfd;
+    picoquic_quic_t* quic;
 } aiopquic_ctx_t;
 
-/*
- * Create the bridge context. Returns NULL on failure.
- */
-static inline aiopquic_ctx_t* aiopquic_ctx_create(
-        uint32_t ring_capacity, uint32_t arena_size) {
+static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity) {
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)calloc(1, sizeof(aiopquic_ctx_t));
     if (!ctx) return NULL;
 
-    ctx->rx_ring = spsc_ring_create(ring_capacity, arena_size);
-    ctx->tx_ring = spsc_ring_create(ring_capacity, arena_size);
+    ctx->rx_ring = spsc_ring_create(ring_capacity);
+    ctx->tx_ring = spsc_ring_create(ring_capacity);
     if (!ctx->rx_ring || !ctx->tx_ring) {
         spsc_ring_destroy(ctx->rx_ring);
         spsc_ring_destroy(ctx->tx_ring);
@@ -76,13 +72,12 @@ static inline aiopquic_ctx_t* aiopquic_ctx_create(
         return NULL;
     }
 #else
-    ctx->eventfd = -1;  /* TODO: pipe() fallback for non-Linux */
+    ctx->eventfd = -1;
 #endif
 
     return ctx;
 }
 
-/* Destroy the bridge context */
 static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
     if (ctx) {
 #ifdef __linux__
@@ -94,7 +89,6 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
     }
 }
 
-/* Signal the asyncio thread that there are events to read */
 static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
 #ifdef __linux__
     uint64_t val = 1;
@@ -102,7 +96,6 @@ static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
 #endif
 }
 
-/* Clear the eventfd (called by asyncio thread after draining) */
 static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
 #ifdef __linux__
     uint64_t val;
@@ -110,10 +103,6 @@ static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
 #endif
 }
 
-/*
- * Map picoquic callback event to our SPSC event type.
- * Returns -1 for events we don't handle.
- */
 static inline int aiopquic_map_event(picoquic_call_back_event_t ev) {
     switch (ev) {
         case picoquic_callback_stream_data:     return SPSC_EVT_STREAM_DATA;
@@ -136,11 +125,10 @@ static inline int aiopquic_map_event(picoquic_call_back_event_t ev) {
 }
 
 /*
- * The main picoquic stream/connection callback.
- * Runs in the picoquic network thread.
- *
- * This is registered with picoquic_create() or picoquic_set_callback().
- * It receives ALL events and writes them to the RX ring.
+ * Picoquic stream/connection callback. Runs in the picoquic network thread.
+ * Mandatory copy-out happens here: picoquic's stream-callback bytes have
+ * callback-frame lifetime, so spsc_ring_push allocates a fresh buffer
+ * and memcpys before publishing the entry.
  */
 static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                                uint64_t stream_id,
@@ -152,20 +140,13 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)callback_ctx;
     if (!ctx) return -1;
 
-    int evt = aiopquic_map_event(fin_or_event);
-    if (evt < 0) {
-        /* Events we don't handle yet — just return success */
-        return 0;
-    }
-
-    /* For prepare_to_send, we handle it differently (TX path) */
+    /* TX-side callback: drain TX ring entry into picoquic's frame buffer. */
     if (fin_or_event == picoquic_callback_prepare_to_send) {
-        /* Read from TX ring and provide data to picoquic */
         spsc_entry_t* tx_entry = spsc_ring_peek(ctx->tx_ring);
         if (tx_entry && tx_entry->stream_id == stream_id &&
             (tx_entry->event_type == SPSC_EVT_TX_STREAM_DATA ||
              tx_entry->event_type == SPSC_EVT_TX_STREAM_FIN)) {
-            const uint8_t* data = spsc_ring_entry_data(ctx->tx_ring, tx_entry);
+            const uint8_t* data = (const uint8_t*)tx_entry->data_buf;
             uint32_t to_send = tx_entry->data_length;
             if (to_send > length) to_send = (uint32_t)length;
 
@@ -180,12 +161,15 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             spsc_ring_pop(ctx->tx_ring);
             return 0;
         }
-        /* Nothing to send — deactivate */
         (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
         return 0;
     }
 
-    /* Push event + data to RX ring */
+    int evt = aiopquic_map_event(fin_or_event);
+    if (evt < 0) {
+        return 0;
+    }
+
     spsc_entry_t entry = {0};
     entry.event_type = (uint32_t)evt;
     entry.stream_id = stream_id;
@@ -201,13 +185,15 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     if (ret == 0) {
         aiopquic_notify_rx(ctx);
     }
+    /* If push failed (ring full / OOM), the event is dropped. picoquic will
+     * keep the bytes in its reassembly chain and re-deliver on the next
+     * scheduling tick once the consumer drains. */
 
     return 0;
 }
 
 /*
  * Packet loop callback — handles wake-up events to drain the TX ring.
- * Runs in the picoquic network thread.
  */
 static int aiopquic_loop_cb(picoquic_quic_t* quic,
                              picoquic_packet_loop_cb_enum cb_mode,
@@ -218,23 +204,19 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
     switch (cb_mode) {
         case picoquic_packet_loop_ready:
             ctx->quic = quic;
-            /* Signal Python that the loop is ready */
             spsc_ring_push_event(ctx->rx_ring, SPSC_EVT_READY, 0, NULL, 0);
             aiopquic_notify_rx(ctx);
             break;
 
         case picoquic_packet_loop_wake_up:
-            /* Drain TX ring — process send commands from asyncio thread */
             while (1) {
                 spsc_entry_t* entry = spsc_ring_peek(ctx->tx_ring);
                 if (!entry) break;
 
                 picoquic_cnx_t* cnx = (picoquic_cnx_t*)entry->cnx;
 
-                /* CONNECT doesn't have a cnx yet */
                 if (entry->event_type == SPSC_EVT_TX_CONNECT) {
-                    const uint8_t* raw = spsc_ring_entry_data(
-                        ctx->tx_ring, entry);
+                    const uint8_t* raw = (const uint8_t*)entry->data_buf;
                     if (raw && entry->data_length >=
                             sizeof(aiopquic_connect_params_t)) {
                         const aiopquic_connect_params_t* p =
@@ -263,19 +245,15 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                             quic,
                             (struct sockaddr*)&p->addr,
                             picoquic_current_time(),
-                            0,  /* preferred version */
+                            0,
                             sni_ptr, alpn_ptr,
                             aiopquic_stream_cb,
                             (void*)ctx);
                         if (new_cnx) {
-                            /* picoquic_create_client_cnx already calls
-                             * picoquic_start_client_cnx internally.
-                             * Notify Python with cnx ptr. */
                             spsc_entry_t resp = {0};
                             resp.event_type = SPSC_EVT_ALMOST_READY;
                             resp.cnx = new_cnx;
-                            spsc_ring_push(ctx->rx_ring, &resp,
-                                           NULL, 0);
+                            spsc_ring_push(ctx->rx_ring, &resp, NULL, 0);
                             aiopquic_notify_rx(ctx);
                         }
                     }
@@ -297,7 +275,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     }
                     case SPSC_EVT_TX_STREAM_DATA:
                     case SPSC_EVT_TX_STREAM_FIN: {
-                        const uint8_t* data = spsc_ring_entry_data(ctx->tx_ring, entry);
+                        const uint8_t* data = (const uint8_t*)entry->data_buf;
                         int is_fin = (entry->event_type == SPSC_EVT_TX_STREAM_FIN);
                         picoquic_add_to_stream(cnx, entry->stream_id,
                                                 data, entry->data_length, is_fin);
@@ -305,7 +283,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     }
                     case SPSC_EVT_TX_DATAGRAM: {
-                        const uint8_t* data = spsc_ring_entry_data(ctx->tx_ring, entry);
+                        const uint8_t* data = (const uint8_t*)entry->data_buf;
                         picoquic_queue_datagram_frame(cnx, entry->data_length, data);
                         spsc_ring_pop(ctx->tx_ring);
                         break;
