@@ -36,4 +36,5 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "interop: tests against public QUIC/H3 endpoints (needs network)",
+    "native: native picoquic_ct/picohttp_ct subprocess smoke (needs build_picoquic_tests.sh)",
 ]
