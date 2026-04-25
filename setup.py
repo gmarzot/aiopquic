@@ -34,6 +34,13 @@ if picoquic_lib is None:
 # Collect static libraries
 extra_objects = [picoquic_lib]
 
+# picoquic-log is split out of picoquic-core in upstream; it provides
+# picoquic_set_qlog/picoquic_set_textlog/etc. Must follow picoquic-core
+# in the link line (core has undefined references into log).
+log_lib = os.path.join(PICOQUIC_BUILD, "libpicoquic-log.a")
+if os.path.exists(log_lib):
+    extra_objects.append(log_lib)
+
 for lib_name in ["libpicotls-core.a", "libpicotls-openssl.a",
                  "libpicotls-fusion.a", "libpicotls-minicrypto.a"]:
     for search_dir in [PICOTLS_BUILD,
@@ -46,6 +53,21 @@ for lib_name in ["libpicotls-core.a", "libpicotls-openssl.a",
 print(f"Linking against: {extra_objects}")
 
 # Use RELATIVE path for source — setuptools requires this
+# picoquic-core and picoquic-log have a circular dependency (log calls
+# into core's frame helpers; core has hooks into log's qlog/textlog).
+# Wrap the static archives in --start-group/--end-group so the linker
+# rescans them until all undefined references are resolved.
+# Dynamic deps (ssl/crypto/pthread) come AFTER the group so the
+# group's openssl references can be satisfied.
+extra_link_args = [
+    "-Wl,--start-group",
+    *extra_objects,
+    "-Wl,--end-group",
+    "-lssl",
+    "-lcrypto",
+    "-lpthread",
+]
+
 extensions = [
     Extension(
         "aiopquic._binding._transport",
@@ -55,8 +77,7 @@ extensions = [
             PICOQUIC_INC,
             PICOTLS_INC,
         ],
-        extra_objects=extra_objects,
-        libraries=["ssl", "crypto", "pthread"],
+        extra_link_args=extra_link_args,
         language="c",
         define_macros=[("_GNU_SOURCE", "1")],
     ),
