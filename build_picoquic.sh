@@ -62,17 +62,22 @@ else
     CMAKE_EXTRA="-DPICOQUIC_FETCH_PTLS=ON"
 fi
 
+# Native test drivers (picoquic_ct, picohttp_ct) are built alongside
+# the libraries so that `pytest -m native` validates picoquic itself
+# on every submodule bump. Adds ~25s to build time; negligible vs
+# the value of catching upstream regressions early.
 cmake "${PICOQUIC_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -Dpicoquic_BUILD_TESTS=OFF \
+    -Dpicoquic_BUILD_TESTS=ON \
     -DBUILD_DEMO=OFF \
     -DBUILD_LOGREADER=OFF \
     -DBUILD_HTTP=ON \
     -DBUILD_LOGLIB=ON \
     ${CMAKE_EXTRA}
 
-cmake --build . -j "${NPROC}"
+cmake --build . -j "${NPROC}" --target picoquic-core picohttp-core picoquic-log
+cmake --build . -j "${NPROC}" --target picoquic_ct picohttp_ct
 
 # Verify key outputs exist (cmake may place in build/ or build/picoquic/)
 PICOQUIC_LIB=$(find "${BUILD_DIR}" -name "libpicoquic-core.a" -print -quit 2>/dev/null)
@@ -84,3 +89,5 @@ fi
 echo -e "${COLOR_GREEN}picoquic build complete.${COLOR_OFF}"
 echo "Libraries:"
 find "${BUILD_DIR}" -name "lib*.a" -exec ls -la {} \; 2>/dev/null || true
+echo "Native test drivers:"
+ls -la "${BUILD_DIR}/picoquic_ct" "${BUILD_DIR}/picohttp_ct" 2>/dev/null || true

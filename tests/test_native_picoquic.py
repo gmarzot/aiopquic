@@ -1,17 +1,21 @@
 """Native picoquic test driver subprocess wrapper.
 
-Runs a curated smoke list of picoquic_ct / picohttp_ct tests as
-subprocesses to confirm picoquic itself is healthy on the currently
-pinned submodule, independent of aiopquic's binding code.
+Runs picoquic_ct + picohttp_ct as subprocesses, exercising every
+non-slow test compiled into the binaries (~552 tests total, ~48s).
+This catches regressions in picoquic itself when the submodule is
+bumped, independent of aiopquic's binding.
 
-Build the drivers first:
-    ./build_picoquic_tests.sh
+Drivers are built as part of ./build_picoquic.sh so this runs in
+default `pytest` if the build succeeded.
 
-Then run:
-    pytest -m native
+Slow categories are excluded via `-x`: stress/fuzz, cnx_stress,
+cnx_ddos, satellite_*, ddos_amplification_*, key_rotation_stress,
+eccf_corrupted_fuzz (picoquic_ct); http_stress, h3zero_*_fuzz,
+h3zero_satellite, picowt_baton_long (picohttp_ct). Run those
+directly with picoquic_ct/picohttp_ct when you want them.
 
-Drivers must run from the picoquic source directory so relative
-cert paths (./certs/cert.pem) resolve.
+Drivers run with cwd = picoquic source dir so relative cert paths
+(./certs/cert.pem) resolve.
 """
 
 import os
@@ -26,82 +30,82 @@ PICOQUIC_CT = PICOQUIC_DIR / "build" / "picoquic_ct"
 PICOHTTP_CT = PICOQUIC_DIR / "build" / "picohttp_ct"
 
 
-# Fast smoke tests — each well under a second. Picked to span:
-# encoding/decoding, hashing, threading, byte streams, socket loop,
-# basic logging. Excludes long-running interop / fuzzer / satellite
-# tests; those are available via picoquic_ct directly when needed.
-PICOQUIC_SMOKE = [
-    "connection_id_print",
-    "connection_id_parse",
-    "error_name",
-    "util_sprintf",
-    "util_uint8_to_str",
-    "util_memcmp",
-    "picohash",
-    "siphash",
-    "bytestream",
-    "picolog_basic",
-    "sockloop_ipv4",
-    "transport_param",
-    "version_negotiation",
-    "ack_loop",
-    "frames_skip",
-    "frames_parse",
-    "datagram",
-    "retry",
+# Tests that take many seconds to minutes individually — excluded
+# from the regression smoke. Run them on demand via the binary.
+PICOQUIC_SLOW = [
+    "stress",
+    "fuzz",
+    "fuzz_initial",
+    "cnx_stress",
+    "cnx_ddos",
+    "key_rotation_stress",
+    "eccf_corrupted_fuzz",
+    "ddos_amplification_0rtt",
+    "ddos_amplification_8k",
+    "satellite_basic",
+    "satellite_seeded",
+    "satellite_loss",
+    "satellite_loss_fc",
+    "satellite_jitter",
+    "satellite_medium",
+    "satellite_preemptive_fc",
+    "satellite_small",
+    "satellite_small_up",
+    "satellite_bbr1",
+    "satellite_cubic_seeded",
+    "satellite_cubic_loss",
+    "satellite_dcubic_seeded",
+    "satellite_prague_seeded",
 ]
 
-PICOHTTP_SMOKE = [
-    "h3zero_integer",
-    "h3zero_varint_stream",
-    "h3zero_capsule",
-    "qpack_huffman",
-    "qpack_huffman_base",
-    "h3zero_parse_qpack",
-    "h3zero_prepare_qpack",
-    "h3zero_user_agent",
-    "h3zero_uri",
-    "h3zero_url_template",
-    "h3zero_wt_protocol_response",
-    "demo_alpn",
-    "demo_ticket",
+PICOHTTP_SLOW = [
+    "http_stress",
+    "h3zero_qpack_fuzz",
+    "h3zero_stream_fuzz",
+    "h3zero_satellite",
+    "picowt_baton_long",
 ]
 
 
-def _run(driver: Path, tests: list[str]) -> subprocess.CompletedProcess:
+def _run(driver: Path, exclude: list[str]) -> subprocess.CompletedProcess:
+    args = [str(driver)]
+    for name in exclude:
+        args.extend(["-x", name])
     return subprocess.run(
-        [str(driver), *tests],
+        args,
         cwd=str(PICOQUIC_DIR),
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=300,
     )
 
 
 @pytest.mark.native
 class TestNativePicoquic:
-    """Run native picoquic_ct smoke list as one batch."""
+    """Native picoquic_ct and picohttp_ct full smoke (slow excluded)."""
 
     @pytest.mark.skipif(
         not PICOQUIC_CT.exists(),
-        reason="picoquic_ct not built; run ./build_picoquic_tests.sh",
+        reason="picoquic_ct not built; run ./build_picoquic.sh",
     )
-    def test_picoquic_ct_smoke(self):
-        result = _run(PICOQUIC_CT, PICOQUIC_SMOKE)
+    def test_picoquic_ct(self):
+        result = _run(PICOQUIC_CT, PICOQUIC_SLOW)
         last = result.stdout.strip().splitlines()[-3:]
         assert result.returncode == 0, (
-            f"picoquic_ct smoke failed (rc={result.returncode}):\n"
-            f"{os.linesep.join(last)}"
+            f"picoquic_ct failed (rc={result.returncode}):\n"
+            f"{os.linesep.join(last)}\n"
+            f"stderr tail: {result.stderr[-2000:]}"
         )
 
     @pytest.mark.skipif(
         not PICOHTTP_CT.exists(),
-        reason="picohttp_ct not built; run ./build_picoquic_tests.sh",
+        reason="picohttp_ct not built; run ./build_picoquic.sh",
     )
-    def test_picohttp_ct_smoke(self):
-        result = _run(PICOHTTP_CT, PICOHTTP_SMOKE)
+    def test_picohttp_ct(self):
+        result = _run(PICOHTTP_CT, PICOHTTP_SLOW)
         last = result.stdout.strip().splitlines()[-3:]
         assert result.returncode == 0, (
-            f"picohttp_ct smoke failed (rc={result.returncode}):\n"
-            f"{os.linesep.join(last)}"
+            f"picohttp_ct failed (rc={result.returncode}):\n"
+            f"{os.linesep.join(last)}\n"
+            f"stderr tail: {result.stderr[-2000:]}"
         )
