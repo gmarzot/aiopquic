@@ -56,6 +56,23 @@ typedef enum {
     SPSC_EVT_TX_STOP_SENDING = 133,
     SPSC_EVT_TX_MARK_ACTIVE = 134,
     SPSC_EVT_TX_CONNECT = 135,
+
+    /* WebTransport (H3) — picoquic thread → asyncio thread. The
+     * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
+     * WT control stream for session events, or the WT stream for
+     * stream events. error_code carries WT error code for refused/
+     * closed/reset/stop_sending. data_buf carries reason text for
+     * close events, payload for stream/datagram events. */
+    SPSC_EVT_WT_SESSION_READY = 64,        /* CONNECT accepted by peer */
+    SPSC_EVT_WT_SESSION_REFUSED = 65,      /* CONNECT refused */
+    SPSC_EVT_WT_SESSION_CLOSED = 66,       /* CLOSE_WEBTRANSPORT_SESSION received */
+    SPSC_EVT_WT_SESSION_DRAINING = 67,     /* DRAIN_WEBTRANSPORT_SESSION received */
+    SPSC_EVT_WT_STREAM_DATA = 68,          /* data on a WT stream */
+    SPSC_EVT_WT_STREAM_FIN = 69,           /* FIN on a WT stream */
+    SPSC_EVT_WT_STREAM_RESET = 70,         /* peer reset a WT stream */
+    SPSC_EVT_WT_STOP_SENDING = 71,         /* peer asked us to stop sending */
+    SPSC_EVT_WT_DATAGRAM = 72,             /* WT datagram received */
+    SPSC_EVT_WT_NEW_STREAM = 73,           /* peer opened a new WT stream */
 } spsc_event_type_t;
 
 typedef struct {

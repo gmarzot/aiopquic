@@ -175,6 +175,73 @@ cdef extern from "c/callback.h":
                           void* callback_ctx, void* callback_argv)
 
 
+# H3+WebTransport: opaque types from picoquic; we hold pointers only.
+cdef extern from "h3zero_common.h":
+    ctypedef struct h3zero_callback_ctx_t:
+        pass
+    ctypedef struct h3zero_stream_ctx_t:
+        uint64_t stream_id
+    ctypedef int (*picohttp_post_data_cb_fn)(
+        picoquic_cnx_t* cnx, uint8_t* bytes, size_t length,
+        int fin_or_event,
+        h3zero_stream_ctx_t* stream_ctx, void* path_app_ctx)
+
+
+cdef extern from "pico_webtransport.h":
+    int picowt_prepare_client_cnx(
+        picoquic_quic_t* quic, sockaddr* server_address,
+        picoquic_cnx_t** p_cnx, h3zero_callback_ctx_t** p_h3_ctx,
+        h3zero_stream_ctx_t** p_stream_ctx,
+        uint64_t current_time, const char* sni)
+
+    int picowt_connect(
+        picoquic_cnx_t* cnx, h3zero_callback_ctx_t* h3_ctx,
+        h3zero_stream_ctx_t* stream_ctx,
+        const char* authority, const char* path,
+        picohttp_post_data_cb_fn wt_callback, void* wt_ctx,
+        const char* wt_available_protocols)
+
+    int picowt_send_close_session_message(
+        picoquic_cnx_t* cnx, h3zero_stream_ctx_t* control_stream_ctx,
+        uint32_t err, const char* err_msg)
+
+    int picowt_send_drain_session_message(
+        picoquic_cnx_t* cnx, h3zero_stream_ctx_t* control_stream_ctx)
+
+    h3zero_stream_ctx_t* picowt_create_local_stream(
+        picoquic_cnx_t* cnx, int is_bidir,
+        h3zero_callback_ctx_t* h3_ctx, uint64_t control_stream_id)
+
+    int picowt_reset_stream(picoquic_cnx_t* cnx,
+                              h3zero_stream_ctx_t* stream_ctx,
+                              uint64_t local_stream_error)
+
+    void picowt_deregister(picoquic_cnx_t* cnx,
+                            h3zero_callback_ctx_t* h3_ctx,
+                            h3zero_stream_ctx_t* control_stream_ctx)
+
+    void picowt_set_transport_parameters(picoquic_cnx_t* cnx)
+    void picowt_set_default_transport_parameters(picoquic_quic_t* quic)
+
+
+cdef extern from "c/h3wt_callback.h":
+    ctypedef struct aiopquic_wt_session_t:
+        aiopquic_ctx_t* bridge
+        picoquic_cnx_t* cnx
+        h3zero_callback_ctx_t* h3_ctx
+        h3zero_stream_ctx_t* control_stream
+        uint64_t control_stream_id
+        int session_ready
+        int session_closing
+
+    aiopquic_wt_session_t* aiopquic_wt_session_create(aiopquic_ctx_t* bridge)
+    void aiopquic_wt_session_destroy(aiopquic_wt_session_t* s)
+    int aiopquic_wt_path_callback(
+        picoquic_cnx_t* cnx, uint8_t* bytes, size_t length,
+        int event,
+        h3zero_stream_ctx_t* stream_ctx, void* path_app_ctx)
+
+
 # Default ring sizing
 DEF DEFAULT_RING_CAPACITY = 4096
 

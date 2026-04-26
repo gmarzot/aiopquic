@@ -11,6 +11,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 PICOQUIC_DIR = os.path.join(ROOT, "third_party", "picoquic")
 PICOQUIC_BUILD = os.path.join(PICOQUIC_DIR, "build")
 PICOQUIC_INC = os.path.join(PICOQUIC_DIR, "picoquic")
+PICOHTTP_INC = os.path.join(PICOQUIC_DIR, "picohttp")
 
 # picotls headers
 LOCAL_PICOQUIC = "/home/gmarzot/Projects/moq/picoquic"
@@ -33,6 +34,13 @@ if picoquic_lib is None:
 
 # Collect static libraries
 extra_objects = [picoquic_lib]
+
+# picohttp-core: H3 + WebTransport + h3zero. Provides picowt_*,
+# h3zero_*, picohttp_* symbols. Must precede picoquic-core in the
+# link line (it calls into core).
+http_lib = os.path.join(PICOQUIC_BUILD, "libpicohttp-core.a")
+if os.path.exists(http_lib):
+    extra_objects.insert(0, http_lib)
 
 # picoquic-log is split out of picoquic-core in upstream; it provides
 # picoquic_set_qlog/picoquic_set_textlog/etc. Must follow picoquic-core
@@ -75,6 +83,7 @@ extensions = [
         include_dirs=[
             os.path.join(ROOT, "src", "aiopquic", "_binding"),
             PICOQUIC_INC,
+            PICOHTTP_INC,
             PICOTLS_INC,
         ],
         extra_link_args=extra_link_args,
