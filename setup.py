@@ -90,6 +90,16 @@ extensions = [
         language="c",
         define_macros=[("_GNU_SOURCE", "1")],
     ),
+    # StreamChain — pure-Cython, no picoquic deps. Used by aiomoqt's
+    # parser as the per-stream byte accumulator. Ships in aiopquic so
+    # one native build covers both packages; aiomoqt imports it as
+    # `from aiopquic.streamchain import StreamChain`.
+    Extension(
+        "aiopquic._binding._streamchain",
+        sources=[os.path.join(
+            "src", "aiopquic", "_binding", "_streamchain.pyx")],
+        language="c",
+    ),
 ]
 
 setup(
