@@ -31,6 +31,17 @@ extern "C" {
 #endif
 
 /*
+ * Packed payload for SPSC_EVT_TX_WT_OPEN. Stored as data_buf:
+ * header + sni + path. ALPN is always "h3" for WT, not carried.
+ */
+typedef struct {
+    struct sockaddr_in addr;
+    uint16_t sni_len;
+    uint16_t path_len;
+    /* followed by: sni_len bytes of SNI, then path_len bytes of path */
+} aiopquic_wt_open_params_t;
+
+/*
  * Per-WebTransport-session context. Lives for the lifetime of the
  * WT session. Allocated when the asyncio side requests a WT session
  * open; freed on session-closed event after Python releases its
@@ -254,6 +265,138 @@ static int aiopquic_wt_path_callback(
         break;
     }
     return 0;
+}
+
+/*
+ * WT TX-event dispatch — called from aiopquic_loop_cb in callback.h.
+ * Returns 1 if event was a recognized WT command, 0 otherwise.
+ * The caller is responsible for spsc_ring_pop on the entry.
+ */
+static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
+                                   aiopquic_ctx_t* ctx,
+                                   spsc_entry_t* entry) {
+    aiopquic_wt_session_t* s = (aiopquic_wt_session_t*)entry->cnx;
+
+    switch (entry->event_type) {
+    case SPSC_EVT_TX_WT_OPEN: {
+        const uint8_t* raw = (const uint8_t*)entry->data_buf;
+        if (!s || !raw ||
+            entry->data_length < sizeof(aiopquic_wt_open_params_t)) {
+            return 1;
+        }
+        const aiopquic_wt_open_params_t* p =
+            (const aiopquic_wt_open_params_t*)raw;
+        char sni_buf[256];
+        char path_buf[1024];
+        size_t offset = sizeof(aiopquic_wt_open_params_t);
+
+        if (p->sni_len == 0 || p->sni_len >= sizeof(sni_buf) ||
+            offset + p->sni_len > entry->data_length) {
+            aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_REFUSED,
+                                    0, 1, NULL, 0);
+            return 1;
+        }
+        memcpy(sni_buf, raw + offset, p->sni_len);
+        sni_buf[p->sni_len] = '\0';
+        offset += p->sni_len;
+
+        if (p->path_len == 0 || p->path_len >= sizeof(path_buf) ||
+            offset + p->path_len > entry->data_length) {
+            aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_REFUSED,
+                                    0, 2, NULL, 0);
+            return 1;
+        }
+        memcpy(path_buf, raw + offset, p->path_len);
+        path_buf[p->path_len] = '\0';
+
+        picoquic_cnx_t* cnx = NULL;
+        h3zero_callback_ctx_t* h3_ctx = NULL;
+        h3zero_stream_ctx_t* control_stream = NULL;
+
+        int rc = picowt_prepare_client_cnx(
+            quic, (struct sockaddr*)&p->addr,
+            &cnx, &h3_ctx, &control_stream,
+            picoquic_current_time(), sni_buf);
+        if (rc != 0 || !cnx || !h3_ctx || !control_stream) {
+            aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_REFUSED,
+                                    0, 3, NULL, 0);
+            return 1;
+        }
+
+        s->cnx = cnx;
+        s->h3_ctx = h3_ctx;
+        s->control_stream = control_stream;
+        s->control_stream_id = control_stream->stream_id;
+
+        rc = picowt_connect(cnx, h3_ctx, control_stream,
+                              sni_buf, path_buf,
+                              aiopquic_wt_path_callback,
+                              (void*)s, NULL);
+        if (rc != 0) {
+            aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_REFUSED,
+                                    s->control_stream_id, 4, NULL, 0);
+        }
+        return 1;
+    }
+
+    case SPSC_EVT_TX_WT_CREATE_STREAM: {
+        if (!s || !s->cnx || !s->h3_ctx) return 1;
+        int is_bidir = entry->is_fin;
+        h3zero_stream_ctx_t* new_stream = picowt_create_local_stream(
+            s->cnx, is_bidir, s->h3_ctx, s->control_stream_id);
+        if (!new_stream) {
+            /* Push 0 sid to indicate failure; Python side surfaces
+             * an exception. */
+            aiopquic_wt_push_event(s, SPSC_EVT_WT_STREAM_CREATED,
+                                    0, 1, NULL, 0);
+        } else {
+            aiopquic_wt_push_event(s, SPSC_EVT_WT_STREAM_CREATED,
+                                    new_stream->stream_id, 0, NULL, 0);
+        }
+        return 1;
+    }
+
+    case SPSC_EVT_TX_WT_CLOSE: {
+        if (!s || !s->cnx || !s->control_stream) return 1;
+        const char* msg = (const char*)entry->data_buf;
+        char buf[256];
+        if (msg && entry->data_length > 0 &&
+            entry->data_length < sizeof(buf)) {
+            memcpy(buf, msg, entry->data_length);
+            buf[entry->data_length] = '\0';
+            picowt_send_close_session_message(
+                s->cnx, s->control_stream,
+                (uint32_t)entry->error_code, buf);
+        } else {
+            picowt_send_close_session_message(
+                s->cnx, s->control_stream,
+                (uint32_t)entry->error_code, "");
+        }
+        s->session_closing = 1;
+        return 1;
+    }
+
+    case SPSC_EVT_TX_WT_DRAIN: {
+        if (!s || !s->cnx || !s->control_stream) return 1;
+        picowt_send_drain_session_message(s->cnx, s->control_stream);
+        return 1;
+    }
+
+    case SPSC_EVT_TX_WT_RESET_STREAM: {
+        if (!s || !s->cnx) return 1;
+        /* The receiving-side stream_ctx was registered by the H3
+         * machinery; we look it up by stream_id via h3zero. */
+        h3zero_stream_ctx_t* st =
+            h3zero_find_stream(s->h3_ctx, entry->stream_id);
+        if (st) {
+            picowt_reset_stream(s->cnx, st, entry->error_code);
+        }
+        return 1;
+    }
+
+    default:
+        return 0;
+    }
 }
 
 #ifdef __cplusplus

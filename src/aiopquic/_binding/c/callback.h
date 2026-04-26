@@ -103,6 +103,15 @@ static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
 #endif
 }
 
+/* WT TX-event dispatch hook. Defined in h3wt_callback.h. The loop
+ * callback below routes any TX entry whose event type is a WT
+ * command (TX_WT_OPEN/CREATE_STREAM/CLOSE/DRAIN/RESET_STREAM)
+ * through this function. Returns 1 if handled, 0 if not a WT TX
+ * event (caller falls through to normal dispatch). */
+static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
+                                   aiopquic_ctx_t* ctx,
+                                   spsc_entry_t* entry);
+
 static inline int aiopquic_map_event(picoquic_call_back_event_t ev) {
     switch (ev) {
         case picoquic_callback_stream_data:     return SPSC_EVT_STREAM_DATA;
@@ -304,6 +313,9 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     }
                     default:
+                        /* Unknown for raw-QUIC; route to WT dispatch
+                         * which handles WT-specific TX commands. */
+                        (void)aiopquic_wt_handle_tx(quic, ctx, entry);
                         spsc_ring_pop(ctx->tx_ring);
                         break;
                 }
