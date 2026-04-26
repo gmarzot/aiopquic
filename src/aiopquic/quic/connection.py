@@ -129,7 +129,8 @@ class QuicConnection:
         if self._transport is None:
             return
         raw_events = self._transport.drain_rx()
-        for evt_type, stream_id, data, is_fin, error_code, cnx_ptr in raw_events:
+        for (evt_type, stream_id, data, is_fin, error_code,
+             cnx_ptr, _stream_ctx_ptr) in raw_events:
             if evt_type == _EVT_STREAM_DATA:
                 self._events.append(StreamDataReceived(
                     stream_id=stream_id,

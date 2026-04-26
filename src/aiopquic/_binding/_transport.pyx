@@ -8,9 +8,9 @@ and the dedicated network thread.
 """
 
 from cpython.buffer cimport PyBuffer_FillInfo
-from libc.stdint cimport uint8_t, uint32_t, uint64_t, uintptr_t
+from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t, uintptr_t
 from libc.stdlib cimport free, malloc
-from libc.string cimport memcpy
+from libc.string cimport memcpy, memset
 
 from aiopquic._binding.spsc_ring cimport (
     spsc_ring_t, spsc_ring_create, spsc_ring_destroy,
@@ -26,6 +26,9 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_STREAM_DATA, SPSC_EVT_TX_STREAM_FIN,
     SPSC_EVT_TX_DATAGRAM, SPSC_EVT_TX_CLOSE,
     SPSC_EVT_TX_MARK_ACTIVE, SPSC_EVT_TX_CONNECT,
+    SPSC_EVT_TX_WT_OPEN, SPSC_EVT_TX_WT_CREATE_STREAM,
+    SPSC_EVT_TX_WT_CLOSE, SPSC_EVT_TX_WT_DRAIN,
+    SPSC_EVT_TX_WT_RESET_STREAM,
 )
 
 # Socket address helpers (needed by picoquic declarations)
@@ -414,10 +417,19 @@ cdef class TransportContext:
         """
         Drain events from the RX ring.
 
-        Returns a list of (event_type, stream_id, data, is_fin, error_code, cnx_ptr).
-        `data` is a memoryview over an internal StreamChunk, or None for events
-        without payload. The chunk owns its buffer; the memoryview keeps it
-        alive via PEP 3118 buffer protocol refcount. No copy after picoquic.
+        Returns a list of
+            (event_type, stream_id, data, is_fin, error_code,
+             cnx_ptr, stream_ctx_ptr).
+        `data` is a memoryview over an internal StreamChunk, or None for
+        events without payload. The chunk owns its buffer; the memoryview
+        keeps it alive via PEP 3118 buffer protocol refcount. No copy
+        after picoquic.
+
+        For raw-QUIC events: cnx_ptr is the picoquic_cnx_t*, stream_ctx
+        is whatever picoquic set on the stream (often NULL).
+        For WebTransport events: cnx_ptr is the picoquic_cnx_t*,
+        stream_ctx_ptr is the aiopquic_wt_session_t* — used for routing
+        events to the right WT session in the asyncio side.
         """
         aiopquic_clear_rx(self._ctx)
 
@@ -445,6 +457,7 @@ cdef class TransportContext:
                 entry.is_fin,
                 entry.error_code,
                 <uintptr_t>entry.cnx,
+                <uintptr_t>entry.stream_ctx,
             ))
             spsc_ring_pop(self._ctx.rx_ring)
 
@@ -665,3 +678,168 @@ cdef class TransportContext:
             raise BufferError("TX ring buffer is full")
 
         self.wake_up()
+
+
+# =====================================================================
+# WebTransport client session — Cython-side state holder.
+#
+# Owns one aiopquic_wt_session_t (allocated in C). Pushes WT TX commands
+# into the TransportContext's tx_ring, then wakes the picoquic thread.
+# Sync-only methods; the Python-level async wrapper in
+# aiopquic.asyncio.webtransport handles futures + event routing.
+# =====================================================================
+
+cdef extern from "c/h3wt_callback.h":
+    ctypedef struct aiopquic_wt_open_params_t:
+        sockaddr_in addr
+        uint16_t sni_len
+        uint16_t path_len
+
+
+cdef class WebTransportSessionState:
+    """C-side state for one WebTransport client session.
+
+    Holds the aiopquic_wt_session_t pointer, which the picoquic-thread
+    uses as the path_app_ctx in our WT path callback. Events for this
+    session show up in drain_rx with stream_ctx_ptr == this pointer.
+    """
+    cdef aiopquic_wt_session_t* _wt
+    cdef TransportContext _transport
+    cdef bint _opened
+
+    def __cinit__(self, TransportContext transport):
+        self._transport = transport
+        self._wt = aiopquic_wt_session_create(transport._ctx)
+        self._opened = False
+        if self._wt is NULL:
+            raise MemoryError("Failed to create WT session")
+
+    def __dealloc__(self):
+        if self._wt is not NULL:
+            aiopquic_wt_session_destroy(self._wt)
+            self._wt = NULL
+
+    @property
+    def session_ptr(self):
+        """Pointer to the aiopquic_wt_session_t struct (uintptr_t).
+
+        Used by the asyncio dispatcher to route incoming events to
+        the correct session: the picoquic-thread side stores this
+        pointer in entry.stream_ctx for every WT event."""
+        return <uintptr_t>self._wt
+
+    @property
+    def cnx_ptr(self):
+        """Pointer to the picoquic_cnx_t (uintptr_t), valid after
+        SESSION_READY. Used for TX_STREAM_DATA pushes that need cnx."""
+        if self._wt is NULL or self._wt.cnx is NULL:
+            return 0
+        return <uintptr_t>self._wt.cnx
+
+    @property
+    def control_stream_id(self):
+        if self._wt is NULL:
+            return 0
+        return self._wt.control_stream_id
+
+    def push_open(self, str host, int port, str path, str sni):
+        """Push TX_WT_OPEN to the picoquic thread. Build the params
+        payload (addr + sni + path), then push entry."""
+        cdef sockaddr_in addr
+        memset(&addr, 0, sizeof(addr))
+        addr.sin_family = AF_INET
+        addr.sin_port = htons(<unsigned short>port)
+        cdef bytes b_host = host.encode()
+        if inet_pton(AF_INET, b_host, &addr.sin_addr) != 1:
+            raise ValueError(f"Invalid IPv4 address: {host}")
+
+        cdef bytes b_sni = sni.encode()
+        cdef bytes b_path = path.encode()
+        cdef uint32_t sni_len = <uint32_t>len(b_sni)
+        cdef uint32_t path_len = <uint32_t>len(b_path)
+        cdef uint32_t hdr_size = sizeof(aiopquic_wt_open_params_t)
+        cdef uint32_t total = hdr_size + sni_len + path_len
+
+        cdef bytearray buf = bytearray(total)
+        cdef uint8_t* p = <uint8_t*><char*>buf
+        # Layout: addr | sni_len(2) | path_len(2) | sni | path
+        memcpy(p, &addr, sizeof(sockaddr_in))
+        # sni_len + path_len native-uint16; aiopquic_wt_open_params_t
+        # struct on the C side uses host byte order for these fields.
+        cdef uint16_t* hdr_lens = <uint16_t*>(p + sizeof(sockaddr_in))
+        hdr_lens[0] = <uint16_t>sni_len
+        hdr_lens[1] = <uint16_t>path_len
+        memcpy(p + hdr_size, <const uint8_t*>b_sni, sni_len)
+        memcpy(p + hdr_size + sni_len, <const uint8_t*>b_path, path_len)
+
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_WT_OPEN
+        entry.cnx = <void*>self._wt   # session ptr — C side downcasts
+        entry.stream_ctx = <void*>self._wt
+        cdef bytes payload = bytes(buf)
+        cdef int ret = spsc_ring_push(
+            self._transport._ctx.tx_ring, &entry,
+            <const uint8_t*>payload, total)
+        if ret != 0:
+            raise BufferError("TX ring full (WT_OPEN)")
+        self._transport.wake_up()
+
+    def push_create_stream(self, bint bidir):
+        """Push TX_WT_CREATE_STREAM. Reply event WT_STREAM_CREATED
+        carries the assigned stream_id in stream_id field."""
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_WT_CREATE_STREAM
+        entry.cnx = <void*>self._wt
+        entry.stream_ctx = <void*>self._wt
+        entry.is_fin = 1 if bidir else 0
+        cdef int ret = spsc_ring_push(
+            self._transport._ctx.tx_ring, &entry, NULL, 0)
+        if ret != 0:
+            raise BufferError("TX ring full (WT_CREATE_STREAM)")
+        self._transport.wake_up()
+
+    def push_close(self, uint32_t error_code, bytes reason=b""):
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_WT_CLOSE
+        entry.cnx = <void*>self._wt
+        entry.stream_ctx = <void*>self._wt
+        entry.error_code = error_code
+        cdef const uint8_t* data_ptr = NULL
+        cdef uint32_t data_len = 0
+        if reason:
+            data_ptr = <const uint8_t*>reason
+            data_len = <uint32_t>len(reason)
+        cdef int ret = spsc_ring_push(
+            self._transport._ctx.tx_ring, &entry, data_ptr, data_len)
+        if ret != 0:
+            raise BufferError("TX ring full (WT_CLOSE)")
+        self._transport.wake_up()
+
+    def push_drain(self):
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_WT_DRAIN
+        entry.cnx = <void*>self._wt
+        entry.stream_ctx = <void*>self._wt
+        cdef int ret = spsc_ring_push(
+            self._transport._ctx.tx_ring, &entry, NULL, 0)
+        if ret != 0:
+            raise BufferError("TX ring full (WT_DRAIN)")
+        self._transport.wake_up()
+
+    def push_reset_stream(self, uint64_t stream_id, uint64_t error_code):
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_WT_RESET_STREAM
+        entry.cnx = <void*>self._wt
+        entry.stream_ctx = <void*>self._wt
+        entry.stream_id = stream_id
+        entry.error_code = error_code
+        cdef int ret = spsc_ring_push(
+            self._transport._ctx.tx_ring, &entry, NULL, 0)
+        if ret != 0:
+            raise BufferError("TX ring full (WT_RESET_STREAM)")
+        self._transport.wake_up()
