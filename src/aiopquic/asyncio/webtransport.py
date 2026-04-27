@@ -22,13 +22,13 @@ from __future__ import annotations
 import asyncio
 import socket
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Callable
+from typing import AsyncGenerator
 
 from aiopquic._binding._transport import (
     TransportContext, WebTransportSessionState,
 )
 from aiopquic.quic.events import (
-    WebTransportSessionReady, WebTransportSessionRefused,
+    WebTransportSessionRefused,
     WebTransportSessionClosed, WebTransportSessionDraining,
     WebTransportStreamDataReceived, WebTransportStreamReset,
     WebTransportStopSending, WebTransportDatagramReceived,
@@ -48,11 +48,6 @@ _EVT_WT_STOP_SENDING = 71
 _EVT_WT_DATAGRAM = 72
 _EVT_WT_NEW_STREAM = 73
 _EVT_WT_STREAM_CREATED = 74
-
-# TX raw-QUIC stream events (we reuse them for WT stream sends —
-# once a WT stream is created, sending is just QUIC stream send).
-_TX_STREAM_DATA = 128
-_TX_STREAM_FIN = 129
 
 
 class WebTransportError(Exception):
@@ -187,16 +182,12 @@ class WebTransportClient:
 
     def send_stream_data(self, stream_id: int, data: bytes,
                           end_stream: bool = False) -> None:
-        """Send bytes on a WT stream. Synchronous from the caller's
-        perspective (push to TX ring + wake_up). The picoquic thread
-        does the wire work."""
-        cnx_ptr = self._state.cnx_ptr
-        if cnx_ptr == 0:
+        """Send bytes on a WT stream. Synchronous (push + wake)."""
+        if not self.session_ready:
             raise WebTransportError("session not open")
-        evt = _TX_STREAM_FIN if end_stream else _TX_STREAM_DATA
-        self._transport.push_tx(evt, stream_id,
-                                  data=data, cnx_ptr=cnx_ptr)
-        self._transport.wake_up()
+        # Cdef class encapsulates the cnx pointer + transport
+        # plumbing — we don't reach into _state.cnx_ptr from here.
+        self._state.push_stream_data(stream_id, data, end_stream)
 
     def reset_stream(self, stream_id: int, error_code: int = 0) -> None:
         self._state.push_reset_stream(stream_id, error_code)
@@ -422,7 +413,15 @@ async def connect_webtransport(
     finally:
         loop = asyncio.get_event_loop()
         if not client.session_closed:
+            # Send the close capsule, then settle briefly so the
+            # picoquic thread can flush it on the wire before we
+            # tear down the network thread. Bounded so we don't
+            # hang on a peer that's already gone.
             client.close(0, b"")
+            try:
+                await asyncio.wait_for(client.wait_closed(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
         _get_dispatcher_registry().detach(loop, transport, client)
         if own_transport:
             try:

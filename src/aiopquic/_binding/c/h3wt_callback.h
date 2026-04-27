@@ -394,6 +394,21 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         return 1;
     }
 
+    case SPSC_EVT_TX_WT_DEREGISTER: {
+        /* Python is releasing this session. picowt_deregister
+         * unregisters the WT prefix from h3_ctx so picoquic stops
+         * dispatching to our path callback; safe to free the
+         * wt_session afterward. The actual cnx + h3_ctx are owned
+         * by picoquic and cleaned up on connection close. */
+        if (s) {
+            if (s->cnx && s->h3_ctx && s->control_stream) {
+                picowt_deregister(s->cnx, s->h3_ctx, s->control_stream);
+            }
+            aiopquic_wt_session_destroy(s);
+        }
+        return 1;
+    }
+
     default:
         return 0;
     }

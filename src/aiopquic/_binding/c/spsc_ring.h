@@ -65,6 +65,7 @@ typedef enum {
     SPSC_EVT_TX_WT_CLOSE = 138,         /* picowt_send_close_session_message */
     SPSC_EVT_TX_WT_DRAIN = 139,         /* picowt_send_drain_session_message */
     SPSC_EVT_TX_WT_RESET_STREAM = 140,  /* picowt_reset_stream */
+    SPSC_EVT_TX_WT_DEREGISTER = 141,    /* picowt_deregister + free wt_session */
 
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the

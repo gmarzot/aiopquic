@@ -28,7 +28,7 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_MARK_ACTIVE, SPSC_EVT_TX_CONNECT,
     SPSC_EVT_TX_WT_OPEN, SPSC_EVT_TX_WT_CREATE_STREAM,
     SPSC_EVT_TX_WT_CLOSE, SPSC_EVT_TX_WT_DRAIN,
-    SPSC_EVT_TX_WT_RESET_STREAM,
+    SPSC_EVT_TX_WT_RESET_STREAM, SPSC_EVT_TX_WT_DEREGISTER,
 )
 
 # Socket address helpers (needed by picoquic declarations)
@@ -705,7 +705,9 @@ cdef class WebTransportSessionState:
     """
     cdef aiopquic_wt_session_t* _wt
     cdef TransportContext _transport
-    cdef bint _opened
+    cdef bint _opened     # set after push_open; picoquic owns the
+                           # session as path_app_ctx — must deregister
+                           # before destroy.
 
     def __cinit__(self, TransportContext transport):
         self._transport = transport
@@ -715,7 +717,29 @@ cdef class WebTransportSessionState:
             raise MemoryError("Failed to create WT session")
 
     def __dealloc__(self):
-        if self._wt is not NULL:
+        """If we ever pushed TX_WT_OPEN, picoquic is holding our
+        session as path_app_ctx. Push TX_WT_DEREGISTER and let the
+        picoquic thread call picowt_deregister + free. Don't free
+        here; doing so would race with any in-flight path callback.
+
+        If never opened, free directly (picoquic has no reference)."""
+        if self._wt is NULL:
+            return
+        if self._opened:
+            # Push deregister; the picoquic thread will free wt.
+            cdef spsc_entry_t entry
+            memset(&entry, 0, sizeof(entry))
+            entry.event_type = SPSC_EVT_TX_WT_DEREGISTER
+            entry.cnx = <void*>self._wt
+            entry.stream_ctx = <void*>self._wt
+            spsc_ring_push(self._transport._ctx.tx_ring, &entry,
+                           NULL, 0)
+            try:
+                self._transport.wake_up()
+            except Exception:
+                pass
+            self._wt = NULL
+        else:
             aiopquic_wt_session_destroy(self._wt)
             self._wt = NULL
 
@@ -783,6 +807,7 @@ cdef class WebTransportSessionState:
             <const uint8_t*>payload, total)
         if ret != 0:
             raise BufferError("TX ring full (WT_OPEN)")
+        self._opened = True
         self._transport.wake_up()
 
     def push_create_stream(self, bint bidir):
@@ -828,6 +853,38 @@ cdef class WebTransportSessionState:
             self._transport._ctx.tx_ring, &entry, NULL, 0)
         if ret != 0:
             raise BufferError("TX ring full (WT_DRAIN)")
+        self._transport.wake_up()
+
+    def push_stream_data(self, uint64_t stream_id, bytes data,
+                          bint end_stream=False):
+        """Send bytes on a WT data stream.
+
+        WT data streams are real QUIC streams once created, so we
+        reuse the raw-QUIC TX_STREAM_DATA / TX_STREAM_FIN path with
+        the session's underlying cnx pointer. This keeps cnx_ptr
+        encapsulated inside the cdef class instead of leaking to
+        the Python WebTransportClient."""
+        cdef picoquic_cnx_t* cnx = NULL
+        if self._wt is not NULL:
+            cnx = <picoquic_cnx_t*>self._wt.cnx
+        if cnx is NULL:
+            raise RuntimeError("WT session not yet open")
+
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = (SPSC_EVT_TX_STREAM_FIN if end_stream
+                             else SPSC_EVT_TX_STREAM_DATA)
+        entry.stream_id = stream_id
+        entry.cnx = <void*>cnx
+        cdef const uint8_t* data_ptr = NULL
+        cdef uint32_t data_len = 0
+        if data:
+            data_ptr = <const uint8_t*>data
+            data_len = <uint32_t>len(data)
+        cdef int ret = spsc_ring_push(
+            self._transport._ctx.tx_ring, &entry, data_ptr, data_len)
+        if ret != 0:
+            raise BufferError("TX ring full (WT stream data)")
         self._transport.wake_up()
 
     def push_reset_stream(self, uint64_t stream_id, uint64_t error_code):
