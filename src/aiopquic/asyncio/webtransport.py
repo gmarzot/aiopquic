@@ -1,21 +1,22 @@
-"""WebTransport asyncio client.
+"""WebTransport asyncio API.
 
-Wraps aiopquic._binding._transport.WebTransportSessionState with an
-async context-manager `connect_webtransport(host, port, path, ...)`
-and a Python-level WebTransportClient that drains events from the
-shared SPSC ring and routes them to per-session futures/queues.
+Three classes:
+  WebTransportSession      — base; established-session API (create_stream,
+                              send_stream_data, receive_stream_data,
+                              events, close, drain, reset_stream, ...).
+                              Holds .role ('client' or 'server') because
+                              MoQT and other higher layers care.
 
-Mirrors the shape of qh3's WebTransport API surface so aiomoqt can
-swap backends with minimal call-site change.
+  WebTransportClient(...)  — initiator subclass; adds open(). Used by
+                              connect_webtransport(host, port, path).
 
-Lifecycle:
-    async with connect_webtransport(host, port, path,
-                                     sni=..., ...) as wt:
-        # session ready, MoQT setup can begin
-        sid = await wt.create_stream(bidir=True)
-        wt.send_stream_data(sid, b"...", end_stream=True)
-        async for event in wt.events():
-            ...
+  WebTransportServerSession(...) — acceptor subclass (Phase C.4 step 2/3);
+                              constructed from an incoming H3 CONNECT.
+
+The cdef class WebTransportSessionState (in _binding._transport) is the
+C-side state holder; both subclasses share one. A process-wide
+_DispatcherRegistry routes drained SPSC events to the right session by
+the wt_session pointer.
 """
 from __future__ import annotations
 
@@ -66,25 +67,25 @@ def _resolve_host(host: str) -> str:
     return infos[0][4][0]
 
 
-class WebTransportClient:
-    """Async WebTransport client over aiopquic.
+# =====================================================================
+# Base: established-session API. Role-agnostic except for the .role
+# property (preserved because MoQT-level code makes role-specific
+# choices: who sends ClientSetup vs ServerSetup, etc.).
+# =====================================================================
 
-    One client = one WT session. Multiple clients can share one
-    TransportContext (the asyncio dispatcher routes events by the
-    session pointer set by the C-side bridge in stream_ctx_ptr).
-    """
+class WebTransportSession:
+    """Established WebTransport session — common base for client and
+    server. Subclasses provide the asymmetric setup."""
 
-    def __init__(self, transport: TransportContext,
-                 host: str, port: int, path: str,
-                 sni: str | None = None):
+    def __init__(self, transport: TransportContext, role: str,
+                 state: WebTransportSessionState | None = None):
+        if role not in ("client", "server"):
+            raise ValueError(f"role must be 'client' or 'server', got {role!r}")
         self._transport = transport
-        self._host = host
-        self._port = port
-        self._path = path
-        self._sni = sni or host
-        self._state = WebTransportSessionState(transport)
+        self._role = role
+        self._state = state or WebTransportSessionState(transport)
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._dispatcher_started = False
+        self._dispatcher_attached = False
         # Session-level signals
         self._session_ready: asyncio.Future | None = None
         self._session_closed = asyncio.Event()
@@ -92,12 +93,27 @@ class WebTransportClient:
         self._draining = False
         # Stream creation (single outstanding)
         self._pending_create: asyncio.Future | None = None
-        # Per-stream incoming queues; entries are
-        # WebTransportStreamDataReceived (data + end_stream) or
-        # WebTransportStreamReset, in receive order.
+        # Per-stream incoming queues
         self._stream_inbox: dict[int, asyncio.Queue] = {}
-        # Datagrams + general event stream for app-level fanout
+        # Datagrams + general event stream
         self._event_queue: asyncio.Queue = asyncio.Queue()
+
+    # --- read-only state ----------------------------------------------
+
+    @property
+    def role(self) -> str:
+        """'client' for the initiating side, 'server' for the
+        accepting side. Higher layers (MoQT) use this to choose
+        between client/server-specific protocol behavior."""
+        return self._role
+
+    @property
+    def is_client(self) -> bool:
+        return self._role == "client"
+
+    @property
+    def is_server(self) -> bool:
+        return self._role == "server"
 
     @property
     def session_ready(self) -> bool:
@@ -119,40 +135,18 @@ class WebTransportClient:
     def cnx_ptr(self) -> int:
         return self._state.cnx_ptr
 
-    # --- lifecycle -----------------------------------------------------
+    # --- dispatcher attach (called by subclass setup paths) -----------
 
-    async def open(self, timeout: float = 10.0) -> None:
-        """Initiate the WT session — push TX_WT_OPEN, await SESSION_READY.
-
-        Picoquic-thread does picowt_prepare_client_cnx + picowt_connect.
-        """
-        loop = asyncio.get_event_loop()
-        self._loop = loop
-        self._ensure_dispatcher()
-        self._session_ready = loop.create_future()
-
-        addr = _resolve_host(self._host)
-        self._state.push_open(addr, self._port, self._path, self._sni)
-
-        try:
-            await asyncio.wait_for(self._session_ready, timeout=timeout)
-        except asyncio.TimeoutError:
-            raise WebTransportError(
-                f"WT CONNECT timed out after {timeout}s"
-            ) from None
-
-    def _ensure_dispatcher(self) -> None:
-        """Register the eventfd reader once per loop. Multiple
-        WebTransportClient instances on the same loop share dispatch."""
-        if self._dispatcher_started:
+    def _attach_dispatcher(self) -> None:
+        if self._dispatcher_attached:
             return
+        if self._loop is None:
+            self._loop = asyncio.get_event_loop()
         eventfd = self._transport.eventfd
-        if eventfd >= 0 and self._loop is not None:
-            # Use a class-level registry so a single add_reader serves
-            # all WT clients on the same TransportContext + loop.
-            registry = _get_dispatcher_registry()
-            registry.attach(self._loop, self._transport, self)
-        self._dispatcher_started = True
+        if eventfd >= 0:
+            _get_dispatcher_registry().attach(
+                self._loop, self._transport, self)
+        self._dispatcher_attached = True
 
     # --- stream management --------------------------------------------
 
@@ -160,14 +154,12 @@ class WebTransportClient:
                               timeout: float = 5.0) -> int:
         """Open a new WT stream. Returns the assigned stream_id.
 
-        Round-trips to the picoquic thread (picowt_create_local_stream
-        allocates the id internally and pushes it back via
-        WT_STREAM_CREATED). At codec rates (3-4 streams/sec/session)
-        the round-trip cost is negligible."""
+        Round-trips to the picoquic thread because picowt allocates
+        the id internally. Codec rates (3-4 streams/sec/session)
+        make this round-trip cost negligible."""
         if not self.session_ready:
             raise WebTransportError("session not ready")
         if self._pending_create is not None:
-            # Serialize creates (single-outstanding).
             await asyncio.shield(self._pending_create)
         self._pending_create = self._loop.create_future()
         self._state.push_create_stream(bidir)
@@ -182,19 +174,19 @@ class WebTransportClient:
 
     def send_stream_data(self, stream_id: int, data: bytes,
                           end_stream: bool = False) -> None:
-        """Send bytes on a WT stream. Synchronous (push + wake)."""
+        """Send bytes on a WT stream. Synchronous (push + wake).
+        cdef class encapsulates the cnx pointer + transport plumbing."""
         if not self.session_ready:
             raise WebTransportError("session not open")
-        # Cdef class encapsulates the cnx pointer + transport
-        # plumbing — we don't reach into _state.cnx_ptr from here.
         self._state.push_stream_data(stream_id, data, end_stream)
 
     def reset_stream(self, stream_id: int, error_code: int = 0) -> None:
         self._state.push_reset_stream(stream_id, error_code)
 
     async def receive_stream_data(self, stream_id: int):
-        """Async-generator helper: yield WebTransportStreamDataReceived
-        events for stream_id until FIN or reset."""
+        """Async-generator: yield WebTransportStreamDataReceived (and
+        any final WebTransportStreamReset) for stream_id, then return
+        on FIN or reset."""
         q = self._stream_inbox.setdefault(stream_id, asyncio.Queue())
         while True:
             ev = await q.get()
@@ -207,7 +199,6 @@ class WebTransportClient:
     # --- session close ------------------------------------------------
 
     def close(self, error_code: int = 0, reason: bytes = b"") -> None:
-        """Send CLOSE_WEBTRANSPORT_SESSION capsule + close control stream."""
         if not self.session_closed:
             self._state.push_close(error_code, reason)
 
@@ -215,8 +206,12 @@ class WebTransportClient:
         self._state.push_drain()
         self._draining = True
 
-    async def wait_closed(self) -> None:
-        await self._session_closed.wait()
+    async def wait_closed(self, timeout: float | None = None) -> None:
+        if timeout is None:
+            await self._session_closed.wait()
+        else:
+            await asyncio.wait_for(self._session_closed.wait(),
+                                     timeout=timeout)
 
     # --- event fan-out ------------------------------------------------
 
@@ -231,7 +226,7 @@ class WebTransportClient:
     # --- internal: dispatcher hook ------------------------------------
 
     def _on_event(self, ev_tuple) -> None:
-        """Called by the shared dispatcher for every drained event whose
+        """Called by the dispatcher for every drained event whose
         stream_ctx_ptr matches this session.
 
         ev_tuple: (event_type, stream_id, data, is_fin, error_code,
@@ -297,9 +292,68 @@ class WebTransportClient:
 
 
 # =====================================================================
+# Initiator-side: subclass adds open().
+# =====================================================================
+
+class WebTransportClient(WebTransportSession):
+    """Initiator-side WT session. Adds open() to drive the
+    CONNECT handshake."""
+
+    def __init__(self, transport: TransportContext,
+                 host: str, port: int, path: str,
+                 sni: str | None = None):
+        super().__init__(transport, role="client")
+        self._host = host
+        self._port = port
+        self._path = path
+        self._sni = sni or host
+
+    async def open(self, timeout: float = 10.0) -> None:
+        """Initiate the WT session — push TX_WT_OPEN, await
+        SESSION_READY. Picoquic-thread does picowt_prepare_client_cnx
+        + picowt_connect."""
+        self._loop = asyncio.get_event_loop()
+        self._attach_dispatcher()
+        self._session_ready = self._loop.create_future()
+
+        addr = _resolve_host(self._host)
+        self._state.push_open(addr, self._port, self._path, self._sni)
+
+        try:
+            await asyncio.wait_for(self._session_ready, timeout=timeout)
+        except asyncio.TimeoutError:
+            raise WebTransportError(
+                f"WT CONNECT timed out after {timeout}s"
+            ) from None
+
+
+# =====================================================================
+# Acceptor-side: subclass added in Phase C.4 step 3 (server-side
+# bridge in C must surface WT_NEW_SESSION events first).
+# =====================================================================
+
+class WebTransportServerSession(WebTransportSession):
+    """Acceptor-side WT session. Constructed by the server's accept
+    callback when a new H3 CONNECT arrives at a registered path.
+
+    The C-side bridge has already allocated the underlying
+    aiopquic_wt_session_t and registered the WT prefix; this Python
+    object just wraps it and routes events from the rx_ring."""
+
+    def __init__(self, transport: TransportContext,
+                 state: WebTransportSessionState):
+        super().__init__(transport, role="server", state=state)
+        # Server side: session is already open at construction time
+        # (the peer sent CONNECT and we accepted it).
+        self._loop = asyncio.get_event_loop()
+        self._attach_dispatcher()
+        self._session_ready = self._loop.create_future()
+        self._session_ready.set_result(None)
+
+
+# =====================================================================
 # Shared dispatcher: one add_reader per (loop, transport); routes
-# every drained event to the matching WebTransportClient by
-# stream_ctx_ptr (the wt_session_t* set in h3wt_callback.h).
+# every drained event to the matching session by stream_ctx_ptr.
 # =====================================================================
 
 class _Dispatcher:
@@ -307,25 +361,25 @@ class _Dispatcher:
                  transport: TransportContext):
         self._loop = loop
         self._transport = transport
-        self._clients: dict[int, WebTransportClient] = {}
+        self._sessions: dict[int, WebTransportSession] = {}
         loop.add_reader(transport.eventfd, self._drain)
 
-    def add_client(self, client: WebTransportClient) -> None:
-        self._clients[client._state.session_ptr] = client
+    def add_session(self, session: WebTransportSession) -> None:
+        self._sessions[session._state.session_ptr] = session
 
-    def remove_client(self, client: WebTransportClient) -> None:
-        self._clients.pop(client._state.session_ptr, None)
+    def remove_session(self, session: WebTransportSession) -> None:
+        self._sessions.pop(session._state.session_ptr, None)
 
     def _drain(self) -> None:
         events = self._transport.drain_rx()
         for ev in events:
             stream_ctx_ptr = ev[6]
-            client = self._clients.get(stream_ctx_ptr)
-            if client is not None:
-                client._on_event(ev)
-            # else: raw-QUIC event or no matching session — drop on
-            # the floor for now. Future: route raw-QUIC events to
-            # QuicConnectionProtocol if it's also using this transport.
+            session = self._sessions.get(stream_ctx_ptr)
+            if session is not None:
+                session._on_event(ev)
+            # else: raw-QUIC event or no matching session — drop.
+            # Future: route raw-QUIC events to QuicConnectionProtocol
+            # when both kinds of consumers share one TransportContext.
 
     def detach(self) -> None:
         try:
@@ -335,30 +389,30 @@ class _Dispatcher:
 
 
 class _DispatcherRegistry:
-    """Process-wide registry of dispatchers keyed by (loop_id,
-    transport_id). Lazy-created; one add_reader per pair."""
+    """Process-wide registry keyed by (loop_id, transport_id).
+    Lazy-created; one add_reader per pair."""
     def __init__(self):
         self._dispatchers: dict[tuple[int, int], _Dispatcher] = {}
 
     def attach(self, loop: asyncio.AbstractEventLoop,
                 transport: TransportContext,
-                client: WebTransportClient) -> None:
+                session: WebTransportSession) -> None:
         key = (id(loop), id(transport))
         d = self._dispatchers.get(key)
         if d is None:
             d = _Dispatcher(loop, transport)
             self._dispatchers[key] = d
-        d.add_client(client)
+        d.add_session(session)
 
     def detach(self, loop: asyncio.AbstractEventLoop,
                 transport: TransportContext,
-                client: WebTransportClient) -> None:
+                session: WebTransportSession) -> None:
         key = (id(loop), id(transport))
         d = self._dispatchers.get(key)
         if d is None:
             return
-        d.remove_client(client)
-        if not d._clients:
+        d.remove_session(session)
+        if not d._sessions:
             d.detach()
             del self._dispatchers[key]
 
@@ -374,7 +428,7 @@ def _get_dispatcher_registry() -> _DispatcherRegistry:
 
 
 # =====================================================================
-# Public async context-manager entry point.
+# Public client-side entry point.
 # =====================================================================
 
 @asynccontextmanager
@@ -392,17 +446,13 @@ async def connect_webtransport(
             wt.send_stream_data(sid, b'...')
             ...
 
-    `transport` defaults to a fresh TransportContext started in
-    client mode; pass an existing one to share rings/threading
-    across multiple sessions.
+    `transport` defaults to a fresh TransportContext started in client
+    mode (alpn='h3', max_datagram_frame_size=64KB); pass an existing
+    one to share rings/threading across multiple sessions.
     """
     own_transport = transport is None
     if own_transport:
         transport = TransportContext()
-        # WT requires h3 ALPN at the QUIC layer + datagram support.
-        # picowt_prepare_client_cnx will create a per-session cnx with
-        # h3zero_callback set; this start() just brings up the
-        # picoquic_quic_t + network thread.
         transport.start(is_client=True, alpn="h3",
                           max_datagram_frame_size=64 * 1024)
 
@@ -413,10 +463,6 @@ async def connect_webtransport(
     finally:
         loop = asyncio.get_event_loop()
         if not client.session_closed:
-            # Send the close capsule, then settle briefly so the
-            # picoquic thread can flush it on the wire before we
-            # tear down the network thread. Bounded so we don't
-            # hang on a peer that's already gone.
             client.close(0, b"")
             try:
                 await asyncio.wait_for(client.wait_closed(), timeout=2.0)
