@@ -68,15 +68,33 @@ class QuicConnection:
 
     Presents the same public API as qh3.quic.connection.QuicConnection
     so that higher layers (H3Connection, aiomoqt) can use it unchanged.
+
+    Two construction modes:
+    - Client / standalone: QuicConnection(configuration=cfg). Owns its
+      own TransportContext; calls _start_transport() then connect().
+    - Engine-spawned (server side): QuicConnection(configuration=cfg,
+      engine=engine, cnx_ptr=cnx). Shares engine's transport; cnx_ptr
+      is the picoquic cnx pointer for this peer. Engine routes events
+      to this connection's _events queue; no own drain.
     """
 
-    def __init__(self, *, configuration: QuicConfiguration):
+    def __init__(self, *, configuration: QuicConfiguration,
+                 engine: "QuicEngine | None" = None,
+                 cnx_ptr: int = 0):
         self._configuration = configuration
-        self._transport: TransportContext | None = None
-        self._cnx_ptr: int = 0
+        self._engine = engine
+        if engine is not None:
+            # Engine-spawned: share engine's transport, no own drain
+            self._transport = engine._transport
+            self._cnx_ptr = cnx_ptr
+            self._connected = True
+            self._closed = False
+        else:
+            self._transport: TransportContext | None = None
+            self._cnx_ptr = 0
+            self._connected = False
+            self._closed = False
         self._events: list[QuicEvent] = []
-        self._connected = False
-        self._closed = False
         self._next_bidi_id: int = 0 if configuration.is_client else 1
         self._next_uni_id: int = 2 if configuration.is_client else 3
         # H3Connection compatibility
@@ -186,10 +204,53 @@ class QuicConnection:
 
     def next_event(self) -> QuicEvent | None:
         """Dequeue next event from the connection."""
-        self._drain_and_convert()
+        if self._engine is None:
+            self._drain_and_convert()
         if self._events:
             return self._events.pop(0)
         return None
+
+    def _enqueue_raw(self, evt_type: int, stream_id: int, data,
+                     is_fin: bool, error_code: int,
+                     stream_ctx_ptr: int) -> None:
+        """Engine-side: append a raw event tuple as a QuicEvent.
+
+        Routes one drained SPSC entry into this connection's queue.
+        Mirrors the conversion logic in _drain_and_convert. Called by
+        QuicEngine after demuxing by cnx_ptr.
+        """
+        if evt_type == _EVT_STREAM_DATA:
+            self._events.append(StreamDataReceived(
+                stream_id=stream_id,
+                data=data if data is not None else memoryview(b""),
+                end_stream=False,
+            ))
+        elif evt_type == _EVT_STREAM_FIN:
+            self._events.append(StreamDataReceived(
+                stream_id=stream_id,
+                data=data if data is not None else memoryview(b""),
+                end_stream=True,
+            ))
+        elif evt_type == _EVT_STREAM_RESET:
+            self._events.append(StreamReset(
+                stream_id=stream_id, error_code=error_code,
+            ))
+        elif evt_type == _EVT_STOP_SENDING:
+            self._events.append(StopSendingReceived(
+                stream_id=stream_id, error_code=error_code,
+            ))
+        elif evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
+            self._closed = True
+            self._events.append(ConnectionTerminated(error_code=error_code))
+        elif evt_type == _EVT_READY:
+            alpn = (self._configuration.alpn_protocols[0]
+                    if self._configuration.alpn_protocols else None)
+            self._events.append(HandshakeCompleted(alpn_protocol=alpn))
+            self._events.append(ProtocolNegotiated(alpn_protocol=alpn))
+        elif evt_type == _EVT_DATAGRAM:
+            self._events.append(DatagramFrameReceived(
+                data=data if data is not None else memoryview(b""),
+            ))
 
     def send_stream_data(self, stream_id: int, data: bytes,
                          end_stream: bool = False) -> None:
@@ -252,7 +313,112 @@ class QuicConnection:
             self._closed = True
 
     def stop(self) -> None:
-        """Stop the transport entirely."""
+        """Stop the transport entirely.
+
+        For engine-spawned connections this is a no-op; the engine
+        owns the transport and shuts it down on engine.close().
+        """
+        if self._engine is not None:
+            return
+        if self._transport is not None:
+            self._transport.stop()
+            self._transport = None
+
+
+class QuicEngine:
+    """Server-side multiplexer over a single picoquic engine.
+
+    Owns the TransportContext, drains SPSC events, and routes them by
+    cnx pointer to a per-connection QuicConnection. On the first READY
+    event for a new cnx, calls create_protocol(connection) to spawn a
+    fresh user protocol bound to that connection.
+
+    The engine is what serve() returns to the user. Lifetime of all
+    connections is bound to the engine (engine.close() tears them
+    down). Used only for the server case; client connect() wraps a
+    standalone QuicConnection.
+    """
+
+    def __init__(self, *, configuration: QuicConfiguration,
+                 create_protocol, stream_handler=None):
+        self._configuration = configuration
+        self._create_protocol = create_protocol
+        self._stream_handler = stream_handler
+        self._transport: TransportContext | None = None
+        self._connections: dict[int, QuicConnection] = {}
+        self._protocols: dict[int, "object"] = {}
+
+    def _start_transport(self, port: int = 0) -> None:
+        if self._transport is not None:
+            return
+        cfg = self._configuration
+        self._transport = TransportContext()
+        self._transport.start(
+            port=port,
+            cert_file=cfg.certificate_file,
+            key_file=cfg.private_key_file,
+            alpn=(cfg.alpn_protocols[0] if cfg.alpn_protocols else None),
+            is_client=cfg.is_client,
+            idle_timeout_ms=int(cfg.idle_timeout * 1000),
+            max_datagram_frame_size=(cfg.max_datagram_frame_size or 0),
+        )
+
+    @property
+    def eventfd(self) -> int:
+        if self._transport is None:
+            return -1
+        return self._transport.eventfd
+
+    def drain_and_route(self) -> None:
+        """Drain SPSC events and route to per-cnx protocols.
+
+        For each event:
+          - cnx_ptr == 0: engine-level (transport ready); ignored here.
+          - cnx_ptr unknown: first READY for a new cnx — spawn
+            QuicConnection + protocol via create_protocol().
+          - cnx_ptr known: enqueue raw event on that connection, then
+            drive the bound protocol to drain it.
+        """
+        if self._transport is None:
+            return
+        raw_events = self._transport.drain_rx()
+        for (evt_type, stream_id, data, is_fin, error_code,
+             cnx_ptr, stream_ctx_ptr) in raw_events:
+            if cnx_ptr == 0:
+                continue  # engine-level event, not per-cnx
+            conn = self._connections.get(cnx_ptr)
+            if conn is None:
+                conn = QuicConnection(
+                    configuration=self._configuration,
+                    engine=self, cnx_ptr=cnx_ptr,
+                )
+                self._connections[cnx_ptr] = conn
+                proto = self._create_protocol(
+                    conn, stream_handler=self._stream_handler,
+                )
+                # Engine owns the eventfd reader; bind protocol to the
+                # loop without adding a second reader (which would
+                # replace ours and break demux for all other cnx).
+                import asyncio as _asyncio
+                proto._loop = _asyncio.get_event_loop()
+                self._protocols[cnx_ptr] = proto
+            conn._enqueue_raw(evt_type, stream_id, data, is_fin,
+                              error_code, stream_ctx_ptr)
+            proto = self._protocols[cnx_ptr]
+            proto._process_events()
+            if evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
+                self._connections.pop(cnx_ptr, None)
+                self._protocols.pop(cnx_ptr, None)
+
+    def close(self) -> None:
+        """Tear down all connections and stop the transport."""
+        for proto in list(self._protocols.values()):
+            try:
+                proto.close()
+            except Exception:
+                pass
+        self._connections.clear()
+        self._protocols.clear()
         if self._transport is not None:
             self._transport.stop()
             self._transport = None
