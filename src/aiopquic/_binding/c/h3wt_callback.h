@@ -399,6 +399,12 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                               sni_buf, path_buf,
                               aiopquic_wt_path_callback,
                               (void*)s, NULL);
+        if (rc == 0) {
+            /* picowt_prepare_client_cnx + picowt_connect leave the
+             * cnx inert; pull the trigger so picoquic kicks off the
+             * TLS handshake on the next packet loop tick. */
+            rc = picoquic_start_client_cnx(cnx);
+        }
         if (rc != 0) {
             aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_REFUSED,
                                     s->control_stream_id, 4, NULL, 0);
@@ -463,8 +469,8 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
 
     case SPSC_EVT_TX_WT_STOP_SENDING: {
         if (!s || !s->cnx) return 1;
-        picoquic_request_stop_sending(s->cnx, entry->stream_id,
-                                       entry->error_code);
+        picoquic_stop_sending(s->cnx, entry->stream_id,
+                               entry->error_code);
         return 1;
     }
 

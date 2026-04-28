@@ -84,6 +84,7 @@ cdef extern from "picoquic.h":
     void picoquic_set_null_verifier(picoquic_quic_t* quic)
     void picoquic_set_default_idle_timeout(picoquic_quic_t* quic, uint64_t idle_timeout_ms)
     void picoquic_set_log_level(picoquic_quic_t* quic, int log_level)
+    int picoquic_set_textlog(picoquic_quic_t* quic, const char* textlog_file)
     void picoquic_set_callback(picoquic_cnx_t* cnx,
         picoquic_stream_data_cb_fn callback_fn, void* callback_ctx)
 
@@ -518,7 +519,7 @@ cdef class TransportContext:
     def start(self, int port=0, cert_file=None, key_file=None,
               alpn=None, bint is_client=True, uint64_t idle_timeout_ms=30000,
               uint32_t max_datagram_frame_size=0,
-              wt_path=None):
+              wt_path=None, debug_log=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -586,6 +587,12 @@ cdef class TransportContext:
             raise RuntimeError("Failed to create picoquic context")
 
         self._ctx.quic = self._quic
+
+        cdef bytes _b_log
+        if debug_log is not None:
+            picoquic_set_log_level(self._quic, 1)
+            _b_log = debug_log.encode() if isinstance(debug_log, str) else debug_log
+            picoquic_set_textlog(self._quic, _b_log)
 
         if is_client:
             picoquic_set_null_verifier(self._quic)
