@@ -5,13 +5,23 @@ from dataclasses import dataclass, field
 
 @dataclass
 class QuicConfiguration:
-    """Configuration for a QUIC connection."""
+    """Configuration for a QUIC connection.
+
+    Defaults tuned for streaming-media workloads (MoQT, WT). Override
+    individual fields where a different policy is needed.
+    """
     alpn_protocols: list[str] | None = None
     idle_timeout: float = 60.0
     is_client: bool = True
-    max_data: int = 1048576
-    max_stream_data: int = 1048576
-    max_datagram_frame_size: int | None = None
+    # 16 MB connection-wide / per-stream flow-control windows. Keeps
+    # high-bandwidth single-stream sustained throughput unblocked
+    # without explicit overrides for the common case.
+    max_data: int = 16 * 1024 * 1024
+    max_stream_data: int = 16 * 1024 * 1024
+    # 65535: the QUIC max for the DATAGRAM frame extension (RFC 9221).
+    # Enables datagrams by default (h3zero only advertises h3_datagram
+    # + webtransport_max_sessions when this is non-zero).
+    max_datagram_frame_size: int | None = 65535
     server_name: str | None = None
     certificate_file: str | None = None
     private_key_file: str | None = None

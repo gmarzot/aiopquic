@@ -399,13 +399,24 @@ class _Dispatcher:
             if session is not None:
                 session._on_event(ev)
 
+    def set_session_factory(self, factory) -> None:
+        """factory(transport, state) -> WebTransportSession; defaults
+        to WebTransportServerSession when unset. Allows callers to
+        substitute application-specific session subclasses (e.g.,
+        aiomoqt's MOQTSessionWTServer)."""
+        self._session_factory = factory
+
     def _spawn_server_session(self, ev) -> None:
         stream_ctx_ptr = ev[6]
         if stream_ctx_ptr in self._sessions:
             return  # already attached (re-entrancy guard)
         state = WebTransportSessionState(self._transport,
                                           session_ptr=stream_ctx_ptr)
-        session = WebTransportServerSession(self._transport, state)
+        factory = getattr(self, '_session_factory', None)
+        if factory is None:
+            session = WebTransportServerSession(self._transport, state)
+        else:
+            session = factory(self._transport, state)
         self._sessions[stream_ctx_ptr] = session
         result = self._acceptor(session)
         if asyncio.iscoroutine(result):
@@ -551,15 +562,13 @@ async def serve_webtransport(
         *, handler,
         cert_file: str, key_file: str,
         transport: TransportContext | None = None,
+        session_factory=None,
 ) -> WebTransportServer:
     """Start a WebTransport server listening on (host, port) at path.
 
-    handler(session) is invoked once per accepted CONNECT, with a
-    WebTransportServerSession. May be a sync function or coroutine.
-
-    `transport` defaults to a fresh TransportContext started in server
-    mode (alpn='h3', wt_path=path); pass an existing one to share
-    rings/threading.
+    handler(session) is invoked once per accepted CONNECT.
+    session_factory(transport, state) constructs each session;
+    defaults to WebTransportServerSession.
     """
     own_transport = transport is None
     if own_transport:
@@ -576,4 +585,6 @@ async def serve_webtransport(
     loop = asyncio.get_event_loop()
     dispatcher = _get_dispatcher_registry().attach_acceptor(
         loop, transport, handler)
+    if session_factory is not None:
+        dispatcher.set_session_factory(session_factory)
     return WebTransportServer(transport, dispatcher, own_transport)

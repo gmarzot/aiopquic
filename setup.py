@@ -100,6 +100,12 @@ extensions = [
             "src", "aiopquic", "_binding", "_streamchain.pyx")],
         language="c",
     ),
+    Extension(
+        "aiopquic._binding._buffer",
+        sources=[os.path.join(
+            "src", "aiopquic", "_binding", "_buffer.pyx")],
+        language="c",
+    ),
 ]
 
 setup(
