@@ -268,6 +268,73 @@ static int aiopquic_wt_path_callback(
 }
 
 /*
+ * Server-side WT path callback. Registered in the picoquic engine's
+ * picohttp_server_parameters_t::path_table with path_app_ctx set to
+ * the bridge (aiopquic_ctx_t*). h3zero invokes this on a CONNECT
+ * landing at the registered path; we accept the WT session,
+ * allocate a per-session aiopquic_wt_session_t, re-point the
+ * stream's callback to aiopquic_wt_path_callback (the per-session
+ * handler used by the client), declare the stream prefix so peer-
+ * opened WT streams within this session route through us, and push
+ * SPSC_EVT_WT_NEW_SESSION so the asyncio side can construct a
+ * Python WebTransportServerSession.
+ */
+static int aiopquic_wt_server_path_callback(
+        picoquic_cnx_t* cnx,
+        uint8_t* path_bytes, size_t path_len,
+        picohttp_call_back_event_t event,
+        h3zero_stream_ctx_t* stream_ctx,
+        void* path_app_ctx) {
+    aiopquic_ctx_t* bridge = (aiopquic_ctx_t*)path_app_ctx;
+    if (!bridge || !stream_ctx) return -1;
+
+    if (event != picohttp_callback_connect) {
+        /* Anything other than the CONNECT-arrival event on the
+         * path-table entry is unexpected; per-session events should
+         * have been re-routed to aiopquic_wt_path_callback by the
+         * stream_ctx->path_callback override below. */
+        return 0;
+    }
+
+    h3zero_callback_ctx_t* h3_ctx =
+        (h3zero_callback_ctx_t*)picoquic_get_callback_context(cnx);
+    if (!h3_ctx) return -1;
+
+    aiopquic_wt_session_t* s = aiopquic_wt_session_create(bridge);
+    if (!s) return -1;
+    s->cnx = cnx;
+    s->h3_ctx = h3_ctx;
+    s->control_stream = stream_ctx;
+    s->control_stream_id = stream_ctx->stream_id;
+    s->session_ready = 1;
+
+    /* Re-point this stream so all further events (post_data,
+     * post_fin, capsules, reset, stop_sending, deregister, ...) go
+     * to the per-session handler with the session ctx. */
+    stream_ctx->path_callback = aiopquic_wt_path_callback;
+    stream_ctx->path_callback_ctx = s;
+
+    /* Register the prefix so peer-opened WT streams within this WT
+     * session are dispatched to our per-session callback. */
+    (void)h3zero_declare_stream_prefix(
+        h3_ctx, s->control_stream_id,
+        aiopquic_wt_path_callback, s);
+
+    /* Surface the new session to Python. cnx + session ptr come from
+     * the spsc_entry fields; path bytes ride in the data buffer so
+     * the asyncio side can demux by path when multiple are served. */
+    spsc_entry_t entry = {0};
+    entry.event_type = SPSC_EVT_WT_NEW_SESSION;
+    entry.stream_id = s->control_stream_id;
+    entry.cnx = cnx;
+    entry.stream_ctx = s;
+    int rc = spsc_ring_push(bridge->rx_ring, &entry,
+                             path_bytes, (uint32_t)path_len);
+    if (rc == 0) aiopquic_notify_rx(bridge);
+    return 0;
+}
+
+/*
  * WT TX-event dispatch — called from aiopquic_loop_cb in callback.h.
  * Returns 1 if event was a recognized WT command, 0 otherwise.
  * The caller is responsible for spsc_ring_pop on the entry.
@@ -391,6 +458,13 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (st) {
             picowt_reset_stream(s->cnx, st, entry->error_code);
         }
+        return 1;
+    }
+
+    case SPSC_EVT_TX_WT_STOP_SENDING: {
+        if (!s || !s->cnx) return 1;
+        picoquic_request_stop_sending(s->cnx, entry->stream_id,
+                                       entry->error_code);
         return 1;
     }
 

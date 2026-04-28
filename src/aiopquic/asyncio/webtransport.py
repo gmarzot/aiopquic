@@ -49,6 +49,7 @@ _EVT_WT_STOP_SENDING = 71
 _EVT_WT_DATAGRAM = 72
 _EVT_WT_NEW_STREAM = 73
 _EVT_WT_STREAM_CREATED = 74
+_EVT_WT_NEW_SESSION = 75
 
 
 class WebTransportError(Exception):
@@ -182,6 +183,16 @@ class WebTransportSession:
 
     def reset_stream(self, stream_id: int, error_code: int = 0) -> None:
         self._state.push_reset_stream(stream_id, error_code)
+
+    def stop_stream(self, stream_id: int, error_code: int = 0) -> None:
+        """Send STOP_SENDING on a WT stream (peer should reset)."""
+        self._state.push_stop_sending(stream_id, error_code)
+
+    def send_datagram_frame(self, data: bytes) -> None:
+        """Send a WebTransport datagram. Not yet wired through the C
+        bridge; raises NotImplementedError until the WT datagram TX
+        path lands."""
+        raise NotImplementedError("WT datagram TX not yet supported")
 
     async def receive_stream_data(self, stream_id: int):
         """Async-generator: yield WebTransportStreamDataReceived (and
@@ -362,6 +373,7 @@ class _Dispatcher:
         self._loop = loop
         self._transport = transport
         self._sessions: dict[int, WebTransportSession] = {}
+        self._acceptor = None  # callable(session) -> None|coroutine
         loop.add_reader(transport.eventfd, self._drain)
 
     def add_session(self, session: WebTransportSession) -> None:
@@ -370,16 +382,34 @@ class _Dispatcher:
     def remove_session(self, session: WebTransportSession) -> None:
         self._sessions.pop(session._state.session_ptr, None)
 
+    def set_acceptor(self, acceptor) -> None:
+        """Install the server-side handler invoked once per
+        EVT_WT_NEW_SESSION. Receives the new WebTransportServerSession."""
+        self._acceptor = acceptor
+
     def _drain(self) -> None:
         events = self._transport.drain_rx()
         for ev in events:
+            evt_type = ev[0]
             stream_ctx_ptr = ev[6]
+            if evt_type == _EVT_WT_NEW_SESSION and self._acceptor is not None:
+                self._spawn_server_session(ev)
+                continue
             session = self._sessions.get(stream_ctx_ptr)
             if session is not None:
                 session._on_event(ev)
-            # else: raw-QUIC event or no matching session — drop.
-            # Future: route raw-QUIC events to QuicConnectionProtocol
-            # when both kinds of consumers share one TransportContext.
+
+    def _spawn_server_session(self, ev) -> None:
+        stream_ctx_ptr = ev[6]
+        if stream_ctx_ptr in self._sessions:
+            return  # already attached (re-entrancy guard)
+        state = WebTransportSessionState(self._transport,
+                                          session_ptr=stream_ctx_ptr)
+        session = WebTransportServerSession(self._transport, state)
+        self._sessions[stream_ctx_ptr] = session
+        result = self._acceptor(session)
+        if asyncio.iscoroutine(result):
+            self._loop.create_task(result)
 
     def detach(self) -> None:
         try:
@@ -403,6 +433,19 @@ class _DispatcherRegistry:
             d = _Dispatcher(loop, transport)
             self._dispatchers[key] = d
         d.add_session(session)
+
+    def attach_acceptor(self, loop: asyncio.AbstractEventLoop,
+                         transport: TransportContext,
+                         acceptor) -> "_Dispatcher":
+        """Bind a server-side accept handler to (loop, transport).
+        Returns the underlying dispatcher so callers can detach."""
+        key = (id(loop), id(transport))
+        d = self._dispatchers.get(key)
+        if d is None:
+            d = _Dispatcher(loop, transport)
+            self._dispatchers[key] = d
+        d.set_acceptor(acceptor)
+        return d
 
     def detach(self, loop: asyncio.AbstractEventLoop,
                 transport: TransportContext,
@@ -474,3 +517,63 @@ async def connect_webtransport(
                 transport.stop()
             except Exception:
                 pass
+
+
+# =====================================================================
+# Public server-side entry point.
+# =====================================================================
+
+class WebTransportServer:
+    """Server handle returned by serve_webtransport. close() tears
+    down the engine and detaches the dispatcher."""
+
+    def __init__(self, transport: TransportContext, dispatcher,
+                 own_transport: bool):
+        self._transport = transport
+        self._dispatcher = dispatcher
+        self._own_transport = own_transport
+
+    def close(self) -> None:
+        try:
+            self._dispatcher.set_acceptor(None)
+            self._dispatcher.detach()
+        except Exception:
+            pass
+        if self._own_transport:
+            try:
+                self._transport.stop()
+            except Exception:
+                pass
+
+
+async def serve_webtransport(
+        host: str, port: int, path: str,
+        *, handler,
+        cert_file: str, key_file: str,
+        transport: TransportContext | None = None,
+) -> WebTransportServer:
+    """Start a WebTransport server listening on (host, port) at path.
+
+    handler(session) is invoked once per accepted CONNECT, with a
+    WebTransportServerSession. May be a sync function or coroutine.
+
+    `transport` defaults to a fresh TransportContext started in server
+    mode (alpn='h3', wt_path=path); pass an existing one to share
+    rings/threading.
+    """
+    own_transport = transport is None
+    if own_transport:
+        transport = TransportContext()
+        transport.start(
+            port=port,
+            cert_file=cert_file, key_file=key_file,
+            alpn="h3",
+            is_client=False,
+            max_datagram_frame_size=64 * 1024,
+            wt_path=path,
+        )
+
+    loop = asyncio.get_event_loop()
+    dispatcher = _get_dispatcher_registry().attach_acceptor(
+        loop, transport, handler)
+    return WebTransportServer(transport, dispatcher, own_transport)

@@ -29,6 +29,7 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_WT_OPEN, SPSC_EVT_TX_WT_CREATE_STREAM,
     SPSC_EVT_TX_WT_CLOSE, SPSC_EVT_TX_WT_DRAIN,
     SPSC_EVT_TX_WT_RESET_STREAM, SPSC_EVT_TX_WT_DEREGISTER,
+    SPSC_EVT_TX_WT_STOP_SENDING,
 )
 
 # Socket address helpers (needed by picoquic declarations)
@@ -189,6 +190,22 @@ cdef extern from "h3zero_common.h":
         int fin_or_event,
         h3zero_stream_ctx_t* stream_ctx, void* path_app_ctx)
 
+    ctypedef struct picohttp_server_path_item_t:
+        const char* path
+        size_t path_length
+        picohttp_post_data_cb_fn path_callback
+        void* path_app_ctx
+
+    ctypedef struct picohttp_server_parameters_t:
+        const char* web_folder
+        picohttp_server_path_item_t* path_table
+        size_t path_table_nb
+
+    int h3zero_callback(picoquic_cnx_t* cnx, uint64_t stream_id,
+                         uint8_t* bytes, size_t length,
+                         int fin_or_event, void* callback_ctx,
+                         void* stream_ctx)
+
 
 cdef extern from "pico_webtransport.h":
     int picowt_prepare_client_cnx(
@@ -240,6 +257,10 @@ cdef extern from "c/h3wt_callback.h":
     aiopquic_wt_session_t* aiopquic_wt_session_create(aiopquic_ctx_t* bridge)
     void aiopquic_wt_session_destroy(aiopquic_wt_session_t* s)
     int aiopquic_wt_path_callback(
+        picoquic_cnx_t* cnx, uint8_t* bytes, size_t length,
+        int event,
+        h3zero_stream_ctx_t* stream_ctx, void* path_app_ctx)
+    int aiopquic_wt_server_path_callback(
         picoquic_cnx_t* cnx, uint8_t* bytes, size_t length,
         int event,
         h3zero_stream_ctx_t* stream_ctx, void* path_app_ctx)
@@ -378,6 +399,10 @@ cdef class TransportContext:
     cdef picoquic_network_thread_ctx_t* _thread_ctx
     cdef picoquic_packet_loop_param_t _param
     cdef bint _started
+    # WT server-mode storage; must persist for picoquic's lifetime.
+    cdef bytes _wt_path_bytes
+    cdef picohttp_server_path_item_t _wt_path_item
+    cdef picohttp_server_parameters_t _wt_params
 
     def __cinit__(self, uint32_t ring_capacity=DEFAULT_RING_CAPACITY):
         self._ctx = aiopquic_ctx_create(ring_capacity)
@@ -492,7 +517,8 @@ cdef class TransportContext:
 
     def start(self, int port=0, cert_file=None, key_file=None,
               alpn=None, bint is_client=True, uint64_t idle_timeout_ms=30000,
-              uint32_t max_datagram_frame_size=0):
+              uint32_t max_datagram_frame_size=0,
+              wt_path=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -504,6 +530,9 @@ cdef class TransportContext:
             is_client: If True, skip cert verification.
             idle_timeout_ms: Idle timeout in milliseconds.
             max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
+            wt_path: Server-mode WebTransport path (e.g. "/moq").
+                When set, uses h3zero_callback as picoquic's default
+                callback and routes CONNECT-on-path to the WT bridge.
         """
         if self._started:
             raise RuntimeError("Transport already started")
@@ -523,14 +552,30 @@ cdef class TransportContext:
             b_alpn = alpn.encode() if isinstance(alpn, str) else alpn
             c_alpn = b_alpn
 
-        # Create picoquic context with our stream callback
+        cdef picoquic_stream_data_cb_fn default_cb_fn = aiopquic_stream_cb
+        cdef void* default_cb_ctx = <void*>self._ctx
+        cdef bytes wt_path_b
+        if wt_path is not None and not is_client:
+            wt_path_b = wt_path.encode() if isinstance(wt_path, str) else wt_path
+            self._wt_path_bytes = wt_path_b
+            self._wt_path_item.path = self._wt_path_bytes
+            self._wt_path_item.path_length = len(self._wt_path_bytes)
+            self._wt_path_item.path_callback = aiopquic_wt_server_path_callback
+            self._wt_path_item.path_app_ctx = <void*>self._ctx
+            self._wt_params.web_folder = NULL
+            self._wt_params.path_table = &self._wt_path_item
+            self._wt_params.path_table_nb = 1
+            default_cb_fn = h3zero_callback
+            default_cb_ctx = <void*>&self._wt_params
+
+        # Create picoquic context with the chosen default callback.
         self._quic = picoquic_create(
             256,            # max connections
             c_cert, c_key,
             NULL,           # cert root (use default)
             c_alpn,
-            aiopquic_stream_cb,
-            <void*>self._ctx,
+            default_cb_fn,
+            default_cb_ctx,
             NULL, NULL,     # no cnx_id callback
             NULL,           # no reset seed
             picoquic_current_time(),
@@ -544,6 +589,9 @@ cdef class TransportContext:
 
         if is_client:
             picoquic_set_null_verifier(self._quic)
+
+        if wt_path is not None and not is_client:
+            picowt_set_default_transport_parameters(self._quic)
 
         if idle_timeout_ms > 0:
             picoquic_set_default_idle_timeout(self._quic, idle_timeout_ms)
@@ -709,12 +757,17 @@ cdef class WebTransportSessionState:
                            # session as path_app_ctx — must deregister
                            # before destroy.
 
-    def __cinit__(self, TransportContext transport):
+    def __cinit__(self, TransportContext transport,
+                  uintptr_t session_ptr=0):
         self._transport = transport
-        self._wt = aiopquic_wt_session_create(transport._ctx)
-        self._opened = False
-        if self._wt is NULL:
-            raise MemoryError("Failed to create WT session")
+        if session_ptr != 0:
+            self._wt = <aiopquic_wt_session_t*><void*>session_ptr
+            self._opened = True
+        else:
+            self._wt = aiopquic_wt_session_create(transport._ctx)
+            self._opened = False
+            if self._wt is NULL:
+                raise MemoryError("Failed to create WT session")
 
     def __dealloc__(self):
         """If we ever pushed TX_WT_OPEN, picoquic is holding our
@@ -723,11 +776,11 @@ cdef class WebTransportSessionState:
         here; doing so would race with any in-flight path callback.
 
         If never opened, free directly (picoquic has no reference)."""
+        cdef spsc_entry_t entry
         if self._wt is NULL:
             return
         if self._opened:
             # Push deregister; the picoquic thread will free wt.
-            cdef spsc_entry_t entry
             memset(&entry, 0, sizeof(entry))
             entry.event_type = SPSC_EVT_TX_WT_DEREGISTER
             entry.cnx = <void*>self._wt
@@ -900,3 +953,18 @@ cdef class WebTransportSessionState:
         if ret != 0:
             raise BufferError("TX ring full (WT_RESET_STREAM)")
         self._transport.wake_up()
+
+    def push_stop_sending(self, uint64_t stream_id, uint64_t error_code):
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_WT_STOP_SENDING
+        entry.cnx = <void*>self._wt
+        entry.stream_ctx = <void*>self._wt
+        entry.stream_id = stream_id
+        entry.error_code = error_code
+        cdef int ret = spsc_ring_push(
+            self._transport._ctx.tx_ring, &entry, NULL, 0)
+        if ret != 0:
+            raise BufferError("TX ring full (WT_STOP_SENDING)")
+        self._transport.wake_up()
+

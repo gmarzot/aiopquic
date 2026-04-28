@@ -66,6 +66,7 @@ typedef enum {
     SPSC_EVT_TX_WT_DRAIN = 139,         /* picowt_send_drain_session_message */
     SPSC_EVT_TX_WT_RESET_STREAM = 140,  /* picowt_reset_stream */
     SPSC_EVT_TX_WT_DEREGISTER = 141,    /* picowt_deregister + free wt_session */
+    SPSC_EVT_TX_WT_STOP_SENDING = 142,  /* picoquic_request_stop_sending on WT stream */
 
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
@@ -85,6 +86,11 @@ typedef enum {
     SPSC_EVT_WT_NEW_STREAM = 73,           /* peer opened a new WT stream */
     SPSC_EVT_WT_STREAM_CREATED = 74,       /* ack of TX_WT_CREATE_STREAM
                                               with assigned stream_id */
+    SPSC_EVT_WT_NEW_SESSION = 75,          /* server-side: peer's CONNECT
+                                              accepted; new WT session
+                                              created. data = path bytes;
+                                              cnx = picoquic_cnx_t*;
+                                              stream_ctx = aiopquic_wt_session_t* */
 } spsc_event_type_t;
 
 typedef struct {
