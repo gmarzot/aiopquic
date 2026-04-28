@@ -157,6 +157,14 @@ static int aiopquic_wt_path_callback(
                 memset(&s->capsule, 0, sizeof(s->capsule));
             }
         } else {
+            /* First data on a peer-opened stream: announce it before
+             * delivering payload. h3zero increments post_received only
+             * after this callback returns, so post_received == 0 is a
+             * clean first-touch marker. */
+            if (stream_ctx->post_received == 0) {
+                aiopquic_wt_push_event(s, SPSC_EVT_WT_NEW_STREAM,
+                                        sid, 0, NULL, 0);
+            }
             aiopquic_wt_push_event(s, SPSC_EVT_WT_STREAM_DATA,
                                     sid, 0, bytes, (uint32_t)length);
         }
@@ -175,6 +183,10 @@ static int aiopquic_wt_path_callback(
                                     s->control_stream_id, 0, NULL, 0);
             s->session_closing = 1;
         } else {
+            if (stream_ctx->post_received == 0) {
+                aiopquic_wt_push_event(s, SPSC_EVT_WT_NEW_STREAM,
+                                        sid, 0, NULL, 0);
+            }
             if (length > 0) {
                 aiopquic_wt_push_event(s, SPSC_EVT_WT_STREAM_DATA,
                                         sid, 0, bytes, (uint32_t)length);
@@ -423,6 +435,13 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
             aiopquic_wt_push_event(s, SPSC_EVT_WT_STREAM_CREATED,
                                     0, 1, NULL, 0);
         } else {
+            /* picowt_create_local_stream wires the OUTBOUND prefix
+             * but doesn't register a path_callback. For bidi, the
+             * peer's reply lands on the inbound side and h3zero needs
+             * a callback to route the bytes back to us. wt_baton sets
+             * this in wt_baton_relay (see picohttp/wt_baton.c:181). */
+            new_stream->path_callback = aiopquic_wt_path_callback;
+            new_stream->path_callback_ctx = s;
             aiopquic_wt_push_event(s, SPSC_EVT_WT_STREAM_CREATED,
                                     new_stream->stream_id, 0, NULL, 0);
         }
