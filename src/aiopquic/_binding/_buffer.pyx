@@ -209,16 +209,21 @@ cdef class Buffer:
 
     # --- push primitives ----------------------------------------------
 
+    cdef inline int _check_push(self, Py_ssize_t need) except -1:
+        if not self._growable:
+            raise BufferReadError("write to fixed-capacity buffer")
+        if self._pos + need > self._capacity:
+            self._grow(self._pos + need)
+        return 0
+
     cpdef int push_uint8(self, int v) except -1:
-        if self._pos + 1 > self._capacity:
-            self._grow(self._pos + 1)
+        self._check_push(1)
         self._buf[self._pos] = <uint8_t>(v & 0xFF)
         self._pos += 1
         return 0
 
     cpdef int push_uint16(self, int v) except -1:
-        if self._pos + 2 > self._capacity:
-            self._grow(self._pos + 2)
+        self._check_push(2)
         cdef uint8_t* p = self._buf + self._pos
         p[0] = <uint8_t>((v >> 8) & 0xFF)
         p[1] = <uint8_t>(v & 0xFF)
@@ -226,8 +231,7 @@ cdef class Buffer:
         return 0
 
     cpdef int push_uint32(self, long v) except -1:
-        if self._pos + 4 > self._capacity:
-            self._grow(self._pos + 4)
+        self._check_push(4)
         cdef uint8_t* p = self._buf + self._pos
         p[0] = <uint8_t>((v >> 24) & 0xFF)
         p[1] = <uint8_t>((v >> 16) & 0xFF)
@@ -237,8 +241,7 @@ cdef class Buffer:
         return 0
 
     def push_uint64(self, v):
-        if self._pos + 8 > self._capacity:
-            self._grow(self._pos + 8)
+        self._check_push(8)
         cdef bytes raw = int(v).to_bytes(8, "big")
         memcpy(self._buf + self._pos, <const char*>raw, 8)
         self._pos += 8
@@ -249,8 +252,7 @@ cdef class Buffer:
         if n == 2: return self.push_uint16(<int>v)
         if n == 4: return self.push_uint32(<long>v)
         if n == 8: return self.push_uint64(v)
-        if self._pos + n > self._capacity:
-            self._grow(self._pos + n)
+        self._check_push(n)
         cdef bytes raw = int(v).to_bytes(n, "big")
         memcpy(self._buf + self._pos, <const char*>raw, n)
         self._pos += n
@@ -274,8 +276,7 @@ cdef class Buffer:
             prefix = 0xC0
         else:
             raise ValueError(f"varint value too large: {v_obj}")
-        if self._pos + n > self._capacity:
-            self._grow(self._pos + n)
+        self._check_push(n)
         cdef uint8_t* p = self._buf + self._pos
         if n == 1:
             p[0] = <uint8_t>(v & 0x3F) | prefix
