@@ -126,6 +126,8 @@ cdef extern from "picoquic.h":
     int picoquic_start_client_cnx(picoquic_cnx_t* cnx)
     int picoquic_close(picoquic_cnx_t* cnx, uint64_t reason)
     int picoquic_get_cnx_state(picoquic_cnx_t* cnx)
+    uint64_t picoquic_get_data_sent(picoquic_cnx_t* cnx)
+    uint64_t picoquic_get_data_received(picoquic_cnx_t* cnx)
     int picoquic_add_to_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
                                 const uint8_t* data, size_t length, int set_fin)
 
@@ -974,4 +976,25 @@ cdef class WebTransportSessionState:
         if ret != 0:
             raise BufferError("TX ring full (WT_STOP_SENDING)")
         self._transport.wake_up()
+
+
+# ---------------------------------------------------------------------------
+# Wire-level cnx counters — picoquic-side accounting of bytes that actually
+# crossed the UDP socket. send_stream_data only queues into picoquic's
+# per-stream send buffer; cwnd/pacing/pacing-fairness then governs when
+# bytes leave the wire. data_sent / data_received expose that ground truth.
+# ---------------------------------------------------------------------------
+
+def cnx_data_sent(uintptr_t cnx_ptr):
+    """Cumulative bytes the cnx has placed on the wire."""
+    if cnx_ptr == 0:
+        return 0
+    return picoquic_get_data_sent(<picoquic_cnx_t*>cnx_ptr)
+
+
+def cnx_data_received(uintptr_t cnx_ptr):
+    """Cumulative bytes the cnx has received from the wire."""
+    if cnx_ptr == 0:
+        return 0
+    return picoquic_get_data_received(<picoquic_cnx_t*>cnx_ptr)
 

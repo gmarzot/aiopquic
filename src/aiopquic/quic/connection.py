@@ -142,6 +142,21 @@ class QuicConnection:
             return -1
         return self._transport.eventfd
 
+    @property
+    def bytes_sent(self) -> int:
+        """Cumulative bytes this cnx has placed on the wire (picoquic-
+        accounting). Differs from bytes-queued: send_stream_data only
+        appends to picoquic's per-stream send buffer; bytes_sent is
+        the on-wire count after cwnd/pacing has done its work."""
+        from aiopquic._binding._transport import cnx_data_sent
+        return cnx_data_sent(self._cnx_ptr)
+
+    @property
+    def bytes_received(self) -> int:
+        """Cumulative bytes this cnx has received from the wire."""
+        from aiopquic._binding._transport import cnx_data_received
+        return cnx_data_received(self._cnx_ptr)
+
     def _drain_and_convert(self) -> None:
         """Drain SPSC ring and convert to QuicEvent objects."""
         if self._transport is None:
