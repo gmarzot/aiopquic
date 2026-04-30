@@ -29,5 +29,9 @@ third_party/picoquic/build/
 # OS
 .DS_Store
 
+# DTrace probe headers (generated during picotls build on macOS)
+.tmp.dprobes.h
+.tmp.*.h
+
 # Demo/runtime data
 *.bin

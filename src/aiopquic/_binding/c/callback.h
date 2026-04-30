@@ -13,15 +13,17 @@
 
 #include "spsc_ring.h"
 #include <picoquic.h>
+#include <picoquic_internal.h>
 #include <picoquic_packet_loop.h>
 
 #include <string.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include <fcntl.h>
+#include <unistd.h>
 #ifdef __linux__
 #include <sys/eventfd.h>
-#include <unistd.h>
 #endif
 
 /*
@@ -46,7 +48,10 @@ extern "C" {
 typedef struct {
     spsc_ring_t*    rx_ring;        /* picoquic → asyncio (events + data) */
     spsc_ring_t*    tx_ring;        /* asyncio → picoquic (send commands) */
-    int             eventfd;        /* notify asyncio of RX events */
+    int             eventfd;        /* readable fd asyncio watches (eventfd on Linux,
+                                       pipe read end elsewhere — self-pipe trick) */
+    int             wake_write_fd;  /* fd the network thread writes to (== eventfd on
+                                       Linux; pipe write end elsewhere) */
     picoquic_quic_t* quic;          /* back-reference to quic context */
 } aiopquic_ctx_t;
 
@@ -75,8 +80,26 @@ static inline aiopquic_ctx_t* aiopquic_ctx_create(
         free(ctx);
         return NULL;
     }
+    ctx->wake_write_fd = ctx->eventfd;
 #else
-    ctx->eventfd = -1;  /* TODO: pipe() fallback for non-Linux */
+    /* Self-pipe trick: pipe[0] is read end (asyncio watches), pipe[1] is
+     * write end (network thread signals). pipe2() isn't on macOS, so set
+     * O_NONBLOCK | O_CLOEXEC via fcntl after creation. */
+    int p[2];
+    if (pipe(p) < 0) {
+        spsc_ring_destroy(ctx->rx_ring);
+        spsc_ring_destroy(ctx->tx_ring);
+        free(ctx);
+        return NULL;
+    }
+    for (int i = 0; i < 2; i++) {
+        int flags = fcntl(p[i], F_GETFL, 0);
+        if (flags >= 0) (void)fcntl(p[i], F_SETFL, flags | O_NONBLOCK);
+        int fd_flags = fcntl(p[i], F_GETFD, 0);
+        if (fd_flags >= 0) (void)fcntl(p[i], F_SETFD, fd_flags | FD_CLOEXEC);
+    }
+    ctx->eventfd = p[0];
+    ctx->wake_write_fd = p[1];
 #endif
 
     return ctx;
@@ -85,28 +108,41 @@ static inline aiopquic_ctx_t* aiopquic_ctx_create(
 /* Destroy the bridge context */
 static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
     if (ctx) {
-#ifdef __linux__
         if (ctx->eventfd >= 0) close(ctx->eventfd);
-#endif
+        if (ctx->wake_write_fd >= 0 && ctx->wake_write_fd != ctx->eventfd) {
+            close(ctx->wake_write_fd);
+        }
         spsc_ring_destroy(ctx->rx_ring);
         spsc_ring_destroy(ctx->tx_ring);
         free(ctx);
     }
 }
 
-/* Signal the asyncio thread that there are events to read */
+/* Signal the asyncio thread that there are events to read.
+ * Linux: 8-byte counter increment on the eventfd.
+ * Other: single byte to the pipe write end (coalesced by drain). */
 static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
 #ifdef __linux__
     uint64_t val = 1;
-    (void)write(ctx->eventfd, &val, sizeof(val));
+    (void)write(ctx->wake_write_fd, &val, sizeof(val));
+#else
+    uint8_t b = 1;
+    (void)write(ctx->wake_write_fd, &b, 1);
 #endif
 }
 
-/* Clear the eventfd (called by asyncio thread after draining) */
+/* Clear the wake fd (called by asyncio thread after draining the RX ring).
+ * Linux: one 8-byte read returns and zeros the accumulated count.
+ * Other: drain the pipe until EAGAIN — many notifies coalesce into one wake. */
 static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
 #ifdef __linux__
     uint64_t val;
     (void)read(ctx->eventfd, &val, sizeof(val));
+#else
+    uint8_t buf[64];
+    while (read(ctx->eventfd, buf, sizeof(buf)) > 0) {
+        /* drain */
+    }
 #endif
 }
 
@@ -192,9 +228,17 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     entry.cnx = cnx;
     entry.stream_ctx = stream_ctx;
 
-    if (fin_or_event == picoquic_callback_stream_reset ||
-        fin_or_event == picoquic_callback_stop_sending) {
+    if (fin_or_event == picoquic_callback_stream_reset) {
         entry.error_code = picoquic_get_remote_stream_error(cnx, stream_id);
+    } else if (fin_or_event == picoquic_callback_stop_sending) {
+        /* picoquic stores STOP_SENDING's error code in stream->remote_stop_error;
+         * no public getter exists, so reach into picoquic_internal.h. */
+        picoquic_stream_head_t* s = picoquic_find_stream(cnx, stream_id);
+        if (s != NULL) entry.error_code = s->remote_stop_error;
+    } else if (fin_or_event == picoquic_callback_application_close) {
+        entry.error_code = picoquic_get_application_error(cnx);
+    } else if (fin_or_event == picoquic_callback_close) {
+        entry.error_code = picoquic_get_remote_error(cnx);
     }
 
     int ret = spsc_ring_push(ctx->rx_ring, &entry, bytes, (uint32_t)length);

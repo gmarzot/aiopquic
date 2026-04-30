@@ -1,10 +1,15 @@
 # cython: language_level=3
-# cython: freethreading_compatible = True
 """
 _transport — Cython bridge between picoquic (C) and Python asyncio.
 
 Manages the picoquic context lifecycle, SPSC ring buffers,
 and the dedicated network thread.
+
+Note: free-threaded Python (cp314t) is not yet supported. The TX-ring
+producer side and TransportContext lifecycle fields rely on the GIL
+for serialization; running under a no-GIL build risks ring corruption
+and use-after-free. Re-enable freethreading_compatible after the
+locking audit in TransportContext is complete.
 """
 
 from libc.stdint cimport uint8_t, uint32_t, uint64_t, uintptr_t
