@@ -4,12 +4,12 @@
 
 ## Overview
 
-`aiopquic` exposes picoquic's QUIC implementation through a lock-free SPSC ring buffer architecture that bridges the picoquic network thread with Python's asyncio event loop. It provides a qh3/aioquic-compatible API, making it a drop-in transport for existing QUIC applications.
+`aiopquic` exposes picoquic's QUIC implementation through a lock-free SPSC ring buffer architecture that bridges the picoquic network thread with Python's asyncio event loop. It provides a qh3/aioquic-compatible **transport** API, making it a drop-in QUIC transport for existing applications. HTTP/3 is *not* bundled — apps that need H3 must bring their own H3 stack (e.g. qh3) layered on top of this transport.
 
 ### Architecture
 
 - **SPSC Ring Buffers** -- Lock-free single producer/single consumer rings using C11 atomics for zero-copy event passing between threads
-- **eventfd Integration** -- Linux eventfd for efficient asyncio `add_reader()` notification (macOS pipe fallback planned)
+- **Cross-platform wake fd** -- Linux `eventfd` for efficient asyncio `add_reader()` notification; `pipe()` self-pipe fallback on macOS / BSD
 - **Dedicated Network Thread** -- picoquic runs in its own thread via `picoquic_start_network_thread()`
 - **Cython Bridge** -- Thin Cython layer over C callbacks, minimal overhead
 
@@ -26,15 +26,17 @@
 
 ### Test Results
 
-52 tests pass across all layers:
+50 tests pass on Linux and macOS (excluding the network-dependent interop suite):
 
 | Suite | Tests | Coverage |
 |-------|-------|----------|
-| `test_asyncio` | 7 | Async API, stream/datagram exchange (loopback) |
-| `test_interop` | 8 | Real QUIC endpoints: nginx, Cloudflare, Google, aiortc |
-| `test_loopback` | 10 | Client/server: streams, datagrams, reset, large data |
 | `test_spsc_ring` | 13 | Lock-free ring buffer (Cython transport layer) |
-| `test_transport` | 14 | Transport lifecycle, eventfd, wake-up, connection management |
+| `test_transport` | 11 | Transport lifecycle, wake fd, wake-up, connection management |
+| `test_loopback` | 17 | Client/server: handshake, streams, datagrams, reset, ALPN mismatch, idle timeout, app-close codes, stop_sending, many-streams stress |
+| `test_asyncio` | 7 | Async API, stream/datagram exchange (loopback) |
+| `test_baton_pattern` | 2 | Pure-QUIC baton-style stream multiplexing (UNI ↔ BIDI) |
+| `test_interop` | 2 | Real public endpoints (network required, opt-in) |
+| `tests/bench/` | 10 | Microbenches: ring push/pop, throughput, latency, handshake rate, datagrams (opt-in via `pytest tests/bench`) |
 
 ## Installation
 
@@ -96,15 +98,16 @@ python -m pytest tests/ -v
 
 ## Known Limitations
 
-- **Linux tested** -- eventfd notification is Linux-specific; macOS support planned (pipe fallback)
-- **Python 3.14+ required** -- uses free-threaded build (3.14t) for optimal performance
-- **Source build only** -- requires building picoquic from source; binary wheel distribution planned
+- **Python 3.14+ required** -- relax planned (test on 3.12/3.13)
+- **Free-threaded Python (3.14t) not yet supported** -- the TX-ring producer side and `TransportContext` lifecycle currently rely on the GIL for serialization; FT support deferred until a per-context locking audit lands
+- **Source build only** -- requires building picoquic + picotls from submodules; binary wheel distribution planned
+- **No bundled HTTP/3** -- aiopquic ships only the QUIC transport. Apps needing H3 must bring their own (e.g. qh3) on top.
 
 ## TODO
 
-- Binary wheel distribution (manylinux, via cibuildwheel)
-- macOS support (pipe-based fallback for eventfd)
-- Native H3/WebTransport layer (using picoquic's built-in HTTP/3)
+- Binary wheel distribution (manylinux + macOS, via cibuildwheel)
+- Free-threaded Python (3.14t) support after TX-ring producer locking audit
+- Native H3/WebTransport layer (using picoquic's built-in HTTP/3 / wt_baton)
 - Relax Python version requirement (test on 3.12/3.13)
 - Performance benchmarks vs qh3/aioquic
 
