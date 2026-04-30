@@ -1,10 +1,16 @@
 # cython: language_level=3
-# cython: freethreading_compatible = True
 """
 _transport — Cython bridge between picoquic (C) and Python asyncio.
 
 Manages the picoquic context lifecycle, SPSC ring buffers,
 and the dedicated network thread.
+
+Note: free-threaded Python (cp314t) is not yet supported. The TX-ring
+producer side, TransportContext lifecycle fields, and the WebTransport
+session/engine state currently rely on the GIL for serialization;
+running under a no-GIL build risks ring corruption and use-after-free.
+Re-enable freethreading_compatible once the per-context locking audit
+covers TX entry points and the WT TX dispatch path.
 """
 
 from cpython.buffer cimport PyBuffer_FillInfo
@@ -84,9 +90,17 @@ cdef extern from "picoquic.h":
     void picoquic_set_null_verifier(picoquic_quic_t* quic)
     void picoquic_set_default_idle_timeout(picoquic_quic_t* quic, uint64_t idle_timeout_ms)
     void picoquic_set_log_level(picoquic_quic_t* quic, int log_level)
-    int picoquic_set_textlog(picoquic_quic_t* quic, const char* textlog_file)
     void picoquic_set_callback(picoquic_cnx_t* cnx,
         picoquic_stream_data_cb_fn callback_fn, void* callback_ctx)
+
+# picoquic_logger.h transitively pulls picoquic_unified_log.h which
+# uses internal-only types. Declare the prototype directly so Cython
+# emits a forward declaration rather than including the header.
+cdef extern from *:
+    """
+    int picoquic_set_textlog(picoquic_quic_t* quic, const char* textlog_file);
+    """
+    int picoquic_set_textlog(picoquic_quic_t* quic, const char* textlog_file)
 
     ctypedef struct picoquic_tp_t:
         uint64_t initial_max_stream_data_bidi_local

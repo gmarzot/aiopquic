@@ -1,3 +1,6 @@
 [submodule "third_party/picoquic"]
 	path = third_party/picoquic
 	url = https://github.com/private-octopus/picoquic.git
+[submodule "third_party/picotls"]
+	path = third_party/picotls
+	url = https://github.com/h2o/picotls.git
