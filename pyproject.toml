@@ -24,6 +24,7 @@ Repository = "https://github.com/gmarzot/aiopquic.git"
 dev = [
     "pytest",
     "pytest-asyncio",
+    "pytest-benchmark",
     "pytest-cov",
     "pytest-xdist",
 ]
@@ -34,6 +35,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Benches are opt-in: run them with `pytest tests/bench`.
+addopts = "--ignore=tests/bench"
+python_files = ["test_*.py", "bench_*.py"]
 markers = [
     "interop: tests against public QUIC/H3 endpoints (needs network)",
+    "bench: microbenchmarks (in tests/bench/, opt-in via path)",
 ]
