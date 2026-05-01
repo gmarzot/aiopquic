@@ -19,13 +19,14 @@
 #include <picoquic.h>
 #include <picoquic_packet_loop.h>
 
+#include <fcntl.h>
 #include <string.h>
+#include <unistd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
 #ifdef __linux__
 #include <sys/eventfd.h>
-#include <unistd.h>
 #endif
 
 /*
@@ -46,7 +47,11 @@ extern "C" {
 typedef struct {
     spsc_ring_t*    rx_ring;
     spsc_ring_t*    tx_ring;
-    int             eventfd;
+    int             eventfd;        /* readable fd asyncio watches (eventfd
+                                       on Linux, pipe read end elsewhere) */
+    int             wake_write_fd;  /* fd the network thread writes to
+                                       (== eventfd on Linux; pipe write end
+                                       elsewhere) */
     picoquic_quic_t* quic;
 } aiopquic_ctx_t;
 
@@ -71,8 +76,26 @@ static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity) {
         free(ctx);
         return NULL;
     }
+    ctx->wake_write_fd = ctx->eventfd;
 #else
-    ctx->eventfd = -1;
+    /* Self-pipe trick: pipe[0] is the read end (asyncio watches),
+     * pipe[1] is the write end (network thread signals). pipe2() isn't
+     * available on macOS, so set O_NONBLOCK | FD_CLOEXEC via fcntl. */
+    int p[2];
+    if (pipe(p) < 0) {
+        spsc_ring_destroy(ctx->rx_ring);
+        spsc_ring_destroy(ctx->tx_ring);
+        free(ctx);
+        return NULL;
+    }
+    for (int i = 0; i < 2; i++) {
+        int flags = fcntl(p[i], F_GETFL, 0);
+        if (flags >= 0) (void)fcntl(p[i], F_SETFL, flags | O_NONBLOCK);
+        int fd_flags = fcntl(p[i], F_GETFD, 0);
+        if (fd_flags >= 0) (void)fcntl(p[i], F_SETFD, fd_flags | FD_CLOEXEC);
+    }
+    ctx->eventfd = p[0];
+    ctx->wake_write_fd = p[1];
 #endif
 
     return ctx;
@@ -80,26 +103,41 @@ static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity) {
 
 static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
     if (ctx) {
-#ifdef __linux__
         if (ctx->eventfd >= 0) close(ctx->eventfd);
-#endif
+        if (ctx->wake_write_fd >= 0 && ctx->wake_write_fd != ctx->eventfd) {
+            close(ctx->wake_write_fd);
+        }
         spsc_ring_destroy(ctx->rx_ring);
         spsc_ring_destroy(ctx->tx_ring);
         free(ctx);
     }
 }
 
+/* Signal asyncio that there are RX events.
+ * Linux: 8-byte counter increment on the eventfd.
+ * Other: single byte to the pipe write end. */
 static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
 #ifdef __linux__
     uint64_t val = 1;
-    (void)write(ctx->eventfd, &val, sizeof(val));
+    (void)write(ctx->wake_write_fd, &val, sizeof(val));
+#else
+    uint8_t b = 1;
+    (void)write(ctx->wake_write_fd, &b, 1);
 #endif
 }
 
+/* Clear the wake fd after asyncio drains the RX ring.
+ * Linux: one read returns and zeros the eventfd counter.
+ * Other: drain the pipe until EAGAIN — many notifies coalesce. */
 static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
 #ifdef __linux__
     uint64_t val;
     (void)read(ctx->eventfd, &val, sizeof(val));
+#else
+    uint8_t buf[64];
+    while (read(ctx->eventfd, buf, sizeof(buf)) > 0) {
+        /* drain */
+    }
 #endif
 }
 
@@ -187,7 +225,16 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
 
     if (fin_or_event == picoquic_callback_stream_reset ||
         fin_or_event == picoquic_callback_stop_sending) {
+        /* picoquic_get_remote_stream_error returns the RESET_STREAM
+         * code; STOP_SENDING is stored in stream->remote_stop_error
+         * (private to picoquic_internal.h, no public getter), so
+         * STOP_SENDING events surface error_code=0 today. TODO: add
+         * a small C helper that includes internal.h to recover it. */
         entry.error_code = picoquic_get_remote_stream_error(cnx, stream_id);
+    } else if (fin_or_event == picoquic_callback_application_close) {
+        entry.error_code = picoquic_get_application_error(cnx);
+    } else if (fin_or_event == picoquic_callback_close) {
+        entry.error_code = picoquic_get_remote_error(cnx);
     }
 
     int ret = spsc_ring_push(ctx->rx_ring, &entry, bytes, (uint32_t)length);

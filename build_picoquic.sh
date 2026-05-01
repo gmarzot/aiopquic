@@ -1,72 +1,97 @@
-#!/bin/bash
-# Build picoquic and its dependencies (picotls) as static libraries.
-# This must be run before `pip install -e .` or `python setup.py build_ext`.
+#!/usr/bin/env bash
+# Build picotls and picoquic (incl. native test drivers picoquic_ct /
+# picohttp_ct) from vendored submodules. Run before
+# `pip install -e .` or `python -m build`.
 #
-# Uses picotls source from the original local picoquic build (_deps/picotls-src)
-# if available, otherwise fetches it via cmake.
+# Sources:
+#   third_party/picotls   (h2o/picotls submodule)
+#   third_party/picoquic  (private-octopus/picoquic submodule)
+#
+# Outputs (under third_party/picoquic/build/):
+#   picotls-build/libpicotls-*.a    picotls static libs
+#   libpicoquic-core.a etc.         picoquic static libs
+#   picoquic_ct, picohttp_ct        native test drivers (used by
+#                                   tests/test_native_picoquic.py)
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PICOQUIC_DIR="${SCRIPT_DIR}/third_party/picoquic"
+PICOTLS_DIR="${SCRIPT_DIR}/third_party/picotls"
 BUILD_DIR="${PICOQUIC_DIR}/build"
-# Use picotls source from the original local repo if available
-LOCAL_PICOQUIC="/home/gmarzot/Projects/moq/picoquic"
-PTLS_SRC="${LOCAL_PICOQUIC}/_deps/picotls-src"
-NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+
+NPROC=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 COLOR_GREEN="\033[0;32m"
 COLOR_RED="\033[0;31m"
 COLOR_OFF="\033[0m"
 
-if [ ! -d "${PICOQUIC_DIR}/picoquic" ]; then
-    echo -e "${COLOR_RED}ERROR: picoquic source not found at ${PICOQUIC_DIR}${COLOR_OFF}"
-    echo "  Run: git submodule update --init --recursive"
+# --- Sanity: submodules present ---
+if [ ! -f "${PICOQUIC_DIR}/CMakeLists.txt" ]; then
+    echo -e "${COLOR_RED}ERROR: picoquic submodule missing at ${PICOQUIC_DIR}${COLOR_OFF}" >&2
+    echo "  Run: git submodule update --init --recursive" >&2
+    exit 1
+fi
+if [ ! -f "${PICOTLS_DIR}/CMakeLists.txt" ]; then
+    echo -e "${COLOR_RED}ERROR: picotls submodule missing at ${PICOTLS_DIR}${COLOR_OFF}" >&2
+    echo "  Run: git submodule update --init --recursive" >&2
     exit 1
 fi
 
-# --- Step 1: Build picotls ---
+# --- Locate OpenSSL (Homebrew on macOS, system on Linux) ---
+CMAKE_OPENSSL_ARGS=()
+if [ -z "${OPENSSL_ROOT_DIR:-}" ] && [ "$(uname -s)" = "Darwin" ]; then
+    if command -v brew >/dev/null 2>&1; then
+        for pkg in openssl@3 openssl@1.1; do
+            prefix="$(brew --prefix "${pkg}" 2>/dev/null || true)"
+            if [ -n "${prefix}" ] && [ -d "${prefix}" ]; then
+                export OPENSSL_ROOT_DIR="${prefix}"
+                break
+            fi
+        done
+    fi
+fi
+if [ -n "${OPENSSL_ROOT_DIR:-}" ]; then
+    echo -e "${COLOR_GREEN}Using OPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}${COLOR_OFF}"
+    CMAKE_OPENSSL_ARGS+=("-DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}")
+fi
+
+# --- Step 1: Build picotls from submodule ---
 PTLS_BUILD_DIR="${BUILD_DIR}/picotls-build"
-PTLS_INSTALL="${BUILD_DIR}/picotls-install"
 
-if [ -d "${PTLS_SRC}" ]; then
-    echo -e "${COLOR_GREEN}Building picotls from ${PTLS_SRC}...${COLOR_OFF}"
-    mkdir -p "${PTLS_BUILD_DIR}"
-    cd "${PTLS_BUILD_DIR}"
-    cmake "${PTLS_SRC}" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-        -DCMAKE_INSTALL_PREFIX="${PTLS_INSTALL}"
-    cmake --build . -j "${NPROC}"
-    cmake --install . 2>/dev/null || true
-    echo -e "${COLOR_GREEN}picotls build complete.${COLOR_OFF}"
-else
-    echo -e "${COLOR_RED}WARNING: picotls source not found at ${PTLS_SRC}${COLOR_OFF}"
-    echo "Will try PICOQUIC_FETCH_PTLS=ON (requires network)."
-fi
+echo -e "${COLOR_GREEN}Building picotls from ${PICOTLS_DIR}...${COLOR_OFF}"
+mkdir -p "${PTLS_BUILD_DIR}"
+cmake -S "${PICOTLS_DIR}" -B "${PTLS_BUILD_DIR}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DWITH_FUSION=OFF \
+    "${CMAKE_OPENSSL_ARGS[@]}"
+cmake --build "${PTLS_BUILD_DIR}" -j "${NPROC}"
+echo -e "${COLOR_GREEN}picotls build complete.${COLOR_OFF}"
 
-# --- Step 2: Build picoquic ---
+# Picotls upstream has no install rules for its static libs, so feed
+# their absolute paths to picoquic's FindPTLS.cmake as cache vars
+# (also sidesteps a quirk in FindPTLS where PTLS_PREFIX/include is
+# mis-globbed).
+PTLS_CORE_LIB="${PTLS_BUILD_DIR}/libpicotls-core.a"
+PTLS_OPENSSL_LIB="${PTLS_BUILD_DIR}/libpicotls-openssl.a"
+PTLS_MINICRYPTO_LIB="${PTLS_BUILD_DIR}/libpicotls-minicrypto.a"
+for lib in "${PTLS_CORE_LIB}" "${PTLS_OPENSSL_LIB}" "${PTLS_MINICRYPTO_LIB}"; do
+    if [ ! -f "${lib}" ]; then
+        echo -e "${COLOR_RED}ERROR: expected ${lib} after picotls build${COLOR_OFF}" >&2
+        exit 1
+    fi
+done
+
+# --- Step 2: Build picoquic against our picotls ---
 echo -e "${COLOR_GREEN}Building picoquic in ${BUILD_DIR}...${COLOR_OFF}"
-
 mkdir -p "${BUILD_DIR}"
-cd "${BUILD_DIR}"
-
-CMAKE_EXTRA=""
-if [ -d "${PTLS_INSTALL}" ]; then
-    # Point FindPTLS.cmake at our built picotls
-    CMAKE_EXTRA="-DPTLS_PREFIX=${PTLS_INSTALL} -DCMAKE_PREFIX_PATH=${PTLS_INSTALL}"
-elif [ -d "${PTLS_SRC}" ]; then
-    # Fallback: point at the build dir directly
-    CMAKE_EXTRA="-DPTLS_PREFIX=${PTLS_BUILD_DIR} -DPTLS_INCLUDE_DIR=${PTLS_SRC}/include"
-else
-    CMAKE_EXTRA="-DPICOQUIC_FETCH_PTLS=ON"
-fi
 
 # Native test drivers (picoquic_ct, picohttp_ct) are built alongside
 # the libraries so that `pytest -m native` validates picoquic itself
-# on every submodule bump. Adds ~25s to build time; negligible vs
-# the value of catching upstream regressions early.
-cmake "${PICOQUIC_DIR}" \
+# on every submodule bump. Adds ~25s to build time; negligible vs the
+# value of catching upstream regressions early.
+cmake -S "${PICOQUIC_DIR}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -Dpicoquic_BUILD_TESTS=ON \
@@ -74,20 +99,23 @@ cmake "${PICOQUIC_DIR}" \
     -DBUILD_LOGREADER=OFF \
     -DBUILD_HTTP=ON \
     -DBUILD_LOGLIB=ON \
-    ${CMAKE_EXTRA}
+    -DPTLS_INCLUDE_DIR="${PICOTLS_DIR}/include" \
+    -DPTLS_CORE_LIBRARY="${PTLS_CORE_LIB}" \
+    -DPTLS_OPENSSL_LIBRARY="${PTLS_OPENSSL_LIB}" \
+    -DPTLS_MINICRYPTO_LIBRARY="${PTLS_MINICRYPTO_LIB}" \
+    "${CMAKE_OPENSSL_ARGS[@]}"
 
-cmake --build . -j "${NPROC}" --target picoquic-core picohttp-core picoquic-log
-cmake --build . -j "${NPROC}" --target picoquic_ct picohttp_ct
+cmake --build "${BUILD_DIR}" -j "${NPROC}" --target picoquic-core picohttp-core picoquic-log
+cmake --build "${BUILD_DIR}" -j "${NPROC}" --target picoquic_ct picohttp_ct
 
-# Verify key outputs exist (cmake may place in build/ or build/picoquic/)
-PICOQUIC_LIB=$(find "${BUILD_DIR}" -name "libpicoquic-core.a" -print -quit 2>/dev/null)
+PICOQUIC_LIB=$(find "${BUILD_DIR}" -name "libpicoquic-core.a" -print -quit 2>/dev/null || true)
 if [ -z "${PICOQUIC_LIB}" ]; then
-    echo -e "${COLOR_RED}ERROR: libpicoquic-core.a not found${COLOR_OFF}"
+    echo -e "${COLOR_RED}ERROR: libpicoquic-core.a not found${COLOR_OFF}" >&2
     exit 1
 fi
 
 echo -e "${COLOR_GREEN}picoquic build complete.${COLOR_OFF}"
-echo "Libraries:"
+echo "Static libraries:"
 find "${BUILD_DIR}" -name "lib*.a" -exec ls -la {} \; 2>/dev/null || true
 echo "Native test drivers:"
 ls -la "${BUILD_DIR}/picoquic_ct" "${BUILD_DIR}/picohttp_ct" 2>/dev/null || true

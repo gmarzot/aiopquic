@@ -1,0 +1,154 @@
+name: Release
+
+# Manually triggered from the Actions tab. Creates the tag, runs a
+# final test gate, then publishes to TestPyPI -> PyPI and cuts a
+# GitHub Release.
+#
+# workflow_dispatch is restricted to repo collaborators with write
+# access by GitHub's default policy, so this is effectively owner-only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.2.0, must match N.N.N)'
+        required: true
+        type: string
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Validate version and create tag
+      id: validate
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        VERSION="${{ inputs.version }}"
+        if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "error: version must be N.N.N, got '$VERSION'" >&2
+          exit 1
+        fi
+        TAG="v$VERSION"
+        if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+          echo "error: tag '$TAG' already exists" >&2
+          exit 1
+        fi
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git tag -a "$TAG" -m "$TAG"
+        git push origin "$TAG"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: tag
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: v${{ needs.tag.outputs.version }}
+        submodules: recursive
+        fetch-depth: 0
+    - name: Set up Python 3.14
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.14"
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake libssl-dev
+    - name: Build picoquic
+      run: ./build_picoquic.sh
+    - name: Install + test
+      timeout-minutes: 15
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e '.[dev]'
+        python -m pytest tests/ -v -m "not interop and not native"
+
+  publish-test:
+    needs: [tag, test]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: v${{ needs.tag.outputs.version }}
+        submodules: recursive
+        fetch-depth: 0
+    - name: Set up Python 3.14
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.14"
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake libssl-dev
+    - name: Build picoquic
+      run: ./build_picoquic.sh
+    - name: Build sdist
+      run: |
+        python -m pip install --upgrade pip build twine
+        python -m build --sdist
+    - name: Publish to TestPyPI
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        TWINE_REPOSITORY_URL: https://test.pypi.org/legacy/
+      run: twine upload dist/*
+
+  publish-prod:
+    needs: [tag, test, publish-test]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: v${{ needs.tag.outputs.version }}
+        submodules: recursive
+        fetch-depth: 0
+    - name: Set up Python 3.14
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.14"
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake libssl-dev
+    - name: Build picoquic
+      run: ./build_picoquic.sh
+    - name: Build sdist
+      run: |
+        python -m pip install --upgrade pip build twine
+        python -m build --sdist
+    - name: Publish to PyPI
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        TWINE_REPOSITORY_URL: https://upload.pypi.org/legacy/
+      run: twine upload dist/*
+
+  github-release:
+    needs: [tag, publish-prod]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: v${{ needs.tag.outputs.version }}
+        fetch-depth: 0
+    - name: Create GitHub Release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TAG="v${{ needs.tag.outputs.version }}"
+        gh release create "$TAG" \
+          --title "$TAG" \
+          --generate-notes \
+          --verify-tag

@@ -622,3 +622,273 @@ class TestLoopback:
                 client.stop()
         finally:
             server.stop()
+
+    def test_alpn_mismatch(self):
+        """Server with one ALPN, client with a different one — no handshake."""
+        port = next_port()
+        server = TransportContext()
+        server.start(port=port, cert_file=CERT_FILE, key_file=KEY_FILE,
+                     alpn="hq-interop", is_client=False)
+        assert wait_for_ready(server), "Server not ready"
+        try:
+            client = TransportContext()
+            client.start(port=0, alpn="other-alpn", is_client=True)
+            assert wait_for_ready(client), "Client not ready"
+            try:
+                client.create_client_connection(
+                    "127.0.0.1", port,
+                    sni="localhost", alpn="other-alpn",
+                )
+
+                deadline = time.monotonic() + 5.0
+                events = []
+                while time.monotonic() < deadline:
+                    events.extend(client.drain_rx())
+                    if has_connection_ready(events):
+                        break
+                    if (has_event(events, SPSC_EVT_CLOSE)
+                            or has_event(events, SPSC_EVT_APP_CLOSE)):
+                        break
+                    time.sleep(0.05)
+
+                assert not has_connection_ready(events), (
+                    f"Handshake unexpectedly succeeded with ALPN mismatch: "
+                    f"{events}"
+                )
+            finally:
+                client.stop()
+        finally:
+            server.stop()
+
+    def test_idle_timeout_fires(self):
+        """Idle timeout is configured and the connection actually closes."""
+        port = next_port()
+        server = TransportContext()
+        server.start(port=port, cert_file=CERT_FILE, key_file=KEY_FILE,
+                     alpn=ALPN, is_client=False, idle_timeout_ms=500)
+        assert wait_for_ready(server), "Server not ready"
+        try:
+            client = TransportContext()
+            client.start(port=0, alpn=ALPN, is_client=True,
+                         idle_timeout_ms=500)
+            assert wait_for_ready(client), "Client not ready"
+            try:
+                client.create_client_connection(
+                    "127.0.0.1", port,
+                    sni="localhost", alpn=ALPN,
+                )
+                events = drain_until(
+                    client, SPSC_EVT_ALMOST_READY, timeout=5.0,
+                )
+                assert get_cnx_ptr(events) != 0, "No client cnx"
+
+                # After ~500ms idle, both sides surface a CLOSE.
+                deadline = time.monotonic() + 5.0
+                got_close = False
+                while time.monotonic() < deadline:
+                    events.extend(client.drain_rx())
+                    if (has_event(events, SPSC_EVT_CLOSE)
+                            or has_event(events, SPSC_EVT_APP_CLOSE)):
+                        got_close = True
+                        break
+                    time.sleep(0.05)
+
+                assert got_close, (
+                    f"Client did not see idle-timeout CLOSE within 5s: "
+                    f"{events}"
+                )
+            finally:
+                client.stop()
+        finally:
+            server.stop()
+
+    def test_application_close_with_reason_code(self):
+        """Client closes with a specific app error code; server sees it."""
+        port = next_port()
+        server = start_server(port)
+        try:
+            client, cnx_ptr = connect_client(port)
+            try:
+                _, srv_cnx = wait_for_server_cnx(server)
+                assert srv_cnx != 0
+
+                client.push_tx(
+                    SPSC_EVT_TX_CLOSE, 0,
+                    error_code=0xCAFE, cnx_ptr=cnx_ptr,
+                )
+                client.wake_up()
+
+                deadline = time.monotonic() + 5.0
+                code = None
+                events = []
+                while time.monotonic() < deadline:
+                    events.extend(server.drain_rx())
+                    for ev in events:
+                        if ev[0] == SPSC_EVT_APP_CLOSE:
+                            code = ev[4]
+                            break
+                    if code is not None:
+                        break
+                    time.sleep(0.02)
+
+                assert code == 0xCAFE, (
+                    f"Expected app close code=0xCAFE, got {code!r}; "
+                    f"events={events}"
+                )
+            finally:
+                client.stop()
+        finally:
+            server.stop()
+
+    def test_stop_sending(self):
+        """Peer issues STOP_SENDING; receiver gets the event.
+
+        NOTE: error_code on STOP_SENDING events is currently 0 because
+        picoquic exposes only the RESET_STREAM error code via its
+        public stream-error getter; STOP_SENDING's code lives in
+        stream->remote_stop_error in picoquic_internal.h. See the TODO
+        in c/callback.h. This test verifies event delivery; tighten
+        the code-equality assertion once the helper lands.
+        """
+        port = next_port()
+        server = start_server(port)
+        try:
+            client, cnx_ptr = connect_client(port)
+            try:
+                client.push_tx(
+                    SPSC_EVT_TX_STREAM_DATA, 0,
+                    data=b"x", cnx_ptr=cnx_ptr,
+                )
+                client.wake_up()
+
+                srv_events = drain_until(
+                    server, SPSC_EVT_STREAM_DATA, timeout=5.0,
+                )
+                srv_cnx = 0
+                for ev in srv_events:
+                    if ev[0] == SPSC_EVT_STREAM_DATA and ev[5]:
+                        srv_cnx = ev[5]
+                        break
+                assert srv_cnx != 0, "No server cnx"
+
+                server.push_tx(
+                    SPSC_EVT_TX_STOP_SENDING, 0,
+                    error_code=99, cnx_ptr=srv_cnx,
+                )
+                server.wake_up()
+
+                deadline = time.monotonic() + 5.0
+                seen = False
+                events = []
+                while time.monotonic() < deadline:
+                    events.extend(client.drain_rx())
+                    for ev in events:
+                        if ev[0] == SPSC_EVT_STOP_SENDING:
+                            seen = True
+                            break
+                    if seen:
+                        break
+                    time.sleep(0.02)
+
+                assert seen, (
+                    f"Client did not receive STOP_SENDING; events={events}"
+                )
+            finally:
+                client.stop()
+        finally:
+            server.stop()
+
+    def test_many_concurrent_streams(self):
+        """Open 64 client-initiated bidi streams; all data arrives intact."""
+        port = next_port()
+        server = start_server(port)
+        try:
+            client, cnx_ptr = connect_client(port)
+            try:
+                n_streams = 64
+                streams = {
+                    sid: f"stream-{sid:03d}-payload".encode()
+                    for sid in range(0, n_streams * 4, 4)
+                }
+                for sid, data in streams.items():
+                    client.push_tx(
+                        SPSC_EVT_TX_STREAM_FIN, sid,
+                        data=data, cnx_ptr=cnx_ptr,
+                    )
+                client.wake_up()
+
+                received = {sid: b"" for sid in streams}
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    for ev in server.drain_rx():
+                        if ev[0] in (SPSC_EVT_STREAM_DATA,
+                                     SPSC_EVT_STREAM_FIN):
+                            sid = ev[1]
+                            if sid in received and ev[2] is not None:
+                                received[sid] += ev[2]
+                    if all(received[sid] == streams[sid]
+                           for sid in streams):
+                        break
+                    time.sleep(0.02)
+
+                missing = [sid for sid in streams
+                           if received[sid] != streams[sid]]
+                assert not missing, (
+                    f"{len(missing)}/{n_streams} streams incomplete: "
+                    f"first missing sid={missing[0]} "
+                    f"got={received[missing[0]]!r} "
+                    f"want={streams[missing[0]]!r}"
+                )
+            finally:
+                client.stop()
+        finally:
+            server.stop()
+
+    def test_tx_ring_overflow_raises(self):
+        """Filling the TX ring without a wake-up surfaces a clean error."""
+        # Small ring so we can actually fill it. The branch's
+        # TransportContext takes only ring_capacity (no arena_size).
+        client = TransportContext(ring_capacity=8)
+        client.start(port=0, alpn=ALPN, is_client=True)
+        assert wait_for_ready(client), "Client not ready"
+        try:
+            import builtins
+            raised = False
+            for _ in range(64):
+                try:
+                    client.push_tx(
+                        SPSC_EVT_TX_STREAM_DATA, 0,
+                        data=b"x" * 256, cnx_ptr=0,
+                    )
+                except builtins.BufferError:
+                    raised = True
+                    break
+            assert raised, "TX ring overflow did not surface BufferError"
+        finally:
+            client.stop()
+
+    def test_bad_sni_does_not_crash(self):
+        """Non-matching / weird SNI values do not crash the wrapper."""
+        port = next_port()
+        server = start_server(port)
+        try:
+            for sni in ("", "  ", "this.does.not.match"):
+                client = TransportContext()
+                client.start(port=0, alpn=ALPN, is_client=True)
+                assert wait_for_ready(client), "Client not ready"
+                try:
+                    client.create_client_connection(
+                        "127.0.0.1", port,
+                        sni=sni, alpn=ALPN,
+                    )
+                    deadline = time.monotonic() + 1.0
+                    while time.monotonic() < deadline:
+                        client.drain_rx()
+                        time.sleep(0.05)
+                    assert client.thread_ready, (
+                        f"Network thread died after sni={sni!r}"
+                    )
+                finally:
+                    client.stop()
+        finally:
+            server.stop()

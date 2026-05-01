@@ -1,44 +1,49 @@
-# aiopquic - Async QUIC Transport (picoquic)
+# aiopquic - Async QUIC + WebTransport (picoquic)
 
-`aiopquic` is a Python/Cython binding to [picoquic](https://github.com/private-octopus/picoquic), providing high-performance QUIC transport for `asyncio` applications.
+`aiopquic` is a Python/Cython binding to [picoquic](https://github.com/private-octopus/picoquic), providing high-performance QUIC transport and WebTransport for `asyncio` applications.
 
 ## Overview
 
-`aiopquic` exposes picoquic's QUIC implementation through a lock-free SPSC ring buffer architecture that bridges the picoquic network thread with Python's asyncio event loop. It provides a qh3/aioquic-compatible API, making it a drop-in transport for existing QUIC applications.
+`aiopquic` exposes picoquic's QUIC implementation through a lock-free SPSC ring buffer architecture that bridges the picoquic network thread with Python's asyncio event loop. It provides a qh3/aioquic-compatible transport API plus a native WebTransport client/server layered on picoquic's H3 + h3zero.
 
 ### Architecture
 
-- **SPSC Ring Buffers** -- Lock-free single producer/single consumer rings using C11 atomics for zero-copy event passing between threads
-- **eventfd Integration** -- Linux eventfd for efficient asyncio `add_reader()` notification (macOS pipe fallback planned)
-- **Dedicated Network Thread** -- picoquic runs in its own thread via `picoquic_start_network_thread()`
-- **Cython Bridge** -- Thin Cython layer over C callbacks, minimal overhead
+- **SPSC Ring Buffers** -- Lock-free single producer/single consumer rings for zero-copy event passing between threads. RX uses per-event `malloc` with ownership transfer at pop (1-copy delivery to Python via `StreamChunk`).
+- **Cross-platform wake fd** -- Linux `eventfd` for efficient asyncio `add_reader()` notification; `pipe()` self-pipe fallback on macOS / BSD.
+- **Dedicated Network Thread** -- picoquic runs in its own thread via `picoquic_start_network_thread()`.
+- **Cython Bridge** -- Thin Cython layer over C callbacks, minimal overhead.
+- **WebTransport** -- `asyncio.webtransport.WebTransportSession` (client + server) over picoquic's `picowt_*` API and h3zero.
 
 ### Features
 
-- QUIC client and server support
-- Stream data send/receive with FIN signaling
+- QUIC client and server support (qh3-compatible asyncio API: `connect()`, `serve()`, `QuicConnectionProtocol`)
+- Stream data send/receive with FIN signaling, stream reset, stop_sending
 - Datagram support
-- Stream reset
-- Connection migration (inherited from picoquic)
-- 0-RTT handshake (inherited from picoquic)
-- Connection management (create, close, idle timeout)
-- qh3-compatible asyncio API (`connect()`, `serve()`, `QuicConnectionProtocol`)
+- WebTransport client + server (`serve_webtransport`, `WebTransportSession`)
+- Connection migration / 0-RTT (inherited from picoquic)
+- Connection management (create, close, idle timeout, application close codes)
+- Per-cnx multiplexing on the server side via `QuicEngine`
+- Native picoquic_ct / picohttp_ct subprocess smoke (catches upstream regressions on every submodule bump)
 
 ### Test Results
 
-52 tests pass across all layers:
+Tests pass on Linux and macOS (excluding the network-dependent interop suite):
 
 | Suite | Tests | Coverage |
 |-------|-------|----------|
-| `test_asyncio` | 7 | Async API, stream/datagram exchange (loopback) |
-| `test_interop` | 8 | Real QUIC endpoints: nginx, Cloudflare, Google, aiortc |
-| `test_loopback` | 10 | Client/server: streams, datagrams, reset, large data |
-| `test_spsc_ring` | 13 | Lock-free ring buffer (Cython transport layer) |
-| `test_transport` | 14 | Transport lifecycle, eventfd, wake-up, connection management |
+| `test_spsc_ring` | per-event malloc ring lifecycle |
+| `test_buffer` | Cython `Buffer` (qh3-compatible) |
+| `test_transport` | Transport lifecycle, wake fd, wake-up, connection management |
+| `test_loopback` | 17 tests — handshake, streams, FIN, reset, datagrams, ALPN mismatch, idle timeout, app-close codes, stop_sending, many-streams stress, TX-ring overflow |
+| `test_asyncio` | qh3-compat client/server stream and datagram exchange |
+| `test_baton_pattern` | Pure-QUIC baton-style stream multiplexing (UNI ↔ BIDI) |
+| `test_native_picoquic` | picoquic_ct / picohttp_ct subprocess driver |
+| `test_interop` | Real public endpoints (network required, opt-in) |
+| `tests/bench/` | 17 microbenches: ring push/pop, single-shot/sustained/parallel/bidirectional throughput, datagrams, RTT latency, handshake rate (opt-in via `pytest tests/bench`) |
 
 ## Installation
 
-Requires Python 3.14+ and a C build toolchain (picoquic is built from source as a git submodule).
+Requires Python 3.14+ and a C build toolchain. picoquic + picotls are built from source as git submodules.
 
 ```bash
 git clone https://github.com/gmarzot/aiopquic.git
@@ -46,8 +51,11 @@ cd aiopquic
 git submodule update --init --recursive
 ./bootstrap_python.sh
 source .venv/bin/activate
-pip install -e .
+./build_picoquic.sh        # builds picotls, picoquic, native test drivers
+pip install -e '.[dev]'
 ```
+
+On macOS, set `OPENSSL_ROOT_DIR` if Homebrew OpenSSL is not auto-detected (the build script tries `openssl@3` then `openssl@1.1`).
 
 ## Usage
 
@@ -56,12 +64,10 @@ pip install -e .
 ```python
 from aiopquic._binding._transport import TransportContext
 
-# Server
 server = TransportContext()
 server.start(port=4433, cert_file="cert.pem", key_file="key.pem",
              alpn="moq-00", is_client=False)
 
-# Client
 client = TransportContext()
 client.start(port=0, alpn="moq-00", is_client=True)
 client.create_client_connection("127.0.0.1", 4433,
@@ -87,30 +93,44 @@ async with connect("quic.nginx.org", 443,
     protocol.transmit()
 ```
 
+### WebTransport
+
+```python
+from aiopquic.asyncio.webtransport import (
+    serve_webtransport, WebTransportSession,
+)
+# See src/aiopquic/asyncio/webtransport.py and tests/ for full examples.
+```
+
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-python -m pytest tests/ -v
+pip install -e '.[dev]'
+python -m pytest tests/ -v -m "not interop and not native"
+
+# Microbenches (opt-in)
+python -m pytest tests/bench
 ```
 
 ## Known Limitations
 
-- **Linux tested** -- eventfd notification is Linux-specific; macOS support planned (pipe fallback)
-- **Python 3.14+ required** -- uses free-threaded build (3.14t) for optimal performance
-- **Source build only** -- requires building picoquic from source; binary wheel distribution planned
+- **Python 3.14+ required** -- relax planned (test on 3.12/3.13).
+- **Free-threaded Python (3.14t) not yet supported** -- the TX-ring producer side, `TransportContext` lifecycle, and the WebTransport engine state currently rely on the GIL for serialization. FT support deferred until a per-context locking audit lands.
+- **STOP_SENDING error codes** surface as 0 today: picoquic's public stream-error getter only returns the RESET_STREAM code. STOP_SENDING's code lives in `stream->remote_stop_error` in `picoquic_internal.h` (no public getter). A small helper that pulls the field is straightforward future work — see TODO in `src/aiopquic/_binding/c/callback.h`.
+- **Source build only** -- requires building picoquic + picotls from submodules; binary wheel distribution planned.
 
 ## TODO
 
-- Binary wheel distribution (manylinux, via cibuildwheel)
-- macOS support (pipe-based fallback for eventfd)
-- Native H3/WebTransport layer (using picoquic's built-in HTTP/3)
+- Binary wheel distribution (manylinux + macOS, via cibuildwheel)
+- Free-threaded Python (3.14t) support after producer-side locking audit
+- STOP_SENDING error-code surfacing helper (read `remote_stop_error` from picoquic_internal.h)
 - Relax Python version requirement (test on 3.12/3.13)
 - Performance benchmarks vs qh3/aioquic
 
 ## Resources
 
 - [picoquic](https://github.com/private-octopus/picoquic) -- QUIC implementation by Christian Huitema
+- [picotls](https://github.com/h2o/picotls) -- TLS 1.3 implementation
 - [Media Over QUIC Working Group](https://datatracker.ietf.org/wg/moq/about/)
 
 ---
