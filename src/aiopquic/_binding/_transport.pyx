@@ -85,6 +85,9 @@ cdef extern from "picoquic.h":
     void picoquic_set_default_idle_timeout(picoquic_quic_t* quic, uint64_t idle_timeout_ms)
     void picoquic_set_log_level(picoquic_quic_t* quic, int log_level)
     int picoquic_set_textlog(picoquic_quic_t* quic, const char* textlog_file)
+    void picoquic_enable_sslkeylog(picoquic_quic_t* quic, int enable)
+    void picoquic_set_key_log_file(picoquic_quic_t* quic,
+                                    const char* keylog_filename)
     void picoquic_set_callback(picoquic_cnx_t* cnx,
         picoquic_stream_data_cb_fn callback_fn, void* callback_ctx)
 
@@ -521,7 +524,7 @@ cdef class TransportContext:
     def start(self, int port=0, cert_file=None, key_file=None,
               alpn=None, bint is_client=True, uint64_t idle_timeout_ms=30000,
               uint32_t max_datagram_frame_size=0,
-              wt_path=None, debug_log=None):
+              wt_path=None, debug_log=None, keylog_filename=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -536,6 +539,11 @@ cdef class TransportContext:
             wt_path: Server-mode WebTransport path (e.g. "/moq").
                 When set, uses h3zero_callback as picoquic's default
                 callback and routes CONNECT-on-path to the WT bridge.
+            keylog_filename: Path to write TLS secrets in NSS Key Log
+                Format (Wireshark-compatible). When set, picoquic emits
+                client/server randoms + master secrets per connection so
+                packet captures can be decrypted offline. Requires
+                picoquic built without PICOQUIC_WITHOUT_SSLKEYLOG.
         """
         if self._started:
             raise RuntimeError("Transport already started")
@@ -595,6 +603,14 @@ cdef class TransportContext:
             picoquic_set_log_level(self._quic, 1)
             _b_log = debug_log.encode() if isinstance(debug_log, str) else debug_log
             picoquic_set_textlog(self._quic, _b_log)
+
+        cdef bytes _b_keylog
+        if keylog_filename is not None:
+            _b_keylog = (keylog_filename.encode()
+                         if isinstance(keylog_filename, str)
+                         else keylog_filename)
+            picoquic_enable_sslkeylog(self._quic, 1)
+            picoquic_set_key_log_file(self._quic, _b_keylog)
 
         if is_client:
             picoquic_set_null_verifier(self._quic)

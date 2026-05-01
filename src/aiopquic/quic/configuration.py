@@ -26,6 +26,10 @@ class QuicConfiguration:
     certificate_file: str | None = None
     private_key_file: str | None = None
     verify_mode: int | None = None
+    # NSS Key Log Format file (Wireshark-compatible). When set, picoquic
+    # writes TLS secrets per connection so packet captures can be
+    # decrypted offline. Honors the SSLKEYLOGFILE env var as a default.
+    secrets_log_file: str | None = None
 
     def load_cert_chain(self, certfile: str, keyfile: str | None = None,
                         password: str | None = None) -> None:

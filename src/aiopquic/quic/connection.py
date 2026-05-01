@@ -4,6 +4,7 @@ Wraps TransportContext (Cython/picoquic) and translates SPSC ring
 events into QuicEvent objects that match qh3's event interface.
 """
 
+import os
 from enum import IntEnum
 
 from .configuration import QuicConfiguration
@@ -113,6 +114,10 @@ class QuicConnection:
             return
         cfg = self._configuration
         self._transport = TransportContext()
+        # SSLKEYLOGFILE env var as a fallback when configuration didn't
+        # set secrets_log_file explicitly — matches the convention used
+        # by curl, openssl s_client, and Chromium-based tooling.
+        keylog = cfg.secrets_log_file or os.environ.get('SSLKEYLOGFILE')
         self._transport.start(
             port=port,
             cert_file=cfg.certificate_file,
@@ -121,6 +126,7 @@ class QuicConnection:
             is_client=cfg.is_client,
             idle_timeout_ms=int(cfg.idle_timeout * 1000),
             max_datagram_frame_size=(cfg.max_datagram_frame_size or 0),
+            keylog_filename=keylog,
         )
 
     def connect(self, addr: tuple[str, int], now: float = 0.0) -> None:
@@ -368,6 +374,7 @@ class QuicEngine:
             return
         cfg = self._configuration
         self._transport = TransportContext()
+        keylog = cfg.secrets_log_file or os.environ.get('SSLKEYLOGFILE')
         self._transport.start(
             port=port,
             cert_file=cfg.certificate_file,
@@ -376,6 +383,7 @@ class QuicEngine:
             is_client=cfg.is_client,
             idle_timeout_ms=int(cfg.idle_timeout * 1000),
             max_datagram_frame_size=(cfg.max_datagram_frame_size or 0),
+            keylog_filename=keylog,
         )
 
     @property
