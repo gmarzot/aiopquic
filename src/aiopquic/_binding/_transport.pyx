@@ -199,6 +199,28 @@ cdef extern from "c/callback.h":
                           void* callback_ctx, void* callback_argv)
 
 
+# Per-stream byte ring (PULL-model send path). Allocated by Python,
+# owned by Python (refcount-style); picoquic-pthread reads from it via
+# stream_ctx in aiopquic_stream_cb.
+cdef extern from "c/stream_buf.h":
+    ctypedef struct aiopquic_stream_buf_t:
+        pass
+
+    aiopquic_stream_buf_t* aiopquic_stream_buf_create(uint32_t capacity)
+    void aiopquic_stream_buf_destroy(aiopquic_stream_buf_t* sb)
+    uint32_t aiopquic_stream_buf_push(
+        aiopquic_stream_buf_t* sb,
+        const uint8_t* data, uint32_t length)
+    uint32_t aiopquic_stream_buf_used(aiopquic_stream_buf_t* sb)
+    uint32_t aiopquic_stream_buf_free(aiopquic_stream_buf_t* sb)
+    void aiopquic_stream_buf_set_fin(aiopquic_stream_buf_t* sb)
+    int aiopquic_stream_buf_fin_pending(aiopquic_stream_buf_t* sb)
+    uint64_t aiopquic_stream_buf_pushed(aiopquic_stream_buf_t* sb)
+    uint64_t aiopquic_stream_buf_popped(aiopquic_stream_buf_t* sb)
+    uint32_t aiopquic_stream_buf_push_hash(aiopquic_stream_buf_t* sb)
+    uint32_t aiopquic_stream_buf_pop_hash(aiopquic_stream_buf_t* sb)
+
+
 # H3+WebTransport: opaque types from picoquic; we hold pointers only.
 cdef extern from "h3zero_common.h":
     ctypedef struct h3zero_callback_ctx_t:
@@ -510,9 +532,13 @@ cdef class TransportContext:
 
     def push_tx(self, uint32_t event_type, uint64_t stream_id,
                 bytes data=None, uint64_t error_code=0,
-                uintptr_t cnx_ptr=0):
+                uintptr_t cnx_ptr=0, uintptr_t stream_ctx=0):
         """
         Push a command into the TX ring (asyncio → picoquic thread).
+
+        stream_ctx is forwarded as the v_stream_ctx pointer for events
+        that consume it (SPSC_EVT_TX_MARK_ACTIVE → picoquic_mark_active_stream).
+        For the PULL-model send path it carries an aiopquic_stream_buf_t*.
 
         After pushing, caller should call wake_up() to signal the network thread.
         """
@@ -524,7 +550,7 @@ cdef class TransportContext:
         entry.stream_id = stream_id
         entry.is_fin = 0
         entry.cnx = <void*>cnx_ptr
-        entry.stream_ctx = NULL
+        entry.stream_ctx = <void*>stream_ctx
         entry.error_code = error_code
 
         if data is not None:
@@ -1027,4 +1053,101 @@ def cnx_data_received(uintptr_t cnx_ptr):
     if cnx_ptr == 0:
         return 0
     return picoquic_get_data_received(<picoquic_cnx_t*>cnx_ptr)
+
+
+# ---------------------------------------------------------------------------
+# Per-stream send buffer (PULL-model send path).
+#
+# Real backpressure: producer push returns # bytes accepted; 0 means full.
+# picoquic pulls from the ring at wire rate via the prepare_to_send callback
+# in aiopquic_stream_cb (when stream_ctx == buffer pointer).
+#
+# Lifecycle:
+#   sb = stream_buf_create(capacity)         # capacity must be power of 2
+#   transport.push_tx(SPSC_EVT_TX_MARK_ACTIVE,
+#                     stream_id, cnx_ptr=cnx, stream_ctx=sb)
+#   transport.wake_up()
+#   stream_buf_push(sb, data)                # producer; returns bytes accepted
+#   ...
+#   stream_buf_set_fin(sb)                   # mark FIN follows on drain
+#   transport.push_tx(SPSC_EVT_TX_MARK_ACTIVE,
+#                     stream_id, cnx_ptr=cnx, stream_ctx=sb)  # ensure active
+#   transport.wake_up()
+#   ... wait for ring to drain ...
+#   stream_buf_destroy(sb)
+# ---------------------------------------------------------------------------
+
+def stream_buf_create(uint32_t capacity):
+    """Allocate a per-stream send buffer of `capacity` bytes (power of 2).
+
+    Returns an integer pointer (uintptr_t) that should be passed as
+    stream_ctx to push_tx(SPSC_EVT_TX_MARK_ACTIVE, ...) and freed via
+    stream_buf_destroy() when the stream is done.
+    """
+    cdef aiopquic_stream_buf_t* sb = aiopquic_stream_buf_create(capacity)
+    if sb is NULL:
+        raise ValueError(
+            f"stream_buf_create({capacity}): bad capacity "
+            "(must be power of 2 and non-zero) or out of memory")
+    return <uintptr_t>sb
+
+
+def stream_buf_destroy(uintptr_t sb_ptr):
+    """Free a stream buffer. Caller must ensure picoquic has stopped
+    referencing it (stream closed / reset / connection ended)."""
+    if sb_ptr == 0:
+        return
+    aiopquic_stream_buf_destroy(<aiopquic_stream_buf_t*>sb_ptr)
+
+
+def stream_buf_push(uintptr_t sb_ptr, bytes data):
+    """Append bytes to the stream's send ring. Returns # bytes accepted.
+
+    A return < len(data) indicates partial acceptance — the ring is at
+    capacity. Caller should retry the unaccepted tail later (after the
+    consumer has drained more).
+    """
+    if sb_ptr == 0 or not data:
+        return 0
+    cdef const uint8_t* p = <const uint8_t*>data
+    return aiopquic_stream_buf_push(
+        <aiopquic_stream_buf_t*>sb_ptr, p, <uint32_t>len(data))
+
+
+def stream_buf_used(uintptr_t sb_ptr):
+    """Bytes currently buffered (waiting for picoquic to pull)."""
+    if sb_ptr == 0:
+        return 0
+    return aiopquic_stream_buf_used(<aiopquic_stream_buf_t*>sb_ptr)
+
+
+def stream_buf_free(uintptr_t sb_ptr):
+    """Bytes of capacity currently free (max producer can push next)."""
+    if sb_ptr == 0:
+        return 0
+    return aiopquic_stream_buf_free(<aiopquic_stream_buf_t*>sb_ptr)
+
+
+def stream_buf_set_fin(uintptr_t sb_ptr):
+    """Mark FIN to be sent once the ring has been fully drained by picoquic."""
+    if sb_ptr == 0:
+        return
+    aiopquic_stream_buf_set_fin(<aiopquic_stream_buf_t*>sb_ptr)
+
+
+def stream_buf_stats(uintptr_t sb_ptr):
+    """Return (pushed, popped, push_hash, pop_hash) for byte-conservation
+    diagnostics. push_hash and pop_hash are FNV-1a accumulators that are
+    updated when AIOPQUIC_TX_HASH=1 was set at stream_buf_create() time.
+    Returns (0, 0, 0, 0) for a NULL pointer.
+    """
+    if sb_ptr == 0:
+        return (0, 0, 0, 0)
+    cdef aiopquic_stream_buf_t* sb = <aiopquic_stream_buf_t*>sb_ptr
+    return (
+        aiopquic_stream_buf_pushed(sb),
+        aiopquic_stream_buf_popped(sb),
+        aiopquic_stream_buf_push_hash(sb),
+        aiopquic_stream_buf_pop_hash(sb),
+    )
 

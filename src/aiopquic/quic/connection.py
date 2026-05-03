@@ -13,8 +13,18 @@ from .events import (
     ProtocolNegotiated, StreamDataReceived, StreamReset,
     StopSendingReceived, DatagramFrameReceived,
 )
-from aiopquic._binding._transport import TransportContext
+from aiopquic._binding._transport import (
+    TransportContext,
+    stream_buf_create, stream_buf_destroy,
+    stream_buf_push, stream_buf_used, stream_buf_free, stream_buf_set_fin,
+    stream_buf_stats,
+)
 
+
+# Per-stream send-ring capacity for the PULL-model send path.
+# 1 MiB gives ~5-10ms of in-flight data at 1-2 Gbps which is enough
+# pipelining headroom without unbounded queueing. Power of two required.
+_STREAM_RING_CAP = 1 << 20
 
 # SPSC event type constants (must match spsc_ring.h)
 _EVT_STREAM_DATA = 0
@@ -103,6 +113,10 @@ class QuicConnection:
         self._remote_max_datagram_frame_size = (
             configuration.max_datagram_frame_size
         )
+        # PULL-model send path: per-stream byte rings. Lazy-created on
+        # first send_stream_data; destroyed in close(). picoquic pulls
+        # from these via prepare_to_send + stream_ctx.
+        self._stream_bufs: dict[int, int] = {}
 
     @property
     def configuration(self) -> QuicConfiguration:
@@ -275,17 +289,46 @@ class QuicConnection:
 
     def send_stream_data(self, stream_id: int, data: bytes,
                          end_stream: bool = False) -> None:
-        """Send data on a stream."""
-        if not end_stream:
-            self._transport.push_tx(
-                _TX_STREAM_DATA, stream_id,
-                data=data, cnx_ptr=self._cnx_ptr,
-            )
-        else:
-            self._transport.push_tx(
-                _TX_STREAM_FIN, stream_id,
-                data=data, cnx_ptr=self._cnx_ptr,
-            )
+        """Send data on a stream — PULL-model with real backpressure.
+
+        Lazily creates a per-stream byte ring on first call; subsequent
+        calls push bytes into the ring. picoquic pulls at wire rate via
+        the prepare_to_send callback. Raises BufferError when the ring
+        cannot fit `data` (caller must wait + retry, e.g. via
+        stream_write_drain's existing BufferError loop).
+
+        end_stream=True marks FIN to follow once the ring is fully drained.
+        """
+        sb = self._stream_bufs.get(stream_id)
+        if sb is None:
+            sb = stream_buf_create(_STREAM_RING_CAP)
+            self._stream_bufs[stream_id] = sb
+
+        if data:
+            if stream_buf_free(sb) < len(data):
+                raise BufferError(
+                    f"per-stream send ring full "
+                    f"(stream={stream_id}, "
+                    f"need={len(data)}, free={stream_buf_free(sb)})"
+                )
+            accepted = stream_buf_push(sb, data)
+            if accepted != len(data):
+                # Defensive: free check passed but push didn't take all.
+                # Shouldn't happen with single-producer; surface as error.
+                raise BufferError(
+                    f"partial push on stream={stream_id}: "
+                    f"{accepted}/{len(data)} accepted"
+                )
+
+        if end_stream:
+            stream_buf_set_fin(sb)
+
+        # Mark the stream active so picoquic schedules prepare_to_send.
+        # Idempotent — picoquic's mark_active_stream is fine to repeat.
+        self._transport.push_tx(
+            _TX_MARK_ACTIVE, stream_id,
+            cnx_ptr=self._cnx_ptr, stream_ctx=sb,
+        )
         self._transport.wake_up()
 
     def send_datagram_frame(self, data: bytes) -> None:
@@ -295,6 +338,19 @@ class QuicConnection:
             data=data, cnx_ptr=self._cnx_ptr,
         )
         self._transport.wake_up()
+
+    def get_stream_buf_stats(self, stream_id: int):
+        """Return (pushed, popped, push_hash, pop_hash) for the per-stream
+        byte ring. pushed and popped are cumulative byte totals; in a clean
+        run they are equal at stream close. push_hash and pop_hash are FNV-1a
+        accumulators (only meaningful when AIOPQUIC_TX_HASH=1 was set when
+        the ring was created); equal hashes prove byte-for-byte conservation
+        through the ring. Returns None if the stream has no per-stream ring.
+        """
+        sb = self._stream_bufs.get(stream_id)
+        if sb is None:
+            return None
+        return stream_buf_stats(sb)
 
     def get_next_available_stream_id(self, is_unidirectional: bool = False) -> int:
         """Allocate the next stream ID."""
@@ -332,6 +388,14 @@ class QuicConnection:
             )
             self._transport.wake_up()
             self._closed = True
+        # NOTE: per-stream send rings are intentionally NOT destroyed
+        # here. picoquic-pthread may still hold stream_ctx pointers to
+        # them; freeing now risks use-after-free. Proper lifecycle
+        # requires an explicit deactivate→free dance via picoquic
+        # mark_active_stream(active=0) before destroy. Until that lands,
+        # buffers are reclaimed at process exit. Acceptable for tests
+        # and short-lived sessions; leaks per long-lived connection
+        # otherwise — TODO before production ship.
 
     def stop(self) -> None:
         """Stop the transport entirely.

@@ -83,20 +83,30 @@ if openssl_root:
 # Apple ld outright rejects them).
 extra_link_args = []
 if platform.system() == "Linux":
+    # Order matters: setuptools places `libraries=` BEFORE
+    # `extra_link_args=` on the cc line. The static archives in the
+    # group have undefined references to EVP_*/SSL_* — those need
+    # libcrypto/libssl to come AFTER the group, not before. Move
+    # -lssl/-lcrypto into extra_link_args here so the resulting
+    # order is: ... -Wl,--start-group [archives] -Wl,--end-group
+    # -lssl -lcrypto -lpthread.
     extra_link_args = [
         "-Wl,--start-group",
         *extra_objects,
         "-Wl,--end-group",
+        "-lssl",
+        "-lcrypto",
+        "-lpthread",
     ]
     extra_objects_for_ext = []
+    libraries = []
 else:
     extra_objects_for_ext = extra_objects
-
-# Platform link libs. pthread is implicit on macOS but Apple ld
-# warns/errors on -lpthread in some toolchains, so omit it there.
-libraries = ["ssl", "crypto"]
-if platform.system() != "Darwin":
-    libraries.append("pthread")
+    # Platform link libs. pthread is implicit on macOS but Apple ld
+    # warns/errors on -lpthread in some toolchains, so omit it there.
+    libraries = ["ssl", "crypto"]
+    if platform.system() != "Darwin":
+        libraries.append("pthread")
 
 define_macros = []
 if platform.system() == "Linux":

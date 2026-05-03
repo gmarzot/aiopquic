@@ -16,10 +16,13 @@
 #define AIOPQUIC_CALLBACK_H
 
 #include "spsc_ring.h"
+#include "stream_buf.h"
+#include "stream_ctx.h"
 #include <picoquic.h>
 #include <picoquic_packet_loop.h>
 
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <netinet/in.h>
@@ -187,8 +190,46 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)callback_ctx;
     if (!ctx) return -1;
 
-    /* TX-side callback: drain TX ring entry into picoquic's frame buffer. */
+    /* TX-side callback. Two paths:
+     *
+     * (1) PULL model: stream_ctx is a aiopquic_stream_buf_t* set by
+     *     picoquic_mark_active_stream(cnx, sid, 1, sb). Drain bytes
+     *     from the ring into picoquic's frame buffer up to the budget.
+     *     If the ring drains to empty AND fin_pending is set, signal
+     *     FIN; else keep the stream active.
+     *
+     * (2) PUSH model (legacy): stream_ctx is NULL. Drain a single
+     *     SPSC TX entry (whatever is at the head of the shared TX
+     *     ring). Only matches if the entry is for this stream_id.
+     *     This path has no upstream backpressure — caller is
+     *     responsible for not over-pushing into picoquic's internal
+     *     queue. Retained for the existing send_stream_data API.
+     */
     if (fin_or_event == picoquic_callback_prepare_to_send) {
+        if (stream_ctx) {
+            aiopquic_stream_buf_t* sb =
+                (aiopquic_stream_buf_t*)stream_ctx;
+            uint32_t want = (uint32_t)length;
+            uint32_t avail = aiopquic_stream_buf_used(sb);
+            uint32_t to_send = (avail < want) ? avail : want;
+            int fin_after = aiopquic_stream_buf_fin_pending(sb);
+            int is_fin = (fin_after && to_send == avail) ? 1 : 0;
+            /* is_still_active=1 means "more data in this ring right now
+             * — keep polling me." When the ring drains to empty, return
+             * 0 so picoquic stops scheduling this stream. The next
+             * producer push fires SPSC_EVT_TX_MARK_ACTIVE which
+             * re-arms picoquic via mark_active_stream(active=1). This
+             * is the correct handshake and keeps picoquic's stream
+             * scheduler from spinning on an empty stream. */
+            int is_still_active = (avail > to_send) ? 1 : 0;
+            uint8_t* buf = picoquic_provide_stream_data_buffer(
+                bytes, to_send, is_fin, is_still_active);
+            if (buf && to_send > 0) {
+                aiopquic_stream_buf_pop(sb, buf, to_send);
+            }
+            return 0;
+        }
+
         spsc_entry_t* tx_entry = spsc_ring_peek(ctx->tx_ring);
         if (tx_entry && tx_entry->stream_id == stream_id &&
             (tx_entry->event_type == SPSC_EVT_TX_STREAM_DATA ||
@@ -217,6 +258,97 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         return 0;
     }
 
+    /* RX-path instrumentation.
+     *   AIOPQUIC_RX_TRACE=1       first chunk per stream only
+     *   AIOPQUIC_RX_TRACE=2/all   every chunk (flood)
+     *   AIOPQUIC_RX_STRIDE=K      every chunk where (chunk_idx % K)==0
+     *                             AND chunk_idx==0 AND fin chunk
+     *                             (covers all streams; same K on Python)
+     *   AIOPQUIC_RX_FOCUS=N       restrict logging to stream_id N
+     * Each line carries stream/chunk/off/len/fin + head[16] (and tail[8]
+     * when focused). Compare to aiomoqt's per-chunk log on the Python
+     * side to localize cross-stream byte misattribution. */
+    static int trace_checked = 0;
+    static int trace_mode = 0;     /* 0=off, 1=first-only, 2=all */
+    static int trace_stride = 0;   /* >0 means stride mode */
+    static int focus_checked = 0;
+    static int has_focus = 0;
+    static uint64_t focus_stream = 0;
+    if (!trace_checked) {
+        const char* env = getenv("AIOPQUIC_RX_TRACE");
+        if (env && *env && *env != '0') {
+            trace_mode = (env[0] == '2' || strcmp(env, "all") == 0) ? 2 : 1;
+        }
+        const char* senv = getenv("AIOPQUIC_RX_STRIDE");
+        if (senv && *senv) {
+            int v = atoi(senv);
+            if (v > 0) trace_stride = v;
+        }
+        trace_checked = 1;
+    }
+    if (!focus_checked) {
+        const char* fenv = getenv("AIOPQUIC_RX_FOCUS");
+        if (fenv && *fenv) {
+            char* endp = NULL;
+            unsigned long long v = strtoull(fenv, &endp, 10);
+            if (endp && endp != fenv) {
+                focus_stream = (uint64_t)v;
+                has_focus = 1;
+            }
+        }
+        focus_checked = 1;
+    }
+    if ((trace_mode > 0 || trace_stride > 0 || has_focus) &&
+        (fin_or_event == picoquic_callback_stream_data ||
+         fin_or_event == picoquic_callback_stream_fin) &&
+        bytes != NULL && length > 0) {
+        int is_focus_target = has_focus && (stream_id == focus_stream);
+        if (!has_focus || is_focus_target) {
+            /* Per-stream chunk index + cumulative byte offset.
+             * 1024-bucket thread-local hash, stream_id+1 marks slot. */
+            static __thread uint64_t seen[1024];
+            static __thread uint32_t chunk_idx[1024];
+            static __thread uint64_t byte_off[1024];
+            unsigned bucket = (unsigned)(stream_id % 1024);
+            int first_for_stream = (seen[bucket] != stream_id + 1);
+            if (first_for_stream) {
+                seen[bucket] = stream_id + 1;
+                chunk_idx[bucket] = 0;
+                byte_off[bucket] = 0;
+            }
+            uint32_t cidx = chunk_idx[bucket];
+            uint64_t boff = byte_off[bucket];
+            int is_fin = (fin_or_event == picoquic_callback_stream_fin) ? 1 : 0;
+            int log_it = is_focus_target || (trace_mode == 2) ||
+                         (trace_mode == 1 && first_for_stream);
+            if (!log_it && trace_stride > 0) {
+                if (cidx == 0 || is_fin || (cidx % (uint32_t)trace_stride) == 0) {
+                    log_it = 1;
+                }
+            }
+            if (log_it) {
+                size_t hn = length < 16 ? length : 16;
+                size_t tn = length < 8 ? length : 8;
+                fprintf(stderr,
+                        "[aiopquic_rx] stream=%llu chunk=%u off=%llu len=%zu fin=%d head=",
+                        (unsigned long long)stream_id, cidx,
+                        (unsigned long long)boff, length, is_fin);
+                for (size_t i = 0; i < hn; i++) {
+                    fprintf(stderr, "%02x", (unsigned)bytes[i]);
+                }
+                if ((is_focus_target || trace_stride > 0) && length > 16) {
+                    fprintf(stderr, " tail=");
+                    for (size_t i = length - tn; i < length; i++) {
+                        fprintf(stderr, "%02x", (unsigned)bytes[i]);
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
+            chunk_idx[bucket] = cidx + 1;
+            byte_off[bucket] = boff + length;
+        }
+    }
+
     spsc_entry_t entry = {0};
     entry.event_type = (uint32_t)evt;
     entry.stream_id = stream_id;
@@ -241,9 +373,13 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     if (ret == 0) {
         aiopquic_notify_rx(ctx);
     }
-    /* If push failed (ring full / OOM), the event is dropped. picoquic will
-     * keep the bytes in its reassembly chain and re-deliver on the next
-     * scheduling tick once the consumer drains. */
+    /* TODO(landing-A): silent drop on ring-full is incompatible with
+     * picoquic's callback contract — bytes are considered consumed once we
+     * return regardless of ret. Replace this whole bytes-bearing path with
+     * per-stream byte rings (mirror of TX stream_buf) + advance
+     * picoquic_set_max_stream_data after Python drains, for canonical QUIC
+     * flow-control backpressure. Track corruption via the existing
+     * tx-hash diagnostic until the refactor lands. */
 
     return 0;
 }
