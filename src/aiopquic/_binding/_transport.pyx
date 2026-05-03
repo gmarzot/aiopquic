@@ -37,6 +37,8 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_WT_CLOSE, SPSC_EVT_TX_WT_DRAIN,
     SPSC_EVT_TX_WT_RESET_STREAM, SPSC_EVT_TX_WT_DEREGISTER,
     SPSC_EVT_TX_WT_STOP_SENDING,
+    SPSC_EVT_TX_OPEN_FLOW_CONTROL,
+    SPSC_EVT_TX_SET_APP_FLOW_CONTROL,
 )
 
 # Socket address helpers (needed by picoquic declarations)
@@ -85,6 +87,9 @@ cdef extern from "picoquic.h":
         const char* ticket_file_name,
         const uint8_t* ticket_encryption_key,
         size_t ticket_encryption_key_length)
+
+    void picoquic_set_default_congestion_algorithm_by_name(
+        picoquic_quic_t* quic, const char* alg_name)
 
     void picoquic_free(picoquic_quic_t* quic)
     uint64_t picoquic_current_time()
@@ -186,6 +191,7 @@ cdef extern from "c/callback.h":
         spsc_ring_t* tx_ring
         int eventfd
         picoquic_quic_t* quic
+        uint32_t rx_ring_cap
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity)
     void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx)
@@ -209,6 +215,7 @@ cdef extern from "c/stream_buf.h":
 
     aiopquic_stream_buf_t* aiopquic_stream_buf_create(uint32_t capacity)
     void aiopquic_stream_buf_destroy(aiopquic_stream_buf_t* sb)
+    uint32_t aiopquic_ceil_pow2_u32(uint32_t n)
     uint32_t aiopquic_stream_buf_push(
         aiopquic_stream_buf_t* sb,
         const uint8_t* data, uint32_t length)
@@ -232,8 +239,10 @@ cdef extern from "c/stream_ctx.h":
     ctypedef struct aiopquic_stream_ctx_t:
         aiopquic_stream_buf_t* tx
         aiopquic_stream_buf_t* rx
+        # Atomic on the C side; Cython sees plain uint64_t and we touch
+        # them via aiopquic_stream_ctx_rx_* accessors.
         uint64_t rx_consumed
-        uint64_t rx_max_data_advertised
+        uint64_t rx_credit_limit
         uint8_t  pending_destroy
 
     aiopquic_stream_ctx_t* aiopquic_stream_ctx_create()
@@ -242,21 +251,18 @@ cdef extern from "c/stream_ctx.h":
     int aiopquic_stream_ctx_ensure_rx(aiopquic_stream_ctx_t* sc,
                                       uint32_t capacity)
     void aiopquic_stream_ctx_destroy(aiopquic_stream_ctx_t* sc)
+    uint64_t aiopquic_stream_ctx_rx_consumed_load(aiopquic_stream_ctx_t* sc)
+    void aiopquic_stream_ctx_rx_consumed_add(
+        aiopquic_stream_ctx_t* sc, uint64_t delta)
 
 
-# picoquic flow-control API (canonical RX backpressure):
-#   picoquic_open_flow_control(cnx, stream_id, expected_data_size)
-#     advances the receive credit window for this stream so the peer
-#     can send up to `expected_data_size` total bytes. Re-call after
-#     drain to extend.
-#   picoquic_set_app_flow_control(cnx, stream_id, 1) opts the stream into
-#     application-controlled flow control — picoquic stops auto-extending
-#     the window; we drive it explicitly via picoquic_open_flow_control.
-cdef extern from "picoquic.h":
-    int picoquic_open_flow_control(void* cnx, uint64_t stream_id,
-                                    uint64_t expected_data_size)
-    int picoquic_set_app_flow_control(void* cnx, uint64_t stream_id,
-                                       int use_app_flow_control)
+# picoquic flow-control APIs are thread-bound to the picoquic worker
+# (PICOQUIC_THREAD_CHECK in sender.c). The asyncio thread cannot call
+# them directly. Instead it queues SPSC events
+# (SPSC_EVT_TX_OPEN_FLOW_CONTROL, SPSC_EVT_TX_SET_APP_FLOW_CONTROL)
+# which the picoquic worker drains and dispatches to the actual
+# picoquic_open_flow_control / picoquic_set_app_flow_control calls.
+# See aiopquic_loop_cb's TX-ring-drain switch in callback.h.
 
 
 # H3+WebTransport: opaque types from picoquic; we hold pointers only.
@@ -577,7 +583,12 @@ cdef class TransportContext:
                                 rx_sb, <uint8_t*>buf, <uint32_t>length)
                             data = memoryview(
                                 StreamChunk._wrap(buf, length))
-                            sc.rx_consumed += <uint64_t>length
+                            # Atomic advance — picoquic worker reads this
+                            # in its next stream_data callback to decide
+                            # when to extend MAX_STREAM_DATA. No SPSC
+                            # dispatch, no wake_up, no thread crossing.
+                            aiopquic_stream_ctx_rx_consumed_add(
+                                sc, <uint64_t>length)
 
             events.append((
                 entry.event_type,
@@ -594,13 +605,18 @@ cdef class TransportContext:
 
     def push_tx(self, uint32_t event_type, uint64_t stream_id,
                 bytes data=None, uint64_t error_code=0,
-                uintptr_t cnx_ptr=0, uintptr_t stream_ctx=0):
+                uintptr_t cnx_ptr=0, uintptr_t stream_ctx=0,
+                uint8_t is_fin=0):
         """
         Push a command into the TX ring (asyncio → picoquic thread).
 
         stream_ctx is forwarded as the v_stream_ctx pointer for events
         that consume it (SPSC_EVT_TX_MARK_ACTIVE → picoquic_mark_active_stream).
         For the PULL-model send path it carries an aiopquic_stream_buf_t*.
+
+        is_fin is also reused as a small auxiliary flag: e.g.,
+        SPSC_EVT_TX_SET_APP_FLOW_CONTROL uses it as the
+        `use_app_flow_control` argument to picoquic_set_app_flow_control.
 
         After pushing, caller should call wake_up() to signal the network thread.
         """
@@ -610,7 +626,7 @@ cdef class TransportContext:
 
         entry.event_type = event_type
         entry.stream_id = stream_id
-        entry.is_fin = 0
+        entry.is_fin = is_fin
         entry.cnx = <void*>cnx_ptr
         entry.stream_ctx = <void*>stream_ctx
         entry.error_code = error_code
@@ -626,7 +642,8 @@ cdef class TransportContext:
     def start(self, int port=0, cert_file=None, key_file=None,
               alpn=None, bint is_client=True, uint64_t idle_timeout_ms=30000,
               uint32_t max_datagram_frame_size=0,
-              wt_path=None, debug_log=None, keylog_filename=None):
+              wt_path=None, debug_log=None, keylog_filename=None,
+              uint32_t rx_ring_cap=0, congestion_control_algorithm=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -649,6 +666,14 @@ cdef class TransportContext:
         """
         if self._started:
             raise RuntimeError("Transport already started")
+
+        # Stash per-stream RX ring capacity on the C ctx so the
+        # stream_data callback sizes per-stream byte rings to match the
+        # configured max_stream_data window. The C-side ring allocator
+        # handles power-of-two rounding internally; we just pass the
+        # configured window verbatim. 0 leaves the C default in place.
+        if rx_ring_cap > 0:
+            self._ctx.rx_ring_cap = aiopquic_ceil_pow2_u32(rx_ring_cap)
 
         cdef const char* c_cert = NULL
         cdef const char* c_key = NULL
@@ -699,6 +724,19 @@ cdef class TransportContext:
             raise RuntimeError("Failed to create picoquic context")
 
         self._ctx.quic = self._quic
+
+        # Optional congestion-control selection. None defers to picoquic's
+        # compile-time default (newreno). Unknown names fall back the
+        # same way (picoquic logs a warning and keeps the default).
+        cdef bytes _b_cc
+        cdef const char* _c_cc
+        if congestion_control_algorithm is not None:
+            _b_cc = (congestion_control_algorithm.encode()
+                     if isinstance(congestion_control_algorithm, str)
+                     else congestion_control_algorithm)
+            _c_cc = _b_cc
+            picoquic_set_default_congestion_algorithm_by_name(
+                self._quic, _c_cc)
 
         cdef bytes _b_log
         if debug_log is not None:
@@ -1307,57 +1345,19 @@ def stream_ctx_get_rx(uintptr_t sc_ptr):
 
 
 def stream_ctx_rx_consumed(uintptr_t sc_ptr):
-    """Cumulative RX bytes Python has drained from the per-stream ring.
-    Drives MAX_STREAM_DATA advancement: peer's send credit limit is
-    rx_consumed + ring_capacity."""
+    """Cumulative RX bytes drained from the per-stream ring (atomic
+    load). Useful for diagnostics; flow-control advancement is now a
+    side-effect of the picoquic worker thread reading this counter
+    inside its stream_data callback — no Python-side dispatch."""
     if sc_ptr == 0:
         return 0
-    cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
-    return sc.rx_consumed
+    return aiopquic_stream_ctx_rx_consumed_load(
+        <aiopquic_stream_ctx_t*>sc_ptr)
 
 
-def stream_ctx_set_rx_consumed(uintptr_t sc_ptr, uint64_t value):
-    """Update rx_consumed counter. Called from connection.py after
-    handing N bytes off as StreamDataReceived events."""
-    if sc_ptr == 0:
-        return
-    cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
-    sc.rx_consumed = value
-
-
-def stream_ctx_set_max_data_advertised(uintptr_t sc_ptr, uint64_t value):
-    """Track the last MAX_STREAM_DATA we advertised so we can avoid
-    spamming picoquic with redundant updates."""
-    if sc_ptr == 0:
-        return
-    cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
-    sc.rx_max_data_advertised = value
-
-
-def stream_ctx_get_max_data_advertised(uintptr_t sc_ptr):
-    if sc_ptr == 0:
-        return 0
-    cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
-    return sc.rx_max_data_advertised
-
-
-def set_max_stream_data(uintptr_t cnx_ptr, uint64_t stream_id,
-                         uint64_t max_data):
-    """Wrap picoquic_open_flow_control. Advances the peer's per-stream
-    send credit. Called from connection.py after draining N bytes from
-    a per-stream RX ring; new max_data = rx_consumed + ring_capacity.
-    """
-    if cnx_ptr == 0:
-        return -1
-    return picoquic_open_flow_control(
-        <void*>cnx_ptr, stream_id, max_data)
-
-
-def enable_app_flow_control(uintptr_t cnx_ptr, uint64_t stream_id):
-    """Opt this stream into application-driven flow control. picoquic
-    stops auto-advancing MAX_STREAM_DATA; we drive it explicitly via
-    set_max_stream_data after each per-stream RX drain."""
-    if cnx_ptr == 0:
-        return -1
-    return picoquic_set_app_flow_control(<void*>cnx_ptr, stream_id, 1)
+# Note: set_max_stream_data and enable_app_flow_control are issued from
+# the connection.py drain path via push_tx(SPSC_EVT_TX_OPEN_FLOW_CONTROL,
+# error_code=new_max) and push_tx(SPSC_EVT_TX_SET_APP_FLOW_CONTROL,
+# is_fin=1). No direct Python wrappers needed — the existing push_tx
+# API already delivers events to the picoquic worker thread.
 

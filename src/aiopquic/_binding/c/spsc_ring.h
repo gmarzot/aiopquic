@@ -68,6 +68,15 @@ typedef enum {
     SPSC_EVT_TX_WT_DEREGISTER = 141,    /* picowt_deregister + free wt_session */
     SPSC_EVT_TX_WT_STOP_SENDING = 142,  /* picoquic_request_stop_sending on WT stream */
 
+    /* Flow-control dispatch (asyncio → picoquic worker). picoquic's
+     * picoquic_open_flow_control / picoquic_set_app_flow_control APIs
+     * are thread-bound to the picoquic worker (PICOQUIC_THREAD_CHECK),
+     * so the asyncio thread must dispatch them via the TX SPSC ring.
+     * - error_code field carries the new max_data limit for OPEN.
+     * - is_fin field carries the use_app_flow_control flag for SET. */
+    SPSC_EVT_TX_OPEN_FLOW_CONTROL = 143,
+    SPSC_EVT_TX_SET_APP_FLOW_CONTROL = 144,
+
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
      * WT control stream for session events, or the WT stream for

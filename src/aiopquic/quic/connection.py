@@ -22,9 +22,7 @@ from aiopquic._binding._transport import (
     stream_ctx_create, stream_ctx_destroy,
     stream_ctx_ensure_tx, stream_ctx_ensure_rx,
     stream_ctx_get_tx, stream_ctx_get_rx,
-    stream_ctx_rx_consumed, stream_ctx_set_rx_consumed,
-    stream_ctx_get_max_data_advertised, stream_ctx_set_max_data_advertised,
-    set_max_stream_data,
+    stream_ctx_rx_consumed,
 )
 
 
@@ -142,6 +140,11 @@ class QuicConnection:
         # set secrets_log_file explicitly — matches the convention used
         # by curl, openssl s_client, and Chromium-based tooling.
         keylog = cfg.secrets_log_file or os.environ.get('SSLKEYLOGFILE')
+        # Per-stream RX byte ring capacity matches the configured
+        # max_stream_data window (spec-bound peer-allowed in-flight
+        # maximum on a single stream). The C-side allocator rounds up
+        # to a power of two internally — caller-side just passes the
+        # configured window verbatim.
         self._transport.start(
             port=port,
             cert_file=cfg.certificate_file,
@@ -151,6 +154,8 @@ class QuicConnection:
             idle_timeout_ms=int(cfg.idle_timeout * 1000),
             max_datagram_frame_size=(cfg.max_datagram_frame_size or 0),
             keylog_filename=keylog,
+            rx_ring_cap=cfg.max_stream_data,
+            congestion_control_algorithm=cfg.congestion_control_algorithm,
         )
 
     def connect(self, addr: tuple[str, int], now: float = 0.0) -> None:
@@ -192,29 +197,27 @@ class QuicConnection:
 
         For STREAM_DATA / STREAM_FIN events on streams owned by an
         aiopquic_stream_ctx_t wrapper, drain_rx() has already popped
-        the bytes from the wrapper's RX ring into `data`. We just
-        register the wrapper for lifecycle bookkeeping."""
+        the bytes from the wrapper's RX ring into `data` AND atomically
+        advanced sc->rx_consumed. The picoquic worker reads that
+        counter on its next stream_data callback for the same stream
+        and extends MAX_STREAM_DATA accordingly — backpressure is a
+        side effect of the worker's own packet processing, no Python-
+        side dispatch needed."""
         if self._transport is None:
             return
         raw_events = self._transport.drain_rx()
         for (evt_type, stream_id, data, is_fin, error_code,
              cnx_ptr, _stream_ctx_ptr) in raw_events:
-            if evt_type == _EVT_STREAM_DATA:
+            if evt_type == _EVT_STREAM_DATA or evt_type == _EVT_STREAM_FIN:
                 if _stream_ctx_ptr and stream_id not in self._stream_ctxs:
                     self._stream_ctxs[stream_id] = _stream_ctx_ptr
                 self._events.append(StreamDataReceived(
                     stream_id=stream_id,
                     data=data if data is not None else memoryview(b""),
-                    end_stream=False,
+                    end_stream=(evt_type == _EVT_STREAM_FIN),
                 ))
-            elif evt_type == _EVT_STREAM_FIN:
-                if _stream_ctx_ptr and stream_id not in self._stream_ctxs:
-                    self._stream_ctxs[stream_id] = _stream_ctx_ptr
-                self._events.append(StreamDataReceived(
-                    stream_id=stream_id,
-                    data=data if data is not None else memoryview(b""),
-                    end_stream=True,
-                ))
+                if evt_type == _EVT_STREAM_DATA:
+                    continue
             elif evt_type == _EVT_STREAM_RESET:
                 self._events.append(StreamReset(
                     stream_id=stream_id,
@@ -484,6 +487,8 @@ class QuicEngine:
             idle_timeout_ms=int(cfg.idle_timeout * 1000),
             max_datagram_frame_size=(cfg.max_datagram_frame_size or 0),
             keylog_filename=keylog,
+            rx_ring_cap=cfg.max_stream_data,
+            congestion_control_algorithm=cfg.congestion_control_algorithm,
         )
 
     @property

@@ -13,9 +13,17 @@ class QuicConfiguration:
     alpn_protocols: list[str] | None = None
     idle_timeout: float = 60.0
     is_client: bool = True
-    # 16 MB connection-wide / per-stream flow-control windows. Keeps
-    # high-bandwidth single-stream sustained throughput unblocked
-    # without explicit overrides for the common case.
+    # Initial flow-control windows advertised to the peer at handshake.
+    # The peer is bound by spec to never send more than max_stream_data
+    # bytes unconsumed on a single stream (and max_data across all
+    # streams) until we extend MAX_STREAM_DATA. The C-side per-stream
+    # RX byte ring is sized to match this advertised cap at allocation
+    # time, so the spec-permitted worst case (peer fills the entire
+    # window before we drain a byte) is handled correctly. As the
+    # consumer drains bytes the picoquic worker thread extends the
+    # cap via picoquic_open_flow_control. Higher caps tolerate larger
+    # peer bursts before backpressure kicks in; lower caps reduce
+    # per-stream memory and bufferbloat.
     max_data: int = 16 * 1024 * 1024
     max_stream_data: int = 16 * 1024 * 1024
     # 65535: the QUIC max for the DATAGRAM frame extension (RFC 9221).
@@ -30,6 +38,14 @@ class QuicConfiguration:
     # writes TLS secrets per connection so packet captures can be
     # decrypted offline. Honors the SSLKEYLOGFILE env var as a default.
     secrets_log_file: str | None = None
+    # Congestion-control algorithm for picoquic to use on this transport.
+    # None defers to picoquic's compile-time default (newreno). Common
+    # values: "newreno" (loss-based, default), "cubic" (loss-based,
+    # widely deployed), "bbr" (delay-based, high-BDP friendly), "bbr1"
+    # (older BBRv1), "prague" (L4S/ECN), "dcubic", "fast". The string
+    # is passed verbatim to picoquic_set_default_congestion_algorithm_by_name;
+    # an unknown name falls back to the compile-time default.
+    congestion_control_algorithm: str | None = None
 
     def load_cert_chain(self, certfile: str, keyfile: str | None = None,
                         password: str | None = None) -> None:

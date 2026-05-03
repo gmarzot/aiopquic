@@ -33,7 +33,9 @@ CHUNK = 64 * 1024
 HEADER_FMT = "<QQQ"        # u64 seq, u64 t_built_ns, u64 magic
 HEADER_LEN = struct.calcsize(HEADER_FMT)
 MAGIC = 0xDEADBEEFCAFEBABE
-RING_CAPACITY = 1 << 20    # 1 MiB per-stream send buffer
+RING_CAPACITY = 1 << 20    # 1 MiB per-stream send buffer (matches RX side
+                           # advertised flow-control window for symmetric
+                           # backpressure and minimal bufferbloat)
 
 
 def _build_chunk(seq, fill_byte=0xBB):

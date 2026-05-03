@@ -55,10 +55,25 @@ static inline uint32_t aiopquic_fnv1a_step(uint32_t h, const uint8_t* p,
     return h;
 }
 
+/* Round up to the next power of two ≥ n, capped at 1<<31 to keep
+ * arithmetic in uint32_t. Callers pass the configured window
+ * (e.g., max_stream_data) verbatim; the ring sizes itself. */
+static inline uint32_t aiopquic_ceil_pow2_u32(uint32_t n) {
+    if (n == 0) return 1;
+    if ((n & (n - 1)) == 0) return n;
+    /* clz is undefined on 0; we already returned. */
+    uint32_t bits = (uint32_t)(32 - __builtin_clz(n));
+    if (bits >= 32) return 1u << 31;
+    return 1u << bits;
+}
+
 static inline aiopquic_stream_buf_t* aiopquic_stream_buf_create(
         uint32_t capacity) {
-    if (capacity == 0 || (capacity & (capacity - 1)) != 0) {
-        return NULL;  /* require power of two */
+    /* Power-of-two is an internal sizing constraint — callers can pass
+     * any positive size and the ring rounds up. */
+    capacity = aiopquic_ceil_pow2_u32(capacity);
+    if (capacity == 0) {
+        return NULL;
     }
     aiopquic_stream_buf_t* sb =
         (aiopquic_stream_buf_t*)calloc(1, sizeof(aiopquic_stream_buf_t));

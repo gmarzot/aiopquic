@@ -21,11 +21,17 @@
 #include <picoquic.h>
 #include <picoquic_packet_loop.h>
 
-/* Per-stream RX byte ring capacity. 1 MiB matches TX side; gives
- * ~5-10ms of in-flight data at 1-2 Gbps peer rate which is plenty of
- * pipelining headroom while picoquic's default flow-control window is
- * also at this scale. Power of two required. */
-#define AIOPQUIC_RX_RING_CAP (1u << 20)
+/* Fallback per-stream RX byte ring capacity when the configured
+ * max_stream_data hasn't been threaded through (e.g., raw transport
+ * tests bypassing QuicConfiguration). Production code paths use the
+ * configured window via aiopquic_ctx_t.rx_ring_cap. Power of two. */
+#define AIOPQUIC_RX_RING_CAP_DEFAULT (1u << 20)
+
+/* MAX_STREAM_DATA hysteresis: advance peer credit when ≥ 1/4 of the
+ * ring has been drained since the last update. Matches picoquic's
+ * own receive_window_threshold cadence and bounds the rate of
+ * MAX_STREAM_DATA frames under sustained drain. */
+#define AIOPQUIC_RX_FC_THRESHOLD_DIV 4
 
 #include <fcntl.h>
 #include <stdlib.h>
@@ -62,6 +68,13 @@ typedef struct {
                                        (== eventfd on Linux; pipe write end
                                        elsewhere) */
     picoquic_quic_t* quic;
+    /* Per-stream RX byte ring capacity. Set at start() time from the
+     * QuicConfiguration's max_stream_data so the ring can hold the
+     * full peer-allowed in-flight window (the spec promises peer
+     * never sends more before MAX_STREAM_DATA is extended). Rounded
+     * up to a power of two by the Cython binding before being stored
+     * here. */
+    uint32_t        rx_ring_cap;
 } aiopquic_ctx_t;
 
 static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity) {
@@ -388,37 +401,54 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                       && bytes != NULL && length > 0;
     int ret;
     if (has_payload) {
+        /* Per-stream RX ring capacity = the max_stream_data window
+         * advertised at handshake (peer-allowed in-flight maximum).
+         * Falls back to AIOPQUIC_RX_RING_CAP_DEFAULT when the
+         * transport context didn't have the configuration plumbed
+         * through (raw-test paths). */
+        uint32_t ring_cap = ctx->rx_ring_cap > 0
+            ? ctx->rx_ring_cap
+            : AIOPQUIC_RX_RING_CAP_DEFAULT;
+        uint32_t fc_threshold = ring_cap / AIOPQUIC_RX_FC_THRESHOLD_DIV;
         aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)stream_ctx;
         if (!sc) {
             sc = aiopquic_stream_ctx_create();
             if (!sc) {
-                /* OOM — close connection rather than drop bytes. */
                 return -1;
             }
             picoquic_set_app_stream_ctx(cnx, stream_id, sc);
             entry.stream_ctx = sc;
+            /* Opt into application-driven flow control. Initial credit
+             * = ring_cap, matching what was advertised at handshake. */
+            (void)picoquic_set_app_flow_control(cnx, stream_id, 1);
+            (void)picoquic_open_flow_control(cnx, stream_id, ring_cap);
+            aiopquic_stream_ctx_rx_credit_store(sc, ring_cap);
         }
-        if (aiopquic_stream_ctx_ensure_rx(sc, AIOPQUIC_RX_RING_CAP) != 0) {
+        if (aiopquic_stream_ctx_ensure_rx(sc, ring_cap) != 0) {
             return -1;
         }
         uint32_t pushed = aiopquic_stream_buf_push(
             sc->rx, bytes, (uint32_t)length);
         if (pushed != length) {
-            /* Ring full despite credit-window sizing — flow control
-             * violation by peer or our own bookkeeping bug. Better to
-             * close noisily than to silently corrupt. */
             fprintf(stderr,
                     "[aiopquic_rx] stream=%llu RX ring overflow: "
-                    "pushed %u of %zu (free=%u). Peer flow-control "
-                    "violation OR app didn't drain in time.\n",
+                    "pushed %u of %zu (free=%u, cap=%u). Peer "
+                    "flow-control violation — this should not be "
+                    "reachable for a spec-compliant peer.\n",
                     (unsigned long long)stream_id, pushed, length,
-                    aiopquic_stream_buf_free(sc->rx));
+                    aiopquic_stream_buf_free(sc->rx), ring_cap);
             return -1;
         }
         if (fin_or_event == picoquic_callback_stream_fin) {
             aiopquic_stream_buf_set_fin(sc->rx);
         }
-        /* Signal-only SPSC event: bytes live on sc->rx, can't be dropped. */
+        uint64_t consumed = aiopquic_stream_ctx_rx_consumed_load(sc);
+        uint64_t want_limit = consumed + ring_cap;
+        uint64_t cur_limit = aiopquic_stream_ctx_rx_credit_load(sc);
+        if (want_limit > cur_limit + fc_threshold) {
+            (void)picoquic_open_flow_control(cnx, stream_id, want_limit);
+            aiopquic_stream_ctx_rx_credit_store(sc, want_limit);
+        }
         ret = spsc_ring_push(ctx->rx_ring, &entry, NULL, 0);
     } else {
         ret = spsc_ring_push(ctx->rx_ring, &entry, bytes, (uint32_t)length);
@@ -542,6 +572,23 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     }
                     case SPSC_EVT_TX_STOP_SENDING: {
                         picoquic_stop_sending(cnx, entry->stream_id, entry->error_code);
+                        spsc_ring_pop(ctx->tx_ring);
+                        break;
+                    }
+                    case SPSC_EVT_TX_OPEN_FLOW_CONTROL: {
+                        /* Asyncio thread asks us to advance the peer's
+                         * MAX_STREAM_DATA limit for this stream. error_code
+                         * carries the new absolute byte limit. Returns
+                         * non-zero if stream not found or cnx not in ready
+                         * state — both transient/recoverable. */
+                        (void)picoquic_open_flow_control(
+                            cnx, entry->stream_id, entry->error_code);
+                        spsc_ring_pop(ctx->tx_ring);
+                        break;
+                    }
+                    case SPSC_EVT_TX_SET_APP_FLOW_CONTROL: {
+                        (void)picoquic_set_app_flow_control(
+                            cnx, entry->stream_id, (int)entry->is_fin);
                         spsc_ring_pop(ctx->tx_ring);
                         break;
                     }

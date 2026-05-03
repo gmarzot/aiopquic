@@ -90,6 +90,7 @@ def _read_summary(proc, timeout=15.0) -> dict:
 @pytest.mark.parametrize("payload_bytes", [
     1 * 1024 * 1024,    # 1 MB — quick smoke
     10 * 1024 * 1024,   # 10 MB — meaningful sustained transfer
+    100 * 1024 * 1024,  # 100 MB — exercises full FC window cycling
 ])
 async def test_aiopquic_client_qh3_server_sink(cert_paths, payload_bytes):
     port = _free_port()
