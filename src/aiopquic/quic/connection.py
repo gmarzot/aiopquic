@@ -228,16 +228,20 @@ class QuicConnection:
                     stream_id=stream_id,
                     error_code=error_code,
                 ))
-            elif evt_type == _EVT_CLOSE:
+            elif evt_type == _EVT_CLOSE or evt_type == _EVT_APP_CLOSE:
                 self._closed = True
                 self._events.append(ConnectionTerminated(
                     error_code=error_code,
                 ))
-            elif evt_type == _EVT_APP_CLOSE:
-                self._closed = True
-                self._events.append(ConnectionTerminated(
-                    error_code=error_code,
-                ))
+                # Connection is now done from picoquic's perspective —
+                # the close callback has fired which means the worker
+                # thread has stopped invoking app callbacks for this
+                # cnx's streams. Safe to free the per-stream wrappers
+                # now; without this they'd leak until process exit.
+                # picoquic's internal cnx cleanup runs separately and
+                # doesn't dereference app_stream_ctx after the close
+                # callback returns.
+                self._destroy_stream_ctxs()
             elif evt_type == _EVT_READY:
                 if cnx_ptr != 0:
                     # Connection handshake complete
@@ -303,6 +307,7 @@ class QuicConnection:
         elif evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
             self._closed = True
             self._events.append(ConnectionTerminated(error_code=error_code))
+            self._destroy_stream_ctxs()
         elif evt_type == _EVT_READY:
             alpn = (self._configuration.alpn_protocols[0]
                     if self._configuration.alpn_protocols else None)
@@ -321,6 +326,20 @@ class QuicConnection:
             sc = stream_ctx_create()
             self._stream_ctxs[stream_id] = sc
         return sc
+
+    def _destroy_stream_ctxs(self) -> None:
+        """Free all per-stream wrappers + their TX/RX byte rings.
+        Idempotent — safe to call multiple times. Called when the
+        connection-close callback has fired (picoquic worker has
+        stopped invoking app callbacks for this cnx's streams).
+        Per-stream early cleanup (before connection close) requires
+        picoquic_unlink_app_stream_ctx via SPSC dispatch; deferred to
+        a future landing — bounded leak per connection until then."""
+        if not self._stream_ctxs:
+            return
+        for sc in self._stream_ctxs.values():
+            stream_ctx_destroy(sc)
+        self._stream_ctxs.clear()
 
     def send_stream_data(self, stream_id: int, data: bytes,
                          end_stream: bool = False) -> None:
