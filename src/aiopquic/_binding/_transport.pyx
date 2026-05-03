@@ -14,6 +14,7 @@ covers TX entry points and the WT TX dispatch path.
 """
 
 from cpython.buffer cimport PyBuffer_FillInfo
+from cpython.bytes cimport PyBytes_AsString, PyBytes_FromStringAndSize
 from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t, uintptr_t
 from libc.stdlib cimport free, malloc
 from libc.string cimport memcpy, memset
@@ -211,6 +212,9 @@ cdef extern from "c/stream_buf.h":
     uint32_t aiopquic_stream_buf_push(
         aiopquic_stream_buf_t* sb,
         const uint8_t* data, uint32_t length)
+    uint32_t aiopquic_stream_buf_pop(
+        aiopquic_stream_buf_t* sb,
+        uint8_t* out, uint32_t max_bytes)
     uint32_t aiopquic_stream_buf_used(aiopquic_stream_buf_t* sb)
     uint32_t aiopquic_stream_buf_free(aiopquic_stream_buf_t* sb)
     void aiopquic_stream_buf_set_fin(aiopquic_stream_buf_t* sb)
@@ -219,6 +223,40 @@ cdef extern from "c/stream_buf.h":
     uint64_t aiopquic_stream_buf_popped(aiopquic_stream_buf_t* sb)
     uint32_t aiopquic_stream_buf_push_hash(aiopquic_stream_buf_t* sb)
     uint32_t aiopquic_stream_buf_pop_hash(aiopquic_stream_buf_t* sb)
+
+
+# Per-stream wrapper holding both TX and RX byte rings + flow-control
+# state. Set as picoquic's app_stream_ctx so the same slot serves both
+# directions for bidi streams.
+cdef extern from "c/stream_ctx.h":
+    ctypedef struct aiopquic_stream_ctx_t:
+        aiopquic_stream_buf_t* tx
+        aiopquic_stream_buf_t* rx
+        uint64_t rx_consumed
+        uint64_t rx_max_data_advertised
+        uint8_t  pending_destroy
+
+    aiopquic_stream_ctx_t* aiopquic_stream_ctx_create()
+    int aiopquic_stream_ctx_ensure_tx(aiopquic_stream_ctx_t* sc,
+                                      uint32_t capacity)
+    int aiopquic_stream_ctx_ensure_rx(aiopquic_stream_ctx_t* sc,
+                                      uint32_t capacity)
+    void aiopquic_stream_ctx_destroy(aiopquic_stream_ctx_t* sc)
+
+
+# picoquic flow-control API (canonical RX backpressure):
+#   picoquic_open_flow_control(cnx, stream_id, expected_data_size)
+#     advances the receive credit window for this stream so the peer
+#     can send up to `expected_data_size` total bytes. Re-call after
+#     drain to extend.
+#   picoquic_set_app_flow_control(cnx, stream_id, 1) opts the stream into
+#     application-controlled flow control — picoquic stops auto-extending
+#     the window; we drive it explicitly via picoquic_open_flow_control.
+cdef extern from "picoquic.h":
+    int picoquic_open_flow_control(void* cnx, uint64_t stream_id,
+                                    uint64_t expected_data_size)
+    int picoquic_set_app_flow_control(void* cnx, uint64_t stream_id,
+                                       int use_app_flow_control)
 
 
 # H3+WebTransport: opaque types from picoquic; we hold pointers only.
@@ -506,6 +544,9 @@ cdef class TransportContext:
         cdef void* buf
         cdef Py_ssize_t length
 
+        cdef aiopquic_stream_ctx_t* sc
+        cdef aiopquic_stream_buf_t* rx_sb
+        cdef uint32_t avail
         for i in range(max_events):
             entry = spsc_ring_peek(self._ctx.rx_ring)
             if entry is NULL:
@@ -516,6 +557,27 @@ cdef class TransportContext:
                 length = entry.data_length
                 buf = spsc_ring_take_data(entry)
                 data = memoryview(StreamChunk._wrap(buf, length))
+            elif (entry.event_type == SPSC_EVT_STREAM_DATA or
+                  entry.event_type == SPSC_EVT_STREAM_FIN) and \
+                  entry.stream_ctx is not NULL:
+                # Canonical RX path: bytes live on the per-stream ring
+                # attached to the wrapper. Pop them here so callers see
+                # the same `data` shape as before. The wrapper pointer
+                # is also returned so the caller can advance MAX_STREAM_DATA
+                # via picoquic_open_flow_control after consuming.
+                sc = <aiopquic_stream_ctx_t*>entry.stream_ctx
+                rx_sb = sc.rx
+                if rx_sb is not NULL:
+                    avail = aiopquic_stream_buf_used(rx_sb)
+                    if avail > 0:
+                        length = avail
+                        buf = malloc(<size_t>length)
+                        if buf is not NULL:
+                            aiopquic_stream_buf_pop(
+                                rx_sb, <uint8_t*>buf, <uint32_t>length)
+                            data = memoryview(
+                                StreamChunk._wrap(buf, length))
+                            sc.rx_consumed += <uint64_t>length
 
             events.append((
                 entry.event_type,
@@ -1150,4 +1212,152 @@ def stream_buf_stats(uintptr_t sb_ptr):
         aiopquic_stream_buf_push_hash(sb),
         aiopquic_stream_buf_pop_hash(sb),
     )
+
+
+def stream_buf_pop_to_bytes(uintptr_t sb_ptr, uint32_t max_bytes):
+    """Pop up to max_bytes from the per-stream byte ring as a fresh
+    `bytes` object. Returns b'' when the ring is empty or sb_ptr is NULL.
+
+    Used on the RX path: picoquic worker thread pushed bytes into this
+    ring synchronously inside the stream_data callback; this drains
+    them on the asyncio thread for delivery as StreamDataReceived.
+    """
+    if sb_ptr == 0 or max_bytes == 0:
+        return b''
+    cdef aiopquic_stream_buf_t* sb = <aiopquic_stream_buf_t*>sb_ptr
+    cdef uint32_t avail = aiopquic_stream_buf_used(sb)
+    if avail == 0:
+        return b''
+    cdef uint32_t to_read = max_bytes if max_bytes < avail else avail
+    cdef bytes out = PyBytes_FromStringAndSize(NULL, to_read)
+    cdef char* buf = PyBytes_AsString(out)
+    cdef uint32_t actual = aiopquic_stream_buf_pop(
+        sb, <uint8_t*>buf, to_read)
+    if actual != to_read:
+        # Shouldn't happen — head only advances on the consumer thread.
+        return out[:actual]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# stream_ctx_t — per-stream wrapper. Allocated on first contact (TX or RX),
+# bound to picoquic's app_stream_ctx slot so both prepare_to_send and
+# stream_data callbacks find the same struct. Holds the per-direction
+# byte rings + RX flow-control state.
+# ---------------------------------------------------------------------------
+def stream_ctx_create():
+    """Allocate a fresh wrapper. Returns its address as uintptr_t.
+    Both rings start NULL — call stream_ctx_ensure_tx / _ensure_rx to
+    populate. Caller must eventually stream_ctx_destroy() to free."""
+    cdef aiopquic_stream_ctx_t* sc = aiopquic_stream_ctx_create()
+    if not sc:
+        raise MemoryError("aiopquic_stream_ctx_create returned NULL")
+    return <uintptr_t>sc
+
+
+def stream_ctx_destroy(uintptr_t sc_ptr):
+    """Free the wrapper + both rings. Call only after the picoquic worker
+    has stopped using this stream_ctx (i.e., after stream_reset/_fin and
+    the next picoquic_packet_loop_wake-up cycle has completed). For now
+    callers defer destroy until process exit to avoid use-after-free with
+    the picoquic worker thread."""
+    if sc_ptr == 0:
+        return
+    aiopquic_stream_ctx_destroy(<aiopquic_stream_ctx_t*>sc_ptr)
+
+
+def stream_ctx_ensure_tx(uintptr_t sc_ptr, uint32_t capacity):
+    """Lazily allocate the TX ring on the wrapper. Idempotent — repeated
+    calls with the ring already present are a no-op. Capacity must be
+    a power of two. Returns 0 on success, raises on alloc failure."""
+    if sc_ptr == 0:
+        raise ValueError("stream_ctx_ensure_tx called with NULL pointer")
+    cdef int ret = aiopquic_stream_ctx_ensure_tx(
+        <aiopquic_stream_ctx_t*>sc_ptr, capacity)
+    if ret != 0:
+        raise MemoryError(f"aiopquic_stream_ctx_ensure_tx failed (ret={ret})")
+    return 0
+
+
+def stream_ctx_ensure_rx(uintptr_t sc_ptr, uint32_t capacity):
+    """Lazily allocate the RX ring on the wrapper. Idempotent."""
+    if sc_ptr == 0:
+        raise ValueError("stream_ctx_ensure_rx called with NULL pointer")
+    cdef int ret = aiopquic_stream_ctx_ensure_rx(
+        <aiopquic_stream_ctx_t*>sc_ptr, capacity)
+    if ret != 0:
+        raise MemoryError(f"aiopquic_stream_ctx_ensure_rx failed (ret={ret})")
+    return 0
+
+
+def stream_ctx_get_tx(uintptr_t sc_ptr):
+    """Return the TX ring pointer (or 0 if not yet ensured)."""
+    if sc_ptr == 0:
+        return 0
+    cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
+    return <uintptr_t>sc.tx
+
+
+def stream_ctx_get_rx(uintptr_t sc_ptr):
+    """Return the RX ring pointer (or 0 if not yet ensured)."""
+    if sc_ptr == 0:
+        return 0
+    cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
+    return <uintptr_t>sc.rx
+
+
+def stream_ctx_rx_consumed(uintptr_t sc_ptr):
+    """Cumulative RX bytes Python has drained from the per-stream ring.
+    Drives MAX_STREAM_DATA advancement: peer's send credit limit is
+    rx_consumed + ring_capacity."""
+    if sc_ptr == 0:
+        return 0
+    cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
+    return sc.rx_consumed
+
+
+def stream_ctx_set_rx_consumed(uintptr_t sc_ptr, uint64_t value):
+    """Update rx_consumed counter. Called from connection.py after
+    handing N bytes off as StreamDataReceived events."""
+    if sc_ptr == 0:
+        return
+    cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
+    sc.rx_consumed = value
+
+
+def stream_ctx_set_max_data_advertised(uintptr_t sc_ptr, uint64_t value):
+    """Track the last MAX_STREAM_DATA we advertised so we can avoid
+    spamming picoquic with redundant updates."""
+    if sc_ptr == 0:
+        return
+    cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
+    sc.rx_max_data_advertised = value
+
+
+def stream_ctx_get_max_data_advertised(uintptr_t sc_ptr):
+    if sc_ptr == 0:
+        return 0
+    cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
+    return sc.rx_max_data_advertised
+
+
+def set_max_stream_data(uintptr_t cnx_ptr, uint64_t stream_id,
+                         uint64_t max_data):
+    """Wrap picoquic_open_flow_control. Advances the peer's per-stream
+    send credit. Called from connection.py after draining N bytes from
+    a per-stream RX ring; new max_data = rx_consumed + ring_capacity.
+    """
+    if cnx_ptr == 0:
+        return -1
+    return picoquic_open_flow_control(
+        <void*>cnx_ptr, stream_id, max_data)
+
+
+def enable_app_flow_control(uintptr_t cnx_ptr, uint64_t stream_id):
+    """Opt this stream into application-driven flow control. picoquic
+    stops auto-advancing MAX_STREAM_DATA; we drive it explicitly via
+    set_max_stream_data after each per-stream RX drain."""
+    if cnx_ptr == 0:
+        return -1
+    return picoquic_set_app_flow_control(<void*>cnx_ptr, stream_id, 1)
 

@@ -21,6 +21,12 @@
 #include <picoquic.h>
 #include <picoquic_packet_loop.h>
 
+/* Per-stream RX byte ring capacity. 1 MiB matches TX side; gives
+ * ~5-10ms of in-flight data at 1-2 Gbps peer rate which is plenty of
+ * pipelining headroom while picoquic's default flow-control window is
+ * also at this scale. Power of two required. */
+#define AIOPQUIC_RX_RING_CAP (1u << 20)
+
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -207,20 +213,18 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
      */
     if (fin_or_event == picoquic_callback_prepare_to_send) {
         if (stream_ctx) {
-            aiopquic_stream_buf_t* sb =
-                (aiopquic_stream_buf_t*)stream_ctx;
+            aiopquic_stream_ctx_t* sc =
+                (aiopquic_stream_ctx_t*)stream_ctx;
+            aiopquic_stream_buf_t* sb = sc->tx;
+            if (!sb) {
+                (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
+                return 0;
+            }
             uint32_t want = (uint32_t)length;
             uint32_t avail = aiopquic_stream_buf_used(sb);
             uint32_t to_send = (avail < want) ? avail : want;
             int fin_after = aiopquic_stream_buf_fin_pending(sb);
             int is_fin = (fin_after && to_send == avail) ? 1 : 0;
-            /* is_still_active=1 means "more data in this ring right now
-             * — keep polling me." When the ring drains to empty, return
-             * 0 so picoquic stops scheduling this stream. The next
-             * producer push fires SPSC_EVT_TX_MARK_ACTIVE which
-             * re-arms picoquic via mark_active_stream(active=1). This
-             * is the correct handshake and keeps picoquic's stream
-             * scheduler from spinning on an empty stream. */
             int is_still_active = (avail > to_send) ? 1 : 0;
             uint8_t* buf = picoquic_provide_stream_data_buffer(
                 bytes, to_send, is_fin, is_still_active);
@@ -369,17 +373,63 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         entry.error_code = picoquic_get_remote_error(cnx);
     }
 
-    int ret = spsc_ring_push(ctx->rx_ring, &entry, bytes, (uint32_t)length);
+    /* Canonical RX path: stream_data / stream_fin bytes are pushed
+     * synchronously into a per-stream byte ring on the wrapper. The
+     * SPSC event delivered to Python carries ONLY the wrapper pointer
+     * (no payload), so picoquic's "callback returns = bytes consumed"
+     * contract is satisfied without ever risking a silent drop on
+     * SPSC ring full.
+     *
+     * The Python consumer (connection.py RX drain) pops bytes from
+     * sc->rx, builds StreamDataReceived events, and (Landing B)
+     * advances peer credit via picoquic_open_flow_control. */
+    int has_payload = (fin_or_event == picoquic_callback_stream_data ||
+                       fin_or_event == picoquic_callback_stream_fin)
+                      && bytes != NULL && length > 0;
+    int ret;
+    if (has_payload) {
+        aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)stream_ctx;
+        if (!sc) {
+            sc = aiopquic_stream_ctx_create();
+            if (!sc) {
+                /* OOM — close connection rather than drop bytes. */
+                return -1;
+            }
+            picoquic_set_app_stream_ctx(cnx, stream_id, sc);
+            entry.stream_ctx = sc;
+        }
+        if (aiopquic_stream_ctx_ensure_rx(sc, AIOPQUIC_RX_RING_CAP) != 0) {
+            return -1;
+        }
+        uint32_t pushed = aiopquic_stream_buf_push(
+            sc->rx, bytes, (uint32_t)length);
+        if (pushed != length) {
+            /* Ring full despite credit-window sizing — flow control
+             * violation by peer or our own bookkeeping bug. Better to
+             * close noisily than to silently corrupt. */
+            fprintf(stderr,
+                    "[aiopquic_rx] stream=%llu RX ring overflow: "
+                    "pushed %u of %zu (free=%u). Peer flow-control "
+                    "violation OR app didn't drain in time.\n",
+                    (unsigned long long)stream_id, pushed, length,
+                    aiopquic_stream_buf_free(sc->rx));
+            return -1;
+        }
+        if (fin_or_event == picoquic_callback_stream_fin) {
+            aiopquic_stream_buf_set_fin(sc->rx);
+        }
+        /* Signal-only SPSC event: bytes live on sc->rx, can't be dropped. */
+        ret = spsc_ring_push(ctx->rx_ring, &entry, NULL, 0);
+    } else {
+        ret = spsc_ring_push(ctx->rx_ring, &entry, bytes, (uint32_t)length);
+    }
     if (ret == 0) {
         aiopquic_notify_rx(ctx);
     }
-    /* TODO(landing-A): silent drop on ring-full is incompatible with
-     * picoquic's callback contract — bytes are considered consumed once we
-     * return regardless of ret. Replace this whole bytes-bearing path with
-     * per-stream byte rings (mirror of TX stream_buf) + advance
-     * picoquic_set_max_stream_data after Python drains, for canonical QUIC
-     * flow-control backpressure. Track corruption via the existing
-     * tx-hash diagnostic until the refactor lands. */
+    /* For non-stream events (datagram, close, ready, etc.) the SPSC
+     * push can still fail under extreme load. Those are control-plane
+     * and rare; if a future deployment hits this we'll move them to a
+     * second priority ring. */
 
     return 0;
 }

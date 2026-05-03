@@ -23,8 +23,9 @@ from _helpers import (
 SPSC_EVT_TX_MARK_ACTIVE = 134
 
 from aiopquic._binding._transport import (
-    stream_buf_create, stream_buf_destroy,
     stream_buf_push, stream_buf_used, stream_buf_free, stream_buf_set_fin,
+    stream_ctx_create, stream_ctx_destroy,
+    stream_ctx_ensure_tx, stream_ctx_get_tx,
 )
 
 
@@ -54,13 +55,15 @@ def test_bench_pull_sustained(big_ring_pair, duration_s, capsys):
     server, client, client_cnx, _ = big_ring_pair
     sid = 0  # client-initiated bidirectional
 
-    sb = stream_buf_create(RING_CAPACITY)
+    sc = stream_ctx_create()
+    stream_ctx_ensure_tx(sc, RING_CAPACITY)
+    sb = stream_ctx_get_tx(sc)
     try:
-        # Activate the stream with our buffer pointer as stream_ctx.
-        # picoquic will fire prepare_to_send when it has wire credit;
-        # the C callback finds sb via stream_ctx and pulls bytes.
+        # Activate the stream with the wrapper pointer as stream_ctx.
+        # picoquic stores it as app_stream_ctx; the prepare_to_send
+        # callback dereferences ->tx to find this byte ring.
         client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
-                       cnx_ptr=client_cnx, stream_ctx=sb)
+                       cnx_ptr=client_cnx, stream_ctx=sc)
         client.wake_up()
 
         sent = 0
@@ -116,14 +119,22 @@ def test_bench_pull_sustained(big_ring_pair, duration_s, capsys):
             if pending_chunk is None:
                 pending_chunk = _build_chunk(chunk_seq)
                 chunk_seq += 1
+            used_before = stream_buf_used(sb)
             accepted = stream_buf_push(sb, pending_chunk)
             sent += accepted
+            if accepted > 0:
+                # Batch MARK_ACTIVE: only re-arm picoquic when our push
+                # could have transitioned the ring from empty to
+                # non-empty (the case where prepare_to_send had set
+                # is_still_active=false and stopped polling). When the
+                # ring is already producing for picoquic, mark_active is
+                # idempotent overhead — skip it.
+                if used_before == 0:
+                    client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+                                   cnx_ptr=client_cnx, stream_ctx=sc)
+                client.wake_up()
             if accepted == len(pending_chunk):
                 pending_chunk = None
-                if (chunk_seq & 0xF) == 0:
-                    # nudge picoquic periodically; mark_active is sticky
-                    # but wake_up tells the loop to schedule sooner.
-                    client.wake_up()
             else:
                 # partial or zero accept = ring is full = real backpressure.
                 if accepted > 0:
@@ -131,7 +142,6 @@ def test_bench_pull_sustained(big_ring_pair, duration_s, capsys):
                     push_partial += 1
                 else:
                     push_full_waits += 1
-                client.wake_up()
                 # tiny yield so picoquic-pthread can drain
                 time.sleep(0.00005)
 
@@ -195,4 +205,4 @@ def test_bench_pull_sustained(big_ring_pair, duration_s, capsys):
         # We destroy the buffer here; if picoquic still references it, it
         # would be a use-after-free, so we wait briefly first.
         time.sleep(0.05)
-        stream_buf_destroy(sb)
+        stream_ctx_destroy(sc)

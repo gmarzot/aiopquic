@@ -18,6 +18,13 @@ from aiopquic._binding._transport import (
     stream_buf_create, stream_buf_destroy,
     stream_buf_push, stream_buf_used, stream_buf_free, stream_buf_set_fin,
     stream_buf_stats,
+    stream_buf_pop_to_bytes,
+    stream_ctx_create, stream_ctx_destroy,
+    stream_ctx_ensure_tx, stream_ctx_ensure_rx,
+    stream_ctx_get_tx, stream_ctx_get_rx,
+    stream_ctx_rx_consumed, stream_ctx_set_rx_consumed,
+    stream_ctx_get_max_data_advertised, stream_ctx_set_max_data_advertised,
+    set_max_stream_data,
 )
 
 
@@ -113,10 +120,13 @@ class QuicConnection:
         self._remote_max_datagram_frame_size = (
             configuration.max_datagram_frame_size
         )
-        # PULL-model send path: per-stream byte rings. Lazy-created on
-        # first send_stream_data; destroyed in close(). picoquic pulls
-        # from these via prepare_to_send + stream_ctx.
-        self._stream_bufs: dict[int, int] = {}
+        # Per-stream wrapper map. Each stream_ctx_t holds {tx, rx} byte
+        # rings + RX flow-control state and is bound to picoquic's
+        # app_stream_ctx slot. Lazy-created on first contact (TX from
+        # send_stream_data, RX from picoquic stream_data callback).
+        # Destroyed via lifecycle hooks (Landing C); for now leak until
+        # process exit to avoid use-after-free with the picoquic worker.
+        self._stream_ctxs: dict[int, int] = {}
 
     @property
     def configuration(self) -> QuicConfiguration:
@@ -178,19 +188,28 @@ class QuicConnection:
         return cnx_data_received(self._cnx_ptr)
 
     def _drain_and_convert(self) -> None:
-        """Drain SPSC ring and convert to QuicEvent objects."""
+        """Drain SPSC ring and convert to QuicEvent objects.
+
+        For STREAM_DATA / STREAM_FIN events on streams owned by an
+        aiopquic_stream_ctx_t wrapper, drain_rx() has already popped
+        the bytes from the wrapper's RX ring into `data`. We just
+        register the wrapper for lifecycle bookkeeping."""
         if self._transport is None:
             return
         raw_events = self._transport.drain_rx()
         for (evt_type, stream_id, data, is_fin, error_code,
              cnx_ptr, _stream_ctx_ptr) in raw_events:
             if evt_type == _EVT_STREAM_DATA:
+                if _stream_ctx_ptr and stream_id not in self._stream_ctxs:
+                    self._stream_ctxs[stream_id] = _stream_ctx_ptr
                 self._events.append(StreamDataReceived(
                     stream_id=stream_id,
                     data=data if data is not None else memoryview(b""),
                     end_stream=False,
                 ))
             elif evt_type == _EVT_STREAM_FIN:
+                if _stream_ctx_ptr and stream_id not in self._stream_ctxs:
+                    self._stream_ctxs[stream_id] = _stream_ctx_ptr
                 self._events.append(StreamDataReceived(
                     stream_id=stream_id,
                     data=data if data is not None else memoryview(b""),
@@ -255,12 +274,16 @@ class QuicConnection:
         QuicEngine after demuxing by cnx_ptr.
         """
         if evt_type == _EVT_STREAM_DATA:
+            if stream_ctx_ptr and stream_id not in self._stream_ctxs:
+                self._stream_ctxs[stream_id] = stream_ctx_ptr
             self._events.append(StreamDataReceived(
                 stream_id=stream_id,
                 data=data if data is not None else memoryview(b""),
                 end_stream=False,
             ))
         elif evt_type == _EVT_STREAM_FIN:
+            if stream_ctx_ptr and stream_id not in self._stream_ctxs:
+                self._stream_ctxs[stream_id] = stream_ctx_ptr
             self._events.append(StreamDataReceived(
                 stream_id=stream_id,
                 data=data if data is not None else memoryview(b""),
@@ -287,22 +310,30 @@ class QuicConnection:
                 data=data if data is not None else memoryview(b""),
             ))
 
+    def _get_or_create_stream_ctx(self, stream_id: int) -> int:
+        """Lazy-allocate the per-stream wrapper. Both TX and RX paths
+        funnel through here so a single wrapper covers bidi streams."""
+        sc = self._stream_ctxs.get(stream_id)
+        if sc is None:
+            sc = stream_ctx_create()
+            self._stream_ctxs[stream_id] = sc
+        return sc
+
     def send_stream_data(self, stream_id: int, data: bytes,
                          end_stream: bool = False) -> None:
         """Send data on a stream — PULL-model with real backpressure.
 
-        Lazily creates a per-stream byte ring on first call; subsequent
-        calls push bytes into the ring. picoquic pulls at wire rate via
-        the prepare_to_send callback. Raises BufferError when the ring
-        cannot fit `data` (caller must wait + retry, e.g. via
-        stream_write_drain's existing BufferError loop).
+        Lazily creates a per-stream wrapper + TX byte ring on first call;
+        subsequent calls push bytes into the ring. picoquic pulls at wire
+        rate via prepare_to_send.
 
-        end_stream=True marks FIN to follow once the ring is fully drained.
+        Raises BufferError when the ring cannot fit `data` (caller must
+        wait + retry).  end_stream=True marks FIN to follow once the
+        ring is fully drained.
         """
-        sb = self._stream_bufs.get(stream_id)
-        if sb is None:
-            sb = stream_buf_create(_STREAM_RING_CAP)
-            self._stream_bufs[stream_id] = sb
+        sc = self._get_or_create_stream_ctx(stream_id)
+        stream_ctx_ensure_tx(sc, _STREAM_RING_CAP)
+        sb = stream_ctx_get_tx(sc)
 
         if data:
             if stream_buf_free(sb) < len(data):
@@ -324,10 +355,11 @@ class QuicConnection:
             stream_buf_set_fin(sb)
 
         # Mark the stream active so picoquic schedules prepare_to_send.
-        # Idempotent — picoquic's mark_active_stream is fine to repeat.
+        # The wrapper pointer is what picoquic stores as app_stream_ctx;
+        # the prepare_to_send callback dereferences ->tx to find the ring.
         self._transport.push_tx(
             _TX_MARK_ACTIVE, stream_id,
-            cnx_ptr=self._cnx_ptr, stream_ctx=sb,
+            cnx_ptr=self._cnx_ptr, stream_ctx=sc,
         )
         self._transport.wake_up()
 
@@ -341,14 +373,18 @@ class QuicConnection:
 
     def get_stream_buf_stats(self, stream_id: int):
         """Return (pushed, popped, push_hash, pop_hash) for the per-stream
-        byte ring. pushed and popped are cumulative byte totals; in a clean
-        run they are equal at stream close. push_hash and pop_hash are FNV-1a
-        accumulators (only meaningful when AIOPQUIC_TX_HASH=1 was set when
-        the ring was created); equal hashes prove byte-for-byte conservation
-        through the ring. Returns None if the stream has no per-stream ring.
+        TX byte ring. pushed and popped are cumulative byte totals; in a
+        clean run they are equal at stream close. push_hash and pop_hash
+        are FNV-1a accumulators (only meaningful when AIOPQUIC_TX_HASH=1
+        was set when the ring was created); equal hashes prove byte-for-
+        byte conservation through the ring. Returns None if the stream
+        has no per-stream wrapper or no TX ring on that wrapper.
         """
-        sb = self._stream_bufs.get(stream_id)
-        if sb is None:
+        sc = self._stream_ctxs.get(stream_id)
+        if sc is None:
+            return None
+        sb = stream_ctx_get_tx(sc)
+        if not sb:
             return None
         return stream_buf_stats(sb)
 
