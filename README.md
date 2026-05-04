@@ -126,7 +126,6 @@ python -m pytest tests/bench
 - STOP_SENDING error-code surfacing helper (read `remote_stop_error` from picoquic_internal.h)
 - Relax Python version requirement (test on 3.12/3.13)
 - Per-stream wrapper cleanup on RESET/FIN before connection close (currently bounded leak per cnx)
-- Performance comparison vs aioquic / qh3
 
 ## Resources
 

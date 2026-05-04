@@ -80,8 +80,11 @@ yum install -y openssl-devel cmake
 
 [tool.cibuildwheel.macos]
 # delocate bundles libssl/libcrypto from Homebrew into the wheel.
-# MACOSX_DEPLOYMENT_TARGET=11.0 covers Big Sur+ (Apple Silicon shipped
-# with 11.0 minimum). For x86_64 wheels the macos-13 runner default is
-# 13.0; we target 11.0 across both archs for consistency.
-environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
+# We do NOT pin MACOSX_DEPLOYMENT_TARGET — each runner uses its
+# native default so the bundled Homebrew dylibs (built against the
+# runner's macOS) satisfy delocate's "library deployment target
+# must be ≤ wheel deployment target" check:
+#   macos-13 runner -> wheel targets macOS 13.0+ (Ventura)   [x86_64]
+#   macos-14 runner -> wheel targets macOS 14.0+ (Sonoma)    [arm64]
+# Older macOS users fall back to sdist (build from source).
 before-all = "brew install cmake openssl@3"
