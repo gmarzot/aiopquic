@@ -121,6 +121,7 @@ python -m pytest tests/bench
 
 ## TODO
 
+- Windows support (eventfd alternative — IOCP / WSAEventSelect on the wake-fd path)
 - Free-threaded Python (3.14t) support after producer-side locking audit
 - STOP_SENDING error-code surfacing helper (read `remote_stop_error` from picoquic_internal.h)
 - Relax Python version requirement (test on 3.12/3.13)
