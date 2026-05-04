@@ -71,8 +71,32 @@ for lib_name in ("libpicotls-fusion.a",):
     if p is not None:
         extra_objects.append(p)
 
-# OpenSSL discovery: env var (CI / Homebrew) wins, else system.
-openssl_root = os.environ.get("OPENSSL_ROOT_DIR")
+def _detect_brew_openssl():
+    """On macOS, fall back to Homebrew's openssl@3 / openssl@1.1 prefix
+    when OPENSSL_ROOT_DIR isn't set. Mirrors the equivalent detection
+    in build_picoquic.sh so the final-extension link line knows where
+    -lssl / -lcrypto live."""
+    if platform.system() != "Darwin":
+        return None
+    import shutil
+    import subprocess
+    if not shutil.which("brew"):
+        return None
+    for pkg in ("openssl@3", "openssl@1.1"):
+        try:
+            prefix = subprocess.check_output(
+                ["brew", "--prefix", pkg], text=True
+            ).strip()
+        except Exception:
+            continue
+        if prefix and os.path.isdir(prefix):
+            return prefix
+    return None
+
+
+# OpenSSL discovery: explicit env var first (CI / advanced users),
+# then Homebrew on macOS, else system include/lib paths.
+openssl_root = os.environ.get("OPENSSL_ROOT_DIR") or _detect_brew_openssl()
 include_dirs = [
     os.path.join(ROOT, "src", "aiopquic", "_binding"),
     PICOQUIC_INC,
