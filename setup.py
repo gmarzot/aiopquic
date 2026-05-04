@@ -28,8 +28,19 @@ def find_lib(name, search_dirs):
 PICOQUIC_LIB_DIRS = [PICOQUIC_BUILD, os.path.join(PICOQUIC_BUILD, "picoquic")]
 PTLS_LIB_DIRS = [PICOTLS_BUILD]
 
+# Skip the picoquic-built check for commands that don't actually compile
+# the extension. sdist + egg_info + dist_info just package source files
+# and don't need the static libraries; failing them would block source
+# distribution from a fresh checkout that hasn't run build_picoquic.sh.
+_NO_BUILD_CMDS = {
+    "sdist", "egg_info", "dist_info", "check",
+    "--help", "--help-commands", "--name", "--version",
+    "--fullname", "--author", "--description", "--long-description",
+}
+_needs_libs = not _NO_BUILD_CMDS.intersection(sys.argv[1:])
+
 picoquic_lib = find_lib("libpicoquic-core.a", PICOQUIC_LIB_DIRS)
-if picoquic_lib is None:
+if picoquic_lib is None and _needs_libs:
     print("ERROR: picoquic not built. Run: ./build_picoquic.sh", file=sys.stderr)
     sys.exit(1)
 
@@ -40,7 +51,8 @@ extra_objects = []
 http_lib = find_lib("libpicohttp-core.a", PICOQUIC_LIB_DIRS)
 if http_lib is not None:
     extra_objects.append(http_lib)
-extra_objects.append(picoquic_lib)
+if picoquic_lib is not None:
+    extra_objects.append(picoquic_lib)
 # picoquic-log is split out of picoquic-core in upstream; provides
 # picoquic_set_qlog/picoquic_set_textlog/etc. Must follow core in
 # the link line.
