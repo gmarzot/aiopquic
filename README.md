@@ -4,7 +4,7 @@
 
 ## Overview
 
-`aiopquic` exposes picoquic's QUIC implementation through a lock-free SPSC ring buffer architecture that bridges the picoquic network thread with Python's asyncio event loop. It provides an asyncio QUIC/HTTP3 transport API in the spirit of qh3/aioquic (similar shapes for `QuicConfiguration`, `QuicConnection`, `connect()` / `serve()`, and event types) plus a native WebTransport client/server layered on picoquic's H3 + h3zero. Note: not a drop-in replacement — semantics differ around backpressure (`send_stream_data` raises `BufferError` on full per-stream ring) and flow-control sizing.
+`aiopquic` exposes picoquic's QUIC implementation through a lock-free SPSC ring buffer architecture that bridges the picoquic network thread with Python's asyncio event loop. It provides an asyncio QUIC/HTTP3 transport API in the spirit of aioquic (and its fork qh3) — similar shapes for `QuicConfiguration`, `QuicConnection`, `connect()` / `serve()`, and event types — plus a native WebTransport client/server layered on picoquic's H3 + h3zero. Note: not a drop-in replacement — semantics differ around backpressure (`send_stream_data` raises `BufferError` on full per-stream ring) and flow-control sizing.
 
 ### Architecture
 
@@ -125,7 +125,7 @@ python -m pytest tests/bench
 - STOP_SENDING error-code surfacing helper (read `remote_stop_error` from picoquic_internal.h)
 - Relax Python version requirement (test on 3.12/3.13)
 - Per-stream wrapper cleanup on RESET/FIN before connection close (currently bounded leak per cnx)
-- Performance comparison vs qh3/aioquic
+- Performance comparison vs aioquic / qh3
 
 ## Resources
 
