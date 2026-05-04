@@ -7,7 +7,7 @@ name = "aiopquic"
 version = "0.2.0"
 description = "High-performance QUIC/HTTP3 library — picoquic-backed, qh3-compatible asyncio API"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 license = "MIT"
 authors = [
     { name = "Giovanni Marzot", email = "gmarzot@marzresearch.net" }
@@ -55,14 +55,8 @@ markers = [
 # auditwheel/delocate handle bundling libssl/libcrypto into the wheel so
 # end users don't need OpenSSL preinstalled.
 [tool.cibuildwheel]
-build = "cp314-*"
+build = "cp312-* cp313-* cp314-*"
 skip = "*-musllinux_* *-manylinux_i686 *-win32 *_ppc64le *_s390x"
-
-# Run before pip install, in the wheel build environment. Builds the
-# vendored picoquic/picotls static libraries that setup.py links into
-# the extension. Submodules are checked out by the GitHub Actions step
-# before invoking cibuildwheel.
-before-build = "bash build_picoquic.sh"
 
 # Quick sanity check on the built wheel: import the binding extension
 # and verify the version string.
@@ -71,11 +65,14 @@ test-command = "python -c 'import aiopquic; from aiopquic._binding import _trans
 [tool.cibuildwheel.linux]
 # manylinux_2_28 = AlmaLinux 8 / RHEL 8 base — has gcc 12, openssl-devel
 # packaged. Wider compatibility than manylinux_2_34; narrower than
-# legacy manylinux2014 but glibc 2.28+ covers everything from RHEL 8 /
-# Ubuntu 20.04+ which is the realistic floor for Python 3.14.
+# legacy manylinux2014 but glibc 2.28+ covers a lot — RHEL 8 / Ubuntu
+# 20.04+. Built once per OS via before-all (build_picoquic.sh too,
+# so the picoquic+picotls static libs are amortized across the cp312/
+# cp313/cp314 wheel builds rather than rebuilt per python version).
 manylinux-x86_64-image = "manylinux_2_28"
 before-all = """
 yum install -y openssl-devel cmake
+bash build_picoquic.sh
 """
 
 [tool.cibuildwheel.macos]
@@ -87,4 +84,7 @@ yum install -y openssl-devel cmake
 #   macos-13 runner -> wheel targets macOS 13.0+ (Ventura)   [x86_64]
 #   macos-14 runner -> wheel targets macOS 14.0+ (Sonoma)    [arm64]
 # Older macOS users fall back to sdist (build from source).
-before-all = "brew install cmake openssl@3"
+before-all = """
+brew install cmake openssl@3
+bash build_picoquic.sh
+"""
