@@ -73,7 +73,7 @@ jobs:
         pip install -e '.[dev]'
         python -m pytest tests/ -v -m "not interop and not native"
 
-  publish-test:
+  build-sdist:
     needs: [tag, test]
     runs-on: ubuntu-latest
     steps:
@@ -86,52 +86,99 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: "3.14"
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake libssl-dev
-    - name: Build picoquic
-      run: ./build_picoquic.sh
     - name: Build sdist
       run: |
-        python -m pip install --upgrade pip build twine
+        python -m pip install --upgrade pip build
         python -m build --sdist
-    - name: Publish to TestPyPI
-      env:
-        TWINE_USERNAME: __token__
-        TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
-        TWINE_REPOSITORY_URL: https://test.pypi.org/legacy/
-      run: twine upload dist/*
+    - name: Upload sdist
+      uses: actions/upload-artifact@v4
+      with:
+        name: sdist
+        path: dist/*.tar.gz
 
-  publish-prod:
-    needs: [tag, test, publish-test]
-    runs-on: ubuntu-latest
+  build-wheels:
+    needs: [tag, test]
+    name: wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux x86_64 manylinux_2_28 (covers RHEL 8 / Ubuntu 20.04+)
+        # macOS x86_64 (Intel) — macos-13 is the last Intel runner
+        # macOS arm64 (Apple Silicon) — macos-14
+        os: [ubuntu-latest, macos-13, macos-14]
     steps:
     - uses: actions/checkout@v4
       with:
         ref: v${{ needs.tag.outputs.version }}
         submodules: recursive
         fetch-depth: 0
+    - name: Build wheels
+      uses: pypa/cibuildwheel@v2.21.3
+      env:
+        # Forward submodule paths into the manylinux container so
+        # build_picoquic.sh can find them (cibuildwheel mounts the
+        # checkout at /project but submodules need to be present).
+        CIBW_ENVIRONMENT_PASS_LINUX: GITHUB_WORKSPACE
+    - name: Upload wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-${{ matrix.os }}
+        path: ./wheelhouse/*.whl
+
+  publish-test:
+    needs: [tag, build-sdist, build-wheels]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist-staging
+    - name: Flatten artifacts into dist/
+      run: |
+        mkdir -p dist
+        find dist-staging -name '*.whl' -exec cp -v {} dist/ \;
+        find dist-staging -name '*.tar.gz' -exec cp -v {} dist/ \;
+        ls -la dist/
     - name: Set up Python 3.14
       uses: actions/setup-python@v5
       with:
         python-version: "3.14"
-    - name: Install system dependencies
+    - name: Publish to TestPyPI
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        TWINE_REPOSITORY_URL: https://test.pypi.org/legacy/
       run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake libssl-dev
-    - name: Build picoquic
-      run: ./build_picoquic.sh
-    - name: Build sdist
+        python -m pip install --upgrade twine
+        twine upload dist/*
+
+  publish-prod:
+    needs: [tag, build-sdist, build-wheels, publish-test]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist-staging
+    - name: Flatten artifacts into dist/
       run: |
-        python -m pip install --upgrade pip build twine
-        python -m build --sdist
+        mkdir -p dist
+        find dist-staging -name '*.whl' -exec cp -v {} dist/ \;
+        find dist-staging -name '*.tar.gz' -exec cp -v {} dist/ \;
+        ls -la dist/
+    - name: Set up Python 3.14
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.14"
     - name: Publish to PyPI
       env:
         TWINE_USERNAME: __token__
         TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         TWINE_REPOSITORY_URL: https://upload.pypi.org/legacy/
-      run: twine upload dist/*
+      run: |
+        python -m pip install --upgrade twine
+        twine upload dist/*
 
   github-release:
     needs: [tag, publish-prod]
