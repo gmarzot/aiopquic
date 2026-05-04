@@ -105,10 +105,11 @@ jobs:
       matrix:
         include:
         - os: ubuntu-latest                   # manylinux_2_28 x86_64
-        - os: macos-13                        # macOS x86_64 Intel
-          macosx_deployment_target: "13.0"
         - os: macos-14                        # macOS arm64 Apple Silicon
           macosx_deployment_target: "14.0"
+        # macos-13 (Intel x86_64) was retired by GitHub in Oct 2025;
+        # Intel Mac users install via sdist (build from source).
+        # Apple Silicon is the active macOS target (since 2020).
     steps:
     - uses: actions/checkout@v4
       with:

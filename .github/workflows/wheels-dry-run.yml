@@ -44,16 +44,10 @@ jobs:
       matrix:
         include:
         - os: ubuntu-latest
-        # Apple Silicon Macs ship with macOS 11.0 (Big Sur) minimum; the
-        # default arm64 wheel target is also 11.0. But Homebrew on the
-        # macos-14 runner installs openssl@3 dylibs built against the
-        # runner's macOS (14.0). delocate refuses to bundle higher-min
-        # dylibs into a lower-min wheel — so we bump the wheel target
-        # to match the runner. Same logic on macos-13: bump to 13.0.
-        - os: macos-13
-          macosx_deployment_target: "13.0"
         - os: macos-14
           macosx_deployment_target: "14.0"
+        # macos-13 (Intel x86_64) retired by GitHub Oct 2025.
+        # Intel Mac users install via sdist.
     steps:
     - uses: actions/checkout@v4
       with:
