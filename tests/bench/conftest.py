@@ -60,13 +60,19 @@ def big_ring_pair():
     picoquic + the wrapper, not ring-full backpressure.
     """
     port = next_port()
+    # rx_ring_cap=1MB matches AIOPQUIC_RX_RING_CAP_DEFAULT in callback.h.
+    # picoquic's default initial_max_stream_data is larger than our
+    # per-stream ring, so without an explicit cap a slow consumer would
+    # let the peer overrun the ring on raw-test paths. Setting it here
+    # lines the worker-advertised window up with the ring capacity.
     server = TransportContext(ring_capacity=65536)
     server.start(port=port, cert_file=CERT_FILE, key_file=KEY_FILE,
-                 alpn=ALPN, is_client=False)
+                 alpn=ALPN, is_client=False, rx_ring_cap=1 << 20)
     assert wait_for_ready(server)
     try:
         client = TransportContext(ring_capacity=65536)
-        client.start(port=0, alpn=ALPN, is_client=True)
+        client.start(port=0, alpn=ALPN, is_client=True,
+                     rx_ring_cap=1 << 20)
         assert wait_for_ready(client)
         try:
             client.create_client_connection(

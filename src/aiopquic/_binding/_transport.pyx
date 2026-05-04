@@ -761,14 +761,25 @@ cdef class TransportContext:
         if idle_timeout_ms > 0:
             picoquic_set_default_idle_timeout(self._quic, idle_timeout_ms)
 
-        # Set datagram transport parameter if requested
+        # Default transport-parameter overrides. Both the per-stream
+        # initial_max_stream_data window AND optional max_datagram_frame
+        # are merged into the existing TP defaults. Setting the per-
+        # stream window to match rx_ring_cap ensures the peer is told
+        # at handshake time exactly how many bytes it may keep
+        # unconsumed before MAX_STREAM_DATA must be extended — keeping
+        # peer-allowed in-flight ≤ our RX ring capacity.
         cdef picoquic_tp_t tp
         cdef const picoquic_tp_t* cur_tp
-        if max_datagram_frame_size > 0:
+        if max_datagram_frame_size > 0 or rx_ring_cap > 0:
             cur_tp = picoquic_get_default_tp(self._quic)
             if cur_tp != NULL:
                 tp = cur_tp[0]
-                tp.max_datagram_frame_size = max_datagram_frame_size
+                if max_datagram_frame_size > 0:
+                    tp.max_datagram_frame_size = max_datagram_frame_size
+                if rx_ring_cap > 0:
+                    tp.initial_max_stream_data_bidi_local = rx_ring_cap
+                    tp.initial_max_stream_data_bidi_remote = rx_ring_cap
+                    tp.initial_max_stream_data_uni = rx_ring_cap
                 picoquic_set_default_tp(self._quic, &tp)
 
         # Configure packet loop parameters (must persist — picoquic stores a pointer)

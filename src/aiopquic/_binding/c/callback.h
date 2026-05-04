@@ -310,15 +310,28 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                       && bytes != NULL && length > 0;
     int ret;
     if (has_payload) {
-        /* Per-stream RX ring capacity = the max_stream_data window
-         * advertised at handshake (peer-allowed in-flight maximum).
-         * Falls back to AIOPQUIC_RX_RING_CAP_DEFAULT when the
-         * transport context didn't have the configuration plumbed
-         * through (raw-test paths). */
-        uint32_t ring_cap = ctx->rx_ring_cap > 0
+        /* The advertised window and the physical ring capacity are
+         * decoupled by 2x to give a safe headroom margin:
+         *   advertise_cap  = the MAX_STREAM_DATA value sent to the peer
+         *                    (matches the configured max_stream_data /
+         *                    rx_ring_cap so peer never SENDS more than
+         *                    this unconsumed)
+         *   physical_cap   = 2 * advertise_cap, the actual byte ring
+         *                    size — covers picoquic's own internal
+         *                    auto-FC extension that may run once before
+         *                    our picoquic_set_app_flow_control opt-in
+         *                    on first stream_data callback (a single
+         *                    MTU or so of overshoot at the boundary).
+         *
+         * Net effect: a spec-compliant peer can never overrun the ring
+         * even when the consumer is artificially slow. RX ring overflow
+         * is now a true protocol violation, not a flow-control timing
+         * artifact. */
+        uint32_t advertise_cap = ctx->rx_ring_cap > 0
             ? ctx->rx_ring_cap
             : AIOPQUIC_RX_RING_CAP_DEFAULT;
-        uint32_t fc_threshold = ring_cap / AIOPQUIC_RX_FC_THRESHOLD_DIV;
+        uint32_t physical_cap = advertise_cap * 2;
+        uint32_t fc_threshold = advertise_cap / AIOPQUIC_RX_FC_THRESHOLD_DIV;
         aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)stream_ctx;
         if (!sc) {
             sc = aiopquic_stream_ctx_create();
@@ -328,12 +341,12 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             picoquic_set_app_stream_ctx(cnx, stream_id, sc);
             entry.stream_ctx = sc;
             /* Opt into application-driven flow control. Initial credit
-             * = ring_cap, matching what was advertised at handshake. */
+             * advertised to peer = advertise_cap. */
             (void)picoquic_set_app_flow_control(cnx, stream_id, 1);
-            (void)picoquic_open_flow_control(cnx, stream_id, ring_cap);
-            aiopquic_stream_ctx_rx_credit_store(sc, ring_cap);
+            (void)picoquic_open_flow_control(cnx, stream_id, advertise_cap);
+            aiopquic_stream_ctx_rx_credit_store(sc, advertise_cap);
         }
-        if (aiopquic_stream_ctx_ensure_rx(sc, ring_cap) != 0) {
+        if (aiopquic_stream_ctx_ensure_rx(sc, physical_cap) != 0) {
             return -1;
         }
         uint32_t pushed = aiopquic_stream_buf_push(
@@ -341,18 +354,18 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         if (pushed != length) {
             fprintf(stderr,
                     "[aiopquic_rx] stream=%llu RX ring overflow: "
-                    "pushed %u of %zu (free=%u, cap=%u). Peer "
-                    "flow-control violation — this should not be "
-                    "reachable for a spec-compliant peer.\n",
+                    "pushed %u of %zu (free=%u, physical_cap=%u, "
+                    "advertised=%u). True peer flow-control violation.\n",
                     (unsigned long long)stream_id, pushed, length,
-                    aiopquic_stream_buf_free(sc->rx), ring_cap);
+                    aiopquic_stream_buf_free(sc->rx),
+                    physical_cap, advertise_cap);
             return -1;
         }
         if (fin_or_event == picoquic_callback_stream_fin) {
             aiopquic_stream_buf_set_fin(sc->rx);
         }
         uint64_t consumed = aiopquic_stream_ctx_rx_consumed_load(sc);
-        uint64_t want_limit = consumed + ring_cap;
+        uint64_t want_limit = consumed + advertise_cap;
         uint64_t cur_limit = aiopquic_stream_ctx_rx_credit_load(sc);
         if (want_limit > cur_limit + fc_threshold) {
             (void)picoquic_open_flow_control(cnx, stream_id, want_limit);
