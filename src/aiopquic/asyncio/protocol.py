@@ -81,6 +81,16 @@ class QuicConnectionProtocol:
         """Close the QUIC connection."""
         self._quic.close()
 
+    def transmit(self) -> None:
+        """No-op for parity with qh3.
+
+        qh3 needs an explicit flush after send_stream_data because it
+        schedules packet emission on the asyncio loop. picoquic flushes
+        on the picoquic thread the moment data is queued, so callers
+        don't need to drive transmission.
+        """
+        return None
+
     async def wait_connected(self) -> None:
         """Wait for TLS handshake to complete."""
         if self._quic._connected:
@@ -94,3 +104,14 @@ class QuicConnectionProtocol:
         await self._closed.wait()
         self._stop()
         self._quic.stop()
+
+    async def __aenter__(self) -> "QuicConnectionProtocol":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.close()
+        try:
+            await asyncio.wait_for(self.wait_closed(), timeout=2.0)
+        except asyncio.TimeoutError:
+            self._stop()
+            self._quic.stop()

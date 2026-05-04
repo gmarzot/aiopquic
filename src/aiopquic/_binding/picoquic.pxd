@@ -180,6 +180,14 @@ cdef extern from "picoquic.h":
     void picoquic_set_null_verifier(picoquic_quic_t* quic)
     void picoquic_set_log_level(picoquic_quic_t* quic, int log_level)
 
+    # SSLKEYLOG (NSS Key Log Format) — emits TLS secrets so packet
+    # captures can be decrypted by Wireshark/tshark. enable_sslkeylog
+    # toggles the feature; set_key_log_file points at the output path.
+    # picoquic must be built without PICOQUIC_WITHOUT_SSLKEYLOG.
+    void picoquic_enable_sslkeylog(picoquic_quic_t* quic, int enable)
+    void picoquic_set_key_log_file(picoquic_quic_t* quic,
+                                    const char* keylog_filename)
+
 
 cdef extern from "picoquic_packet_loop.h":
     ctypedef struct picoquic_packet_loop_param_t:

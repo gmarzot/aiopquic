@@ -1,34 +1,39 @@
-"""QUIC server — matches qh3.asyncio.server API."""
+"""QUIC server — matches qh3.asyncio.server API.
+
+Per-connection multiplexing: picoquic does packet→cnx demux in C; the
+QuicEngine drains the shared SPSC ring and routes events to per-cnx
+QuicConnection + protocol instances. The user's create_protocol factory
+is invoked once per accepted connection (matching qh3's per-connection
+protocol model).
+"""
 
 import asyncio
 from typing import Callable
 
 from aiopquic.quic.configuration import QuicConfiguration
-from aiopquic.quic.connection import QuicConnection
+from aiopquic.quic.connection import QuicEngine
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
 
 
 class QuicServer:
-    """QUIC server that accepts incoming connections.
-
-    Unlike qh3's QuicServer (which multiplexes over a single UDP socket),
-    this uses picoquic's built-in server support via TransportContext.
-    """
+    """QUIC server that accepts incoming connections via picoquic."""
 
     def __init__(
         self,
-        quic: QuicConnection,
-        protocol: QuicConnectionProtocol,
+        engine: QuicEngine,
         loop: asyncio.AbstractEventLoop,
     ):
-        self._quic = quic
-        self._protocol = protocol
+        self._engine = engine
         self._loop = loop
 
     def close(self) -> None:
-        """Stop the server."""
-        self._protocol._stop()
-        self._quic.stop()
+        """Stop the server and tear down all live connections."""
+        if self._loop is not None and self._engine.eventfd >= 0:
+            try:
+                self._loop.remove_reader(self._engine.eventfd)
+            except Exception:
+                pass
+        self._engine.close()
 
 
 async def serve(
@@ -41,20 +46,24 @@ async def serve(
 ) -> QuicServer:
     """Start a QUIC server.
 
-    Usage:
-        server = await serve('0.0.0.0', 4433, configuration=config)
-        # ... server is running
-        server.close()
+    create_protocol is called once per accepted connection with a fresh
+    per-cnx QuicConnection. Falls back to the default
+    QuicConnectionProtocol if not supplied.
     """
-    quic = QuicConnection(configuration=configuration)
-    quic._start_transport(port=port)
+    if create_protocol is None:
+        create_protocol = (
+            lambda conn, stream_handler=None: QuicConnectionProtocol(
+                conn, stream_handler=stream_handler))
 
-    if create_protocol is not None:
-        protocol = create_protocol(quic, stream_handler=stream_handler)
-    else:
-        protocol = QuicConnectionProtocol(quic, stream_handler=stream_handler)
+    engine = QuicEngine(
+        configuration=configuration,
+        create_protocol=create_protocol,
+        stream_handler=stream_handler,
+    )
+    engine._start_transport(port=port)
 
     loop = asyncio.get_event_loop()
-    protocol._start(loop)
+    if engine.eventfd >= 0:
+        loop.add_reader(engine.eventfd, engine.drain_and_route)
 
-    return QuicServer(quic, protocol, loop)
+    return QuicServer(engine, loop)

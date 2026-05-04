@@ -22,7 +22,7 @@ def test_create_ring():
 def test_create_ring_custom_size():
     """Create a ring with custom capacity (must be power of 2)."""
     from aiopquic._binding._transport import RingBuffer
-    ring = RingBuffer(capacity=256, arena_size=1024 * 1024)
+    ring = RingBuffer(capacity=256)
     assert ring.capacity == 256
     assert ring.empty is True
 
@@ -30,7 +30,7 @@ def test_create_ring_custom_size():
 def test_push_pop_no_data():
     """Push and pop an event with no payload."""
     from aiopquic._binding._transport import RingBuffer
-    ring = RingBuffer(capacity=16, arena_size=4096)
+    ring = RingBuffer(capacity=16)
 
     ring.push(event_type=6, stream_id=0)  # SPSC_EVT_READY
     assert ring.count == 1
@@ -51,7 +51,7 @@ def test_push_pop_no_data():
 def test_push_pop_with_data():
     """Push and pop an event with payload data."""
     from aiopquic._binding._transport import RingBuffer
-    ring = RingBuffer(capacity=16, arena_size=4096)
+    ring = RingBuffer(capacity=16)
 
     payload = b"Hello, QUIC!"
     ring.push(event_type=0, stream_id=42, data=payload)
@@ -67,7 +67,7 @@ def test_push_pop_with_data():
 def test_push_pop_with_fin():
     """Push stream data with FIN flag."""
     from aiopquic._binding._transport import RingBuffer
-    ring = RingBuffer(capacity=16, arena_size=4096)
+    ring = RingBuffer(capacity=16)
 
     ring.push(event_type=1, stream_id=4, data=b"end", is_fin=1)
 
@@ -81,7 +81,7 @@ def test_push_pop_with_fin():
 def test_push_pop_with_error_code():
     """Push a close event with error code."""
     from aiopquic._binding._transport import RingBuffer
-    ring = RingBuffer(capacity=16, arena_size=4096)
+    ring = RingBuffer(capacity=16)
 
     ring.push(event_type=4, stream_id=0, error_code=0x100)
 
@@ -94,7 +94,7 @@ def test_push_pop_with_error_code():
 def test_multiple_push_pop():
     """Push multiple entries and pop them in FIFO order."""
     from aiopquic._binding._transport import RingBuffer
-    ring = RingBuffer(capacity=16, arena_size=4096)
+    ring = RingBuffer(capacity=16)
 
     for i in range(10):
         ring.push(event_type=0, stream_id=i, data=f"msg-{i}".encode())
@@ -114,7 +114,7 @@ def test_multiple_push_pop():
 def test_ring_full():
     """Ring should raise BufferError when full."""
     from aiopquic._binding._transport import RingBuffer
-    ring = RingBuffer(capacity=4, arena_size=4096)
+    ring = RingBuffer(capacity=4)
 
     for i in range(4):
         ring.push(event_type=0, stream_id=i)
@@ -126,7 +126,7 @@ def test_ring_full():
 def test_ring_wrap_around():
     """Fill, drain, refill — ensure wrap-around works."""
     from aiopquic._binding._transport import RingBuffer
-    ring = RingBuffer(capacity=4, arena_size=4096)
+    ring = RingBuffer(capacity=4)
 
     # Fill
     for i in range(4):
@@ -149,7 +149,7 @@ def test_ring_wrap_around():
 def test_large_data():
     """Push entries with large payloads."""
     from aiopquic._binding._transport import RingBuffer
-    ring = RingBuffer(capacity=16, arena_size=1024 * 1024)
+    ring = RingBuffer(capacity=16)
 
     big_data = b"\xab" * 65536
     ring.push(event_type=0, stream_id=0, data=big_data)
@@ -161,7 +161,7 @@ def test_large_data():
 def test_threaded_producer_consumer():
     """Basic thread safety: one producer thread, one consumer thread."""
     from aiopquic._binding._transport import RingBuffer
-    ring = RingBuffer(capacity=1024, arena_size=1024 * 1024)
+    ring = RingBuffer(capacity=1024)
 
     num_messages = 10000
     received = []

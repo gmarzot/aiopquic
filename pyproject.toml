@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiopquic"
-version = "0.1.0"
+version = "0.2.0"
 description = "High-performance QUIC/HTTP3 library — picoquic-backed, qh3-compatible asyncio API"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 license = "MIT"
 authors = [
     { name = "Giovanni Marzot", email = "gmarzot@marzresearch.net" }
@@ -24,6 +24,7 @@ Repository = "https://github.com/gmarzot/aiopquic.git"
 dev = [
     "pytest",
     "pytest-asyncio",
+    "pytest-benchmark",
     "pytest-cov",
     "pytest-xdist",
 ]
@@ -34,6 +35,56 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Benches are opt-in: run them with `pytest tests/bench`.
+addopts = "--ignore=tests/bench"
+python_files = ["test_*.py", "bench_*.py"]
 markers = [
     "interop: tests against public QUIC/H3 endpoints (needs network)",
+    "native: native picoquic_ct/picohttp_ct subprocess smoke (needs build_picoquic_tests.sh)",
+    "bench: microbenchmarks (in tests/bench/, opt-in via path)",
 ]
+
+# ---------------------------------------------------------------------------
+# Wheel build matrix (cibuildwheel)
+# ---------------------------------------------------------------------------
+# Targets: Linux x86_64 (manylinux_2_28), macOS x86_64 (10.15+), macOS arm64.
+# Python: cp314 only — aiopquic requires Python 3.14+.
+#
+# Each wheel build first compiles picoquic+picotls from the vendored
+# submodules via build_picoquic.sh inside the cibuildwheel container.
+# auditwheel/delocate handle bundling libssl/libcrypto into the wheel so
+# end users don't need OpenSSL preinstalled.
+[tool.cibuildwheel]
+build = "cp312-* cp313-* cp314-*"
+skip = "*-musllinux_* *-manylinux_i686 *-win32 *_ppc64le *_s390x"
+
+# Quick sanity check on the built wheel: import the binding extension
+# and verify the version string.
+test-command = "python -c 'import aiopquic; from aiopquic._binding import _transport; print(\"aiopquic\", aiopquic.__version__ if hasattr(aiopquic, \"__version__\") else \"ok\")'"
+
+[tool.cibuildwheel.linux]
+# manylinux_2_28 = AlmaLinux 8 / RHEL 8 base — has gcc 12, openssl-devel
+# packaged. Wider compatibility than manylinux_2_34; narrower than
+# legacy manylinux2014 but glibc 2.28+ covers a lot — RHEL 8 / Ubuntu
+# 20.04+. Built once per OS via before-all (build_picoquic.sh too,
+# so the picoquic+picotls static libs are amortized across the cp312/
+# cp313/cp314 wheel builds rather than rebuilt per python version).
+manylinux-x86_64-image = "manylinux_2_28"
+before-all = """
+yum install -y openssl-devel cmake
+bash build_picoquic.sh
+"""
+
+[tool.cibuildwheel.macos]
+# delocate bundles libssl/libcrypto from Homebrew into the wheel.
+# We do NOT pin MACOSX_DEPLOYMENT_TARGET — each runner uses its
+# native default so the bundled Homebrew dylibs (built against the
+# runner's macOS) satisfy delocate's "library deployment target
+# must be ≤ wheel deployment target" check:
+#   macos-13 runner -> wheel targets macOS 13.0+ (Ventura)   [x86_64]
+#   macos-14 runner -> wheel targets macOS 14.0+ (Sonoma)    [arm64]
+# Older macOS users fall back to sdist (build from source).
+before-all = """
+brew install cmake openssl@3
+bash build_picoquic.sh
+"""

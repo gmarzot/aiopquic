@@ -4,6 +4,7 @@ Wraps TransportContext (Cython/picoquic) and translates SPSC ring
 events into QuicEvent objects that match qh3's event interface.
 """
 
+import os
 from enum import IntEnum
 
 from .configuration import QuicConfiguration
@@ -12,8 +13,23 @@ from .events import (
     ProtocolNegotiated, StreamDataReceived, StreamReset,
     StopSendingReceived, DatagramFrameReceived,
 )
-from aiopquic._binding._transport import TransportContext
+from aiopquic._binding._transport import (
+    TransportContext,
+    stream_buf_create, stream_buf_destroy,
+    stream_buf_push, stream_buf_used, stream_buf_free, stream_buf_set_fin,
+    stream_buf_stats,
+    stream_buf_pop_to_bytes,
+    stream_ctx_create, stream_ctx_destroy,
+    stream_ctx_ensure_tx, stream_ctx_ensure_rx,
+    stream_ctx_get_tx, stream_ctx_get_rx,
+    stream_ctx_rx_consumed,
+)
 
+
+# Per-stream send-ring capacity for the PULL-model send path.
+# 1 MiB gives ~5-10ms of in-flight data at 1-2 Gbps which is enough
+# pipelining headroom without unbounded queueing. Power of two required.
+_STREAM_RING_CAP = 1 << 20
 
 # SPSC event type constants (must match spsc_ring.h)
 _EVT_STREAM_DATA = 0
@@ -68,15 +84,33 @@ class QuicConnection:
 
     Presents the same public API as qh3.quic.connection.QuicConnection
     so that higher layers (H3Connection, aiomoqt) can use it unchanged.
+
+    Two construction modes:
+    - Client / standalone: QuicConnection(configuration=cfg). Owns its
+      own TransportContext; calls _start_transport() then connect().
+    - Engine-spawned (server side): QuicConnection(configuration=cfg,
+      engine=engine, cnx_ptr=cnx). Shares engine's transport; cnx_ptr
+      is the picoquic cnx pointer for this peer. Engine routes events
+      to this connection's _events queue; no own drain.
     """
 
-    def __init__(self, *, configuration: QuicConfiguration):
+    def __init__(self, *, configuration: QuicConfiguration,
+                 engine: "QuicEngine | None" = None,
+                 cnx_ptr: int = 0):
         self._configuration = configuration
-        self._transport: TransportContext | None = None
-        self._cnx_ptr: int = 0
+        self._engine = engine
+        if engine is not None:
+            # Engine-spawned: share engine's transport, no own drain
+            self._transport = engine._transport
+            self._cnx_ptr = cnx_ptr
+            self._connected = True
+            self._closed = False
+        else:
+            self._transport: TransportContext | None = None
+            self._cnx_ptr = 0
+            self._connected = False
+            self._closed = False
         self._events: list[QuicEvent] = []
-        self._connected = False
-        self._closed = False
         self._next_bidi_id: int = 0 if configuration.is_client else 1
         self._next_uni_id: int = 2 if configuration.is_client else 3
         # H3Connection compatibility
@@ -84,6 +118,13 @@ class QuicConnection:
         self._remote_max_datagram_frame_size = (
             configuration.max_datagram_frame_size
         )
+        # Per-stream wrapper map. Each stream_ctx_t holds {tx, rx} byte
+        # rings + RX flow-control state and is bound to picoquic's
+        # app_stream_ctx slot. Lazy-created on first contact (TX from
+        # send_stream_data, RX from picoquic stream_data callback).
+        # Destroyed via lifecycle hooks (Landing C); for now leak until
+        # process exit to avoid use-after-free with the picoquic worker.
+        self._stream_ctxs: dict[int, int] = {}
 
     @property
     def configuration(self) -> QuicConfiguration:
@@ -95,6 +136,15 @@ class QuicConnection:
             return
         cfg = self._configuration
         self._transport = TransportContext()
+        # SSLKEYLOGFILE env var as a fallback when configuration didn't
+        # set secrets_log_file explicitly — matches the convention used
+        # by curl, openssl s_client, and Chromium-based tooling.
+        keylog = cfg.secrets_log_file or os.environ.get('SSLKEYLOGFILE')
+        # Per-stream RX byte ring capacity matches the configured
+        # max_stream_data window (spec-bound peer-allowed in-flight
+        # maximum on a single stream). The C-side allocator rounds up
+        # to a power of two internally — caller-side just passes the
+        # configured window verbatim.
         self._transport.start(
             port=port,
             cert_file=cfg.certificate_file,
@@ -103,6 +153,9 @@ class QuicConnection:
             is_client=cfg.is_client,
             idle_timeout_ms=int(cfg.idle_timeout * 1000),
             max_datagram_frame_size=(cfg.max_datagram_frame_size or 0),
+            keylog_filename=keylog,
+            rx_ring_cap=cfg.max_stream_data,
+            congestion_control_algorithm=cfg.congestion_control_algorithm,
         )
 
     def connect(self, addr: tuple[str, int], now: float = 0.0) -> None:
@@ -124,24 +177,47 @@ class QuicConnection:
             return -1
         return self._transport.eventfd
 
+    @property
+    def bytes_sent(self) -> int:
+        """Cumulative bytes this cnx has placed on the wire (picoquic-
+        accounting). Differs from bytes-queued: send_stream_data only
+        appends to picoquic's per-stream send buffer; bytes_sent is
+        the on-wire count after cwnd/pacing has done its work."""
+        from aiopquic._binding._transport import cnx_data_sent
+        return cnx_data_sent(self._cnx_ptr)
+
+    @property
+    def bytes_received(self) -> int:
+        """Cumulative bytes this cnx has received from the wire."""
+        from aiopquic._binding._transport import cnx_data_received
+        return cnx_data_received(self._cnx_ptr)
+
     def _drain_and_convert(self) -> None:
-        """Drain SPSC ring and convert to QuicEvent objects."""
+        """Drain SPSC ring and convert to QuicEvent objects.
+
+        For STREAM_DATA / STREAM_FIN events on streams owned by an
+        aiopquic_stream_ctx_t wrapper, drain_rx() has already popped
+        the bytes from the wrapper's RX ring into `data` AND atomically
+        advanced sc->rx_consumed. The picoquic worker reads that
+        counter on its next stream_data callback for the same stream
+        and extends MAX_STREAM_DATA accordingly — backpressure is a
+        side effect of the worker's own packet processing, no Python-
+        side dispatch needed."""
         if self._transport is None:
             return
         raw_events = self._transport.drain_rx()
-        for evt_type, stream_id, data, is_fin, error_code, cnx_ptr in raw_events:
-            if evt_type == _EVT_STREAM_DATA:
+        for (evt_type, stream_id, data, is_fin, error_code,
+             cnx_ptr, _stream_ctx_ptr) in raw_events:
+            if evt_type == _EVT_STREAM_DATA or evt_type == _EVT_STREAM_FIN:
+                if _stream_ctx_ptr and stream_id not in self._stream_ctxs:
+                    self._stream_ctxs[stream_id] = _stream_ctx_ptr
                 self._events.append(StreamDataReceived(
                     stream_id=stream_id,
-                    data=data or b"",
-                    end_stream=False,
+                    data=data if data is not None else memoryview(b""),
+                    end_stream=(evt_type == _EVT_STREAM_FIN),
                 ))
-            elif evt_type == _EVT_STREAM_FIN:
-                self._events.append(StreamDataReceived(
-                    stream_id=stream_id,
-                    data=data or b"",
-                    end_stream=True,
-                ))
+                if evt_type == _EVT_STREAM_DATA:
+                    continue
             elif evt_type == _EVT_STREAM_RESET:
                 self._events.append(StreamReset(
                     stream_id=stream_id,
@@ -152,16 +228,20 @@ class QuicConnection:
                     stream_id=stream_id,
                     error_code=error_code,
                 ))
-            elif evt_type == _EVT_CLOSE:
+            elif evt_type == _EVT_CLOSE or evt_type == _EVT_APP_CLOSE:
                 self._closed = True
                 self._events.append(ConnectionTerminated(
                     error_code=error_code,
                 ))
-            elif evt_type == _EVT_APP_CLOSE:
-                self._closed = True
-                self._events.append(ConnectionTerminated(
-                    error_code=error_code,
-                ))
+                # Connection is now done from picoquic's perspective —
+                # the close callback has fired which means the worker
+                # thread has stopped invoking app callbacks for this
+                # cnx's streams. Safe to free the per-stream wrappers
+                # now; without this they'd leak until process exit.
+                # picoquic's internal cnx cleanup runs separately and
+                # doesn't dereference app_stream_ctx after the close
+                # callback returns.
+                self._destroy_stream_ctxs()
             elif evt_type == _EVT_READY:
                 if cnx_ptr != 0:
                     # Connection handshake complete
@@ -180,29 +260,129 @@ class QuicConnection:
                     self._cnx_ptr = cnx_ptr
             elif evt_type == _EVT_DATAGRAM:
                 self._events.append(DatagramFrameReceived(
-                    data=data or b"",
+                    data=data if data is not None else memoryview(b""),
                 ))
 
     def next_event(self) -> QuicEvent | None:
         """Dequeue next event from the connection."""
-        self._drain_and_convert()
+        if self._engine is None:
+            self._drain_and_convert()
         if self._events:
             return self._events.pop(0)
         return None
 
+    def _enqueue_raw(self, evt_type: int, stream_id: int, data,
+                     is_fin: bool, error_code: int,
+                     stream_ctx_ptr: int) -> None:
+        """Engine-side: append a raw event tuple as a QuicEvent.
+
+        Routes one drained SPSC entry into this connection's queue.
+        Mirrors the conversion logic in _drain_and_convert. Called by
+        QuicEngine after demuxing by cnx_ptr.
+        """
+        if evt_type == _EVT_STREAM_DATA:
+            if stream_ctx_ptr and stream_id not in self._stream_ctxs:
+                self._stream_ctxs[stream_id] = stream_ctx_ptr
+            self._events.append(StreamDataReceived(
+                stream_id=stream_id,
+                data=data if data is not None else memoryview(b""),
+                end_stream=False,
+            ))
+        elif evt_type == _EVT_STREAM_FIN:
+            if stream_ctx_ptr and stream_id not in self._stream_ctxs:
+                self._stream_ctxs[stream_id] = stream_ctx_ptr
+            self._events.append(StreamDataReceived(
+                stream_id=stream_id,
+                data=data if data is not None else memoryview(b""),
+                end_stream=True,
+            ))
+        elif evt_type == _EVT_STREAM_RESET:
+            self._events.append(StreamReset(
+                stream_id=stream_id, error_code=error_code,
+            ))
+        elif evt_type == _EVT_STOP_SENDING:
+            self._events.append(StopSendingReceived(
+                stream_id=stream_id, error_code=error_code,
+            ))
+        elif evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
+            self._closed = True
+            self._events.append(ConnectionTerminated(error_code=error_code))
+            self._destroy_stream_ctxs()
+        elif evt_type == _EVT_READY:
+            alpn = (self._configuration.alpn_protocols[0]
+                    if self._configuration.alpn_protocols else None)
+            self._events.append(HandshakeCompleted(alpn_protocol=alpn))
+            self._events.append(ProtocolNegotiated(alpn_protocol=alpn))
+        elif evt_type == _EVT_DATAGRAM:
+            self._events.append(DatagramFrameReceived(
+                data=data if data is not None else memoryview(b""),
+            ))
+
+    def _get_or_create_stream_ctx(self, stream_id: int) -> int:
+        """Lazy-allocate the per-stream wrapper. Both TX and RX paths
+        funnel through here so a single wrapper covers bidi streams."""
+        sc = self._stream_ctxs.get(stream_id)
+        if sc is None:
+            sc = stream_ctx_create()
+            self._stream_ctxs[stream_id] = sc
+        return sc
+
+    def _destroy_stream_ctxs(self) -> None:
+        """Free all per-stream wrappers + their TX/RX byte rings.
+        Idempotent — safe to call multiple times. Called when the
+        connection-close callback has fired (picoquic worker has
+        stopped invoking app callbacks for this cnx's streams).
+        Per-stream early cleanup (before connection close) requires
+        picoquic_unlink_app_stream_ctx via SPSC dispatch; deferred to
+        a future landing — bounded leak per connection until then."""
+        if not self._stream_ctxs:
+            return
+        for sc in self._stream_ctxs.values():
+            stream_ctx_destroy(sc)
+        self._stream_ctxs.clear()
+
     def send_stream_data(self, stream_id: int, data: bytes,
                          end_stream: bool = False) -> None:
-        """Send data on a stream."""
-        if not end_stream:
-            self._transport.push_tx(
-                _TX_STREAM_DATA, stream_id,
-                data=data, cnx_ptr=self._cnx_ptr,
-            )
-        else:
-            self._transport.push_tx(
-                _TX_STREAM_FIN, stream_id,
-                data=data, cnx_ptr=self._cnx_ptr,
-            )
+        """Send data on a stream — PULL-model with real backpressure.
+
+        Lazily creates a per-stream wrapper + TX byte ring on first call;
+        subsequent calls push bytes into the ring. picoquic pulls at wire
+        rate via prepare_to_send.
+
+        Raises BufferError when the ring cannot fit `data` (caller must
+        wait + retry).  end_stream=True marks FIN to follow once the
+        ring is fully drained.
+        """
+        sc = self._get_or_create_stream_ctx(stream_id)
+        stream_ctx_ensure_tx(sc, _STREAM_RING_CAP)
+        sb = stream_ctx_get_tx(sc)
+
+        if data:
+            if stream_buf_free(sb) < len(data):
+                raise BufferError(
+                    f"per-stream send ring full "
+                    f"(stream={stream_id}, "
+                    f"need={len(data)}, free={stream_buf_free(sb)})"
+                )
+            accepted = stream_buf_push(sb, data)
+            if accepted != len(data):
+                # Defensive: free check passed but push didn't take all.
+                # Shouldn't happen with single-producer; surface as error.
+                raise BufferError(
+                    f"partial push on stream={stream_id}: "
+                    f"{accepted}/{len(data)} accepted"
+                )
+
+        if end_stream:
+            stream_buf_set_fin(sb)
+
+        # Mark the stream active so picoquic schedules prepare_to_send.
+        # The wrapper pointer is what picoquic stores as app_stream_ctx;
+        # the prepare_to_send callback dereferences ->tx to find the ring.
+        self._transport.push_tx(
+            _TX_MARK_ACTIVE, stream_id,
+            cnx_ptr=self._cnx_ptr, stream_ctx=sc,
+        )
         self._transport.wake_up()
 
     def send_datagram_frame(self, data: bytes) -> None:
@@ -212,6 +392,23 @@ class QuicConnection:
             data=data, cnx_ptr=self._cnx_ptr,
         )
         self._transport.wake_up()
+
+    def get_stream_buf_stats(self, stream_id: int):
+        """Return (pushed, popped, push_hash, pop_hash) for the per-stream
+        TX byte ring. pushed and popped are cumulative byte totals; in a
+        clean run they are equal at stream close. push_hash and pop_hash
+        are FNV-1a accumulators (only meaningful when AIOPQUIC_TX_HASH=1
+        was set when the ring was created); equal hashes prove byte-for-
+        byte conservation through the ring. Returns None if the stream
+        has no per-stream wrapper or no TX ring on that wrapper.
+        """
+        sc = self._stream_ctxs.get(stream_id)
+        if sc is None:
+            return None
+        sb = stream_ctx_get_tx(sc)
+        if not sb:
+            return None
+        return stream_buf_stats(sb)
 
     def get_next_available_stream_id(self, is_unidirectional: bool = False) -> int:
         """Allocate the next stream ID."""
@@ -249,9 +446,126 @@ class QuicConnection:
             )
             self._transport.wake_up()
             self._closed = True
+        # NOTE: per-stream send rings are intentionally NOT destroyed
+        # here. picoquic-pthread may still hold stream_ctx pointers to
+        # them; freeing now risks use-after-free. Proper lifecycle
+        # requires an explicit deactivate→free dance via picoquic
+        # mark_active_stream(active=0) before destroy. Until that lands,
+        # buffers are reclaimed at process exit. Acceptable for tests
+        # and short-lived sessions; leaks per long-lived connection
+        # otherwise — TODO before production ship.
 
     def stop(self) -> None:
-        """Stop the transport entirely."""
+        """Stop the transport entirely.
+
+        For engine-spawned connections this is a no-op; the engine
+        owns the transport and shuts it down on engine.close().
+        """
+        if self._engine is not None:
+            return
+        if self._transport is not None:
+            self._transport.stop()
+            self._transport = None
+
+
+class QuicEngine:
+    """Server-side multiplexer over a single picoquic engine.
+
+    Owns the TransportContext, drains SPSC events, and routes them by
+    cnx pointer to a per-connection QuicConnection. On the first READY
+    event for a new cnx, calls create_protocol(connection) to spawn a
+    fresh user protocol bound to that connection.
+
+    The engine is what serve() returns to the user. Lifetime of all
+    connections is bound to the engine (engine.close() tears them
+    down). Used only for the server case; client connect() wraps a
+    standalone QuicConnection.
+    """
+
+    def __init__(self, *, configuration: QuicConfiguration,
+                 create_protocol, stream_handler=None):
+        self._configuration = configuration
+        self._create_protocol = create_protocol
+        self._stream_handler = stream_handler
+        self._transport: TransportContext | None = None
+        self._connections: dict[int, QuicConnection] = {}
+        self._protocols: dict[int, "object"] = {}
+
+    def _start_transport(self, port: int = 0) -> None:
+        if self._transport is not None:
+            return
+        cfg = self._configuration
+        self._transport = TransportContext()
+        keylog = cfg.secrets_log_file or os.environ.get('SSLKEYLOGFILE')
+        self._transport.start(
+            port=port,
+            cert_file=cfg.certificate_file,
+            key_file=cfg.private_key_file,
+            alpn=(cfg.alpn_protocols[0] if cfg.alpn_protocols else None),
+            is_client=cfg.is_client,
+            idle_timeout_ms=int(cfg.idle_timeout * 1000),
+            max_datagram_frame_size=(cfg.max_datagram_frame_size or 0),
+            keylog_filename=keylog,
+            rx_ring_cap=cfg.max_stream_data,
+            congestion_control_algorithm=cfg.congestion_control_algorithm,
+        )
+
+    @property
+    def eventfd(self) -> int:
+        if self._transport is None:
+            return -1
+        return self._transport.eventfd
+
+    def drain_and_route(self) -> None:
+        """Drain SPSC events and route to per-cnx protocols.
+
+        For each event:
+          - cnx_ptr == 0: engine-level (transport ready); ignored here.
+          - cnx_ptr unknown: first READY for a new cnx — spawn
+            QuicConnection + protocol via create_protocol().
+          - cnx_ptr known: enqueue raw event on that connection, then
+            drive the bound protocol to drain it.
+        """
+        if self._transport is None:
+            return
+        raw_events = self._transport.drain_rx()
+        for (evt_type, stream_id, data, is_fin, error_code,
+             cnx_ptr, stream_ctx_ptr) in raw_events:
+            if cnx_ptr == 0:
+                continue  # engine-level event, not per-cnx
+            conn = self._connections.get(cnx_ptr)
+            if conn is None:
+                conn = QuicConnection(
+                    configuration=self._configuration,
+                    engine=self, cnx_ptr=cnx_ptr,
+                )
+                self._connections[cnx_ptr] = conn
+                proto = self._create_protocol(
+                    conn, stream_handler=self._stream_handler,
+                )
+                # Engine owns the eventfd reader; bind protocol to the
+                # loop without adding a second reader (which would
+                # replace ours and break demux for all other cnx).
+                import asyncio as _asyncio
+                proto._loop = _asyncio.get_event_loop()
+                self._protocols[cnx_ptr] = proto
+            conn._enqueue_raw(evt_type, stream_id, data, is_fin,
+                              error_code, stream_ctx_ptr)
+            proto = self._protocols[cnx_ptr]
+            proto._process_events()
+            if evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
+                self._connections.pop(cnx_ptr, None)
+                self._protocols.pop(cnx_ptr, None)
+
+    def close(self) -> None:
+        """Tear down all connections and stop the transport."""
+        for proto in list(self._protocols.values()):
+            try:
+                proto.close()
+            except Exception:
+                pass
+        self._connections.clear()
+        self._protocols.clear()
         if self._transport is not None:
             self._transport.stop()
             self._transport = None

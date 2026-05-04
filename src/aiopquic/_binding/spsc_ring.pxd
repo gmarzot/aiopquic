@@ -3,7 +3,6 @@
 from libc.stdint cimport uint8_t, uint32_t, uint64_t
 
 cdef extern from "c/spsc_ring.h":
-    # Event types
     enum:
         SPSC_EVT_STREAM_DATA
         SPSC_EVT_STREAM_FIN
@@ -28,13 +27,23 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_TX_STOP_SENDING
         SPSC_EVT_TX_MARK_ACTIVE
         SPSC_EVT_TX_CONNECT
+        SPSC_EVT_TX_WT_OPEN
+        SPSC_EVT_TX_WT_CREATE_STREAM
+        SPSC_EVT_TX_WT_CLOSE
+        SPSC_EVT_TX_WT_DRAIN
+        SPSC_EVT_TX_WT_RESET_STREAM
+        SPSC_EVT_TX_WT_DEREGISTER
+        SPSC_EVT_TX_WT_STOP_SENDING
+        SPSC_EVT_TX_OPEN_FLOW_CONTROL
+        SPSC_EVT_TX_SET_APP_FLOW_CONTROL
+        SPSC_EVT_WT_NEW_SESSION
 
     ctypedef struct spsc_entry_t:
         uint64_t    stream_id
         uint32_t    event_type
-        uint32_t    data_offset
         uint32_t    data_length
         uint8_t     is_fin
+        void*       data_buf
         void*       cnx
         void*       stream_ctx
         uint64_t    error_code
@@ -42,9 +51,8 @@ cdef extern from "c/spsc_ring.h":
     ctypedef struct spsc_ring_t:
         uint32_t    capacity
         uint32_t    mask
-        uint32_t    arena_size
 
-    spsc_ring_t* spsc_ring_create(uint32_t capacity, uint32_t arena_size)
+    spsc_ring_t* spsc_ring_create(uint32_t capacity)
     void spsc_ring_destroy(spsc_ring_t* ring)
     uint32_t spsc_ring_count(spsc_ring_t* ring)
     int spsc_ring_full(spsc_ring_t* ring)
@@ -55,6 +63,7 @@ cdef extern from "c/spsc_ring.h":
     const uint8_t* spsc_ring_entry_data(spsc_ring_t* ring,
                                          const spsc_entry_t* entry)
     void spsc_ring_pop(spsc_ring_t* ring)
+    void* spsc_ring_take_data(spsc_entry_t* entry)
     int spsc_ring_push_event(spsc_ring_t* ring, uint32_t event_type,
                               uint64_t stream_id, void* cnx, uint64_t error_code)
     int spsc_ring_push_stream_data(spsc_ring_t* ring, uint64_t stream_id,
