@@ -1,5 +1,68 @@
 # Changelog
 
+## v0.2.1 (2026-05-05)
+
+Stability + performance fix release. Targets an intermittent segfault
+seen under sustained `QuicConnection.send_stream_data` stress in 0.2.0.
+
+### Highlights
+
+- **Segfault under sustained `send_stream_data` closed.** Reproducer
+  (extended object-stress matrix, 13 cases × 5 back-to-back runs)
+  was reliably triggering a segfault on 0.2.0; runs 65/65 byte-perfect
+  on 0.2.1.
+- **Latency win:** lowlevel 1 KiB p99 latency **−62%** (3,689 µs →
+  1,387 µs). Smaller per-stream cache footprint.
+- **Throughput win:** highlevel 1 KiB throughput **+6.1%** (215K →
+  228K obj/s). Wrapper cost (highlevel/lowlevel) improved from 73%
+  to 78%.
+- All 0.2.0 byte-conservation guarantees preserved.
+
+### Changes
+
+**Combined Cython send-data fast path.** New entry
+`stream_ctx_send_data` collapses 5 Python↔Cython transitions per
+send (`ensure_tx` + `get_tx` + `free_check` + `push` + `set_fin`)
+into 1. Atomic from Python's perspective: ring full returns 0, no
+partial commit, caller safely retries the same buffer. Pull model
+unchanged. `QuicConnection.send_stream_data` rewired to use it.
+
+**RX ring sized 1× the advertised window (was 2×).** Audit
+confirmed picoquic gates auto-extend on
+`!stream->use_app_flow_control` (`picoquic/frames.c:4638`); the
+opt-in inside the first stream_data callback closes the auto-extend
+path before any frame can ship out. The previous 2× headroom was
+unnecessary memory traffic + cache footprint per stream. Matches
+the canonical picoquic flow-control pattern
+(`picoquictest/flow_control_test.c`). RX ring overflow remains a
+hard error — the spec-correct response to a peer that exceeds the
+advertised window is `FLOW_CONTROL_ERROR` connection close.
+
+### Why the segfault closed (hypothesis)
+
+The two changes together narrowed the per-call worker-thread race
+window: fewer Cython entries per send (fewer GIL acquire/release
+cycles for the picoquic worker to race against ctx state) and half
+the per-stream memory pressure (faster ctx-cleanup, smaller
+allocator footprint). The underlying lifecycle race (Landing C
+UAF suspect) may still exist in principle; empirically, 65/65 cases
+pass across 5 back-to-back runs of the same matrix that segfaulted
+on 0.2.0.
+
+### New benches
+
+- `tests/bench/bench_baselines_lowlevel.py` (renamed) — 30s
+  steady-state SPSC-direct baseline, the transport-layer ceiling.
+- `tests/bench/bench_baselines_highlevel.py` — 30s steady-state
+  baseline through `QuicConnection.send_stream_data`, the path
+  client libraries (aiomoqt) actually use. Gap between the two
+  quantifies wrapper cost; tracked separately so transport vs
+  wrapper regressions stay distinguishable.
+- `tests/bench/bench_stream_object_stress.py` — high-level API,
+  byte-verifying, varying obj sizes (64 B – 256 KiB) and rates.
+  This is the segfault reproducer that closed on 0.2.1.
+
+
 ## v0.2.0 (2026-05-04)
 
 First high-performance release. Transport rewrite around a canonical

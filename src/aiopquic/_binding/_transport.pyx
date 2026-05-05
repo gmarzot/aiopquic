@@ -254,6 +254,10 @@ cdef extern from "c/stream_ctx.h":
     uint64_t aiopquic_stream_ctx_rx_consumed_load(aiopquic_stream_ctx_t* sc)
     void aiopquic_stream_ctx_rx_consumed_add(
         aiopquic_stream_ctx_t* sc, uint64_t delta)
+    int aiopquic_stream_ctx_send_data(
+        aiopquic_stream_ctx_t* sc,
+        const uint8_t* data, uint32_t length,
+        uint32_t capacity, uint8_t set_fin)
 
 
 # picoquic flow-control APIs are thread-bound to the picoquic worker
@@ -1364,6 +1368,32 @@ def stream_ctx_rx_consumed(uintptr_t sc_ptr):
         return 0
     return aiopquic_stream_ctx_rx_consumed_load(
         <aiopquic_stream_ctx_t*>sc_ptr)
+
+
+def stream_ctx_send_data(uintptr_t sc_ptr, bytes data,
+                          uint32_t capacity, bint fin):
+    """Combined send-data fast path — collapses ensure_tx + free-check
+    + push + (optional) set_fin into one Cython call.
+
+    Returns:
+       1  pushed all bytes (and set FIN if requested)
+       0  ring full — caller waits + retries the SAME data buffer
+          (push is all-or-nothing; no partial commit happens).
+      -1  allocation failure (caller raises MemoryError).
+
+    Pull model unchanged: bytes go into the SPSC TX ring; picoquic
+    pulls at wire rate via prepare_to_send. The MARK_ACTIVE event +
+    wake_up still fire from QuicConnection.send_stream_data after a
+    successful return.
+    """
+    if sc_ptr == 0:
+        raise ValueError("stream_ctx_send_data called with NULL sc")
+    cdef const uint8_t* p = <const uint8_t*>data if data else NULL
+    cdef uint32_t length = <uint32_t>len(data) if data else 0
+    return aiopquic_stream_ctx_send_data(
+        <aiopquic_stream_ctx_t*>sc_ptr,
+        p, length, capacity, <uint8_t>(1 if fin else 0),
+    )
 
 
 # Note: set_max_stream_data and enable_app_flow_control are issued from

@@ -310,27 +310,23 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                       && bytes != NULL && length > 0;
     int ret;
     if (has_payload) {
-        /* The advertised window and the physical ring capacity are
-         * decoupled by 2x to give a safe headroom margin:
-         *   advertise_cap  = the MAX_STREAM_DATA value sent to the peer
-         *                    (matches the configured max_stream_data /
-         *                    rx_ring_cap so peer never SENDS more than
-         *                    this unconsumed)
-         *   physical_cap   = 2 * advertise_cap, the actual byte ring
-         *                    size — covers picoquic's own internal
-         *                    auto-FC extension that may run once before
-         *                    our picoquic_set_app_flow_control opt-in
-         *                    on first stream_data callback (a single
-         *                    MTU or so of overshoot at the boundary).
-         *
-         * Net effect: a spec-compliant peer can never overrun the ring
-         * even when the consumer is artificially slow. RX ring overflow
-         * is now a true protocol violation, not a flow-control timing
-         * artifact. */
+        /* Physical RX ring sized at exactly the advertised window
+         * (1x). picoquic's auto-FC extension is gated by
+         * !stream->use_app_flow_control (frames.c:4638), and we set
+         * use_app_flow_control=1 SYNCHRONOUSLY inside this first
+         * stream_data callback before returning to picoquic's send
+         * framer — so no auto-extend frame can be emitted after our
+         * opt-in. Before our opt-in, the peer's max in-flight bytes
+         * is bounded by the initial_max_stream_data transport
+         * parameter; after, by advertise_cap. Neither produces 2x
+         * overshoot, so the previous 2x headroom was unnecessary
+         * memory traffic + cache footprint per stream. RX ring
+         * overflow remains a hard error: a peer that overruns is a
+         * spec-correct FLOW_CONTROL_ERROR connection close. */
         uint32_t advertise_cap = ctx->rx_ring_cap > 0
             ? ctx->rx_ring_cap
             : AIOPQUIC_RX_RING_CAP_DEFAULT;
-        uint32_t physical_cap = advertise_cap * 2;
+        uint32_t physical_cap = advertise_cap;
         uint32_t fc_threshold = advertise_cap / AIOPQUIC_RX_FC_THRESHOLD_DIV;
         aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)stream_ctx;
         if (!sc) {

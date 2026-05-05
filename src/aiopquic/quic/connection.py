@@ -23,6 +23,7 @@ from aiopquic._binding._transport import (
     stream_ctx_ensure_tx, stream_ctx_ensure_rx,
     stream_ctx_get_tx, stream_ctx_get_rx,
     stream_ctx_rx_consumed,
+    stream_ctx_send_data,
 )
 
 
@@ -350,31 +351,26 @@ class QuicConnection:
         rate via prepare_to_send.
 
         Raises BufferError when the ring cannot fit `data` (caller must
-        wait + retry).  end_stream=True marks FIN to follow once the
-        ring is fully drained.
+        wait + retry the SAME data buffer — push is all-or-nothing, no
+        partial commit happens). end_stream=True marks FIN to follow
+        once the ring is fully drained.
         """
         sc = self._get_or_create_stream_ctx(stream_id)
-        stream_ctx_ensure_tx(sc, _STREAM_RING_CAP)
-        sb = stream_ctx_get_tx(sc)
-
-        if data:
-            if stream_buf_free(sb) < len(data):
-                raise BufferError(
-                    f"per-stream send ring full "
-                    f"(stream={stream_id}, "
-                    f"need={len(data)}, free={stream_buf_free(sb)})"
-                )
-            accepted = stream_buf_push(sb, data)
-            if accepted != len(data):
-                # Defensive: free check passed but push didn't take all.
-                # Shouldn't happen with single-producer; surface as error.
-                raise BufferError(
-                    f"partial push on stream={stream_id}: "
-                    f"{accepted}/{len(data)} accepted"
-                )
-
-        if end_stream:
-            stream_buf_set_fin(sb)
+        # Combined ensure-tx + free-check + push + set-fin in a single
+        # Cython call. Returns:
+        #   1   all bytes pushed (and FIN set if requested)
+        #   0   ring full — atomic, no bytes committed; caller retries
+        #  -1   allocation failure
+        rc = stream_ctx_send_data(sc, data, _STREAM_RING_CAP, end_stream)
+        if rc == 0:
+            raise BufferError(
+                f"per-stream send ring full "
+                f"(stream={stream_id}, need={len(data) if data else 0})"
+            )
+        if rc < 0:
+            raise MemoryError(
+                f"stream_ctx_send_data alloc failed (stream={stream_id})"
+            )
 
         # Mark the stream active so picoquic schedules prepare_to_send.
         # The wrapper pointer is what picoquic stores as app_stream_ctx;
