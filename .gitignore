@@ -35,3 +35,7 @@ third_party/picoquic/build/
 
 # Demo/runtime data
 *.bin
+
+
+# Built bench binary (rebuild via tests/bench/sim_link/build.sh)
+tests/bench/sim_link/sim_link_bench

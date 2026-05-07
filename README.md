@@ -46,25 +46,42 @@ Tests pass on Linux and macOS. The interop suite is opt-in (network-dependent).
 
 ### Performance
 
-Sustained single-stream throughput, 30s steady-state, byte-verifying, high-level asyncio API (`QuicConnection.send_stream_data` — what client libraries see):
+Sustained single-stream throughput, 30s steady-state, byte-verifying, high-level asyncio API (`QuicConnection.send_stream_data`):
 
 | platform | 1 KiB | 4 KiB | 16 KiB |
 |---|---|---|---|
 | AMD Ryzen 7 PRO 7840U / WSL2 / Linux 6.6 | 1,570 Mbps | 2,118 Mbps | 2,031 Mbps |
-| Apple M-series / macOS Sonnoma | 953 Mbps | 1,130 Mbps | 1,104 Mbps |
+| Apple M-series / macOS Sonoma | 953 Mbps | 1,130 Mbps | 1,104 Mbps |
 
-Numbers are local UDP loopback. **The kernel's UDP loopback is the ceiling on every platform we've measured** — picoquic native (`picoquicdemo -a perf`) on Ryzen WSL2 sustains 2,184 Mbps single-stream, and `aiopquic`'s lowlevel SPSC path lands at 2,322 Mbps for the same workload, so the 30 % gap to "wire" comes from the asyncio wrapper at small object sizes, much less above 4 KiB. Above this, throughput doesn't scale with concurrent streams (Ryzen P=64 × 16 KiB ≈ same 2 Gbps wall) — it's the kernel UDP path, not picoquic.
+These are over local UDP loopback at the QUIC default MTU (~1,400 B). **The realistic ceiling at that MTU is the kernel's per-syscall sendmsg rate, not bandwidth.** On Ryzen WSL2, raw `iperf3 -u -l 1400` over loopback maxes at **3.15 Gbps** (≈ 280 K syscalls/s); raise the datagram size and it climbs cleanly — 4 KiB → 7.9, 8 KiB → 12.8, 32 KiB → 33.7 Gbps. So QUIC pinned at MTU is in a regime where the syscall rate is the wall.
 
-For platform-independent **protocol-only** measurements (no kernel UDP), use `picoquicdemo -a perf` on your hardware as the calibration reference, or wait for the upcoming `sim_link` bench harness on this branch's roadmap (binds picoquic's in-process simulated-link API to Python).
+In that regime, here's where the layers land on Ryzen WSL2:
+
+| layer | ss_mbps | of UDP@1400 ceiling |
+|---|---|---|
+| `iperf3 -u -l 1400` (raw UDP loopback) | 3,150 | 100 % |
+| `picoquicdemo -a perf` (picoquic over UDP) | 2,184 | 69 % |
+| `aiopquic` lowlevel (SPSC ring + UDP) | 2,322 | 74 % |
+| `aiopquic` highlevel (asyncio + SPSC + UDP) | 2,031 | 64 % |
+| **`sim_link_bench`** (picoquic only, no kernel UDP) | **11,216** | — *(off-axis)* |
+
+The asyncio wrapper costs ~10 % below the lowlevel SPSC path; picoquic's own QUIC framing/encryption/ACK overhead accounts for ~25 % vs raw UDP. Both are normal for QUIC-over-loopback at MTU.
+
+`sim_link_bench` (`tests/bench/sim_link/`) drives picoquic over its `picoquictest_sim_link` simulated link — packets are routed in-process between two `picoquic_quic_t` instances, no kernel UDP, no sockets, no syscall-rate ceiling. It isolates picoquic protocol CPU cost from the loopback wall and is platform-independent. The 11.2 Gbps number above is what picoquic can do without any kernel involvement on this hardware. Build with `./tests/bench/sim_link/build.sh` after `./build_picoquic.sh`.
 
 Calibrate on your own hardware:
 
 ```bash
-pytest tests/bench/bench_baselines_highlevel.py -s -v          # default 30 s
+# UDP-over-loopback path (what aiopquic users actually see)
+pytest tests/bench/bench_baselines_highlevel.py -s -v          # 30s default
 pytest tests/bench/bench_baselines_highlevel.py -s -v --duration=60
+
+# Protocol-only reference (no kernel UDP)
+PICOQUIC_SOLUTION_DIR=third_party/picoquic/ \
+    tests/bench/sim_link/sim_link_bench --duration-s 30 --rate-gbps 100
 ```
 
-Microbenches (ring lifecycle, stream churn, concurrent-streams short bursts) live under `tests/bench/` for development reference but are **not** representative of sustained throughput — short windows inflate numbers from warmup transients.
+Microbenches (ring lifecycle, stream churn, concurrent-streams short bursts) live under `tests/bench/` for development reference. Their reported numbers are *not* representative of sustained throughput — short windows inflate numbers from warmup transients (a 100-stream churn case at 256 B per stream measures ~1 ms of work, dominated by setup cost).
 
 ## Installation
 

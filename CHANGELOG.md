@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.2.7 (2026-05-07)
+
+### sim_link_bench: protocol-only throughput reference
+
+New standalone C bench at `tests/bench/sim_link/` that drives two
+`picoquic_quic_t` instances over `picoquictest_sim_link` — packets
+routed in-process between them, no kernel UDP, no sockets, no
+sendmsg/recvmsg syscalls. Isolates picoquic protocol CPU cost from
+the kernel UDP-loopback wall.
+
+On Ryzen 7 PRO 7840U / WSL2: 11.2 Gbps single-stream sustained
+(30s steady-state). Compare to picoquic-over-UDP-loopback (2.18 Gbps
+via `picoquicdemo -a perf`) and `aiopquic` highlevel (2.03 Gbps);
+the gap is the kernel sendmsg-rate ceiling, not picoquic.
+
+Build: `./tests/bench/sim_link/build.sh` after `./build_picoquic.sh`.
+
+### README: corrected loopback-ceiling analysis
+
+Earlier README framing claimed kernel UDP loopback was the dominant
+wall ("5× drop"). That was wrong. iperf3 baseline shows kernel UDP
+loopback at QUIC MTU (1,400 B) is **3.15 Gbps** — bandwidth scales
+cleanly with datagram size up to 32 KiB at 33+ Gbps. The wall at
+QUIC MTU is the per-syscall sendmsg rate (~280 K/s), not bandwidth.
+
+Updated Performance section with the iperf3 anchor, full layer
+breakdown (raw UDP / picoquicdemo / aiopquic lowlevel / aiopquic
+highlevel / sim_link), and notes that QUIC-over-loopback at MTU
+landing at 64-74% of UDP ceiling is normal QUIC overhead, not a
+defect to chase.
+
 ## v0.2.6 (2026-05-07)
 
 ### Bench: `--duration` pytest option for opt-in benches
