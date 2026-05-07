@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <time.h>
 
 #include "picoquic.h"
 #include "picoquic_internal.h"
@@ -263,11 +264,19 @@ int main(int argc, char **argv)
     uint64_t sim_time_out = ss_end_deadline + 60000000ULL;  /* +60s slack */
 
     /* Steady-state samples: bytes received at warmup_deadline and at
-     * ss_end_deadline. Difference / duration_s = real throughput. */
+     * ss_end_deadline. Difference / duration_s = real throughput.
+     *
+     * sim_throughput is platform-independent (it's the picoquic CC
+     * equilibrium at this link config). The real cross-platform metric
+     * is wall_throughput — bytes / wall-clock seconds spent processing
+     * the simulator. We track wall timestamps at each window boundary. */
     int64_t warmup_recv = -1;
     int64_t ss_end_recv = -1;
     int64_t warmup_sent = -1;
     int64_t ss_end_sent = -1;
+
+    struct timespec wall_handshake, wall_warmup, wall_ss_end;
+    clock_gettime(CLOCK_MONOTONIC, &wall_handshake);
 
     while (ret == 0 &&
            picoquic_get_cnx_state(tctx->cnx_client) != picoquic_state_disconnected) {
@@ -278,9 +287,10 @@ int main(int argc, char **argv)
         if (warmup_recv < 0 && simulated_time >= warmup_deadline) {
             warmup_recv = client_bctx.bytes_recv;
             warmup_sent = server_bctx.bytes_sent;
+            clock_gettime(CLOCK_MONOTONIC, &wall_warmup);
             if (!quiet) {
                 fprintf(stderr, "[warmup] sim_t=%.3fs recv=%" PRId64
-                        " (%.1f Mbps over %.2fs)\n",
+                        " (%.1f sim_Mbps over %.2fs)\n",
                         (simulated_time - handshake_done_us) / 1e6,
                         warmup_recv,
                         (warmup_recv * 8.0) /
@@ -293,6 +303,7 @@ int main(int argc, char **argv)
         if (simulated_time >= ss_end_deadline) {
             ss_end_recv = client_bctx.bytes_recv;
             ss_end_sent = server_bctx.bytes_sent;
+            clock_gettime(CLOCK_MONOTONIC, &wall_ss_end);
             break;
         }
 
@@ -308,34 +319,53 @@ int main(int argc, char **argv)
     if (warmup_recv < 0) {
         warmup_recv = client_bctx.bytes_recv;
         warmup_sent = server_bctx.bytes_sent;
+        clock_gettime(CLOCK_MONOTONIC, &wall_warmup);
     }
     if (ss_end_recv < 0) {
         ss_end_recv = client_bctx.bytes_recv;
         ss_end_sent = server_bctx.bytes_sent;
+        clock_gettime(CLOCK_MONOTONIC, &wall_ss_end);
     }
 
-    double warmup_mbps = (warmup_recv * 8.0) /
+    /* Sim-time mbps: picoquic CC equilibrium at the simulated link
+     * config. Same number across machines — useful as a determinism
+     * check, NOT as a hardware comparison. */
+    double sim_warmup_mbps = (warmup_recv * 8.0) /
         (double)(warmup_deadline - handshake_done_us);
-    double ss_mbps = ((ss_end_recv - warmup_recv) * 8.0) /
+    double sim_ss_mbps = ((ss_end_recv - warmup_recv) * 8.0) /
         (double)(ss_end_deadline - warmup_deadline);
-    double overall_mbps = (ss_end_recv * 8.0) /
-        (double)(ss_end_deadline - handshake_done_us);
-    double obj_per_s = (double)(ss_end_recv - warmup_recv) /
-        ((double)(ss_end_deadline - warmup_deadline) / 1e6) /
-        (double)obj_size;
 
-    /* Two lines: warmup window + steady-state. Steady-state is the
-     * real number to report. Overall = total/total for sanity. */
-    printf("sim_link_bench obj=%" PRId64 "B "
-           "warmup_recv=%" PRId64 " warmup_mbps=%.1f "
-           "ss_recv=%" PRId64 " ss_mbps=%.1f obj_per_s=%.0f "
-           "overall_mbps=%.1f sim_total_s=%.3f "
-           "rtt_us=%" PRId64 " rate_gbps=%.2f rounds=%d\n",
-           obj_size, warmup_recv, warmup_mbps,
-           (ss_end_recv - warmup_recv), ss_mbps, obj_per_s,
-           overall_mbps,
-           (ss_end_deadline - handshake_done_us) / 1e6,
+    /* Wall-time mbps: bytes processed per second of host CPU time.
+     * THIS is the cross-platform aiopquic CPU performance number.
+     * Lower means the host is slower at running the simulator. */
+    double wall_warmup_s =
+        (wall_warmup.tv_sec - wall_handshake.tv_sec) +
+        (wall_warmup.tv_nsec - wall_handshake.tv_nsec) / 1e9;
+    double wall_ss_s =
+        (wall_ss_end.tv_sec - wall_warmup.tv_sec) +
+        (wall_ss_end.tv_nsec - wall_warmup.tv_nsec) / 1e9;
+    double wall_total_s =
+        (wall_ss_end.tv_sec - wall_handshake.tv_sec) +
+        (wall_ss_end.tv_nsec - wall_handshake.tv_nsec) / 1e9;
+    double wall_ss_mbps = (wall_ss_s > 0)
+        ? ((ss_end_recv - warmup_recv) * 8.0) / (wall_ss_s * 1e6)
+        : 0.0;
+    double obj_per_wall_s = (wall_ss_s > 0)
+        ? (double)(ss_end_recv - warmup_recv) /
+          (double)obj_size / wall_ss_s
+        : 0.0;
+
+    printf("sim_link_bench obj=%" PRId64 "B"
+           " | sim_ss_mbps=%.1f sim_total_s=%.3f"
+           " | wall_ss_mbps=%.1f wall_ss_s=%.2f wall_total_s=%.2f"
+           " obj_per_wall_s=%.0f"
+           " | rtt_us=%" PRId64 " rate_gbps=%.2f rounds=%d\n",
+           obj_size,
+           sim_ss_mbps, (ss_end_deadline - handshake_done_us) / 1e6,
+           wall_ss_mbps, wall_ss_s, wall_total_s, obj_per_wall_s,
            rtt_us, rate_gbps, nb_trials);
+    (void)sim_warmup_mbps;
+    (void)wall_warmup_s;
 
     /* Cleanly close so picoquic doesn't complain at exit. */
     (void)picoquic_close(tctx->cnx_client, 0);
