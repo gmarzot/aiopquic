@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.2.4 (2026-05-07)
+
+Two correctness fixes upstream from us, plus README cleanup.
+
+### Picoquic upstream double-close fix
+
+aiopquic 0.2.2 shipped a TX_CLOSE state guard that filtered
+`picoquic_close()` calls when the cnx was already in a terminal
+state. That worked around a fall-through in `picoquic_close_ex`
+which set `ret = -1` for the already-closed branch but still ran
+`picoquic_reinsert_by_wake_time`, manipulating wake-list state that
+had been cleaned up at the original close — UAF on the worker
+thread.
+
+picoquic [#2097](https://github.com/private-octopus/picoquic/pull/2097)
+fixes this at the source: wraps the side effects in `if (ret == 0)`
+and adds an `ecdc_double_close_test` that drives a real cnx through
+close and verifies a second `picoquic_close()` is a safe no-op.
+
+This release pins the picoquic submodule to that PR's HEAD
+(`a9e58d8e`) and removes our TX_CLOSE state guard. Verified end-to-
+end: 0 segfaults in 100 runs of the aiomoqt full pytest stress that
+previously hit at ~15% rate on the original release wheel.
+
+### WebTransport empty-path normalization
+
+`MOQTServer(path="")` against a client connecting to root used to
+fail WT CONNECT with code 2. picoquic's path table is exact-match
+(no default route); the server-side empty path didn't match the
+client's HTTP/3 default `:path: /`. This release normalizes at the
+Cython layer:
+
+  - Server-side empty `wt_path` → `"*"` — picoquic's wildcard match
+    fallback (PR #2085, already in our pin) — accepts any client
+    path.
+  - Client-side empty `path` → `"/"` — HTTP/3 root request semantics
+    (RFC 9114 §4.3.1).
+
+Consumers can pass `path=""` or omit it on either side and have
+WebTransport CONNECT route correctly without thinking about
+picoquic path-match rules. aiopquic 0.2.2's helper-only
+normalization (`serve_webtransport` / `connect_webtransport`)
+moved down to `_transport.pyx` so direct class users (e.g.
+aiomoqt's `MOQTSessionWTClient`) get the fix automatically.
+
+### README
+
+Refreshed to reflect current state: wheels-first install, real perf
+table (lowlevel + highlevel + multi-stream + stream churn) on the
+test host, drops stale "Python 3.14+ required" / "Source build only"
+limits, accurate datagram-support note (QUIC datagrams TX/RX, WT
+datagram TX deferred), `uv pip install` examples, TODO list updated.
+
+
 ## v0.2.3 (2026-05-07)
 
 Wheel-build perf release. Closes the ~30% throughput / ~36× p50

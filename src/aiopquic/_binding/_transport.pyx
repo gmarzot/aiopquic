@@ -699,6 +699,9 @@ cdef class TransportContext:
         cdef bytes wt_path_b
         if wt_path is not None and not is_client:
             wt_path_b = wt_path.encode() if isinstance(wt_path, str) else wt_path
+            # Empty server path → picoquic's "*" wildcard (PR #2085).
+            if wt_path_b == b"":
+                wt_path_b = b"*"
             self._wt_path_bytes = wt_path_b
             self._wt_path_item.path = self._wt_path_bytes
             self._wt_path_item.path_length = len(self._wt_path_bytes)
@@ -1011,7 +1014,8 @@ cdef class WebTransportSessionState:
             raise ValueError(f"Invalid IPv4 address: {host}")
 
         cdef bytes b_sni = sni.encode()
-        cdef bytes b_path = path.encode()
+        # Empty client path → "/" (HTTP/3 root, RFC 9114 §4.3.1).
+        cdef bytes b_path = b"/" if path == "" else path.encode()
         cdef uint32_t sni_len = <uint32_t>len(b_sni)
         cdef uint32_t path_len = <uint32_t>len(b_path)
         cdef uint32_t hdr_size = sizeof(aiopquic_wt_open_params_t)

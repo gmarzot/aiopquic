@@ -479,26 +479,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     }
                     case SPSC_EVT_TX_CLOSE: {
-                        /* Skip if cnx is already in any closing/closed
-                         * state. picoquic_close_ex (sender.c) does NOT
-                         * early-return when called on an already-closed
-                         * cnx — it falls through to
-                         * picoquic_reinsert_by_wake_time which touches
-                         * wake-list state that may have been cleaned
-                         * up when the peer-initiated close was
-                         * processed. The race: peer close arrives,
-                         * worker fires picoquic_callback_close, our RX
-                         * event is queued. Before asyncio drains and
-                         * sets self._closed=True, app code calls
-                         * QuicConnection.close() which pushes a
-                         * TX_CLOSE here. picoquic_close on the now-
-                         * disconnected cnx then triggers a UAF on the
-                         * wake list. Filter at the source. */
-                        picoquic_state_enum st =
-                            picoquic_get_cnx_state(cnx);
-                        if (st < picoquic_state_disconnecting) {
-                            picoquic_close(cnx, entry->error_code);
-                        }
+                        picoquic_close(cnx, entry->error_code);
                         spsc_ring_pop(ctx->tx_ring);
                         break;
                     }
