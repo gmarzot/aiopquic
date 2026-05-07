@@ -59,13 +59,25 @@ fi
 # --- Step 1: Build picotls from submodule ---
 PTLS_BUILD_DIR="${BUILD_DIR}/picotls-build"
 
+# Allow callers to override the picoquic+picotls compile flags. CI
+# wheel builds set this via the cibuildwheel environment block to
+# pin perf-relevant flags (frame pointer, stack protector, unwind
+# tables) so wheels match what local source builds achieve. Empty
+# default keeps cmake's own Release defaults (-O3 -DNDEBUG).
+PICOQUIC_C_FLAGS="${PICOQUIC_C_FLAGS:-}"
+CMAKE_FLAG_ARGS=()
+if [ -n "${PICOQUIC_C_FLAGS}" ]; then
+    CMAKE_FLAG_ARGS+=("-DCMAKE_C_FLAGS_RELEASE=${PICOQUIC_C_FLAGS}")
+fi
+
 echo -e "${COLOR_GREEN}Building picotls from ${PICOTLS_DIR}...${COLOR_OFF}"
 mkdir -p "${PTLS_BUILD_DIR}"
 cmake -S "${PICOTLS_DIR}" -B "${PTLS_BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DWITH_FUSION=OFF \
-    "${CMAKE_OPENSSL_ARGS[@]}"
+    ${CMAKE_FLAG_ARGS[@]+"${CMAKE_FLAG_ARGS[@]}"} \
+    ${CMAKE_OPENSSL_ARGS[@]+"${CMAKE_OPENSSL_ARGS[@]}"}
 cmake --build "${PTLS_BUILD_DIR}" -j "${NPROC}"
 echo -e "${COLOR_GREEN}picotls build complete.${COLOR_OFF}"
 
@@ -104,7 +116,8 @@ cmake -S "${PICOQUIC_DIR}" -B "${BUILD_DIR}" \
     -DPTLS_CORE_LIBRARY="${PTLS_CORE_LIB}" \
     -DPTLS_OPENSSL_LIBRARY="${PTLS_OPENSSL_LIB}" \
     -DPTLS_MINICRYPTO_LIBRARY="${PTLS_MINICRYPTO_LIB}" \
-    "${CMAKE_OPENSSL_ARGS[@]}"
+    ${CMAKE_FLAG_ARGS[@]+"${CMAKE_FLAG_ARGS[@]}"} \
+    ${CMAKE_OPENSSL_ARGS[@]+"${CMAKE_OPENSSL_ARGS[@]}"}
 
 cmake --build "${BUILD_DIR}" -j "${NPROC}" --target picoquic-core picohttp-core picoquic-log
 cmake --build "${BUILD_DIR}" -j "${NPROC}" --target picoquic_ct picohttp_ct

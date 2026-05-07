@@ -63,17 +63,31 @@ skip = "*-musllinux_* *-manylinux_i686 *-win32 *_ppc64le *_s390x"
 test-command = "python -c 'import aiopquic; from aiopquic._binding import _transport; print(\"aiopquic\", aiopquic.__version__ if hasattr(aiopquic, \"__version__\") else \"ok\")'"
 
 [tool.cibuildwheel.linux]
-# manylinux_2_28 = AlmaLinux 8 / RHEL 8 base — has gcc 12, openssl-devel
-# packaged. Wider compatibility than manylinux_2_34; narrower than
-# legacy manylinux2014 but glibc 2.28+ covers a lot — RHEL 8 / Ubuntu
-# 20.04+. Built once per OS via before-all (build_picoquic.sh too,
-# so the picoquic+picotls static libs are amortized across the cp312/
-# cp313/cp314 wheel builds rather than rebuilt per python version).
-manylinux-x86_64-image = "manylinux_2_28"
+# manylinux_2_34 = AlmaLinux 9 / RHEL 9 base. Ships gcc-toolset-14
+# (gcc 14.2.1) and OpenSSL 3.5.1.
+#
+# We chose this image over manylinux_2_28 (RHEL 8, OpenSSL 1.1.1k)
+# because the RHEL OpenSSL 1.1.1k FIPS build produces a ~30%
+# throughput / ~30× p50 latency regression vs OpenSSL 3.x in our
+# loopback TLS hot path on AMD Ryzen. We A/B-tested several
+# wheel-build configurations (manylinux_2_28 with default gcc 14
+# and dnf-installed gcc 11; manylinux2014 with gcc 10; manylinux_2_34
+# with gcc 14) and found OpenSSL version was the only variable that
+# moved the numbers. Suspect: RHEL's OpenSSL 1.1.1k crypto-policies
+# routing + FIPS provider overhead routes Ryzen workloads through
+# slower ASM paths than OpenSSL 3.0+ does.
+#
+# Trade-off: manylinux_2_34 narrows wheel compatibility to glibc
+# 2.34+ (RHEL 9 / Ubuntu 22.04+); older systems install via sdist.
+manylinux-x86_64-image = "manylinux_2_34"
 before-all = """
-yum install -y openssl-devel cmake
+dnf install -y openssl-devel cmake
 bash build_picoquic.sh
 """
+
+[tool.cibuildwheel.linux.environment]
+CFLAGS = "-O3 -fno-strict-overflow -fPIC"
+PICOQUIC_C_FLAGS = "-O3 -DNDEBUG"
 
 [tool.cibuildwheel.macos]
 # delocate bundles libssl/libcrypto from Homebrew into the wheel.
