@@ -99,7 +99,7 @@ For older Linux (glibc 2.28–2.33) install via sdist; build toolchain required.
 git clone https://github.com/gmarzot/aiopquic.git
 cd aiopquic
 git submodule update --init --recursive
-./bootstrap_python.sh    # creates .venv with uv-managed Python 3.14t and pins cython 3.2+
+./bootstrap_python.sh    # creates .venv with uv-managed Python 3.14 (GIL build) and pins cython 3.2+
 source .venv/bin/activate
 ./build_picoquic.sh      # builds picotls, picoquic, native test drivers
 uv pip install -e '.[dev]'    # or: pip install -e '.[dev]'

@@ -10,8 +10,12 @@ COLOR_RED="\033[0;31m"
 COLOR_OFF="\033[0m"
 
 $ECHO "${COLOR_GREEN}Setting up Python/Cython test environment... ${COLOR_OFF}"
-PYTHON_VERSION="3.14t"  # Free-threaded build (nogil, PEP 779)
-CYTHON_VERSION="3.2.4"  # Full free-threading support (pymutex, critical sections)
+PYTHON_VERSION="3.14"   # CPython 3.14 stable (GIL build) — matches the
+                        # default wheels we ship to PyPI. Use 3.14t for
+                        # the free-threaded variant (PEP 779) when
+                        # validating no-GIL behavior; it builds and runs
+                        # against this codebase.
+CYTHON_VERSION="3.2.4"  # Latest on PyPI; supports both 3.14 and 3.14t.
 
 PLATFORM="$(uname -s)"
 case "${PLATFORM}" in
