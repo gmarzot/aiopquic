@@ -192,6 +192,9 @@ cdef extern from "c/callback.h":
         int eventfd
         picoquic_quic_t* quic
         uint32_t rx_ring_cap
+        uint64_t worker_mark_active_processed
+        uint64_t worker_prepare_to_send_calls
+        uint64_t worker_prepare_to_send_pulled_bytes
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity)
     void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx)
@@ -493,12 +496,23 @@ cdef class TransportContext:
     cdef bytes _wt_path_bytes
     cdef picohttp_server_path_item_t _wt_path_item
     cdef picohttp_server_parameters_t _wt_params
+    # Forensic counters for the atomic send_stream_data path.
+    # All updated from the asyncio thread (single producer); reads
+    # from Python don't need atomicity beyond the GIL.
+    cdef uint64_t _send_calls
+    cdef uint64_t _send_busy_event_ring
+    cdef uint64_t _send_busy_stream_ring
+    cdef uint64_t _send_alloc_fail
 
     def __cinit__(self, uint32_t ring_capacity=DEFAULT_RING_CAPACITY):
         self._ctx = aiopquic_ctx_create(ring_capacity)
         self._quic = NULL
         self._thread_ctx = NULL
         self._started = False
+        self._send_calls = 0
+        self._send_busy_event_ring = 0
+        self._send_busy_stream_ring = 0
+        self._send_alloc_fail = 0
         if self._ctx is NULL:
             raise MemoryError("Failed to create transport context")
 
@@ -527,6 +541,16 @@ cdef class TransportContext:
     def rx_count(self):
         """Number of events pending in the RX ring."""
         return spsc_ring_count(self._ctx.rx_ring)
+
+    @property
+    def tx_count(self):
+        """Number of events pending in the TX ring."""
+        return spsc_ring_count(self._ctx.tx_ring)
+
+    @property
+    def tx_capacity(self):
+        """TX ring entry capacity (constant; for free-space pre-checks)."""
+        return self._ctx.tx_ring.capacity
 
     def drain_rx(self, int max_events=256):
         """
@@ -642,6 +666,126 @@ cdef class TransportContext:
         cdef int ret = spsc_ring_push(self._ctx.tx_ring, &entry, data_ptr, data_len)
         if ret != 0:
             raise BufferError("TX ring buffer is full")
+
+    def tx_send_atomic(self, uint64_t stream_id, bytes data,
+                        bint end_stream, uintptr_t cnx_ptr,
+                        uintptr_t stream_ctx,
+                        uint32_t stream_ring_cap):
+        """Atomic send_stream_data primitive — all-or-nothing.
+
+        Composes ensure-tx-ring + tx-event-ring capacity check + per-
+        stream byte-ring push + TX_MARK_ACTIVE event push + worker
+        wake-up into one Cython call. Holds the GIL through all four
+        steps so no other Python coroutine can interleave between the
+        bytes-commit and the event-push that the previous Python-level
+        composition exposed.
+
+        On a retryable failure (return 1 or 2), no bytes are committed
+        to sc->tx — caller may safely re-call with the SAME data buffer
+        without risk of duplicating bytes on the wire.
+
+        Returns:
+            0   success — bytes pushed to sc->tx, MARK_ACTIVE event
+                queued, worker notified
+            1   TX event ring full (caller retries)
+            2   per-stream send ring full (caller retries)
+           -1   allocation failure (sc->tx couldn't be created)
+        """
+        cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>stream_ctx
+        cdef const uint8_t* data_ptr = NULL
+        cdef uint32_t data_len = 0
+        cdef spsc_entry_t entry
+        cdef int rc
+
+        self._send_calls += 1
+
+        if data is not None:
+            data_ptr = <const uint8_t*>data
+            data_len = <uint32_t>len(data)
+
+        # PRE-CHECK 1: TX event ring must have room for the
+        # MARK_ACTIVE event we'll push after committing bytes.
+        # Without this, retry semantics duplicate bytes on the wire.
+        # Single-producer (asyncio thread) ⇒ no TOCTOU window.
+        if spsc_ring_count(self._ctx.tx_ring) >= self._ctx.tx_ring.capacity:
+            self._send_busy_event_ring += 1
+            return 1
+
+        # COMMIT: push bytes to per-stream ring (atomic, all-or-nothing
+        # internally; rc=0 means ring full, rc<0 alloc fail).
+        rc = aiopquic_stream_ctx_send_data(
+            sc, data_ptr, data_len, stream_ring_cap, end_stream)
+        if rc == 0:
+            self._send_busy_stream_ring += 1
+            return 2
+        if rc < 0:
+            self._send_alloc_fail += 1
+            return -1
+
+        # Push MARK_ACTIVE event. Pre-check above guarantees room.
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_MARK_ACTIVE
+        entry.stream_id = stream_id
+        entry.cnx = <void*>cnx_ptr
+        entry.stream_ctx = <void*>sc
+        rc = spsc_ring_push(self._ctx.tx_ring, &entry, NULL, 0)
+        if rc != 0:
+            # Should never happen given the pre-check (single producer)
+            # — but if it does, bytes are already in sc->tx and event
+            # didn't post. Surface as a real error rather than silent
+            # corruption.
+            self._send_busy_event_ring += 1
+            return 1
+
+        # Wake the worker thread so it picks up the event quickly.
+        if self._thread_ctx is not NULL:
+            picoquic_wake_up_network_thread(self._thread_ctx)
+
+        return 0
+
+    @property
+    def send_calls(self):
+        """Total tx_send_atomic invocations."""
+        return self._send_calls
+
+    @property
+    def send_busy_event_ring(self):
+        """Times tx_send_atomic returned 1 (TX event ring full)."""
+        return self._send_busy_event_ring
+
+    @property
+    def send_busy_stream_ring(self):
+        """Times tx_send_atomic returned 2 (per-stream byte ring full)."""
+        return self._send_busy_stream_ring
+
+    @property
+    def send_alloc_fail(self):
+        """Times tx_send_atomic returned -1 (allocation failure)."""
+        return self._send_alloc_fail
+
+    @property
+    def worker_mark_active_processed(self):
+        """Worker thread: count of TX_MARK_ACTIVE events drained from
+        tx_ring and dispatched to picoquic_mark_active_stream. If this
+        is < send_calls, MARK_ACTIVE events are being lost in the ring
+        between Python push and worker dequeue (which would be a real
+        SPSC bug)."""
+        return self._ctx.worker_mark_active_processed
+
+    @property
+    def worker_prepare_to_send_calls(self):
+        """Worker thread: count of picoquic_callback_prepare_to_send
+        invocations on this context. Compare against
+        worker_mark_active_processed to see whether picoquic ever
+        actually polled the streams it was asked to mark active."""
+        return self._ctx.worker_prepare_to_send_calls
+
+    @property
+    def worker_prepare_to_send_pulled_bytes(self):
+        """Worker thread: cumulative bytes pulled from sc->tx rings via
+        prepare_to_send. Should equal total bytes Python pushed across
+        all streams once everything is drained."""
+        return self._ctx.worker_prepare_to_send_pulled_bytes
 
     def start(self, int port=0, cert_file=None, key_file=None,
               alpn=None, bint is_client=True, uint64_t idle_timeout_ms=30000,
@@ -793,7 +937,13 @@ cdef class TransportContext:
         self._param.local_port = <unsigned short>port
         self._param.local_af = AF_INET
         self._param.dest_if = 0
-        self._param.socket_buffer_size = 0
+        # SO_RCVBUF/SO_SNDBUF size. Default 0 lets picoquic use kernel
+        # default (~200 KB on Linux). At line-rate UDP loopback (~3 Gbps
+        # at QUIC MTU), 200 KB drains in 0.5 ms — bursty publishers
+        # overrun the receive buffer, kernel drops packets, entire
+        # streams disappear. 16 MiB matches the typical TCP autotune
+        # ceiling and is plenty for sustained loopback.
+        self._param.socket_buffer_size = 64 * 1024 * 1024
         self._param.do_not_use_gso = 0
         self._param.extra_socket_required = 0
         self._param.prefer_extra_socket = 0

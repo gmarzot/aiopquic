@@ -346,40 +346,38 @@ class QuicConnection:
                          end_stream: bool = False) -> None:
         """Send data on a stream — PULL-model with real backpressure.
 
-        Lazily creates a per-stream wrapper + TX byte ring on first call;
-        subsequent calls push bytes into the ring. picoquic pulls at wire
-        rate via prepare_to_send.
+        Calls the atomic Cython send primitive that bundles per-stream-
+        ring push + MARK_ACTIVE event push + worker wake-up under a
+        single GIL hold. All-or-nothing: on BufferError, no bytes are
+        committed to sc->tx, so the caller can retry the SAME data
+        buffer without risking duplicated bytes on the wire.
 
-        Raises BufferError when the ring cannot fit `data` (caller must
-        wait + retry the SAME data buffer — push is all-or-nothing, no
-        partial commit happens). end_stream=True marks FIN to follow
-        once the ring is fully drained.
+        Raises BufferError on any retryable backpressure (TX event ring
+        full or per-stream send ring full); raises MemoryError on
+        allocation failure.
         """
         sc = self._get_or_create_stream_ctx(stream_id)
-        # Combined ensure-tx + free-check + push + set-fin in a single
-        # Cython call. Returns:
-        #   1   all bytes pushed (and FIN set if requested)
-        #   0   ring full — atomic, no bytes committed; caller retries
-        #  -1   allocation failure
-        rc = stream_ctx_send_data(sc, data, _STREAM_RING_CAP, end_stream)
-        if rc == 0:
+        rc = self._transport.tx_send_atomic(
+            stream_id,
+            data if data is not None else b"",
+            end_stream,
+            self._cnx_ptr,
+            sc,
+            _STREAM_RING_CAP,
+        )
+        if rc == 1:
+            raise BufferError(
+                f"TX event ring full (stream={stream_id})"
+            )
+        if rc == 2:
             raise BufferError(
                 f"per-stream send ring full "
                 f"(stream={stream_id}, need={len(data) if data else 0})"
             )
         if rc < 0:
             raise MemoryError(
-                f"stream_ctx_send_data alloc failed (stream={stream_id})"
+                f"send_stream_data alloc failed (stream={stream_id})"
             )
-
-        # Mark the stream active so picoquic schedules prepare_to_send.
-        # The wrapper pointer is what picoquic stores as app_stream_ctx;
-        # the prepare_to_send callback dereferences ->tx to find the ring.
-        self._transport.push_tx(
-            _TX_MARK_ACTIVE, stream_id,
-            cnx_ptr=self._cnx_ptr, stream_ctx=sc,
-        )
-        self._transport.wake_up()
 
     def send_datagram_frame(self, data: bytes) -> None:
         """Send a datagram frame."""

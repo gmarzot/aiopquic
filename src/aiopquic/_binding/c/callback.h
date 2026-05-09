@@ -75,6 +75,13 @@ typedef struct {
      * up to a power of two by the Cython binding before being stored
      * here. */
     uint32_t        rx_ring_cap;
+    /* Forensic counters — incremented from the picoquic worker thread
+     * as it processes TX events. The asyncio thread reads them via
+     * Cython properties to verify per-event accounting. Plain ints,
+     * read with relaxed semantics (only one writer). */
+    uint64_t        worker_mark_active_processed;
+    uint64_t        worker_prepare_to_send_calls;
+    uint64_t        worker_prepare_to_send_pulled_bytes;
 } aiopquic_ctx_t;
 
 static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity) {
@@ -225,6 +232,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
      *     queue. Retained for the existing send_stream_data API.
      */
     if (fin_or_event == picoquic_callback_prepare_to_send) {
+        ctx->worker_prepare_to_send_calls++;
         if (stream_ctx) {
             aiopquic_stream_ctx_t* sc =
                 (aiopquic_stream_ctx_t*)stream_ctx;
@@ -243,6 +251,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                 bytes, to_send, is_fin, is_still_active);
             if (buf && to_send > 0) {
                 aiopquic_stream_buf_pop(sb, buf, to_send);
+                ctx->worker_prepare_to_send_pulled_bytes += to_send;
             }
             return 0;
         }
@@ -460,6 +469,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     case SPSC_EVT_TX_MARK_ACTIVE: {
                         picoquic_mark_active_stream(cnx, entry->stream_id,
                                                      1, entry->stream_ctx);
+                        ctx->worker_mark_active_processed++;
                         spsc_ring_pop(ctx->tx_ring);
                         break;
                     }
