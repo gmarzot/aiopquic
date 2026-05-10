@@ -645,3 +645,562 @@ def test_bench_wt_split_writes_stress_mp(n_streams, objs_per_stream,
         f"short={res['streams_short']} "
         f"bad_payload={res['streams_bad_payload']}"
     )
+
+
+# =======================================================================
+# Concurrent-writers MP variant — closer to aiomoqt's actual TX shape.
+# aiomoqt's PublishedTrack._generate_subgroup launches num_subgroups
+# concurrent asyncio tasks, each opening + writing + FINing streams in
+# a continuous loop. The streams INTERLEAVE on the same WT session.
+# This is the TX-shape diff between the sequential MP test above
+# (which is byte-perfect at scale) and aiomoqt mp-loopback (which
+# parse-rejects with the missing-5-byte-SubgroupHeader signature).
+# =======================================================================
+
+
+async def _run_split_writes_wt_mp_concurrent(
+        n_streams_total: int, objs_per_stream: int, obj_size: int,
+        num_writers: int) -> dict:
+    """Concurrent-writers MP variant.
+
+    num_writers asyncio tasks share a single WT connection. Each
+    writer opens streams sequentially within its own task body; the
+    TX side of the session sees calls from N tasks interleaved
+    arbitrarily by the asyncio scheduler. n_streams_total streams are
+    distributed across the writers (n_streams_total / num_writers
+    per writer, remainder distributed to first writers)."""
+    import multiprocessing as _mp
+    try:
+        ctx = _mp.get_context("fork")
+    except ValueError:
+        ctx = _mp.get_context()
+    port = _next_port()
+    pad = bytes(i & 0xFF for i in range(obj_size))
+    expected_per_stream = HEADER_SIZE + objs_per_stream * obj_size
+
+    ready_event = ctx.Event()
+    import tempfile as _tempfile
+    _f = _tempfile.NamedTemporaryFile(prefix="wt_mp_concurrent_summary_",
+                                          suffix=".pkl", delete=False)
+    summary_path = _f.name
+    _f.close()
+    proc = ctx.Process(
+        target=_server_subproc_entry,
+        args=(port, n_streams_total, objs_per_stream, obj_size,
+              ready_event, summary_path),
+        daemon=True,
+    )
+    proc.start()
+
+    try:
+        for _ in range(500):
+            if ready_event.is_set():
+                break
+            await asyncio.sleep(0.02)
+        if not ready_event.is_set():
+            raise RuntimeError("server subproc never signaled ready")
+
+        sids: list[int] = []
+        full_waits_box = [0]
+        t_start = 0.0
+        t_send_done = 0.0
+
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+
+            async def _writer(writer_idx: int, n_for_writer: int):
+                local_full_waits = 0
+                for _ in range(n_for_writer):
+                    sid = await wt.create_stream(bidir=False)
+                    sids.append(sid)
+                    while True:
+                        try:
+                            wt.send_stream_data(
+                                sid, HEADER_SENTINEL, end_stream=False)
+                            break
+                        except BufferError:
+                            local_full_waits += 1
+                            await asyncio.sleep(0.0001)
+                    for k in range(objs_per_stream):
+                        is_last = (k == objs_per_stream - 1)
+                        while True:
+                            try:
+                                wt.send_stream_data(
+                                    sid, pad, end_stream=is_last)
+                                break
+                            except BufferError:
+                                local_full_waits += 1
+                                await asyncio.sleep(0.0001)
+                    # Yield between streams to give other writers a
+                    # chance — mirrors aiomoqt's per-stream cadence
+                    # under concurrent subgroup tasks.
+                    await asyncio.sleep(0)
+                full_waits_box[0] += local_full_waits
+
+            t_start = time.monotonic()
+            base = n_streams_total // num_writers
+            extra = n_streams_total - base * num_writers
+            writer_tasks = []
+            for w in range(num_writers):
+                n_for_writer = base + (1 if w < extra else 0)
+                writer_tasks.append(asyncio.create_task(
+                    _writer(w, n_for_writer)))
+            await asyncio.gather(*writer_tasks)
+            t_send_done = time.monotonic()
+
+            import os.path as _osp
+            proc_deadline = time.monotonic() + 30.0
+            while time.monotonic() < proc_deadline:
+                if (_osp.exists(summary_path)
+                        and os.path.getsize(summary_path) > 0):
+                    break
+                await asyncio.sleep(0.1)
+    finally:
+        proc.join(timeout=5.0)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=2.0)
+
+    summary = {}
+    try:
+        import pickle as _pickle
+        with open(summary_path, "rb") as _f:
+            summary = _pickle.load(_f)
+        os.unlink(summary_path)
+    except Exception:
+        pass
+    captured: dict[int, bytes] = summary.get("captured", {})
+    captured_fin: dict[int, bool] = summary.get("captured_fin", {})
+    new_stream_count = summary.get("new_stream_count", -1)
+
+    elapsed = max(1e-6, t_send_done - t_start)
+    streams_per_s = n_streams_total / elapsed
+    bytes_per_stream = expected_per_stream
+
+    streams_complete = 0
+    streams_short = 0
+    streams_no_header = 0
+    streams_bad_payload = 0
+    streams_no_fin = 0
+    streams_missing = 0
+    missing_sids: list[int] = []
+    examples_no_header: list[tuple[int, str]] = []
+    examples_short: list[tuple[int, int]] = []
+    examples_no_fin: list[tuple[int, int]] = []
+
+    for sid in sids:
+        rx = captured.get(sid)
+        if rx is None:
+            streams_missing += 1
+            missing_sids.append(sid)
+            continue
+        if not captured_fin.get(sid, False):
+            streams_no_fin += 1
+            if len(examples_no_fin) < 5:
+                examples_no_fin.append((sid, len(rx)))
+            continue
+        n = len(rx)
+        if n != bytes_per_stream:
+            streams_short += 1
+            if len(examples_short) < 5:
+                examples_short.append((sid, n))
+            continue
+        if rx[:HEADER_SIZE] != HEADER_SENTINEL:
+            streams_no_header += 1
+            if len(examples_no_header) < 5:
+                examples_no_header.append(
+                    (sid, rx[:16].hex())
+                )
+            continue
+        ok = True
+        off = HEADER_SIZE
+        for _ in range(objs_per_stream):
+            if rx[off:off + obj_size] != pad:
+                ok = False
+                break
+            off += obj_size
+        if not ok:
+            streams_bad_payload += 1
+            continue
+        streams_complete += 1
+
+    bps = (n_streams_total * bytes_per_stream * 8 / 1e6) / elapsed
+
+    return {
+        "n_streams": n_streams_total,
+        "objs_per_stream": objs_per_stream,
+        "obj_size": obj_size,
+        "elapsed_s": round(elapsed, 3),
+        "streams_per_s": round(streams_per_s, 0),
+        "Mbps": round(bps, 1),
+        "streams_complete": streams_complete,
+        "streams_short": streams_short,
+        "streams_no_header": streams_no_header,
+        "streams_bad_payload": streams_bad_payload,
+        "streams_no_fin": streams_no_fin,
+        "streams_missing": streams_missing,
+        "missing_sids_first8": missing_sids[:8],
+        "missing_sids_last8": missing_sids[-8:],
+        "missing_runs": [],
+        "missing_runs_largest": 0,
+        "no_header_examples": examples_no_header,
+        "short_examples": examples_short,
+        "no_fin_examples": examples_no_fin,
+        "full_waits": full_waits_box[0],
+        "new_stream_events": new_stream_count,
+        "yield_per_stream": False,
+        "num_writers": num_writers,
+        "pass": streams_complete == n_streams_total,
+    }
+
+
+@pytest.mark.bench
+@pytest.mark.parametrize("n_streams,objs_per_stream,obj_size,num_writers", [
+    # Mirror aiomoqt -P 2 -g 120 -s 1024 mp-loopback shape:
+    # n_streams = group count; objs_per_stream = objs per stream
+    # (group_size 120 / num_subgroups 2 = 60); num_writers = -P value.
+    (   50,  60, 1024, 2),
+    (  100,  60, 1024, 2),
+    (  500,  60, 1024, 2),
+    ( 1000,  60, 1024, 2),
+    (  500,  60, 1024, 4),
+    (  500,  60, 1024, 8),
+    ( 1000,  60, 1024, 8),
+], ids=[
+    "mpc-50s-60o-1K-P2", "mpc-100s-60o-1K-P2",
+    "mpc-500s-60o-1K-P2", "mpc-1000s-60o-1K-P2",
+    "mpc-500s-60o-1K-P4", "mpc-500s-60o-1K-P8",
+    "mpc-1000s-60o-1K-P8",
+])
+def test_bench_wt_split_writes_stress_mp_concurrent(
+        n_streams, objs_per_stream, obj_size, num_writers):
+    """Concurrent-writers MP variant. num_writers asyncio tasks share
+    a single WT session, each opening and writing streams in
+    parallel — exactly mirroring aiomoqt PublishedTrack's per-subgroup
+    task layout. The interleaved TX call pattern is the most likely
+    trigger differential vs the sequential mp test."""
+    res = asyncio.run(_run_split_writes_wt_mp_concurrent(
+        n_streams, objs_per_stream, obj_size, num_writers))
+    _print(res)
+    print(f"  num_writers: {res['num_writers']}")
+    assert res['pass'], (
+        f"streams_complete={res['streams_complete']}/{res['n_streams']} "
+        f"missing={res['streams_missing']} "
+        f"no_fin={res['streams_no_fin']} "
+        f"no_header={res['streams_no_header']} "
+        f"short={res['streams_short']} "
+        f"bad_payload={res['streams_bad_payload']}"
+    )
+
+
+# =======================================================================
+# Sustained-duration MP variant — matches aiomoqt's bench shape: open
+# streams continuously at a target rate for a fixed wall-clock window,
+# rather than a one-shot batch. The aiomoqt-observed parse-reject rate
+# (~0.02% at 250 Mbps) is too rare to catch in a small batch; a 20s+
+# run at the same target rate accumulates enough streams to surface it.
+# =======================================================================
+
+
+def _server_subproc_entry_sustained(port: int, target_obj_size: int,
+                                       ready_event, summary_path: str,
+                                       runtime_sec: float):
+    """Subprocess server for sustained mode. Collects every uni stream
+    as it arrives until runtime_sec elapses (plus 5s drain grace)."""
+    import asyncio as _asyncio
+    from aiopquic.asyncio.webtransport import (
+        serve_webtransport,
+        WebTransportNewStream as _NS,
+        WebTransportStreamDataReceived as _SDR,
+    )
+
+    captured: dict[int, bytearray] = {}
+    captured_fin: dict[int, bool] = {}
+    new_stream_count = [0]
+
+    async def _main():
+        async def _collect_stream(session, sid):
+            buf = bytearray()
+            try:
+                async for sev in session.receive_stream_data(sid):
+                    if isinstance(sev, _SDR):
+                        buf.extend(sev.data)
+                        if sev.end_stream:
+                            captured[sid] = buf
+                            captured_fin[sid] = True
+                            return
+            except Exception:
+                captured[sid] = buf
+                captured_fin[sid] = False
+
+        async def server_handler(session):
+            async def _accept_streams():
+                async for ev in session.events():
+                    if isinstance(ev, _NS):
+                        new_stream_count[0] += 1
+                        _asyncio.create_task(
+                            _collect_stream(session, ev.stream_id))
+            _asyncio.create_task(_accept_streams())
+
+        server = await serve_webtransport(
+            "127.0.0.1", port, "/wt",
+            handler=server_handler,
+            cert_file=CERT_FILE, key_file=KEY_FILE,
+        )
+        try:
+            ready_event.set()
+            # Run for runtime_sec + drain grace.
+            await _asyncio.sleep(runtime_sec + 5.0)
+        finally:
+            server.close()
+            await _asyncio.sleep(0.05)
+            import pickle as _pickle
+            summary = {
+                "captured": {sid: bytes(buf)
+                               for sid, buf in captured.items()},
+                "captured_fin": dict(captured_fin),
+                "new_stream_count": new_stream_count[0],
+            }
+            with open(summary_path, "wb") as _f:
+                _pickle.dump(summary, _f)
+
+    try:
+        _asyncio.run(_main())
+    except BaseException:
+        pass
+    os._exit(0)
+
+
+async def _run_split_writes_wt_mp_sustained(
+        runtime_sec: float, objs_per_stream: int, obj_size: int,
+        num_writers: int, target_obj_per_sec: int) -> dict:
+    """Sustained-duration concurrent MP variant.
+
+    Each writer opens streams in a continuous loop for runtime_sec
+    seconds, paced to target_obj_per_sec / num_writers per writer.
+    Mirrors aiomoqt's bench shape: continuous churn at a target
+    object rate rather than a one-shot batch."""
+    import multiprocessing as _mp
+    try:
+        ctx = _mp.get_context("fork")
+    except ValueError:
+        ctx = _mp.get_context()
+    port = _next_port()
+    pad = bytes(i & 0xFF for i in range(obj_size))
+    bytes_per_stream = HEADER_SIZE + objs_per_stream * obj_size
+
+    ready_event = ctx.Event()
+    import tempfile as _tempfile
+    _f = _tempfile.NamedTemporaryFile(prefix="wt_mp_sustained_summary_",
+                                          suffix=".pkl", delete=False)
+    summary_path = _f.name
+    _f.close()
+    proc = ctx.Process(
+        target=_server_subproc_entry_sustained,
+        args=(port, obj_size, ready_event, summary_path, runtime_sec),
+        daemon=True,
+    )
+    proc.start()
+
+    sids: list[int] = []
+    full_waits_box = [0]
+    t_start = 0.0
+    t_send_done = 0.0
+
+    try:
+        for _ in range(500):
+            if ready_event.is_set():
+                break
+            await asyncio.sleep(0.02)
+        if not ready_event.is_set():
+            raise RuntimeError("server subproc never signaled ready")
+
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+
+            obj_period = num_writers / target_obj_per_sec
+            stream_period = obj_period * objs_per_stream
+
+            async def _writer(writer_idx: int):
+                local_full_waits = 0
+                writer_t_start = asyncio.get_event_loop().time()
+                stream_count_local = 0
+                next_stream_t = writer_t_start
+                deadline = writer_t_start + runtime_sec
+                while True:
+                    now = asyncio.get_event_loop().time()
+                    if now >= deadline:
+                        break
+                    # Pace
+                    sleep_for = next_stream_t - now
+                    if sleep_for > 0:
+                        await asyncio.sleep(sleep_for)
+                    sid = await wt.create_stream(bidir=False)
+                    sids.append(sid)
+                    while True:
+                        try:
+                            wt.send_stream_data(
+                                sid, HEADER_SENTINEL, end_stream=False)
+                            break
+                        except BufferError:
+                            local_full_waits += 1
+                            await asyncio.sleep(0.0001)
+                    for k in range(objs_per_stream):
+                        is_last = (k == objs_per_stream - 1)
+                        while True:
+                            try:
+                                wt.send_stream_data(
+                                    sid, pad, end_stream=is_last)
+                                break
+                            except BufferError:
+                                local_full_waits += 1
+                                await asyncio.sleep(0.0001)
+                    stream_count_local += 1
+                    next_stream_t = (writer_t_start
+                                       + stream_count_local * stream_period)
+                full_waits_box[0] += local_full_waits
+
+            t_start = time.monotonic()
+            tasks = [asyncio.create_task(_writer(w))
+                       for w in range(num_writers)]
+            await asyncio.gather(*tasks)
+            t_send_done = time.monotonic()
+
+            import os.path as _osp
+            proc_deadline = time.monotonic() + (runtime_sec + 10.0)
+            while time.monotonic() < proc_deadline:
+                if (_osp.exists(summary_path)
+                        and os.path.getsize(summary_path) > 0):
+                    break
+                await asyncio.sleep(0.1)
+    finally:
+        proc.join(timeout=5.0)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=2.0)
+
+    summary = {}
+    try:
+        import pickle as _pickle
+        with open(summary_path, "rb") as _f:
+            summary = _pickle.load(_f)
+        os.unlink(summary_path)
+    except Exception:
+        pass
+    captured: dict[int, bytes] = summary.get("captured", {})
+    captured_fin: dict[int, bool] = summary.get("captured_fin", {})
+    new_stream_count = summary.get("new_stream_count", -1)
+
+    n_streams = len(sids)
+    elapsed = max(1e-6, t_send_done - t_start)
+    streams_per_s = n_streams / elapsed
+
+    streams_complete = 0
+    streams_short = 0
+    streams_no_header = 0
+    streams_bad_payload = 0
+    streams_no_fin = 0
+    streams_missing = 0
+    missing_sids: list[int] = []
+    examples_no_header: list[tuple[int, str]] = []
+    examples_short: list[tuple[int, int]] = []
+    examples_no_fin: list[tuple[int, int]] = []
+
+    for sid in sids:
+        rx = captured.get(sid)
+        if rx is None:
+            streams_missing += 1
+            missing_sids.append(sid)
+            continue
+        if not captured_fin.get(sid, False):
+            streams_no_fin += 1
+            if len(examples_no_fin) < 5:
+                examples_no_fin.append((sid, len(rx)))
+            continue
+        n = len(rx)
+        if n != bytes_per_stream:
+            streams_short += 1
+            if len(examples_short) < 5:
+                examples_short.append((sid, n))
+            continue
+        if rx[:HEADER_SIZE] != HEADER_SENTINEL:
+            streams_no_header += 1
+            if len(examples_no_header) < 5:
+                examples_no_header.append(
+                    (sid, rx[:16].hex())
+                )
+            continue
+        ok = True
+        off = HEADER_SIZE
+        for _ in range(objs_per_stream):
+            if rx[off:off + obj_size] != pad:
+                ok = False
+                break
+            off += obj_size
+        if not ok:
+            streams_bad_payload += 1
+            continue
+        streams_complete += 1
+
+    bps = (n_streams * bytes_per_stream * 8 / 1e6) / elapsed
+
+    return {
+        "n_streams": n_streams,
+        "objs_per_stream": objs_per_stream,
+        "obj_size": obj_size,
+        "elapsed_s": round(elapsed, 3),
+        "streams_per_s": round(streams_per_s, 0),
+        "Mbps": round(bps, 1),
+        "streams_complete": streams_complete,
+        "streams_short": streams_short,
+        "streams_no_header": streams_no_header,
+        "streams_bad_payload": streams_bad_payload,
+        "streams_no_fin": streams_no_fin,
+        "streams_missing": streams_missing,
+        "missing_sids_first8": missing_sids[:8],
+        "missing_sids_last8": missing_sids[-8:],
+        "missing_runs": [],
+        "missing_runs_largest": 0,
+        "no_header_examples": examples_no_header,
+        "short_examples": examples_short,
+        "no_fin_examples": examples_no_fin,
+        "full_waits": full_waits_box[0],
+        "new_stream_events": new_stream_count,
+        "yield_per_stream": False,
+        "num_writers": num_writers,
+        "runtime_sec": runtime_sec,
+        "target_obj_per_sec": target_obj_per_sec,
+        "pass": (streams_complete == n_streams) and n_streams > 0,
+    }
+
+
+@pytest.mark.bench
+@pytest.mark.parametrize("runtime,objs_per_stream,obj_size,num_writers,target_obj_s", [
+    # Mirror aiomoqt mp-loopback at common rate points. Tx-side:
+    # 250 Mbps with 1024 B obj = ~30,500 obj/s. 500 Mbps = ~61,000.
+    # P=2 spreads across 2 concurrent writers.
+    (15.0,  60, 1024, 2,  30500),  # ~250 Mbps for 15s
+    (15.0,  60, 1024, 2,  61000),  # ~500 Mbps for 15s
+    (20.0,  60, 1024, 2, 122000),  # ~1 Gbps for 20s
+], ids=[
+    "sus-250M-15s-P2", "sus-500M-15s-P2", "sus-1G-20s-P2",
+])
+def test_bench_wt_split_writes_stress_mp_sustained(
+        runtime, objs_per_stream, obj_size, num_writers, target_obj_s):
+    """Sustained-duration MP variant. Matches aiomoqt mp-loopback
+    bench shape: continuous churn at target rate for runtime_sec
+    seconds. The 0.02% parse-reject rate seen in aiomoqt at 250 Mbps
+    requires ~5000+ streams to catch reproducibly — this test runs
+    that volume in 15-20 seconds."""
+    res = asyncio.run(_run_split_writes_wt_mp_sustained(
+        runtime, objs_per_stream, obj_size, num_writers, target_obj_s))
+    _print(res)
+    print(f"  num_writers: {res['num_writers']}  "
+          f"runtime: {res['runtime_sec']}s  "
+          f"target: {res['target_obj_per_sec']} obj/s")
+    assert res['pass'], (
+        f"streams_complete={res['streams_complete']}/{res['n_streams']} "
+        f"missing={res['streams_missing']} "
+        f"no_fin={res['streams_no_fin']} "
+        f"no_header={res['streams_no_header']} "
+        f"short={res['streams_short']} "
+        f"bad_payload={res['streams_bad_payload']}"
+    )
