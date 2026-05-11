@@ -352,7 +352,7 @@ static inline void aiopquic_wt_push_event_with_sc(
         if (event_type == SPSC_EVT_WT_STREAM_DATA) {
             s->bridge->worker_rx_event_drops_stream_data++;
         }
-        if (getenv("AIOPQUIC_RX_LOG")
+        if (aiopquic_rx_log_enabled()
                 && s->bridge->worker_rx_event_drops <= 100) {
             fprintf(stderr,
                 "[aiopquic_rx] WT EVENT RING FULL (sc): drop "
@@ -392,7 +392,7 @@ static inline void aiopquic_wt_push_event(
         if (event_type == SPSC_EVT_WT_STREAM_DATA) {
             s->bridge->worker_rx_event_drops_stream_data++;
         }
-        if (getenv("AIOPQUIC_RX_LOG")
+        if (aiopquic_rx_log_enabled()
                 && s->bridge->worker_rx_event_drops <= 100) {
             fprintf(stderr,
                 "[aiopquic_rx] WT EVENT RING FULL: drop "
@@ -502,7 +502,7 @@ static int aiopquic_wt_path_callback(
                  * FLOW_CONTROL_ERROR connection close, but we let
                  * the worker continue and just count the event. */
                 s->bridge->worker_rx_byte_ring_overflow++;
-                if (getenv("AIOPQUIC_RX_LOG")
+                if (aiopquic_rx_log_enabled()
                         && s->bridge->worker_rx_byte_ring_overflow <= 16) {
                     fprintf(stderr,
                         "[aiopquic_rx] WT stream=%llu RX ring overflow: "

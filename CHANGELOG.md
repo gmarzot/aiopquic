@@ -1,5 +1,174 @@
 # Changelog
 
+## v0.3.0 (2026-05-11)
+
+Receiver-side durability + WT backpressure. The 0.2.x WT path
+ack'd inbound bytes synchronously into a transient SPSC ring entry
+regardless of consumer drain rate, so a slow consumer led to UDP
+kernel buffer overflow → packet loss → thousands of parse rejects
+at 1+ Gbps in aiomoqt mp-loopback. v0.3.0 moves WT RX onto the same
+per-stream byte-ring + drain-driven `picoquic_open_flow_control`
+architecture raw QUIC already used correctly. Effect: data loss is
+replaced by honest latency growth (the TCP trade-off) — slow
+consumers back-pressure the publisher all the way to TX pacing
+instead of silently dropping packets.
+
+Sustained verification at this commit (Ryzen WSL2, 60 s windows):
+
+| Target rate | Delivered | avg latency | Loss |
+|---|---|---|---|
+|   83 Mbps |   83 Mbps |    5 ms | 0 |
+|  249 Mbps |  249 Mbps |   32 ms | 0 |
+|  490 Mbps |  493 Mbps |  567 ms | 0 |
+|  980 Mbps |  534 Mbps (capped) | 3938 ms | 0 |
+
+The 534 Mbps cap at 980 Mbps target is the aiomoqt consumer-CPU
+saturation point — Phase B holds data integrity (0 loss in 3.6M
+objects) but the queue grows. At sub-saturation rates the latency
+floor is tight (5 ms avg at 83 Mbps). Aiopquic raw-QUIC sustained
+holds 2.5 Gbps with 0 errors over 5 s — the bound at the aiomoqt
+layer is parser/dispatch CPU, not transport.
+
+Pre-v0.3.0 aiomoqt mp-loopback parse-reject counts (15 s runs):
+250M = 1-2, 500M = 2, 1000M = 4063, 1500M = 7130, 2000M = many.
+
+### SPSC RX-event ring durability (A0/A1/A2)
+
+The `aiopquic_stream_cb` callback silently dropped events when the
+RX SPSC event ring filled — bytes for raw-QUIC streams were already
+in the per-stream `sc->rx` buffer, but the notification event was
+gone, so asyncio was never told the bytes arrived. Short streams
+whose only callback fell in an overflow window appeared missing
+from the receiver's stream dict (the "split-write stream-loss"
+investigation reproducer at `tests/bench/bench_split_writes_stress.py`).
+
+- `event_ring_capacity` knob on `QuicConfiguration`, plumbed through
+  `_start_transport`. Defaults to 262144 entries (was 4096).
+- New worker counters `worker_rx_event_drops` /
+  `_drops_stream_data` / `_byte_ring_overflow` exposed on
+  `TransportContext` for diagnostics.
+
+### Drain coalescing (C1/C2)
+
+- **C1**: rx-side eventfd coalesce. `aiopquic_notify_rx` writes the
+  wake fd only on the 0→1 transition of `rx_notify_pending`.
+  `drain_rx` now (a) drains the ring snapshot, (b) RELEASE-stores
+  pending=0, (c) drains the wake-fd counter, (d) re-arms via a
+  fresh wake-fd write if the ring is still non-empty. Re-arm closes
+  the race where a producer observed pending=1 between our
+  peek-empty and pending=0 and skipped its own wake.
+- **C2**: tx-side wake-up coalesce. `tx_send_atomic` invokes
+  `picoquic_wake_up_network_thread` only on the 0→1 transition of
+  `tx_wake_pending`. The packet-loop wake handler clears the flag
+  back to 0 BEFORE its drain-until-empty loop, so any push that
+  races against the worker either lands in the loop's next peek or
+  causes a fresh wake.
+
+Throughput impact on `bench_split_writes_stress`:
+`500s × 60o × 1024B` went from 3,566 → 6,255 Mbps (+75%) vs
+pre-coalesce baseline.
+
+### C5: env-gated overflow log
+
+Replace `fprintf(stderr,...)` on RX byte-ring overflow with a
+shared counter + AIOPQUIC_RX_LOG=1 one-shot stderr (libc stdio
+holds a global lock and stalls the picoquic worker under load).
+
+### WT first-touch deduplication (`h3wt_callback.h`)
+
+WT_NEW_STREAM events were being emitted on every `post_data`
+callback (~104 events per real stream at 60 objs/stream). picoquic's
+h3zero only auto-increments `stream_ctx->post_received` for
+POST-method requests (`h3zero_common.c:1350: if (is_post)`), NOT
+for WebTransport path callbacks. We now own this field as a
+first-touch sentinel and set it ourselves after pushing
+WT_NEW_STREAM. Same fix in `post_data` and `post_fin`.
+
+Throughput impact (`bench_wt_split_writes_stress.py` 1000-stream
+SP test): 373 → 1,130 Mbps (+200%, the win was wasted CPU on racing
+collectors spawned per duplicate event).
+
+### `max_data` plumbed through to picoquic transport parameters
+
+`QuicConfiguration.max_data` (default 16 MiB) was unplumbed —
+picoquic's compiled-in default of 1 MiB for `initial_max_data`
+applied, and any MP-loopback workload >1 MiB had its sustained rate
+capped at 1 MiB / RTT by the MAX_DATA roundtrip. Now passed via
+`TransportContext.start(initial_max_data=...)` to `picoquic_tp_t`.
+
+### WT Phase B: per-stream byte ring + drain-driven flow control
+
+The pre-0.3.0 WT data-receive path malloc'd+memcpy'd inline into
+SPSC ring entries and returned 0 to h3zero — picoquic ACKed the
+bytes immediately regardless of the consumer's drain rate. With a
+slow consumer the publisher's MAX_STREAM_DATA window kept opening,
+the kernel UDP socket buffer filled, and packets dropped on the
+wire (visible as thousands of missing streams at sustained 1+ Gbps
+in aiomoqt mp-loopback).
+
+This release migrates WT RX to the same architecture raw QUIC has
+always used:
+
+1. Per-stream `aiopquic_stream_ctx_t` side-table in each WT session
+   (open-addressed hash table, capacity 4096, auto-resize at 50%
+   load, hot-slot cache for sequential access). h3zero owns the
+   stream-ctx slot picoquic provides, so we can't attach via
+   `picoquic_set_app_stream_ctx`; the hash table works around that
+   while keeping lookup O(1) regardless of total streams seen.
+2. `post_data` pushes bytes into `sc->rx`. First-touch opts into
+   app-driven flow control (`picoquic_set_app_flow_control` +
+   initial `picoquic_open_flow_control`); subsequent callbacks
+   extend MAX_STREAM_DATA proportional to `consumed` (hysteresis:
+   extend when consumed + advertise exceeds current credit +
+   advertise/4 — same as raw QUIC).
+3. SPSC events carry a borrowed pointer to the per-stream sc
+   (`data_buf=sc`, `data_length=0`) — new `spsc_ring_push_borrowed`
+   variant; `spsc_ring_pop` only frees `data_buf` when
+   `data_length > 0`.
+4. Cython `drain_rx` recognizes the WT_STREAM_DATA / WT_STREAM_FIN
+   borrowed-pointer events: pop bytes from `sc->rx`,
+   atomic-increment `consumed`. The worker reads `consumed` in the
+   next callback and extends the window.
+
+Result: slow consumer → ring fills → no extension → publisher
+window exhausts → publisher stops sending → backpressure all the
+way to TX pacing. No UDP-buffer-overrun loss possible.
+
+### New stress tests (`tests/bench/bench_wt_split_writes_stress.py`)
+
+- SP and MP variants of the aiomoqt-shape WT split-write pattern
+  (5B header + K × 1024B objects per stream + FIN, at high
+  stream-churn rate).
+- Concurrent-writers MP variant (P=2/4/8 asyncio tasks sharing one
+  WT session) mirrors `PublishedTrack._generate_subgroup`.
+- Sustained-duration MP variant runs at a target rate for a fixed
+  wall-clock window. Holds **1 Gbps × 20s × P=2 with 40,670
+  streams byte-perfect**.
+
+### Verification matrix (this release)
+
+Pre-fix vs post-fix on aiomoqt mp-loopback over WT:
+
+| Rate (Mbps) | parse fails (pre) | parse fails (post) |
+|---|---|---|
+| 250  | 1-2 per run | **0** |
+| 500  | 2          | **0** |
+| 1000 | 4063       | **0** |
+| 1500 | 7130       | **0** |
+| 2000 | many       | **0** |
+
+aiopquic stress suite 27/27 PASS (10 SP/MP WT + 7 raw-QUIC
+split-write + 3 sustained-1Gbps + 7 concurrent-writers). aiopquic
+unit suite 99/99.
+
+### Known limit (deferred)
+
+Per-stream sc allocated in WT Phase B is not yet reclaimed on
+FIN/RESET — bounded for bench runs (~40K × ring-bytes fits in RAM)
+but long-running sessions will leak. Reap-on-FIN needs
+worker/consumer ref-counting; deliberately scoped out to keep the
+byte-flow correctness change isolated.
+
 ## v0.2.7 (2026-05-07)
 
 ### sim_link_bench: protocol-only throughput reference

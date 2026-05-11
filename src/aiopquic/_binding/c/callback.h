@@ -34,11 +34,33 @@
 #define AIOPQUIC_RX_FC_THRESHOLD_DIV 4
 
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+/* Cached AIOPQUIC_RX_LOG env flag — resolved once at first use so the
+ * overflow-diagnostic fprintf paths don't repeatedly hit getenv()
+ * under sustained overflow (libc env lookups are not cheap when fired
+ * from inside the picoquic worker callback). 0=unset, 1=set, -1=not
+ * yet probed. Atomic only to ensure the first-probe write is visible
+ * across threads — there is no correctness issue if two threads race
+ * the probe; both write the same value. */
+static _Atomic(int) _aiopquic_rx_log_cached = -1;
+
+static inline int aiopquic_rx_log_enabled(void) {
+    int v = atomic_load_explicit(&_aiopquic_rx_log_cached,
+                                  memory_order_relaxed);
+    if (v < 0) {
+        const char* s = getenv("AIOPQUIC_RX_LOG");
+        v = (s && *s && *s != '0') ? 1 : 0;
+        atomic_store_explicit(&_aiopquic_rx_log_cached, v,
+                              memory_order_relaxed);
+    }
+    return v;
+}
 
 #ifdef __linux__
 #include <sys/eventfd.h>
@@ -435,7 +457,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
              * lock and stalls the worker thread under load, so the
              * default is silent). */
             ctx->worker_rx_byte_ring_overflow++;
-            if (getenv("AIOPQUIC_RX_LOG")) {
+            if (aiopquic_rx_log_enabled()) {
                 fprintf(stderr,
                     "[aiopquic_rx] stream=%llu RX ring overflow: "
                     "pushed %u of %zu (free=%u, physical_cap=%u, "
@@ -474,7 +496,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         if (has_payload) {
             ctx->worker_rx_event_drops_stream_data++;
         }
-        if (getenv("AIOPQUIC_RX_LOG")
+        if (aiopquic_rx_log_enabled()
                 && ctx->worker_rx_event_drops <= 100) {
             fprintf(stderr,
                 "[aiopquic_rx] EVENT RING FULL: drop "
