@@ -133,8 +133,8 @@ cdef class StreamChain:
             raise ValueError("StreamChain.pull_bytes negative")
         cdef Py_ssize_t avail = self._total - self._pos
         if n > avail:
-            from aiomoqt.messages.base import MOQTUnderflow
-            raise MOQTUnderflow(self._pos, self._pos + n)
+            from aiopquic.exceptions import StreamUnderflow
+            raise StreamUnderflow(self._pos, self._pos + n)
         if n == 0:
             return b""
 
@@ -183,8 +183,8 @@ cdef class StreamChain:
     cpdef int pull_uint8(self) except? -1:
         cdef Py_ssize_t avail = self._total - self._pos
         if avail < 1:
-            from aiomoqt.messages.base import MOQTUnderflow
-            raise MOQTUnderflow(self._pos, self._pos + 1)
+            from aiopquic.exceptions import StreamUnderflow
+            raise StreamUnderflow(self._pos, self._pos + 1)
         cdef _Chunk c = self._chunk_at(self._chunk_idx)
         cdef int b = (<uint8_t*>c.buf.buf)[self._chunk_off]
         self._chunk_off += 1
@@ -206,8 +206,8 @@ cdef class StreamChain:
     cdef long _pull_uint_n(self, Py_ssize_t n) except? -1:
         cdef Py_ssize_t avail = self._total - self._pos
         if n > avail:
-            from aiomoqt.messages.base import MOQTUnderflow
-            raise MOQTUnderflow(self._pos, self._pos + n)
+            from aiopquic.exceptions import StreamUnderflow
+            raise StreamUnderflow(self._pos, self._pos + n)
         cdef _Chunk c = self._chunk_at(self._chunk_idx)
         cdef Py_ssize_t chunk_avail = c.buf.len - self._chunk_off
         cdef uint8_t* p
@@ -250,15 +250,15 @@ cdef class StreamChain:
         """QUIC variable-length integer (RFC 9000 §16)."""
         cdef Py_ssize_t avail = self._total - self._pos
         if avail < 1:
-            from aiomoqt.messages.base import MOQTUnderflow
-            raise MOQTUnderflow(self._pos, self._pos + 1)
+            from aiopquic.exceptions import StreamUnderflow
+            raise StreamUnderflow(self._pos, self._pos + 1)
         cdef _Chunk c = self._chunk_at(self._chunk_idx)
         cdef uint8_t first = (<uint8_t*>c.buf.buf)[self._chunk_off]
         cdef int prefix = first >> 6
         cdef Py_ssize_t nbytes = 1 << prefix  # 1, 2, 4, or 8
         if nbytes > avail:
-            from aiomoqt.messages.base import MOQTUnderflow
-            raise MOQTUnderflow(self._pos, self._pos + nbytes)
+            from aiopquic.exceptions import StreamUnderflow
+            raise StreamUnderflow(self._pos, self._pos + nbytes)
 
         cdef Py_ssize_t chunk_avail = c.buf.len - self._chunk_off
         cdef uint8_t* p
