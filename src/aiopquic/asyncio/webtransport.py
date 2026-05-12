@@ -205,7 +205,9 @@ class WebTransportSession:
         """Async-generator: yield WebTransportStreamDataReceived (and
         any final WebTransportStreamReset) for stream_id, then return
         on FIN or reset."""
-        q = self._stream_inbox.setdefault(stream_id, asyncio.Queue())
+        q = self._stream_inbox.get(stream_id)
+        if q is None:
+            self._stream_inbox[stream_id] = q = asyncio.Queue()
         while True:
             ev = await q.get()
             yield ev
@@ -292,18 +294,24 @@ class WebTransportSession:
             payload = data if data is not None else memoryview(b"")
             ev = WebTransportStreamDataReceived(
                 stream_id=sid, data=payload, end_stream=False)
-            q = self._stream_inbox.setdefault(sid, asyncio.Queue())
+            q = self._stream_inbox.get(sid)
+            if q is None:
+                self._stream_inbox[sid] = q = asyncio.Queue()
             q.put_nowait(ev)
         elif evt_type == _EVT_WT_STREAM_FIN:
             payload = data if data is not None else memoryview(b"")
             ev = WebTransportStreamDataReceived(
                 stream_id=sid, data=payload, end_stream=True)
-            q = self._stream_inbox.setdefault(sid, asyncio.Queue())
+            q = self._stream_inbox.get(sid)
+            if q is None:
+                self._stream_inbox[sid] = q = asyncio.Queue()
             q.put_nowait(ev)
         elif evt_type == _EVT_WT_STREAM_RESET:
             ev = WebTransportStreamReset(stream_id=sid,
                                             error_code=error_code)
-            q = self._stream_inbox.setdefault(sid, asyncio.Queue())
+            q = self._stream_inbox.get(sid)
+            if q is None:
+                self._stream_inbox[sid] = q = asyncio.Queue()
             q.put_nowait(ev)
         elif evt_type == _EVT_WT_STOP_SENDING:
             self._event_queue.put_nowait(
