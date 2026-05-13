@@ -1,5 +1,135 @@
 # Changelog
 
+## v0.3.1 (2026-05-12)
+
+Receiver-side dispatch perf. The 0.3.0 release fixed durability +
+backpressure; 0.3.1 attacks the per-chunk Python dispatch cost that
+was the sustained-rate wall on Ryzen WSL2 (~534 Mbps consumer cap).
+0.3.1 moves the coalescing into Cython: when the picoquic worker
+fires multiple stream_data callbacks for the same stream in quick
+succession, `drain_rx` now drops the redundant no-data SPSC events
+that the C-side per-stream byte ring already absorbed. Net result:
+**87% fewer Python `_on_event` dispatches per session**, 10× lower
+mp-loopback latency, ~3× higher sustained ceiling on the same box.
+
+Sustained verification at this commit (Ryzen WSL2, mp-loopback,
+30 s windows, paired with aiomoqt 0.9.3):
+
+| Target | Delivered | avg lat (0.3.0 / 0.3.1) | Loss |
+|---|---|---|---|
+|  250 Mbps |  250 Mbps |  32 ms / **3.9 ms**  | 0 |
+|  500 Mbps |  506 Mbps | 567 ms / **8 ms**    | 0 |
+|  980 Mbps |  987 Mbps | 3938 ms / **65 ms**  | 0 |
+| 1500 Mbps | 1.3-1.4 Gbps | — / ~150 ms       | 0 |
+
+Cross-platform sanity on argo (Apple M4, 4P+6E, native macOS — no
+WSL vSwitch overhead):
+
+| Target | Tx | Rx | avg lat |
+|---|---|---|---|
+| 250 Mbps  | 253 Mbps  | 261 Mbps  | **0.5–0.9 ms** |
+| 500 Mbps  | 506 Mbps  | 526 Mbps  | **1–2 ms**     |
+
+Sub-millisecond MoQT delivery on native macOS at quarter-Gbps was
+not previously visible — WSL2's UDP loopback floor (3.2 Gbps with
+~1.5 ms native syscall cost) was masking it.
+
+### Cython drain_rx coalescing (the big one)
+
+`drain_rx` already pops ALL bytes available in `sc->rx` on the
+FIRST event it sees for a stream this cycle. Subsequent SPSC
+events for the same stream therefore find `avail == 0` and emit
+events with `data=None` — pure dispatch waste that Python had to
+walk through. 0.3.1 drops those no-data DATA events in Cython
+before they reach Python. FIN events still emit unconditionally
+(they carry end-of-stream regardless of data presence).
+
+Common path: applies to both raw-QUIC `SPSC_EVT_STREAM_DATA` and
+WT `SPSC_EVT_WT_STREAM_DATA`.
+
+cProfile diff on 30 s aiomoqt subscriber @ 250 Mbps mp-loopback:
+
+| metric                        |    0.3.0 |   0.3.1 | delta  |
+|-------------------------------|---------:|--------:|-------:|
+| total function calls          |   55.7 M |  31.4 M | -44%   |
+| `_on_event` (aiopquic) calls  |  1,459 K |   186 K | -87%   |
+| `_on_event` (aiomoqt) calls   |  1,459 K |   186 K | -87%   |
+| `put_nowait` calls            |  1,567 K |   357 K | -77%   |
+| `_on_event` self-time         |   3.09 s |  0.38 s | -88%   |
+
+`drain_rx` is now spending its time on actual payload deliveries
+instead of shuttling empty events. Receiver ceiling on Ryzen WSL2
+moved from ~534 Mbps to ~1.4 Gbps (the new wall is single-Python-
+process receive CPU, not dispatch).
+
+### WT `setdefault(sid, asyncio.Queue())` allocation bug
+
+`dict.setdefault(key, default)` evaluates its default every call,
+even when the key is present. The four WT event dispatch sites
+that used `self._stream_inbox.setdefault(sid, asyncio.Queue())`
+were therefore allocating a fresh asyncio.Queue (plus its
+internal asyncio.Lock) on every inbound WT event — 1.46 M wasted
+allocations per 30 s session at 250 Mbps. After fix: 30.8 K
+allocations (only the genuine new-stream cases).
+
+Replaced with explicit `get` + create-if-None at 4 sites
+(`receive_stream_data`, `_EVT_WT_STREAM_DATA`, `_EVT_WT_STREAM_FIN`,
+`_EVT_WT_STREAM_RESET`). Raw QUIC path doesn't use this idiom — no
+equivalent fix needed.
+
+### `WT-Available-Protocols` plumbing (WebTransport subprotocols)
+
+The WT CONNECT request constructed by aiopquic previously hardcoded
+`NULL` for picoquic's `wt_available_protocols` argument, so clients
+had no way to advertise subprotocols in the WebTransport handshake.
+This broke MoQT-over-WT version negotiation per moq-transport-16 §3.1
+("MOQT uses ALPN in QUIC and `WT-Available-Protocols` in WebTransport
+to perform version negotiation"): moxygen-based relays could not see
+the offered protocol set, fell back to legacy CLIENT_SETUP version-
+array parsing, and rejected the connection. Discovered 2026-05-13
+when basic adaptive_bench WT → mvfst (test.moqx.akaleapi.net) was
+broken in 0.9.x but fine in 0.8.2 (qh3 silently masked the missing
+header in the prior transport).
+
+The fix:
+
+- `WebTransportClient.__init__` accepts `wt_available_protocols:
+  list[str] | None`. Stored on the session; opaque list of
+  subprotocol identifiers — aiopquic does no interpretation.
+- `connect_webtransport(...)` forwards the same kwarg.
+- `WebTransportClient.open()` SF-list-formats the list per RFC 9651
+  (each value double-quoted, comma-joined) before push_open, since
+  picoquic copies the value verbatim into the QPACK literal — it
+  does not do Structured Fields formatting on its side.
+- `aiopquic_wt_open_params_t` (the SPSC payload) gets a
+  `protocols_len: uint16_t`; bytes packed after the path block.
+- C-side TX_WT_OPEN handler unpacks the protocols string and passes
+  it to `picowt_connect` instead of NULL. Empty list still passes
+  NULL (no header on the wire).
+
+Layer-clean: aiopquic stays MoQT-agnostic. The string the caller
+hands us goes on the wire verbatim. aiomoqt (0.9.3) is the one
+that decides what to advertise based on its draft.
+
+### `aiopquic.exceptions.StreamUnderflow` (layer cleanup)
+
+`StreamChain` previously did `from aiomoqt.messages.base import
+MOQTUnderflow` inline in `pull_*` helpers — a transport-layer
+module importing from an upper-layer protocol library. New
+`aiopquic.exceptions.StreamUnderflow` exception (same `(pos,
+needed)` shape) replaces those raises. Aiomoqt 0.9.3 aliases
+`MOQTUnderflow = StreamUnderflow` so existing `except` sites in
+that layer keep working unchanged. No upward imports remain in
+aiopquic.
+
+### Compatibility
+
+- `aiopquic.exceptions.StreamUnderflow` is the canonical exception
+  raised by `StreamChain.pull_*` going forward. Callers that
+  imported `MOQTUnderflow` from `aiomoqt.messages.base` still
+  catch the same exception (alias).
+- No ABI/protocol/wire change. Wire-level behaviour identical to 0.3.0.
+
 ## v0.3.0 (2026-05-11)
 
 Receiver-side durability + WT backpressure. The 0.2.x WT path
