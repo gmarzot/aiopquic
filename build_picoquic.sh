@@ -38,6 +38,31 @@ if [ ! -f "${PICOTLS_DIR}/CMakeLists.txt" ]; then
     exit 1
 fi
 
+# --- Apply local picoquic patches (PRs not merged upstream yet) ---
+# Patches live in patches/picoquic-*.patch and are applied to the
+# vendored submodule before cmake. Skipped when AIOPQUIC_SKIP_PATCHES=1.
+# Idempotent: `git apply --check` is used to detect already-applied
+# patches and skip them, so re-running this script is safe.
+PATCH_DIR="${SCRIPT_DIR}/patches"
+if [ "${AIOPQUIC_SKIP_PATCHES:-0}" = "1" ]; then
+    echo -e "${COLOR_GREEN}AIOPQUIC_SKIP_PATCHES=1: skipping patch application${COLOR_OFF}"
+elif [ -d "${PATCH_DIR}" ]; then
+    shopt -s nullglob
+    for patch in "${PATCH_DIR}"/*.patch; do
+        name="$(basename "${patch}")"
+        if git -C "${PICOQUIC_DIR}" apply --check "${patch}" >/dev/null 2>&1; then
+            echo -e "${COLOR_GREEN}applying ${name}${COLOR_OFF}"
+            git -C "${PICOQUIC_DIR}" apply "${patch}"
+        elif git -C "${PICOQUIC_DIR}" apply --check --reverse "${patch}" >/dev/null 2>&1; then
+            echo -e "${COLOR_GREEN}${name}: already applied (skipping)${COLOR_OFF}"
+        else
+            echo -e "${COLOR_RED}${name}: cannot apply cleanly AND not already applied — likely upstream-merged or conflicts; remove the patch if so${COLOR_OFF}" >&2
+            exit 1
+        fi
+    done
+    shopt -u nullglob
+fi
+
 # --- Locate OpenSSL (Homebrew on macOS, system on Linux) ---
 CMAKE_OPENSSL_ARGS=()
 if [ -z "${OPENSSL_ROOT_DIR:-}" ] && [ "$(uname -s)" = "Darwin" ]; then
