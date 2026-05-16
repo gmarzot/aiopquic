@@ -61,11 +61,12 @@ class TestTransportLifecycle:
         assert ctx.eventfd >= 0
         ctx.stop()
 
-    def test_wake_up_without_start_raises(self):
-        """wake_up before start should raise RuntimeError."""
+    def test_wake_up_without_start_is_noop(self):
+        """wake_up before start is a no-op (teardown-race friendly).
+        Originally raised RuntimeError; changed in perf-0.3.2 so the
+        Phase-7 push_* callers don't crash when transport is stopping."""
         ctx = TransportContext()
-        with pytest.raises(RuntimeError, match="not started"):
-            ctx.wake_up()
+        assert ctx.wake_up() is None
 
     def test_wake_up_after_start(self):
         """wake_up should succeed when the thread is running."""
