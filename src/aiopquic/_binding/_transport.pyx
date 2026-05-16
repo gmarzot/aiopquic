@@ -13,6 +13,9 @@ Re-enable freethreading_compatible once the per-context locking audit
 covers TX entry points and the WT TX dispatch path.
 """
 
+import os
+import sys
+
 from cpython.buffer cimport PyBuffer_FillInfo
 from cpython.bytes cimport PyBytes_AsString, PyBytes_FromStringAndSize
 from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t, uintptr_t
@@ -1129,15 +1132,36 @@ cdef class TransportContext:
         # streams disappear. 16 MiB matches the typical TCP autotune
         # ceiling and is plenty for sustained loopback.
         self._param.socket_buffer_size = 64 * 1024 * 1024
-        self._param.do_not_use_gso = 0
         self._param.extra_socket_required = 0
         self._param.prefer_extra_socket = 0
-        # Max GSO segment size on Linux. picoquic batches up to this
-        # many bytes per sendmmsg-style send; 65535 caps at one UDP
-        # datagram of the largest stride the kernel will accept. Free
-        # win for high-pps workloads — 0 leaves picoquic's default
-        # (smaller batch, more syscalls).
-        self._param.send_length_max = 65535
+        # GSO + max-send-length defaults are platform-specific. The
+        # send_length_max field changes meaning depending on
+        # do_not_use_gso:
+        #   GSO on (Linux):  send_length_max caps the kernel-coalesced
+        #     buffer size for UDP segmentation offload. 65535 = max
+        #     stride; kernel splits into individual QUIC packets. Big
+        #     win at high pps — fewer sendmmsg syscalls.
+        #   GSO off (macOS, FreeBSD): send_length_max becomes the
+        #     max size of a single UDP datagram passed to sendmsg.
+        #     macOS net.inet.udp.maxdgram defaults to 9216 so anything
+        #     larger hits EMSGSIZE. lo0 MTU is 16384.
+        # Defaults: Linux gets GSO + 65535; Darwin gets GSO off +
+        # picoquic's default (0). Env vars AIOPQUIC_GSO and
+        # AIOPQUIC_SEND_LENGTH_MAX override either side.
+        cdef bint _darwin = sys.platform == "darwin"
+        cdef int _gso_default = 0 if _darwin else 1
+        cdef size_t _slm_default = 0 if _darwin else 65535
+        _gso_env = os.environ.get("AIOPQUIC_GSO")
+        if _gso_env is not None:
+            _gso_default = 0 if _gso_env in ("0", "false", "False") else 1
+        _slm_env = os.environ.get("AIOPQUIC_SEND_LENGTH_MAX")
+        if _slm_env is not None:
+            try:
+                _slm_default = <size_t>int(_slm_env)
+            except (TypeError, ValueError):
+                pass
+        self._param.do_not_use_gso = 0 if _gso_default else 1
+        self._param.send_length_max = _slm_default
 
         # Start the network thread
         cdef int ret = 0
