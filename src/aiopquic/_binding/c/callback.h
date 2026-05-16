@@ -646,15 +646,20 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     }
                     case SPSC_EVT_TX_CLOSE: {
-                        /* picoquic_close on an already-disconnecting
-                         * cnx hits picoquic_reinsert_by_wake_time on a
-                         * wake-list that was torn down by the original
-                         * close -> UAF on the worker thread. Skip when
-                         * cnx is already past picoquic_state_ready: the
-                         * peer's CLOSE_CONNECTION has already started
-                         * teardown and our app's close() is redundant. */
-                        picoquic_state_enum st = picoquic_get_cnx_state(cnx);
-                        if (st < picoquic_state_disconnecting) {
+                        /* The cnx pointer here may be stale: the peer's
+                         * CLOSE_CONNECTION can land + free the cnx
+                         * between the Python push of TX_CLOSE and our
+                         * pop. Dereferencing it (even to read state)
+                         * UAFs at picoquic_close+0x1c (the cnx->quic
+                         * load on the first line). Walk picoquic's
+                         * live-cnx list to confirm before calling. */
+                        picoquic_cnx_t* cur = picoquic_get_first_cnx(quic);
+                        int alive = 0;
+                        while (cur) {
+                            if (cur == cnx) { alive = 1; break; }
+                            cur = picoquic_get_next_cnx(cur);
+                        }
+                        if (alive) {
                             picoquic_close(cnx, entry->error_code);
                         }
                         spsc_ring_pop(ctx->tx_ring);
