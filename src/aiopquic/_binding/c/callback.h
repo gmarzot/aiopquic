@@ -646,7 +646,17 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     }
                     case SPSC_EVT_TX_CLOSE: {
-                        picoquic_close(cnx, entry->error_code);
+                        /* picoquic_close on an already-disconnecting
+                         * cnx hits picoquic_reinsert_by_wake_time on a
+                         * wake-list that was torn down by the original
+                         * close -> UAF on the worker thread. Skip when
+                         * cnx is already past picoquic_state_ready: the
+                         * peer's CLOSE_CONNECTION has already started
+                         * teardown and our app's close() is redundant. */
+                        picoquic_state_enum st = picoquic_get_cnx_state(cnx);
+                        if (st < picoquic_state_disconnecting) {
+                            picoquic_close(cnx, entry->error_code);
+                        }
                         spsc_ring_pop(ctx->tx_ring);
                         break;
                     }
