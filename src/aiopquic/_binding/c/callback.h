@@ -344,6 +344,33 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             if (buf && to_send > 0) {
                 aiopquic_stream_buf_pop(sb, buf, to_send);
                 ctx->worker_prepare_to_send_pulled_bytes += to_send;
+                /* Edge-trigger TX backpressure: if a Python writer
+                 * was blocked (set tx_drain_pending=1 after seeing
+                 * sc->tx full), CAS-clear and emit one SPSC event
+                 * so it can wake and retry. Single-shot per cycle —
+                 * only the CAS winner pushes the event. */
+                uint32_t expected = 1;
+                if (atomic_compare_exchange_strong_explicit(
+                        &sc->tx_drain_pending, &expected, 0,
+                        memory_order_acq_rel, memory_order_relaxed)) {
+                    spsc_entry_t drain_entry = {0};
+                    drain_entry.event_type = SPSC_EVT_STREAM_TX_DRAINED;
+                    drain_entry.stream_id = stream_id;
+                    drain_entry.cnx = cnx;
+                    drain_entry.stream_ctx = sc;
+                    if (spsc_ring_push(ctx->rx_ring,
+                                       &drain_entry, NULL, 0) == 0) {
+                        aiopquic_notify_rx(ctx);
+                    } else {
+                        /* RX ring full — re-arm so Python re-attempts
+                         * once it drains; the worker will retry next
+                         * prepare_to_send. Better than losing the
+                         * wakeup. */
+                        atomic_store_explicit(
+                            &sc->tx_drain_pending, 1,
+                            memory_order_release);
+                    }
+                }
             }
             return 0;
         }

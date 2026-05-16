@@ -28,12 +28,14 @@ Save/rollback/commit semantics:
 
 from collections import deque
 
-from cpython.bytes cimport PyBytes_FromStringAndSize
+from cpython.bytes cimport (
+    PyBytes_AsString, PyBytes_FromStringAndSize,
+)
 from cpython.buffer cimport (
     PyObject_GetBuffer, PyBuffer_Release, Py_buffer,
     PyBUF_SIMPLE,
 )
-from libc.stdint cimport uint8_t
+from libc.stdint cimport uint8_t, uint64_t
 from libc.string cimport memcpy
 
 
@@ -364,6 +366,76 @@ cdef class StreamChain:
         self._save_chunk_off = 0
         self._save_pos = 0
 
+    # --- subgroup-stream object body parse ------------------------
+
+    cpdef object parse_object_subgroup(self,
+                                       bint extensions_present,
+                                       Py_ssize_t exts_len_limit):
+        """Parse one subgroup-stream object body in Cython.
+
+        Body format (common to d14/d16/d18+):
+            delta varint
+            extensions block (only if extensions_present):
+                ext_block_len varint
+                <ext_id varint, value>* where
+                    ext_id even -> value is uint_var
+                    ext_id odd  -> value is len-prefixed bytes
+            payload_len varint
+            if payload_len == 0: status varint
+            else: payload bytes
+
+        Returns tuple (object_id_delta, exts_or_None, status, payload).
+        Underflow propagates StreamUnderflow; caller's chain.save() /
+        rollback() at the outer level resets the cursor. Framer desync
+        (ext_len > exts_len_limit) raises RuntimeError.
+        """
+        cdef object delta = self.pull_uint_var()
+        cdef object exts = None
+        cdef object ext_id
+        cdef object ext_value
+        cdef object exts_len_obj
+        cdef Py_ssize_t exts_len
+        cdef Py_ssize_t exts_end
+        cdef object value_len_obj
+        cdef Py_ssize_t value_len
+        cdef object payload_len_obj
+        cdef Py_ssize_t payload_len
+        cdef object status
+        cdef object payload
+
+        if extensions_present:
+            exts_len_obj = self.pull_uint_var()
+            exts_len = <Py_ssize_t>exts_len_obj
+            if exts_len > exts_len_limit:
+                raise RuntimeError(
+                    f"framer desync: ext_len={exts_len} exceeds "
+                    f"limit {exts_len_limit}"
+                )
+            if exts_len > 0:
+                exts_end = self._pos + exts_len
+                exts = {}
+                while self._pos < exts_end:
+                    ext_id = self.pull_uint_var()
+                    if not (ext_id & 1):
+                        ext_value = self.pull_uint_var()
+                    else:
+                        value_len_obj = self.pull_uint_var()
+                        value_len = <Py_ssize_t>value_len_obj
+                        ext_value = self.pull_bytes(value_len)
+                    exts[ext_id] = ext_value
+                if not exts:
+                    exts = None
+
+        payload_len_obj = self.pull_uint_var()
+        payload_len = <Py_ssize_t>payload_len_obj
+        if payload_len == 0:
+            status = self.pull_uint_var()
+            payload = b""
+        else:
+            payload = self.pull_bytes(payload_len)
+            status = 0  # ObjectStatus.NORMAL — caller maps int -> enum
+        return (delta, exts, status, payload)
+
     # --- data_slice -----------------------------------------------
 
     def data_slice(self, Py_ssize_t start, Py_ssize_t end):
@@ -430,3 +502,137 @@ cdef class StreamChain:
         self._chunk_idx = total_chunks
         self._chunk_off = 0
         self._pos = pos
+
+
+# --- subgroup-stream object body encode ---------------------------
+#
+# Symmetric counterpart to StreamChain.parse_object_subgroup. Builds the
+# wire bytes for one object body in a single Cython call — eliminates
+# the per-object ObjectHeader + Buffer allocations and the Python-frame
+# cost of _extensions_encode + serialize on the publisher hot path.
+
+cdef inline Py_ssize_t _varint_size(uint64_t v):
+    if v < 64:
+        return 1
+    elif v < 16384:
+        return 2
+    elif v < 1073741824:
+        return 4
+    else:
+        return 8
+
+
+cdef inline Py_ssize_t _varint_write(uint8_t* dst, uint64_t v):
+    if v < 64:
+        dst[0] = <uint8_t>v
+        return 1
+    elif v < 16384:
+        dst[0] = <uint8_t>((v >> 8) | 0x40)
+        dst[1] = <uint8_t>(v & 0xff)
+        return 2
+    elif v < 1073741824:
+        dst[0] = <uint8_t>((v >> 24) | 0x80)
+        dst[1] = <uint8_t>((v >> 16) & 0xff)
+        dst[2] = <uint8_t>((v >> 8) & 0xff)
+        dst[3] = <uint8_t>(v & 0xff)
+        return 4
+    else:
+        dst[0] = <uint8_t>((v >> 56) | 0xc0)
+        dst[1] = <uint8_t>((v >> 48) & 0xff)
+        dst[2] = <uint8_t>((v >> 40) & 0xff)
+        dst[3] = <uint8_t>((v >> 32) & 0xff)
+        dst[4] = <uint8_t>((v >> 24) & 0xff)
+        dst[5] = <uint8_t>((v >> 16) & 0xff)
+        dst[6] = <uint8_t>((v >> 8) & 0xff)
+        dst[7] = <uint8_t>(v & 0xff)
+        return 8
+
+
+cpdef bytes encode_object_subgroup(
+    object delta, object exts, int status,
+    bytes payload, bint extensions_present):
+    """Build one subgroup-stream object body in Cython.
+
+    Wire format (common to d14/d16/d18+):
+        delta varint
+        if extensions_present: ext_block_len varint + <ext_id, value>*
+            ext_id even -> value varint
+            ext_id odd  -> len-prefixed bytes
+        if status == 0 (NORMAL) and payload non-empty:
+            payload_len varint + payload bytes
+        else:
+            payload_len=0 varint + status varint
+        Per spec: extensions are written only on NORMAL-with-payload
+        objects; non-NORMAL/empty objects carry an empty ext block.
+
+    Args:
+        delta: object_id - prev_object_id - 1 (or object_id for first obj)
+        exts: dict[int, int|bytes] or None
+        status: int (0 = NORMAL; caller maps ObjectStatus -> int)
+        payload: bytes
+        extensions_present: bool
+
+    Returns: bytes ready to push on the stream (concatenated wire form).
+    """
+    cdef uint64_t delta_v = <uint64_t>delta
+    cdef Py_ssize_t payload_len = <Py_ssize_t>len(payload)
+    cdef Py_ssize_t total_size = 0
+    cdef Py_ssize_t ext_block_size = 0
+    cdef Py_ssize_t value_len
+    cdef bint write_exts
+    cdef object ext_id
+    cdef object ext_value
+    cdef uint64_t ext_id_v
+    cdef uint64_t v_v
+
+    write_exts = extensions_present and status == 0 and exts is not None
+
+    total_size += _varint_size(delta_v)
+    if extensions_present:
+        if write_exts:
+            for ext_id, ext_value in exts.items():
+                ext_id_v = <uint64_t>ext_id
+                ext_block_size += _varint_size(ext_id_v)
+                if not (ext_id_v & 1):
+                    ext_block_size += _varint_size(<uint64_t>ext_value)
+                else:
+                    value_len = <Py_ssize_t>len(ext_value)
+                    ext_block_size += (
+                        _varint_size(<uint64_t>value_len) + value_len)
+        total_size += _varint_size(<uint64_t>ext_block_size) + ext_block_size
+
+    if status == 0 and payload_len > 0:
+        total_size += _varint_size(<uint64_t>payload_len) + payload_len
+    else:
+        total_size += _varint_size(0) + _varint_size(<uint64_t>status)
+
+    cdef bytes out = PyBytes_FromStringAndSize(NULL, total_size)
+    cdef uint8_t* p = <uint8_t*>PyBytes_AsString(out)
+    cdef Py_ssize_t off = 0
+
+    off += _varint_write(p + off, delta_v)
+    if extensions_present:
+        off += _varint_write(p + off, <uint64_t>ext_block_size)
+        if write_exts:
+            for ext_id, ext_value in exts.items():
+                ext_id_v = <uint64_t>ext_id
+                off += _varint_write(p + off, ext_id_v)
+                if not (ext_id_v & 1):
+                    off += _varint_write(p + off, <uint64_t>ext_value)
+                else:
+                    value_len = <Py_ssize_t>len(ext_value)
+                    off += _varint_write(p + off, <uint64_t>value_len)
+                    memcpy(p + off,
+                           <const char*>PyBytes_AsString(ext_value),
+                           value_len)
+                    off += value_len
+
+    if status == 0 and payload_len > 0:
+        off += _varint_write(p + off, <uint64_t>payload_len)
+        memcpy(p + off, <const char*>PyBytes_AsString(payload), payload_len)
+        off += payload_len
+    else:
+        off += _varint_write(p + off, 0)
+        off += _varint_write(p + off, <uint64_t>status)
+
+    return out

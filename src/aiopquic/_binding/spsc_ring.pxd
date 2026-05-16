@@ -19,6 +19,7 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_PATH_SUSPENDED
         SPSC_EVT_PATH_DELETED
         SPSC_EVT_PACING_CHANGED
+        SPSC_EVT_STREAM_TX_DRAINED
         SPSC_EVT_TX_STREAM_DATA
         SPSC_EVT_TX_STREAM_FIN
         SPSC_EVT_TX_DATAGRAM

@@ -26,6 +26,7 @@ from aiopquic._binding.spsc_ring cimport (
     spsc_ring_take_data,
     spsc_entry_t,
     SPSC_EVT_STREAM_DATA, SPSC_EVT_STREAM_FIN,
+    SPSC_EVT_STREAM_TX_DRAINED,
     SPSC_EVT_STREAM_RESET, SPSC_EVT_STOP_SENDING,
     SPSC_EVT_CLOSE, SPSC_EVT_APP_CLOSE,
     SPSC_EVT_READY, SPSC_EVT_ALMOST_READY,
@@ -160,10 +161,14 @@ cdef extern from "picoquic_packet_loop.h":
         unsigned short local_port
         int local_af
         int dest_if
+        unsigned short public_port
+        int is_port_shared
         int socket_buffer_size
         int do_not_use_gso
         int extra_socket_required
         int prefer_extra_socket
+        int simulate_eio
+        size_t send_length_max
 
     ctypedef int (*picoquic_packet_loop_cb_fn)(
         picoquic_quic_t* quic, int cb_mode,
@@ -682,6 +687,94 @@ cdef class TransportContext:
         aiopquic_clear_rx(self._ctx)
         return events
 
+    def drain_rx_callback(self, handler, int max_events=256):
+        """Drain events and call handler() per entry — zero list/tuple
+        allocation compared with drain_rx.
+
+        handler is a callable invoked per ring entry as:
+            handler(evt_type, stream_id, data, is_fin, error_code,
+                    cnx_ptr, stream_ctx_ptr)
+
+        Returns the number of entries drained. Same per-entry semantics
+        as drain_rx (StreamChunk memoryview construction, byte-ring pop,
+        rx_consumed advance, no-data coalescing). Use this when the
+        caller appends directly to its own event list — skips the
+        intermediate list-of-tuples that drain_rx builds.
+        """
+        cdef int i
+        cdef int count = 0
+        cdef spsc_entry_t* entry
+        cdef void* buf
+        cdef Py_ssize_t length
+        cdef aiopquic_stream_ctx_t* sc
+        cdef aiopquic_stream_buf_t* rx_sb
+        cdef uint32_t avail
+        for i in range(max_events):
+            entry = spsc_ring_peek(self._ctx.rx_ring)
+            if entry is NULL:
+                break
+
+            data = None
+            if entry.data_length > 0 and entry.data_buf is not NULL:
+                length = entry.data_length
+                buf = spsc_ring_take_data(entry)
+                data = memoryview(StreamChunk._wrap(buf, length))
+            elif (entry.event_type == SPSC_EVT_STREAM_DATA or
+                  entry.event_type == SPSC_EVT_STREAM_FIN) and \
+                  entry.stream_ctx is not NULL:
+                sc = <aiopquic_stream_ctx_t*>entry.stream_ctx
+                rx_sb = sc.rx
+                if rx_sb is not NULL:
+                    avail = aiopquic_stream_buf_used(rx_sb)
+                    if avail > 0:
+                        length = avail
+                        buf = malloc(<size_t>length)
+                        if buf is not NULL:
+                            aiopquic_stream_buf_pop(
+                                rx_sb, <uint8_t*>buf, <uint32_t>length)
+                            data = memoryview(
+                                StreamChunk._wrap(buf, length))
+                            aiopquic_stream_ctx_rx_consumed_add(
+                                sc, <uint64_t>length)
+            elif (entry.event_type == SPSC_EVT_WT_STREAM_DATA or
+                  entry.event_type == SPSC_EVT_WT_STREAM_FIN) and \
+                  entry.data_buf is not NULL and entry.data_length == 0:
+                sc = <aiopquic_stream_ctx_t*>entry.data_buf
+                rx_sb = sc.rx
+                if rx_sb is not NULL:
+                    avail = aiopquic_stream_buf_used(rx_sb)
+                    if avail > 0:
+                        length = avail
+                        buf = malloc(<size_t>length)
+                        if buf is not NULL:
+                            aiopquic_stream_buf_pop(
+                                rx_sb, <uint8_t*>buf, <uint32_t>length)
+                            data = memoryview(
+                                StreamChunk._wrap(buf, length))
+                            aiopquic_stream_ctx_rx_consumed_add(
+                                sc, <uint64_t>length)
+
+            if (data is None and
+                (entry.event_type == SPSC_EVT_STREAM_DATA or
+                 entry.event_type == SPSC_EVT_WT_STREAM_DATA)):
+                spsc_ring_pop(self._ctx.rx_ring)
+                continue
+
+            handler(
+                entry.event_type,
+                entry.stream_id,
+                data,
+                entry.is_fin,
+                entry.error_code,
+                <uintptr_t>entry.cnx,
+                <uintptr_t>entry.stream_ctx,
+            )
+            spsc_ring_pop(self._ctx.rx_ring)
+            count += 1
+
+        aiopquic_clear_rx(self._ctx)
+        return count
+
     def push_tx(self, uint32_t event_type, uint64_t stream_id,
                 bytes data=None, uint64_t error_code=0,
                 uintptr_t cnx_ptr=0, uintptr_t stream_ctx=0,
@@ -1039,6 +1132,12 @@ cdef class TransportContext:
         self._param.do_not_use_gso = 0
         self._param.extra_socket_required = 0
         self._param.prefer_extra_socket = 0
+        # Max GSO segment size on Linux. picoquic batches up to this
+        # many bytes per sendmmsg-style send; 65535 caps at one UDP
+        # datagram of the largest stride the kernel will accept. Free
+        # win for high-pps workloads — 0 leaves picoquic's default
+        # (smaller batch, more syscalls).
+        self._param.send_length_max = 65535
 
         # Start the network thread
         cdef int ret = 0
@@ -1071,9 +1170,14 @@ cdef class TransportContext:
         return self._thread_ctx.thread_is_ready != 0
 
     def wake_up(self):
-        """Signal the network thread to process TX ring entries."""
+        """Signal the network thread to process TX ring entries.
+
+        No-op when the network thread is stopped — teardown is a normal
+        state for unsynchronized push_* callers (e.g. subgroup-task
+        cancel handlers firing after the transport has shut down).
+        """
         if self._thread_ctx is NULL:
-            raise RuntimeError("Network thread not started")
+            return
         cdef int ret = picoquic_wake_up_network_thread(self._thread_ctx)
         if ret != 0:
             raise RuntimeError(f"Failed to wake network thread (ret={ret})")

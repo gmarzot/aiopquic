@@ -70,6 +70,16 @@ if [ -n "${PICOQUIC_C_FLAGS}" ]; then
     CMAKE_FLAG_ARGS+=("-DCMAKE_C_FLAGS_RELEASE=${PICOQUIC_C_FLAGS}")
 fi
 
+# Optional: enable io_uring submission for high-pps Linux workloads
+# (10-30% improvement on packet-rate-limited paths). Requires
+# liburing-dev on the build host. Default OFF — opt-in to keep wheel
+# builds platform-portable.
+PICOQUIC_IO_URING_ARGS=()
+if [ "${AIOPQUIC_IO_URING:-0}" = "1" ]; then
+    echo -e "${COLOR_GREEN}AIOPQUIC_IO_URING=1: enabling -DWITH_IO_URING=ON${COLOR_OFF}"
+    PICOQUIC_IO_URING_ARGS+=("-DWITH_IO_URING=ON")
+fi
+
 echo -e "${COLOR_GREEN}Building picotls from ${PICOTLS_DIR}...${COLOR_OFF}"
 mkdir -p "${PTLS_BUILD_DIR}"
 cmake -S "${PICOTLS_DIR}" -B "${PTLS_BUILD_DIR}" \
@@ -117,7 +127,8 @@ cmake -S "${PICOQUIC_DIR}" -B "${BUILD_DIR}" \
     -DPTLS_OPENSSL_LIBRARY="${PTLS_OPENSSL_LIB}" \
     -DPTLS_MINICRYPTO_LIBRARY="${PTLS_MINICRYPTO_LIB}" \
     ${CMAKE_FLAG_ARGS[@]+"${CMAKE_FLAG_ARGS[@]}"} \
-    ${CMAKE_OPENSSL_ARGS[@]+"${CMAKE_OPENSSL_ARGS[@]}"}
+    ${CMAKE_OPENSSL_ARGS[@]+"${CMAKE_OPENSSL_ARGS[@]}"} \
+    ${PICOQUIC_IO_URING_ARGS[@]+"${PICOQUIC_IO_URING_ARGS[@]}"}
 
 cmake --build "${BUILD_DIR}" -j "${NPROC}" --target picoquic-core picohttp-core picoquic-log
 cmake --build "${BUILD_DIR}" -j "${NPROC}" --target picoquic_ct picohttp_ct

@@ -4,6 +4,7 @@ Wraps TransportContext (Cython/picoquic) and translates SPSC ring
 events into QuicEvent objects that match qh3's event interface.
 """
 
+import asyncio
 import os
 from enum import IntEnum
 
@@ -42,6 +43,7 @@ _EVT_APP_CLOSE = 5
 _EVT_READY = 6
 _EVT_ALMOST_READY = 7
 _EVT_DATAGRAM = 8
+_EVT_STREAM_TX_DRAINED = 15
 
 # TX event types
 _TX_STREAM_DATA = 128
@@ -126,6 +128,12 @@ class QuicConnection:
         # Destroyed via lifecycle hooks (Landing C); for now leak until
         # process exit to avoid use-after-free with the picoquic worker.
         self._stream_ctxs: dict[int, int] = {}
+        # Per-stream "sc->tx drained" events for event-driven TX
+        # backpressure. Set by _handle_raw_event when the picoquic
+        # worker fires SPSC_EVT_STREAM_TX_DRAINED for a stream;
+        # awaited by aiomoqt's stream_write_drain on BufferError.
+        # Lazy-created on first reference from either side.
+        self._stream_tx_drain_events: dict[int, asyncio.Event] = {}
 
     @property
     def configuration(self) -> QuicConfiguration:
@@ -206,73 +214,101 @@ class QuicConnection:
     def _drain_and_convert(self) -> None:
         """Drain SPSC ring and convert to QuicEvent objects.
 
-        For STREAM_DATA / STREAM_FIN events on streams owned by an
-        aiopquic_stream_ctx_t wrapper, drain_rx() has already popped
-        the bytes from the wrapper's RX ring into `data` AND atomically
-        advanced sc->rx_consumed. The picoquic worker reads that
-        counter on its next stream_data callback for the same stream
-        and extends MAX_STREAM_DATA accordingly — backpressure is a
-        side effect of the worker's own packet processing, no Python-
-        side dispatch needed."""
+        Routes through the Cython `drain_rx_callback` so per-entry
+        events are appended directly to `self._events` without the
+        intermediate list-of-tuples that drain_rx() builds.
+        """
         if self._transport is None:
             return
-        raw_events = self._transport.drain_rx()
-        for (evt_type, stream_id, data, is_fin, error_code,
-             cnx_ptr, _stream_ctx_ptr) in raw_events:
-            if evt_type == _EVT_STREAM_DATA or evt_type == _EVT_STREAM_FIN:
-                if _stream_ctx_ptr and stream_id not in self._stream_ctxs:
-                    self._stream_ctxs[stream_id] = _stream_ctx_ptr
-                self._events.append(StreamDataReceived(
-                    stream_id=stream_id,
-                    data=data if data is not None else memoryview(b""),
-                    end_stream=(evt_type == _EVT_STREAM_FIN),
+        self._transport.drain_rx_callback(self._handle_raw_event)
+
+    def _handle_raw_event(self, evt_type, stream_id, data, is_fin,
+                          error_code, cnx_ptr, _stream_ctx_ptr) -> None:
+        """Per-entry handler invoked from drain_rx_callback.
+
+        For STREAM_DATA / STREAM_FIN events on streams owned by an
+        aiopquic_stream_ctx_t wrapper, the Cython side has already
+        popped bytes from the wrapper's RX ring into `data` AND
+        atomically advanced sc->rx_consumed. The picoquic worker reads
+        that counter on its next stream_data callback for the same
+        stream and extends MAX_STREAM_DATA — backpressure is a side
+        effect of worker packet processing, no Python dispatch needed.
+        """
+        if evt_type == _EVT_STREAM_DATA or evt_type == _EVT_STREAM_FIN:
+            if _stream_ctx_ptr and stream_id not in self._stream_ctxs:
+                self._stream_ctxs[stream_id] = _stream_ctx_ptr
+            self._events.append(StreamDataReceived(
+                stream_id=stream_id,
+                data=data if data is not None else memoryview(b""),
+                end_stream=(evt_type == _EVT_STREAM_FIN),
+            ))
+        elif evt_type == _EVT_STREAM_RESET:
+            self._events.append(StreamReset(
+                stream_id=stream_id,
+                error_code=error_code,
+            ))
+        elif evt_type == _EVT_STOP_SENDING:
+            self._events.append(StopSendingReceived(
+                stream_id=stream_id,
+                error_code=error_code,
+            ))
+        elif evt_type == _EVT_CLOSE or evt_type == _EVT_APP_CLOSE:
+            self._closed = True
+            self._events.append(ConnectionTerminated(
+                error_code=error_code,
+            ))
+            # picoquic's close callback has fired — worker has stopped
+            # invoking app callbacks for this cnx's streams. Safe to
+            # free per-stream wrappers; without this they'd leak until
+            # process exit.
+            self._destroy_stream_ctxs()
+        elif evt_type == _EVT_READY:
+            if cnx_ptr != 0:
+                self._cnx_ptr = cnx_ptr
+                self._connected = True
+                alpn = (self._configuration.alpn_protocols[0]
+                        if self._configuration.alpn_protocols else None)
+                self._events.append(HandshakeCompleted(
+                    alpn_protocol=alpn,
                 ))
-                if evt_type == _EVT_STREAM_DATA:
-                    continue
-            elif evt_type == _EVT_STREAM_RESET:
-                self._events.append(StreamReset(
-                    stream_id=stream_id,
-                    error_code=error_code,
+                self._events.append(ProtocolNegotiated(
+                    alpn_protocol=alpn,
                 ))
-            elif evt_type == _EVT_STOP_SENDING:
-                self._events.append(StopSendingReceived(
-                    stream_id=stream_id,
-                    error_code=error_code,
-                ))
-            elif evt_type == _EVT_CLOSE or evt_type == _EVT_APP_CLOSE:
-                self._closed = True
-                self._events.append(ConnectionTerminated(
-                    error_code=error_code,
-                ))
-                # Connection is now done from picoquic's perspective —
-                # the close callback has fired which means the worker
-                # thread has stopped invoking app callbacks for this
-                # cnx's streams. Safe to free the per-stream wrappers
-                # now; without this they'd leak until process exit.
-                # picoquic's internal cnx cleanup runs separately and
-                # doesn't dereference app_stream_ctx after the close
-                # callback returns.
-                self._destroy_stream_ctxs()
-            elif evt_type == _EVT_READY:
-                if cnx_ptr != 0:
-                    # Connection handshake complete
-                    self._cnx_ptr = cnx_ptr
-                    self._connected = True
-                    alpn = (self._configuration.alpn_protocols[0]
-                            if self._configuration.alpn_protocols else None)
-                    self._events.append(HandshakeCompleted(
-                        alpn_protocol=alpn,
-                    ))
-                    self._events.append(ProtocolNegotiated(
-                        alpn_protocol=alpn,
-                    ))
-            elif evt_type == _EVT_ALMOST_READY:
-                if cnx_ptr != 0:
-                    self._cnx_ptr = cnx_ptr
-            elif evt_type == _EVT_DATAGRAM:
-                self._events.append(DatagramFrameReceived(
-                    data=data if data is not None else memoryview(b""),
-                ))
+        elif evt_type == _EVT_ALMOST_READY:
+            if cnx_ptr != 0:
+                self._cnx_ptr = cnx_ptr
+        elif evt_type == _EVT_DATAGRAM:
+            self._events.append(DatagramFrameReceived(
+                data=data if data is not None else memoryview(b""),
+            ))
+        elif evt_type == _EVT_STREAM_TX_DRAINED:
+            # Picoquic worker drained sc->tx after Python had armed
+            # tx_drain_pending. Wake the blocked writer.
+            event = self._stream_tx_drain_events.get(stream_id)
+            if event is None:
+                event = asyncio.Event()
+                self._stream_tx_drain_events[stream_id] = event
+            event.set()
+
+    def get_tx_drain_event(self, stream_id: int) -> asyncio.Event:
+        """Return the asyncio.Event signalling that the picoquic
+        worker has drained bytes from this stream's sc->tx after the
+        ring was last reported full.
+
+        Lazy-creates the Event on first reference. Caller pattern:
+            event = quic.get_tx_drain_event(sid)
+            event.clear()
+            try:
+                quic.send_stream_data(sid, data, end_stream)
+            except BufferError:
+                await event.wait()
+                continue  # retry
+        """
+        event = self._stream_tx_drain_events.get(stream_id)
+        if event is None:
+            event = asyncio.Event()
+            self._stream_tx_drain_events[stream_id] = event
+        return event
 
     def next_event(self) -> QuicEvent | None:
         """Dequeue next event from the connection."""

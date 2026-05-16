@@ -66,6 +66,7 @@ typedef enum {
     SPSC_EVT_PATH_SUSPENDED = 12,
     SPSC_EVT_PATH_DELETED = 13,
     SPSC_EVT_PACING_CHANGED = 14,
+    SPSC_EVT_STREAM_TX_DRAINED = 15,    /* edge: sc->tx had a waiter and worker just drained */
 
     SPSC_EVT_TX_STREAM_DATA = 128,
     SPSC_EVT_TX_STREAM_FIN = 129,

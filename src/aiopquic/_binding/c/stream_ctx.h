@@ -45,6 +45,13 @@ typedef struct {
      * (not in Python) so the worker-side hysteresis check needs no
      * additional state. Written only by the picoquic worker. */
     _Atomic(uint64_t) rx_credit_limit;
+    /* Edge-triggered TX backpressure signal. Python sets this to 1
+     * when a send_data attempt returns 0 (sc->tx full). The picoquic
+     * worker thread CAS-clears it from 1->0 after popping bytes in
+     * prepare_to_send; the CAS winner emits one SPSC event so the
+     * blocked Python writer wakes and retries. Only one event fires
+     * per fill->drain cycle. */
+    _Atomic(uint32_t) tx_drain_pending;
     /* fin/reset arrived; free wrapper after final drain. */
     uint8_t  pending_destroy;
 } aiopquic_stream_ctx_t;
@@ -138,7 +145,15 @@ static inline int aiopquic_stream_ctx_send_data(
         uint64_t head = atomic_load_explicit(&sc->tx->head,
                                              memory_order_acquire);
         uint32_t free_bytes = sc->tx->capacity - (uint32_t)(tail - head);
-        if (free_bytes < len) return 0;
+        if (free_bytes < len) {
+            /* Arm the edge-trigger so the worker emits one
+             * SPSC_EVT_STREAM_TX_DRAINED when it next drains bytes
+             * from sc->tx. Caller awaits on the matching asyncio
+             * Event instead of polling sleep. */
+            atomic_store_explicit(&sc->tx_drain_pending, 1,
+                                  memory_order_release);
+            return 0;
+        }
         uint32_t accepted = aiopquic_stream_buf_push(sc->tx, data, len);
         if (accepted != len) return 0;  /* defensive; shouldn't happen */
     }
