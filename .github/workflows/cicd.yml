@@ -36,10 +36,19 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+      - name: Capture submodule SHAs for cache key
+        id: shas
+        run: |
+          pico=$(cd third_party/picoquic && git rev-parse HEAD)
+          ptls=$(cd third_party/picotls && git rev-parse HEAD)
+          echo "pico=$pico" >> "$GITHUB_OUTPUT"
+          echo "ptls=$ptls" >> "$GITHUB_OUTPUT"
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: 'pyproject.toml'
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -52,7 +61,14 @@ jobs:
           # runners; idempotent install for hardness.
           brew list cmake >/dev/null 2>&1 || brew install cmake
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+      - name: Cache picoquic build
+        id: picoquic-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/picoquic/build
+          key: picoquic-build-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build_picoquic.sh', 'patches/*.patch') }}
       - name: Build picoquic
+        if: steps.picoquic-cache.outputs.cache-hit != 'true'
         run: ./build_picoquic.sh
       - name: Install + test (core tier)
         timeout-minutes: 15
@@ -74,10 +90,19 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+      - name: Capture submodule SHAs for cache key
+        id: shas
+        run: |
+          pico=$(cd third_party/picoquic && git rev-parse HEAD)
+          ptls=$(cd third_party/picotls && git rev-parse HEAD)
+          echo "pico=$pico" >> "$GITHUB_OUTPUT"
+          echo "ptls=$ptls" >> "$GITHUB_OUTPUT"
       - name: Set up Python 3.14
         uses: actions/setup-python@v5
         with:
           python-version: "3.14"
+          cache: 'pip'
+          cache-dependency-path: 'pyproject.toml'
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -88,7 +113,14 @@ jobs:
         run: |
           brew list cmake >/dev/null 2>&1 || brew install cmake
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+      - name: Cache picoquic build (incl. native test drivers)
+        id: picoquic-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/picoquic/build
+          key: picoquic-build-native-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build_picoquic.sh', 'patches/*.patch', 'build_picoquic_tests.sh') }}
       - name: Build picoquic + native test drivers
+        if: steps.picoquic-cache.outputs.cache-hit != 'true'
         run: |
           ./build_picoquic.sh
           if [ -x ./build_picoquic_tests.sh ]; then
@@ -116,10 +148,19 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+      - name: Capture submodule SHAs for cache key
+        id: shas
+        run: |
+          pico=$(cd third_party/picoquic && git rev-parse HEAD)
+          ptls=$(cd third_party/picotls && git rev-parse HEAD)
+          echo "pico=$pico" >> "$GITHUB_OUTPUT"
+          echo "ptls=$ptls" >> "$GITHUB_OUTPUT"
       - name: Set up Python 3.14
         uses: actions/setup-python@v5
         with:
           python-version: "3.14"
+          cache: 'pip'
+          cache-dependency-path: 'pyproject.toml'
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -130,7 +171,14 @@ jobs:
         run: |
           brew list cmake >/dev/null 2>&1 || brew install cmake
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+      - name: Cache picoquic build
+        id: picoquic-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/picoquic/build
+          key: picoquic-build-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build_picoquic.sh', 'patches/*.patch') }}
       - name: Build picoquic
+        if: steps.picoquic-cache.outputs.cache-hit != 'true'
         run: ./build_picoquic.sh
       - name: Run latency-floor microbench (single-object RTT)
         timeout-minutes: 5
