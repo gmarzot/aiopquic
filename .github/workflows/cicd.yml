@@ -264,7 +264,7 @@ jobs:
         run: |
           mkdir -p third_party/native
           cd third_party/native
-          git clone --depth 1 https://github.com/ngtcp2/nghttp3
+          git clone --depth 1 --recurse-submodules https://github.com/ngtcp2/nghttp3
           (cd nghttp3 && autoreconf -i && \
             ./configure --enable-lib-only --prefix=$(pwd)/inst && \
             make -j$(nproc) install)
