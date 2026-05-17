@@ -234,18 +234,24 @@ jobs:
       - name: Build picoquic
         if: steps.picoquic-cache.outputs.cache-hit != 'true'
         run: ./build_picoquic.sh
-      - name: Run latency-floor microbench (single-object RTT)
+      - name: Run microbenches (RTT floor + datagram throughput)
         timeout-minutes: 5
         run: |
-          # Request/reply pattern — no in-flight tail, so the
-          # byte-conservation drain-deadline that bench_baselines_*
-          # rely on doesn't apply here. Reports floor + p50/p99 of
-          # per-object RTT, which is the user-facing perf signal we
-          # actually care about for media-latency workloads.
+          # Two transport-level benches that complete deterministically
+          # without the in-flight drain-tail issue bench_baselines_*
+          # has on noisy hosted runners:
+          #   - bench_latency_floor::test_bench_single_object_rtt:
+          #     request/reply — RTT floor + p50/p99. User-facing media
+          #     latency signal.
+          #   - bench_datagram::test_bench_datagram_throughput:
+          #     transport-level datagram path (100, 1000 datagrams).
+          #     Catches regressions in the DATAGRAM frame send/recv
+          #     path which has no other CI coverage.
           # Floor enforcement deferred until hosted-runner noise is
           # calibrated.
           python -m pip install --upgrade pip
           pip install -e '.[dev]'
           python -m pytest \
             tests/bench/bench_latency_floor.py::test_bench_single_object_rtt \
+            tests/bench/bench_datagram.py \
             -v -s --benchmark-disable
