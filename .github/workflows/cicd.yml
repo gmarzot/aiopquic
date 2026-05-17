@@ -22,6 +22,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Opt every job + every third-party action into the Node 24 runtime
+# ahead of GitHub's 2026-06-02 hard cutover (Node 20 removed entirely
+# 2026-09-16). One env beats per-action version cherry-picking and
+# covers actions that haven't shipped a Node-24 release yet.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   core:
     name: core / ${{ matrix.os }} / py${{ matrix.python-version }}
@@ -189,6 +196,110 @@ jobs:
             tests/interop/test_qh3.py \
             -v --tb=short
 
+  peer-interop-native:
+    # Native (C / Rust) QUIC peers — independent stacks built from source.
+    # Skipped silently in dev (env vars unset); this job sets them.
+    # Build instructions match tests/interop/README.md.
+    #
+    #   - ngtcp2: HTTP/0.9-over-QUIC examples (h09client, h09server)
+    #     speak the canonical IETF interop reference protocol. Built
+    #     with gnutls (shortest path on Ubuntu — no custom OpenSSL).
+    #     Needs nghttp3 built first.
+    #   - s2n-quic: AWS Rust QUIC stack. s2n-quic-qns is the interop
+    #     runner binary; test file accepts S2N_QUIC_QNS or
+    #     S2N_QUIC_PERF env var.
+    name: peer interop (native)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: 'pip'
+          cache-dependency-path: 'pyproject.toml'
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake libssl-dev \
+            libgnutls28-dev libev-dev pkg-config autoconf automake libtool
+      - name: Capture submodule SHAs for picoquic cache key
+        id: shas
+        run: |
+          pico=$(cd third_party/picoquic && git rev-parse HEAD)
+          ptls=$(cd third_party/picotls && git rev-parse HEAD)
+          echo "pico=$pico" >> "$GITHUB_OUTPUT"
+          echo "ptls=$ptls" >> "$GITHUB_OUTPUT"
+      - name: Cache picoquic build
+        id: picoquic-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/picoquic/build
+          key: picoquic-build-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build_picoquic.sh', 'patches/*.patch') }}
+      - name: Build picoquic
+        if: steps.picoquic-cache.outputs.cache-hit != 'true'
+        run: ./build_picoquic.sh
+      - name: Resolve ngtcp2 + nghttp3 HEAD SHAs
+        id: native-shas
+        run: |
+          ng3=$(git ls-remote https://github.com/ngtcp2/nghttp3 HEAD | cut -f1)
+          ng2=$(git ls-remote https://github.com/ngtcp2/ngtcp2 HEAD | cut -f1)
+          echo "nghttp3=$ng3" >> "$GITHUB_OUTPUT"
+          echo "ngtcp2=$ng2" >> "$GITHUB_OUTPUT"
+      - name: Cache ngtcp2 + nghttp3 builds
+        id: ngtcp2-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/native/nghttp3
+            third_party/native/ngtcp2
+          key: ngtcp2-${{ runner.os }}-gnutls-${{ steps.native-shas.outputs.ngtcp2 }}-${{ steps.native-shas.outputs.nghttp3 }}
+      - name: Build nghttp3 + ngtcp2 (gnutls)
+        if: steps.ngtcp2-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p third_party/native
+          cd third_party/native
+          git clone --depth 1 https://github.com/ngtcp2/nghttp3
+          (cd nghttp3 && autoreconf -i && \
+            ./configure --enable-lib-only --prefix=$(pwd)/inst && \
+            make -j$(nproc) install)
+          git clone --depth 1 --recurse-submodules https://github.com/ngtcp2/ngtcp2
+          (cd ngtcp2 && autoreconf -i && \
+            PKG_CONFIG_PATH=$(pwd)/../nghttp3/inst/lib/pkgconfig \
+            ./configure --with-gnutls --with-libnghttp3=$(pwd)/../nghttp3/inst && \
+            make -j$(nproc))
+      - name: Cargo cache for s2n-quic
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: s2n-quic -> s2n-quic/target
+          shared-key: s2n-quic-qns
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build s2n-quic-qns
+        run: |
+          if [ ! -x s2n-quic/target/release/s2n-quic-qns ]; then
+            git clone --depth 1 https://github.com/aws/s2n-quic
+            (cd s2n-quic && cargo build --release --bin s2n-quic-qns)
+          fi
+      - name: Run native peer interop tests
+        timeout-minutes: 12
+        env:
+          NGTCP2_CLIENT: ${{ github.workspace }}/third_party/native/ngtcp2/examples/h09client
+          NGTCP2_SERVER: ${{ github.workspace }}/third_party/native/ngtcp2/examples/h09server
+          S2N_QUIC_QNS: ${{ github.workspace }}/s2n-quic/target/release/s2n-quic-qns
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          python -m pytest \
+            tests/interop/test_ngtcp2.py \
+            tests/interop/test_s2n_quic.py \
+            -v --tb=short
+
   benchmark:
     name: benchmark / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -234,24 +345,35 @@ jobs:
       - name: Build picoquic
         if: steps.picoquic-cache.outputs.cache-hit != 'true'
         run: ./build_picoquic.sh
-      - name: Run microbenches (RTT floor + datagram throughput)
-        timeout-minutes: 5
+      - name: Run microbenches (latency + datagram + bulk + parallel)
+        timeout-minutes: 8
         run: |
-          # Two transport-level benches that complete deterministically
+          # Four transport-level benches that complete deterministically
           # without the in-flight drain-tail issue bench_baselines_*
-          # has on noisy hosted runners:
+          # has on noisy hosted runners. All asserts run on FIN /
+          # full-payload-received, never on a duration window.
+          #
           #   - bench_latency_floor::test_bench_single_object_rtt:
           #     request/reply — RTT floor + p50/p99. User-facing media
           #     latency signal.
           #   - bench_datagram::test_bench_datagram_throughput:
           #     transport-level datagram path (100, 1000 datagrams).
-          #     Catches regressions in the DATAGRAM frame send/recv
-          #     path which has no other CI coverage.
+          #     DATAGRAM frame send/recv path coverage.
+          #   - bench_throughput::test_bench_stream_throughput:
+          #     single-stream bulk send sweep [64KB, 1MB, 32MB].
+          #     Reports Gb/s; asserts byte-exact delivery on FIN.
+          #   - bench_throughput_parallel::test_bench_parallel_streams:
+          #     N concurrent BIDI streams [4x1MB, 8x1MB, 16x256KB].
+          #     Catches per-stream scheduling / fairness regressions
+          #     the single-stream bench can't see.
+          #
           # Floor enforcement deferred until hosted-runner noise is
-          # calibrated.
+          # calibrated across a few runs.
           python -m pip install --upgrade pip
           pip install -e '.[dev]'
           python -m pytest \
             tests/bench/bench_latency_floor.py::test_bench_single_object_rtt \
             tests/bench/bench_datagram.py \
+            tests/bench/bench_throughput.py \
+            tests/bench/bench_throughput_parallel.py \
             -v -s --benchmark-disable
