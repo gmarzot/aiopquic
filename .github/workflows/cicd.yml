@@ -2,33 +2,140 @@ name: CI
 
 # PR + main test gate. Releases (TestPyPI -> PyPI -> GitHub Release) live
 # in release.yml, triggered manually via workflow_dispatch.
+#
+# Tiers (post-enhancement):
+#   - core: unit + loopback. Required on (linux, macos) x (3.12, 3.13, 3.14).
+#   - native: picoquic_ct + picohttp_ct subprocess smoke. continue-on-error
+#     initially while runner flakiness is characterized.
+#   - perf-gate: bench_baselines_lowlevel short window, very conservative
+#     floor. continue-on-error initially.
+#
+# Once the new tiers are stable across a few PRs the continue-on-error
+# flags are removed and they become required.
 
 on:
   pull_request:
   push:
     branches: [ main ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  core:
+    name: core / ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: recursive
-        fetch-depth: 0
-    - name: Set up Python 3.14
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.14"
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake libssl-dev
-    - name: Build picoquic
-      run: ./build_picoquic.sh
-    - name: Install + test
-      timeout-minutes: 15
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e '.[dev]'
-        python -m pytest tests/ -v -m "not interop and not native"
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # cmake + openssl@3 are usually preinstalled on macos-latest
+          # runners; idempotent install for hardness.
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+      - name: Build picoquic
+        run: ./build_picoquic.sh
+      - name: Install + test (core tier)
+        timeout-minutes: 15
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          python -m pytest tests/ -v -m "not interop and not native"
+
+  native:
+    name: native picoquic_ct / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+      - name: Build picoquic + native test drivers
+        run: |
+          ./build_picoquic.sh
+          if [ -x ./build_picoquic_tests.sh ]; then
+            ./build_picoquic_tests.sh
+          else
+            echo "::warning::build_picoquic_tests.sh not present; skipping native test driver build"
+          fi
+      - name: Install + run native tier
+        timeout-minutes: 20
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          python -m pytest tests/ -v -m native || true
+
+  perf-gate:
+    name: perf gate / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+      - name: Build picoquic
+        run: ./build_picoquic.sh
+      - name: Run bench_baselines_lowlevel (short window)
+        timeout-minutes: 8
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          python -m pytest tests/bench/bench_baselines_lowlevel.py \
+            -v -s --benchmark-disable --duration=10
