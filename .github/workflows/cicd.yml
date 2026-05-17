@@ -85,7 +85,7 @@ jobs:
           python -m pytest tests/ -v -m "not interop and not native"
 
   native:
-    name: native picoquic_ct / ${{ matrix.os }}
+    name: picoquic / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     continue-on-error: true
     strategy:
