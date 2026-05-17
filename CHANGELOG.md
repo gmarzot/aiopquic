@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.3.2 (2026-05-16)
+
+Pairs with [aiomoqt 0.9.4](https://pypi.org/project/aiomoqt/0.9.4/).
+Send-path perf wins + a macOS-only UAF that crashed at session close.
+
+### TX_CLOSE UAF (macOS argo segfault)
+
+`SPSC_EVT_TX_CLOSE` dereferenced a stale `cnx*`: the peer's
+CLOSE_CONNECTION could free the cnx between the Python push and the
+worker's pop, and any `cnx->state` read (including a state guard)
+hit the freed pointer. macOS exposed it as `picoquic_close+0x1c`
+segfaults at session teardown.
+
+Fix: walk picoquic's live-cnx list to confirm the pointer is still
+valid before calling `picoquic_close`. Two commits: `517928a`
+restored a state-guard scaffold, `005de88` replaced it with the
+live-list walk.
+
+### Perf
+
+- `send_length_max = 65535` (GSO max) — single sendmsg covers a
+  full 64KB worth of UDP datagrams on Linux.
+- Cython `drain_rx_callback` — coalesces stream-data events in C
+  before they cross into Python.
+- Cython `parse_object_subgroup` / `encode_object_subgroup` — moves
+  the hot MoQT body-shape parser into the binding.
+- Event-driven TX backpressure — `SPSC_EVT_STREAM_TX_DRAINED` wakes
+  per-stream waiters when the worker drains, replacing the polling
+  loop the higher level had been using.
+
+### Platform fix
+
+`AIOPQUIC_GSO` env override + Darwin defaults: macOS has no
+UDP GSO, so `do_not_use_gso=1` and `send_length_max=0` are the
+defaults there. Linux gets the GSO send_length_max=65535 default.
+
+### Picoquic pin
+
+Advanced to upstream `2b1e14d5` + open PR #2097 ("Do not reschedule
+already closed connection") as a build-time patch.
+
 ## v0.3.1 (2026-05-12)
 
 Receiver-side dispatch perf. The 0.3.0 release fixed durability +
