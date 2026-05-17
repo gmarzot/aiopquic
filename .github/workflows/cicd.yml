@@ -377,3 +377,62 @@ jobs:
             tests/bench/bench_throughput.py \
             tests/bench/bench_throughput_parallel.py \
             -v -s --benchmark-disable
+
+  benchmark-io-uring:
+    # Same bench surface as `benchmark`, but built with io_uring
+    # submission enabled (picoquic cmake option WITH_IO_URING=ON
+    # via build_picoquic.sh's AIOPQUIC_IO_URING=1 env). Linux-only —
+    # io_uring is a Linux kernel feature, no macOS counterpart.
+    # Goal: lock in that the io_uring path builds + benchmarks pass
+    # byte-exact; future runs can compare throughput numbers against
+    # the default benchmark job to characterize the io_uring win.
+    name: benchmark (io_uring)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Capture submodule SHAs for cache key
+        id: shas
+        run: |
+          pico=$(cd third_party/picoquic && git rev-parse HEAD)
+          ptls=$(cd third_party/picotls && git rev-parse HEAD)
+          echo "pico=$pico" >> "$GITHUB_OUTPUT"
+          echo "ptls=$ptls" >> "$GITHUB_OUTPUT"
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: 'pip'
+          cache-dependency-path: 'pyproject.toml'
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev liburing-dev
+      - name: Cache picoquic build (io_uring)
+        id: picoquic-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/picoquic/build
+          # Distinct cache namespace from the default benchmark job —
+          # WITH_IO_URING=ON changes compile-time defines so build
+          # artifacts are not interchangeable.
+          key: picoquic-build-iouring-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build_picoquic.sh', 'patches/*.patch') }}
+      - name: Build picoquic with io_uring
+        if: steps.picoquic-cache.outputs.cache-hit != 'true'
+        env:
+          AIOPQUIC_IO_URING: "1"
+        run: ./build_picoquic.sh
+      - name: Run microbenches against io_uring build
+        timeout-minutes: 8
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          python -m pytest \
+            tests/bench/bench_latency_floor.py::test_bench_single_object_rtt \
+            tests/bench/bench_datagram.py \
+            tests/bench/bench_throughput.py \
+            tests/bench/bench_throughput_parallel.py \
+            -v -s --benchmark-disable
