@@ -135,6 +135,60 @@ jobs:
           pip install -e '.[dev]'
           python -m pytest tests/ -v -m native || true
 
+  interop-py-peers:
+    # aioquic + qh3 are pip-installable Python QUIC implementations.
+    # tests/interop/test_aioquic.py and test_qh3.py each spawn the
+    # peer as a subprocess (tests/interop/peers/*_echo.py) and exchange
+    # bytes with aiopquic in both directions. Skipped silently in the
+    # core tier because aioquic/qh3 aren't in our dev extras; this job
+    # installs them and runs those test files specifically.
+    name: interop py peers (aioquic + qh3)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Capture submodule SHAs for cache key
+        id: shas
+        run: |
+          pico=$(cd third_party/picoquic && git rev-parse HEAD)
+          ptls=$(cd third_party/picotls && git rev-parse HEAD)
+          echo "pico=$pico" >> "$GITHUB_OUTPUT"
+          echo "ptls=$ptls" >> "$GITHUB_OUTPUT"
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: 'pip'
+          cache-dependency-path: 'pyproject.toml'
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev
+      - name: Cache picoquic build
+        id: picoquic-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/picoquic/build
+          key: picoquic-build-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build_picoquic.sh', 'patches/*.patch') }}
+      - name: Build picoquic
+        if: steps.picoquic-cache.outputs.cache-hit != 'true'
+        run: ./build_picoquic.sh
+      - name: Install aiopquic + Python QUIC peers
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          pip install aioquic qh3
+      - name: Run Python-peer interop tests
+        timeout-minutes: 10
+        run: |
+          python -m pytest \
+            tests/interop/test_aioquic.py \
+            tests/interop/test_qh3.py \
+            -v --tb=short
+
   perf-gate:
     name: perf gate / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
