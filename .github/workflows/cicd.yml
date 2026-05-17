@@ -132,10 +132,14 @@ jobs:
           brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
       - name: Build picoquic
         run: ./build_picoquic.sh
-      - name: Run bench_baselines_lowlevel (short window)
-        timeout-minutes: 8
+      - name: Run bench_baselines_lowlevel (default 30 s/case)
+        timeout-minutes: 10
         run: |
+          # Uses bench default --duration (30 s). At shorter durations
+          # the in-flight tail (last ~1 MiB stream-ring fill) doesn't
+          # drain within the 1.5 s end-deadline and byte-conservation
+          # asserts false-fail. 30 s amortizes the tail to <1% of run.
           python -m pip install --upgrade pip
           pip install -e '.[dev]'
           python -m pytest tests/bench/bench_baselines_lowlevel.py \
-            -v -s --benchmark-disable --duration=10
+            -v -s --benchmark-disable
