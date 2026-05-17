@@ -135,14 +135,14 @@ jobs:
           pip install -e '.[dev]'
           python -m pytest tests/ -v -m native || true
 
-  interop-py-peers:
+  peer-interop:
     # aioquic + qh3 are pip-installable Python QUIC implementations.
     # tests/interop/test_aioquic.py and test_qh3.py each spawn the
     # peer as a subprocess (tests/interop/peers/*_echo.py) and exchange
     # bytes with aiopquic in both directions. Skipped silently in the
     # core tier because aioquic/qh3 aren't in our dev extras; this job
     # installs them and runs those test files specifically.
-    name: interop py peers (aioquic + qh3)
+    name: peer interop
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -189,8 +189,8 @@ jobs:
             tests/interop/test_qh3.py \
             -v --tb=short
 
-  perf-gate:
-    name: perf gate / ${{ matrix.os }}
+  benchmark:
+    name: benchmark / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     continue-on-error: true
     strategy:
