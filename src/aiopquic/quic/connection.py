@@ -310,6 +310,30 @@ class QuicConnection:
             self._stream_tx_drain_events[stream_id] = event
         return event
 
+    def tx_pressure(self, stream_id: int = 0) -> float:
+        """Current TX-ring fill ratio in [0.0, 1.0], for backpressure-
+        aware yielding from tight send loops.
+
+        BufferError from `send_stream_data` is the hard backpressure
+        signal — ring full, caller must await the drain event. This
+        method is the soft signal: ratio of pending events to ring
+        capacity. Callers can yield (e.g., `await asyncio.sleep(0)`)
+        when the ratio exceeds a threshold to give the picoquic worker
+        thread cycles to drain. Count-based yields starve the worker
+        on fast Python paths (notably Linux with UDP GSO, where the
+        Python side can outrun a single sendmsg-per-batch worker).
+
+        `stream_id` is reserved for future per-stream ring accounting.
+        Today the ring is shared across the whole connection, so the
+        ratio is connection-global.
+        """
+        if self._transport is None:
+            return 0.0
+        cap = self._transport.tx_capacity
+        if not cap:
+            return 0.0
+        return self._transport.tx_count / cap
+
     def next_event(self) -> QuicEvent | None:
         """Dequeue next event from the connection."""
         if self._engine is None:
