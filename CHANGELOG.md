@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.3.3 (2026-05-18)
+
+Pairs with [aiomoqt 0.9.5](https://pypi.org/project/aiomoqt/0.9.5/).
+
+### `QuicConnection.tx_pressure(stream_id) -> float`
+
+New public method: returns the TX-ring fill ratio in `[0.0, 1.0]`.
+A soft companion to the hard `BufferError` boundary that
+`send_stream_data` already raises. Tight send loops can use this to
+release the GIL when the picoquic worker has pending TX entries to
+drain, avoiding count-based yield heuristics that can starve the
+worker on fast Python paths.
+
+`stream_id` is reserved for future per-stream ring accounting; today
+the ring is connection-global, so the returned value is global.
+aiomoqt 0.9.5 uses this in `MOQTSession.stream_write_drain` to
+auto-yield under pressure.
+
 ## v0.3.2 (2026-05-16)
 
 Pairs with [aiomoqt 0.9.4](https://pypi.org/project/aiomoqt/0.9.4/).
