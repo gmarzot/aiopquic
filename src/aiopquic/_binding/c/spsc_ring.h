@@ -141,6 +141,14 @@ typedef struct {
     _Alignas(SPSC_CACHELINE) _Atomic(uint64_t) head;
     char _pad_head[SPSC_CACHELINE - sizeof(_Atomic(uint64_t))];
 
+    /* Running total of data_length across all in-flight entries.
+     * Tracked at push (+= data_len on the data-carrying push path)
+     * and pop (-= entry->data_length before free). Bytes-aware
+     * companion to spsc_ring_count() for latency-targeted callers
+     * that need to bound queue depth in bytes rather than events. */
+    _Alignas(SPSC_CACHELINE) _Atomic(uint64_t) bytes_pending;
+    char _pad_bytes[SPSC_CACHELINE - sizeof(_Atomic(uint64_t))];
+
     uint32_t    capacity;
     uint32_t    mask;
     spsc_entry_t* entries;
@@ -164,6 +172,7 @@ static inline spsc_ring_t* spsc_ring_create(uint32_t capacity) {
 
     atomic_store_explicit(&ring->head, 0, memory_order_relaxed);
     atomic_store_explicit(&ring->tail, 0, memory_order_relaxed);
+    atomic_store_explicit(&ring->bytes_pending, 0, memory_order_relaxed);
     return ring;
 }
 
@@ -188,6 +197,10 @@ static inline uint32_t spsc_ring_count(spsc_ring_t* ring) {
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
     uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
     return (uint32_t)(tail - head);
+}
+
+static inline uint64_t spsc_ring_bytes_pending(spsc_ring_t* ring) {
+    return atomic_load_explicit(&ring->bytes_pending, memory_order_acquire);
 }
 
 static inline int spsc_ring_full(spsc_ring_t* ring) {
@@ -230,6 +243,12 @@ static inline int spsc_ring_push(spsc_ring_t* ring, const spsc_entry_t* entry,
     *e = *entry;
     e->data_buf = buf;
     e->data_length = (buf ? data_len : 0);
+
+    if (e->data_length > 0) {
+        atomic_fetch_add_explicit(&ring->bytes_pending,
+                                   (uint64_t)e->data_length,
+                                   memory_order_relaxed);
+    }
 
     /* Release: ensure entry + buf writes are visible before tail advances. */
     atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
@@ -305,6 +324,9 @@ static inline void spsc_ring_pop(spsc_ring_t* ring) {
      * data_buf is owned by the WT session, not the ring entry, and
      * must outlive the entry. */
     if (e->data_buf && e->data_length > 0) {
+        atomic_fetch_sub_explicit(&ring->bytes_pending,
+                                   (uint64_t)e->data_length,
+                                   memory_order_relaxed);
         free(e->data_buf);
         e->data_buf = NULL;
     }

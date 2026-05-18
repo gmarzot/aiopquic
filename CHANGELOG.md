@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.3.4 (unreleased)
+
+### TX stale-cnx UAF guard
+
+The peer's `CLOSE_CONNECTION` (or app-side close, or timeout) can
+free a `picoquic_cnx_t*` between Python's `push_tx` and the C
+worker's SPSC pop. The previous `if (!cnx)` guard only caught
+explicit NULL — not a stale-but-non-NULL pointer to freed memory.
+
+Surfaced as `picoquic_create_stream` NULL-page faults on macOS at
+multi-stream small-object unbounded-rate publishes. Same shape as
+the `TX_CLOSE` UAF fixed in 0.3.2, but in the other TX_* handlers
+(`MARK_ACTIVE`, `STREAM_DATA`, `STREAM_FIN`, `DATAGRAM`,
+`STREAM_RESET`, `STOP_SENDING`, `OPEN_FLOW_CONTROL`,
+`SET_APP_FLOW_CONTROL`).
+
+Fix: factor the live-cnx-list walk that 0.3.2 added inline for
+`TX_CLOSE` into a `static inline aiopquic_cnx_is_alive()` helper.
+Apply the helper at the TX dispatch entry — every TX_* handler is
+now UAF-safe. The `TX_CLOSE` case loses its duplicate inline walk.
+
+Walk cost: O(N_cnx) per TX event. For aiomoqt's current publisher /
+client shape (1–2 cnxs) it's a few pointer compares per event —
+effectively free. Marked TODO for replacement with a generation
+counter (O(1)) if a many-cnx relay role emerges.
+
 ## v0.3.3 (2026-05-18)
 
 Pairs with [aiomoqt 0.9.5](https://pypi.org/project/aiomoqt/0.9.5/).

@@ -38,6 +38,31 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* O(N_connections) walk over picoquic's live-cnx list. Used as the
+ * guard before dispatching any TX_* SPSC event into a `cnx*` from
+ * the entry — the cnx may have been freed between the Python push
+ * and our pop (peer CLOSE_CONNECTION, app-side close, timeout). Any
+ * deref into a freed cnx is a UAF, surfacing as a NULL-page fault
+ * inside picoquic when a struct field is loaded.
+ *
+ * TODO(0.3.5+): replace with a generation-counter lookup if aiomoqt
+ * grows into a relay role with many concurrent cnxs. For the
+ * current publisher/client shape (1–2 cnxs) the walk is one or two
+ * pointer compares per event — effectively free. Cost scales O(N)
+ * and starts to matter past ~50 cnxs at megapacket-per-second
+ * event rates. */
+static inline int aiopquic_cnx_is_alive(picoquic_quic_t* quic,
+                                         picoquic_cnx_t* cnx) {
+    picoquic_cnx_t* cur = picoquic_get_first_cnx(quic);
+    while (cur) {
+        if (cur == cnx) {
+            return 1;
+        }
+        cur = picoquic_get_next_cnx(cur);
+    }
+    return 0;
+}
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -617,7 +642,11 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     continue;
                 }
 
-                if (!cnx) {
+                /* Stale-cnx guard. Drops events whose cnx was freed
+                 * between the Python push and this pop. Without this,
+                 * any picoquic_* call below UAFs. See
+                 * aiopquic_cnx_is_alive() comment for cost notes. */
+                if (!cnx || !aiopquic_cnx_is_alive(quic, cnx)) {
                     spsc_ring_pop(ctx->tx_ring);
                     continue;
                 }
@@ -646,22 +675,9 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     }
                     case SPSC_EVT_TX_CLOSE: {
-                        /* The cnx pointer here may be stale: the peer's
-                         * CLOSE_CONNECTION can land + free the cnx
-                         * between the Python push of TX_CLOSE and our
-                         * pop. Dereferencing it (even to read state)
-                         * UAFs at picoquic_close+0x1c (the cnx->quic
-                         * load on the first line). Walk picoquic's
-                         * live-cnx list to confirm before calling. */
-                        picoquic_cnx_t* cur = picoquic_get_first_cnx(quic);
-                        int alive = 0;
-                        while (cur) {
-                            if (cur == cnx) { alive = 1; break; }
-                            cur = picoquic_get_next_cnx(cur);
-                        }
-                        if (alive) {
-                            picoquic_close(cnx, entry->error_code);
-                        }
+                        /* cnx liveness already verified by the outer
+                         * aiopquic_cnx_is_alive() guard above. */
+                        picoquic_close(cnx, entry->error_code);
                         spsc_ring_pop(ctx->tx_ring);
                         break;
                     }

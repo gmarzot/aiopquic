@@ -61,6 +61,7 @@ cdef extern from "c/spsc_ring.h":
     spsc_ring_t* spsc_ring_create(uint32_t capacity)
     void spsc_ring_destroy(spsc_ring_t* ring)
     uint32_t spsc_ring_count(spsc_ring_t* ring)
+    uint64_t spsc_ring_bytes_pending(spsc_ring_t* ring)
     int spsc_ring_full(spsc_ring_t* ring)
     int spsc_ring_empty(spsc_ring_t* ring)
     int spsc_ring_push(spsc_ring_t* ring, const spsc_entry_t* entry,

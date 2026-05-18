@@ -334,6 +334,24 @@ class QuicConnection:
             return 0.0
         return self._transport.tx_count / cap
 
+    def tx_pending_bytes(self, stream_id: int = 0) -> int:
+        """Aggregate bytes across all in-flight TX-ring entries.
+
+        Bytes-aware companion to `tx_pressure()`: the sum of
+        `data_length` over events currently queued for the picoquic
+        worker. For latency-targeted backpressure, callers can compare
+        this against an absolute byte budget (independent of ring
+        entry count or object size) — at a known drain rate the
+        budget translates directly to a queue-time-in-flight bound.
+
+        `stream_id` is reserved for future per-stream accounting;
+        currently the ring is connection-global, so the value is
+        connection-wide.
+        """
+        if self._transport is None:
+            return 0
+        return self._transport.tx_bytes_pending
+
     def next_event(self) -> QuicEvent | None:
         """Dequeue next event from the connection."""
         if self._engine is None:

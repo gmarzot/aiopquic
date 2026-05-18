@@ -24,7 +24,8 @@ from libc.string cimport memcpy, memset
 
 from aiopquic._binding.spsc_ring cimport (
     spsc_ring_t, spsc_ring_create, spsc_ring_destroy,
-    spsc_ring_count, spsc_ring_empty, spsc_ring_peek,
+    spsc_ring_count, spsc_ring_bytes_pending,
+    spsc_ring_empty, spsc_ring_peek,
     spsc_ring_entry_data, spsc_ring_pop, spsc_ring_push,
     spsc_ring_take_data,
     spsc_entry_t,
@@ -561,6 +562,14 @@ cdef class TransportContext:
     def tx_count(self):
         """Number of events pending in the TX ring."""
         return spsc_ring_count(self._ctx.tx_ring)
+
+    @property
+    def tx_bytes_pending(self):
+        """Aggregate bytes across all in-flight TX-ring entries (the
+        sum of `data_length` over events currently queued). For latency-
+        targeted backpressure: callers can cap publish rate against a
+        bytes budget independent of ring entry capacity or object size."""
+        return spsc_ring_bytes_pending(self._ctx.tx_ring)
 
     @property
     def tx_capacity(self):
