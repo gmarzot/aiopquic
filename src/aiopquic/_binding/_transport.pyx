@@ -373,6 +373,11 @@ cdef extern from "c/h3wt_callback.h":
         picoquic_cnx_t* cnx, uint8_t* bytes, size_t length,
         int event,
         h3zero_stream_ctx_t* stream_ctx, void* path_app_ctx)
+    # Per-WT-stream sc->tx byte-ring lookup. Lazy-allocates the
+    # wrapper on first call for a given sid; subsequent calls hit
+    # the hot-path cache inside the helper.
+    aiopquic_stream_ctx_t* aiopquic_wt_session_find_or_create_stream_tx(
+        aiopquic_wt_session_t* s, uint64_t stream_id)
 
 
 # Default ring sizing
@@ -1484,35 +1489,104 @@ cdef class WebTransportSessionState:
         self._transport.wake_up()
 
     def push_stream_data(self, uint64_t stream_id, bytes data,
-                          bint end_stream=False):
-        """Send bytes on a WT data stream.
+                          bint end_stream=False,
+                          uint32_t stream_ring_cap=1048576):
+        """Send bytes on a WT data stream — pull model.
 
-        WT data streams are real QUIC streams once created, so we
-        reuse the raw-QUIC TX_STREAM_DATA / TX_STREAM_FIN path with
-        the session's underlying cnx pointer. This keeps cnx_ptr
-        encapsulated inside the cdef class instead of leaking to
-        the Python WebTransportClient."""
+        Atomic from the asyncio thread's perspective:
+          1. Look up (or lazy-create) the per-WT-stream sc.
+          2. PRE-CHECK the SPSC TX-event ring has room for the
+             MARK_ACTIVE event we'll need to push.
+          3. Atomically commit bytes into sc->tx (lazy-allocates the
+             ring at stream_ring_cap on first push). All-or-nothing —
+             on ring-full no bytes are committed; tx_drain_pending is
+             armed so the picoquic worker emits one
+             SPSC_EVT_STREAM_TX_DRAINED when it next drains.
+          4. Push TX_MARK_ACTIVE (guaranteed room from step 2 under
+             the single-producer asyncio model). Worker pops it,
+             calls picoquic_mark_active_stream(cnx, sid, 1, NULL) —
+             passing NULL so picoquic's app_stream_ctx doesn't clobber
+             h3zero's stream lookup. picoquic then asks h3zero for
+             bytes via prepare_to_send; h3zero invokes our
+             aiopquic_wt_path_callback(provide_data) which drains
+             sc->tx and emits the drain event via the same edge-
+             triggered pattern raw-QUIC uses.
+
+        Raises:
+          BufferError: TX-event ring or sc->tx is full. Bytes from
+              the failed call were NOT committed; caller can retry
+              the SAME data buffer without risk of duplicating bytes.
+          RuntimeError: WT session not yet open.
+          MemoryError: sc allocation or ring allocation failed.
+        """
         cdef picoquic_cnx_t* cnx = NULL
         if self._wt is not NULL:
             cnx = <picoquic_cnx_t*>self._wt.cnx
         if cnx is NULL:
             raise RuntimeError("WT session not yet open")
 
-        cdef spsc_entry_t entry
-        memset(&entry, 0, sizeof(entry))
-        entry.event_type = (SPSC_EVT_TX_STREAM_FIN if end_stream
-                             else SPSC_EVT_TX_STREAM_DATA)
-        entry.stream_id = stream_id
-        entry.cnx = <void*>cnx
+        # Lazy-allocate per-WT-stream sc wrapper.
+        cdef aiopquic_stream_ctx_t* sc = (
+            aiopquic_wt_session_find_or_create_stream_tx(
+                self._wt, stream_id))
+        if sc is NULL:
+            raise MemoryError(
+                f"WT TX stream-ctx alloc failed (stream={stream_id})"
+            )
+
         cdef const uint8_t* data_ptr = NULL
         cdef uint32_t data_len = 0
         if data:
             data_ptr = <const uint8_t*>data
             data_len = <uint32_t>len(data)
+
+        # PRE-CHECK 1: TX event ring must have room for the
+        # MARK_ACTIVE event we'll push after committing bytes.
+        # Without this, retry semantics could duplicate bytes.
+        # Single-producer (asyncio thread) ⇒ no TOCTOU window.
+        if (spsc_ring_count(self._transport._ctx.tx_ring) >=
+                self._transport._ctx.tx_ring.capacity):
+            raise BufferError(
+                f"TX event ring full (WT stream={stream_id})"
+            )
+
+        # COMMIT: push bytes to per-stream sc->tx (lazy-allocates
+        # ring at stream_ring_cap if absent; atomic / all-or-nothing).
+        cdef int rc = aiopquic_stream_ctx_send_data(
+            sc, data_ptr, data_len, stream_ring_cap,
+            <uint8_t>(1 if end_stream else 0))
+        if rc == 0:
+            # sc->tx full; tx_drain_pending armed inside helper.
+            raise BufferError(
+                f"WT TX ring full (stream={stream_id}, "
+                f"need={data_len})"
+            )
+        if rc < 0:
+            raise MemoryError(
+                f"WT sc->tx alloc failed (stream={stream_id})"
+            )
+
+        # MARK_ACTIVE: stream_ctx=NULL preserves h3zero's lookup-by-
+        # sid behavior. h3zero handles NULL app_stream_ctx safely on
+        # both prepare_to_send (h3zero_common.c:1640) and stream_data
+        # (h3zero_common.c:1492) paths.
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_MARK_ACTIVE
+        entry.stream_id = stream_id
+        entry.cnx = <void*>cnx
+        entry.stream_ctx = NULL
         cdef int ret = spsc_ring_push(
-            self._transport._ctx.tx_ring, &entry, data_ptr, data_len)
+            self._transport._ctx.tx_ring, &entry, NULL, 0)
         if ret != 0:
-            raise BufferError("TX ring full (WT stream data)")
+            # Should never happen given the pre-check (single producer)
+            # — but bytes are already in sc->tx; surface rather than
+            # silently strand. Caller can re-push (next call will
+            # re-issue MARK_ACTIVE; bytes already in sc->tx are not
+            # duplicated since send_data is all-or-nothing per call).
+            raise BufferError(
+                f"TX event ring full (WT MARK_ACTIVE stream={stream_id})"
+            )
         self._transport.wake_up()
 
     def push_reset_stream(self, uint64_t stream_id, uint64_t error_code):

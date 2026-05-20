@@ -236,12 +236,18 @@ typedef struct st_aiopquic_wt_session_t {
     int                           session_ready;   /* CONNECT accepted */
     int                           session_closing; /* close/drain seen or initiated */
     aiopquic_wt_stream_table_t    stream_rx;       /* per-stream RX byte rings */
+    aiopquic_wt_stream_table_t    stream_tx;       /* per-stream TX byte rings */
     /* Hot-path cache: the most recently accessed (sid, sc). On the
      * SP/MP stress workload the same stream is touched ~60+ times
      * in a row, so a single-slot cache hits the common case before
      * the hash lookup. */
     uint64_t                      stream_rx_cache_id;
     aiopquic_stream_ctx_t*        stream_rx_cache_sc;
+    /* Same cache shape, TX side. push_stream_data + the picoquic
+     * provide_data callback both follow the same stream-id locality
+     * pattern as RX. */
+    uint64_t                      stream_tx_cache_id;
+    aiopquic_stream_ctx_t*        stream_tx_cache_sc;
 } aiopquic_wt_session_t;
 
 /*
@@ -304,6 +310,63 @@ static inline void aiopquic_wt_session_remove_stream_rx(
     aiopquic_wt_stream_table_remove(&s->stream_rx, stream_id);
 }
 
+/*
+ * Per-stream TX context. Mirrors the RX helpers above for the
+ * outbound byte ring. Allocated lazily on the first push for a given
+ * stream_id; the picoquic worker reads back via
+ * picohttp_callback_provide_data when picoquic pulls bytes.
+ *
+ * Created by the asyncio thread (single-producer) via Cython
+ * push_stream_data; read by the picoquic worker (single-consumer)
+ * inside the provide_data callback. Removed on session destroy or
+ * stream FIN / reset / stop_sending.
+ */
+static inline aiopquic_stream_ctx_t* aiopquic_wt_session_find_or_create_stream_tx(
+        aiopquic_wt_session_t* s, uint64_t stream_id) {
+    if (s->stream_tx_cache_sc && s->stream_tx_cache_id == stream_id) {
+        return s->stream_tx_cache_sc;
+    }
+    aiopquic_stream_ctx_t* sc =
+        aiopquic_wt_stream_table_find(&s->stream_tx, stream_id);
+    if (sc) {
+        s->stream_tx_cache_id = stream_id;
+        s->stream_tx_cache_sc = sc;
+        return sc;
+    }
+    sc = aiopquic_stream_ctx_create();
+    if (!sc) return NULL;
+    if (aiopquic_wt_stream_table_insert(&s->stream_tx, stream_id, sc) != 0) {
+        aiopquic_stream_ctx_destroy(sc);
+        return NULL;
+    }
+    s->stream_tx_cache_id = stream_id;
+    s->stream_tx_cache_sc = sc;
+    return sc;
+}
+
+/*
+ * Lookup-only variant. Returns NULL if no per-stream TX context
+ * exists. Used on the provide_data path so a callback for a stream
+ * that's never had bytes pushed (e.g. peer-initiated bidi) provides
+ * 0 bytes rather than allocating a useless empty ring.
+ */
+static inline aiopquic_stream_ctx_t* aiopquic_wt_session_find_stream_tx(
+        aiopquic_wt_session_t* s, uint64_t stream_id) {
+    if (s->stream_tx_cache_sc && s->stream_tx_cache_id == stream_id) {
+        return s->stream_tx_cache_sc;
+    }
+    return aiopquic_wt_stream_table_find(&s->stream_tx, stream_id);
+}
+
+static inline void aiopquic_wt_session_remove_stream_tx(
+        aiopquic_wt_session_t* s, uint64_t stream_id) {
+    if (s->stream_tx_cache_id == stream_id) {
+        s->stream_tx_cache_id = 0;
+        s->stream_tx_cache_sc = NULL;
+    }
+    aiopquic_wt_stream_table_remove(&s->stream_tx, stream_id);
+}
+
 static inline aiopquic_wt_session_t* aiopquic_wt_session_create(
         aiopquic_ctx_t* bridge) {
     aiopquic_wt_session_t* s =
@@ -314,6 +377,11 @@ static inline aiopquic_wt_session_t* aiopquic_wt_session_create(
         free(s);
         return NULL;
     }
+    if (aiopquic_wt_stream_table_init(&s->stream_tx) != 0) {
+        aiopquic_wt_stream_table_destroy(&s->stream_rx);
+        free(s);
+        return NULL;
+    }
     return s;
 }
 
@@ -321,6 +389,7 @@ static inline void aiopquic_wt_session_destroy(aiopquic_wt_session_t* s) {
     if (!s) return;
     picowt_release_capsule(&s->capsule);
     aiopquic_wt_stream_table_destroy(&s->stream_rx);
+    aiopquic_wt_stream_table_destroy(&s->stream_tx);
     free(s);
 }
 
@@ -604,22 +673,77 @@ static int aiopquic_wt_path_callback(
         break;
 
     case picohttp_callback_provide_data: {
-        /* picoquic asking for TX bytes on stream sid. Drain TX ring. */
-        spsc_entry_t* tx = spsc_ring_peek(s->bridge->tx_ring);
-        if (tx && tx->stream_id == sid &&
-            (tx->event_type == SPSC_EVT_TX_STREAM_DATA ||
-             tx->event_type == SPSC_EVT_TX_STREAM_FIN)) {
-            const uint8_t* data = (const uint8_t*)tx->data_buf;
-            uint32_t to_send = tx->data_length;
-            if (to_send > length) to_send = (uint32_t)length;
-            int is_fin = (tx->event_type == SPSC_EVT_TX_STREAM_FIN);
-            int still_active = !is_fin;
-            uint8_t* buf = picoquic_provide_stream_data_buffer(
-                bytes, to_send, is_fin, still_active);
-            if (buf && data) memcpy(buf, data, to_send);
-            spsc_ring_pop(s->bridge->tx_ring);
-        } else {
+        /* picoquic asking for TX bytes on stream sid. Pull from this
+         * stream's sc->tx byte ring. Mirrors the raw-QUIC
+         * prepare_to_send path: drain bytes into picoquic's frame
+         * buffer up to the budget, set is_fin if FIN-pending and the
+         * ring just drained empty, emit SPSC_EVT_STREAM_TX_DRAINED via
+         * the edge-trigger pattern when a Python writer is blocked.
+         *
+         * Lookup-only: a callback for a stream that has never had
+         * bytes pushed (e.g. a peer-initiated bidi we haven't replied
+         * on yet) provides 0 bytes — picoquic stops asking until
+         * something marks the stream active. */
+        aiopquic_stream_ctx_t* sc =
+            aiopquic_wt_session_find_stream_tx(s, sid);
+        if (!sc || !sc->tx) {
             (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
+            break;
+        }
+        aiopquic_stream_buf_t* sb = sc->tx;
+        uint32_t want = (uint32_t)length;
+        uint32_t avail = aiopquic_stream_buf_used(sb);
+        uint32_t to_send = (avail < want) ? avail : want;
+        int fin_after = aiopquic_stream_buf_fin_pending(sb);
+        int is_fin = (fin_after && to_send == avail) ? 1 : 0;
+        int still_active = (avail > to_send) ? 1 : 0;
+        uint8_t* buf = picoquic_provide_stream_data_buffer(
+            bytes, to_send, is_fin, still_active);
+        if (buf && to_send > 0) {
+            aiopquic_stream_buf_pop(sb, buf, to_send);
+            /* Edge-trigger TX backpressure: if a Python writer was
+             * blocked (set tx_drain_pending=1 after seeing sc->tx
+             * full), CAS-clear and emit one SPSC_EVT_STREAM_TX_DRAINED
+             * so it wakes and retries. Single-shot per fill->drain
+             * cycle — only the CAS winner pushes. RX ring carries
+             * the wakeup; routing back to the asyncio per-stream
+             * Event is handled by the existing dispatcher path.
+             *
+             * stream_ctx field carries the per-stream sc so the
+             * Python side routes the wake to the right per-stream
+             * Event without an extra lookup. */
+            uint32_t expected = 1;
+            if (atomic_compare_exchange_strong_explicit(
+                    &sc->tx_drain_pending, &expected, 0,
+                    memory_order_acq_rel, memory_order_relaxed)) {
+                spsc_entry_t drain_entry = {0};
+                drain_entry.event_type = SPSC_EVT_STREAM_TX_DRAINED;
+                drain_entry.stream_id = sid;
+                drain_entry.cnx = s->cnx;
+                /* stream_ctx routes the event to the right WT session
+                 * via the dispatcher's _sessions map keyed by session
+                 * pointer — same convention as the other _EVT_WT_*
+                 * events. The per-stream sc is recoverable from the
+                 * session + stream_id if Python needs it. */
+                drain_entry.stream_ctx = s;
+                if (spsc_ring_push(s->bridge->rx_ring,
+                                   &drain_entry, NULL, 0) == 0) {
+                    aiopquic_notify_rx(s->bridge);
+                } else {
+                    /* RX ring full — re-arm so we retry on the next
+                     * provide_data. Better than losing the wakeup. */
+                    atomic_store_explicit(
+                        &sc->tx_drain_pending, 1,
+                        memory_order_release);
+                }
+            }
+        }
+        /* On FIN we can free this stream's TX ring now that picoquic
+         * has it; provide_data won't be called for this stream again.
+         * remove_stream_tx calls aiopquic_stream_ctx_destroy on the
+         * stored sc — do not double-free. */
+        if (is_fin) {
+            aiopquic_wt_session_remove_stream_tx(s, sid);
         }
         break;
     }
@@ -655,6 +779,11 @@ static int aiopquic_wt_path_callback(
                                     sid,
                                     picoquic_get_remote_stream_error(cnx, sid),
                                     NULL, 0);
+            /* Peer reset the stream — picoquic won't ask for more TX
+             * bytes on it. Safe to free the per-stream TX ring now.
+             * RX side has a pending_destroy / drain dance (Python may
+             * still be reading); TX has no such constraint. */
+            aiopquic_wt_session_remove_stream_tx(s, sid);
         }
         break;
 
@@ -663,6 +792,9 @@ static int aiopquic_wt_path_callback(
                                 sid,
                                 picoquic_get_remote_stream_error(cnx, sid),
                                 NULL, 0);
+        /* Peer told us "stop sending on this stream" — free its
+         * TX ring; we won't be reading from it again. */
+        aiopquic_wt_session_remove_stream_tx(s, sid);
         break;
 
     case picohttp_callback_deregister:
@@ -905,6 +1037,9 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (st) {
             picowt_reset_stream(s->cnx, st, entry->error_code);
         }
+        /* We aborted this stream — free its TX ring. No further
+         * provide_data callbacks will fire for it. */
+        aiopquic_wt_session_remove_stream_tx(s, entry->stream_id);
         return 1;
     }
 

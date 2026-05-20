@@ -38,6 +38,11 @@ from aiopquic.quic.events import (
 )
 
 
+# Must match spsc_ring.h SPSC_EVT_STREAM_TX_DRAINED — shared with
+# the raw-QUIC path. Fired by the picoquic worker when sc->tx drains
+# after a Python writer was blocked, edge-trigger via tx_drain_pending.
+_EVT_STREAM_TX_DRAINED = 15
+
 # Must match spsc_ring.h SPSC_EVT_WT_* values.
 _EVT_WT_SESSION_READY = 64
 _EVT_WT_SESSION_REFUSED = 65
@@ -100,6 +105,11 @@ class WebTransportSession:
         self._pending_creates: deque[asyncio.Future] = deque()
         # Per-stream incoming queues
         self._stream_inbox: dict[int, asyncio.Queue] = {}
+        # Per-stream drain events. Set by _on_event when the picoquic
+        # worker fires SPSC_EVT_STREAM_TX_DRAINED for a stream; awaited
+        # by send_stream_data_drained / external callers via
+        # get_tx_drain_event. Lazy-allocated per stream_id.
+        self._stream_tx_drain_events: dict[int, asyncio.Event] = {}
         # Datagrams + general event stream
         self._event_queue: asyncio.Queue = asyncio.Queue()
 
@@ -182,11 +192,94 @@ class WebTransportSession:
 
     def send_stream_data(self, stream_id: int, data: bytes,
                           end_stream: bool = False) -> None:
-        """Send bytes on a WT stream. Synchronous (push + wake).
-        cdef class encapsulates the cnx pointer + transport plumbing."""
+        """Send bytes on a WT stream.
+
+        Writes into the stream's per-WT-stream sc->tx byte ring and
+        marks the stream active. Picoquic pulls bytes at wire rate via
+        prepare_to_send. All-or-nothing on backpressure: BufferError
+        means no bytes committed and caller may retry the same buffer.
+        """
         if not self.session_ready:
             raise WebTransportError("session not open")
         self._state.push_stream_data(stream_id, data, end_stream)
+
+    def get_tx_drain_event(self, stream_id: int) -> asyncio.Event:
+        """asyncio.Event signalled when the picoquic worker drains
+        bytes from this stream's sc->tx after the ring was reported
+        full. Caller pattern:
+            event = wt.get_tx_drain_event(sid)
+            event.clear()
+            try:
+                wt.send_stream_data(sid, data, end_stream)
+            except BufferError:
+                await event.wait()
+                continue  # retry
+        """
+        event = self._stream_tx_drain_events.get(stream_id)
+        if event is None:
+            event = asyncio.Event()
+            self._stream_tx_drain_events[stream_id] = event
+        return event
+
+    def tx_pressure(self, stream_id: int = 0) -> float:
+        """TX-ring fill ratio in [0.0, 1.0], for backpressure-aware
+        yielding from tight send loops. BufferError from
+        send_stream_data is the hard signal; this is the soft
+        companion. `stream_id` is reserved for future per-stream ring
+        accounting; the SPSC TX ring is shared across all WT streams
+        on this session today so the value is connection-global.
+        """
+        cap = self._transport.tx_capacity
+        if not cap:
+            return 0.0
+        return self._transport.tx_count / cap
+
+    def tx_pending_bytes(self, stream_id: int = 0) -> int:
+        """Aggregate bytes across in-flight SPSC TX-ring entries.
+        Bytes-aware companion to tx_pressure for latency-budget
+        backpressure. `stream_id` is reserved for future per-stream
+        accounting; today the value is connection-global.
+        """
+        return self._transport.tx_bytes_pending
+
+    async def send_stream_data_drained(self, stream_id: int, data: bytes,
+                                         end_stream: bool = False,
+                                         *,
+                                         soft_yield_at: float = 0.5,
+                                         hard_wait_at: float = 0.9) -> None:
+        """Send with built-in TX-ring backpressure for WT.
+
+        Composes send_stream_data + get_tx_drain_event + tx_pressure so
+        every WT caller gets worker-thread-aware pacing without copying
+        the heuristic. Mirrors aiopquic.QuicConnection.send_stream_data_drained.
+
+        Layers:
+          - hard ring-saturation guard: await the drain event when
+            `tx_pressure > hard_wait_at` (default 0.9).
+          - send: atomic push to sc->tx + MARK_ACTIVE under one GIL hold.
+          - soft post-send yield: `await asyncio.sleep(0)` when
+            `tx_pressure > soft_yield_at` (default 0.5).
+          - BufferError retry: await the per-stream drain event and
+            retry the same data buffer.
+
+        Application-level policies (byte budgets, fairness) belong
+        above this layer.
+        """
+        event = self.get_tx_drain_event(stream_id)
+        while True:
+            if self.tx_pressure(stream_id) > hard_wait_at:
+                event.clear()
+                await event.wait()
+                continue
+            event.clear()
+            try:
+                self.send_stream_data(stream_id, data,
+                                       end_stream=end_stream)
+                if self.tx_pressure(stream_id) > soft_yield_at:
+                    await asyncio.sleep(0)
+                return
+            except BufferError:
+                await event.wait()
 
     def reset_stream(self, stream_id: int, error_code: int = 0) -> None:
         self._state.push_reset_stream(stream_id, error_code)
@@ -324,6 +417,14 @@ class WebTransportSession:
         elif evt_type == _EVT_WT_NEW_STREAM:
             self._event_queue.put_nowait(
                 WebTransportNewStream(stream_id=sid))
+        elif evt_type == _EVT_STREAM_TX_DRAINED:
+            # Picoquic worker drained bytes from this stream's sc->tx
+            # and the edge-trigger CAS won. Wake any blocked writer.
+            event = self._stream_tx_drain_events.get(sid)
+            if event is None:
+                event = asyncio.Event()
+                self._stream_tx_drain_events[sid] = event
+            event.set()
 
 
 # =====================================================================
