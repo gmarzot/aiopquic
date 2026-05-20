@@ -467,6 +467,52 @@ class QuicConnection:
                 f"send_stream_data alloc failed (stream={stream_id})"
             )
 
+    async def send_stream_data_drained(self, stream_id: int, data: bytes,
+                                         end_stream: bool = False,
+                                         *,
+                                         soft_yield_at: float = 0.5,
+                                         hard_wait_at: float = 0.9) -> None:
+        """Send with built-in TX-ring backpressure: hard-wait on the
+        SPSC drain event when the ring is saturated, soft-yield after a
+        successful send to release the GIL while the picoquic worker
+        catches up. The "obvious correct way" to send from an async
+        producer loop — any caller using this gets worker-thread-aware
+        pacing without copying the heuristic.
+
+        Layers (composed with `send_stream_data` + `get_tx_drain_event`
+        + `tx_pressure`):
+          - hard ring-saturation guard: if `tx_pressure > hard_wait_at`
+            (default 0.9), await the SPSC drain event before queuing.
+            Bounds ring fill independent of object size.
+          - successful send: call `send_stream_data` (atomic push +
+            MARK_ACTIVE + worker wake under one GIL hold).
+          - soft post-send yield: if `tx_pressure > soft_yield_at`
+            (default 0.5), `await asyncio.sleep(0)` so the worker
+            thread sees the GIL. Fast Python paths (notably Linux with
+            UDP GSO) can otherwise outrun a single sendmsg-per-batch
+            worker.
+          - `BufferError` retry: ring went full between the pressure
+            check and the send — await the drain event and retry the
+            same data buffer (send_stream_data is all-or-nothing).
+
+        Application-level policies (a byte budget, fairness across
+        streams, etc.) belong in the caller above this layer.
+        """
+        event = self.get_tx_drain_event(stream_id)
+        while True:
+            if self.tx_pressure(stream_id) > hard_wait_at:
+                event.clear()
+                await event.wait()
+                continue
+            event.clear()
+            try:
+                self.send_stream_data(stream_id, data, end_stream=end_stream)
+                if self.tx_pressure(stream_id) > soft_yield_at:
+                    await asyncio.sleep(0)
+                return
+            except BufferError:
+                await event.wait()
+
     def send_datagram_frame(self, data: bytes) -> None:
         """Send a datagram frame."""
         self._transport.push_tx(
