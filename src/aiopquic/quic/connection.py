@@ -223,7 +223,8 @@ class QuicConnection:
         self._transport.drain_rx_callback(self._handle_raw_event)
 
     def _handle_raw_event(self, evt_type, stream_id, data, is_fin,
-                          error_code, cnx_ptr, _stream_ctx_ptr) -> None:
+                          error_code, cnx_ptr, _stream_ctx_ptr,
+                          _sc_ptr) -> None:
         """Per-entry handler invoked from drain_rx_callback.
 
         For STREAM_DATA / STREAM_FIN events on streams owned by an
@@ -257,6 +258,17 @@ class QuicConnection:
             self._events.append(ConnectionTerminated(
                 error_code=error_code,
             ))
+            # Wake any producer parked in send_stream_data_drained /
+            # stream_write_drain waiting on per-stream or ring drain
+            # events. After close the worker stops invoking drain
+            # callbacks for this cnx, so without these explicit sets
+            # the waiter would deadlock until process exit. Producer
+            # wakes, loops, observes _closed and exits cleanly.
+            for ev in self._stream_tx_drain_events.values():
+                ev.set()
+            ring_ev = getattr(self._transport, '_tx_ring_drain_event', None)
+            if ring_ev is not None:
+                ring_ev.set()
             # picoquic's close callback has fired — worker has stopped
             # invoking app callbacks for this cnx's streams. Safe to
             # free per-stream wrappers; without this they'd leak until
@@ -335,18 +347,21 @@ class QuicConnection:
         return self._transport.tx_count / cap
 
     def tx_pending_bytes(self, stream_id: int = 0) -> int:
-        """Aggregate bytes across all in-flight TX-ring entries.
+        """Connection-global bytes pending in the SPSC TX event ring.
 
-        Bytes-aware companion to `tx_pressure()`: the sum of
-        `data_length` over events currently queued for the picoquic
-        worker. For latency-targeted backpressure, callers can compare
-        this against an absolute byte budget (independent of ring
-        entry count or object size) — at a known drain rate the
-        budget translates directly to a queue-time-in-flight bound.
+        Returns the sum of data_length over events currently queued for
+        the picoquic worker. In the PULL model this is ~0 because
+        MARK_ACTIVE entries carry no payload — actual bytes live in
+        per-stream sc->tx rings. For per-stream sc->tx byte accounting
+        use _transport.stream_tx_buf_used(sc_ptr) directly with sc_ptr
+        from _stream_ctxs[stream_id].
 
-        `stream_id` is reserved for future per-stream accounting;
-        currently the ring is connection-global, so the value is
-        connection-wide.
+        stream_id arg kept for API stability but is currently unused:
+        the SPSC ring is connection-global. A per-stream variant was
+        explored and reverted — it mis-aligned the byte-budget threshold
+        check (which assumes sc->tx scope) with the ring_event wakeup
+        predicate (which fires on SPSC ring drain). Realigning needs a
+        dedicated per-stream wait predicate; deferred for redesign.
         """
         if self._transport is None:
             return 0
@@ -396,6 +411,12 @@ class QuicConnection:
         elif evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
             self._closed = True
             self._events.append(ConnectionTerminated(error_code=error_code))
+            # Wake parked drain waiters — see matching block ~line 256.
+            for ev in self._stream_tx_drain_events.values():
+                ev.set()
+            ring_ev = getattr(self._transport, '_tx_ring_drain_event', None)
+            if ring_ev is not None:
+                ring_ev.set()
             self._destroy_stream_ctxs()
         elif evt_type == _EVT_READY:
             alpn = (self._configuration.alpn_protocols[0]
@@ -472,46 +493,69 @@ class QuicConnection:
                                          *,
                                          soft_yield_at: float = 0.5,
                                          hard_wait_at: float = 0.9) -> None:
-        """Send with built-in TX-ring backpressure: hard-wait on the
-        SPSC drain event when the ring is saturated, soft-yield after a
-        successful send to release the GIL while the picoquic worker
-        catches up. The "obvious correct way" to send from an async
-        producer loop — any caller using this gets worker-thread-aware
-        pacing without copying the heuristic.
+        """Send with built-in TX-ring backpressure for raw QUIC.
 
-        Layers (composed with `send_stream_data` + `get_tx_drain_event`
-        + `tx_pressure`):
-          - hard ring-saturation guard: if `tx_pressure > hard_wait_at`
-            (default 0.9), await the SPSC drain event before queuing.
-            Bounds ring fill independent of object size.
-          - successful send: call `send_stream_data` (atomic push +
-            MARK_ACTIVE + worker wake under one GIL hold).
-          - soft post-send yield: if `tx_pressure > soft_yield_at`
-            (default 0.5), `await asyncio.sleep(0)` so the worker
-            thread sees the GIL. Fast Python paths (notably Linux with
-            UDP GSO) can otherwise outrun a single sendmsg-per-batch
-            worker.
-          - `BufferError` retry: ring went full between the pressure
-            check and the send — await the drain event and retry the
-            same data buffer (send_stream_data is all-or-nothing).
+        Composes send_stream_data + get_tx_drain_event + tx_pressure
+        and the connection-global tx_ring_drain_event so every caller
+        gets worker-thread-aware pacing without copying the heuristic.
+        Mirrors aiopquic.asyncio.WebTransportSession.send_stream_data_drained.
 
-        Application-level policies (a byte budget, fairness across
-        streams, etc.) belong in the caller above this layer.
+        Layers:
+          - hard ring-saturation guard: await the connection-global
+            tx_ring_drain_event when tx_pressure > hard_wait_at
+            (default 0.9). Uses the clear-arm-recheck-wait pattern so
+            there is no lost wakeup if the worker drains the ring
+            between our threshold check and the wait.
+          - send: atomic push to sc->tx + MARK_ACTIVE under one GIL hold.
+          - soft post-send yield: await asyncio.sleep(0) when
+            tx_pressure > soft_yield_at (default 0.5).
+          - BufferError retry: await whichever drain event the Cython
+            side armed (sc->tx-full arms per-stream event; TX-ring-full
+            arms connection-global event). asyncio.wait FIRST_COMPLETED
+            on both wakes us on whichever fires.
+
+        Application-level policies (byte budgets, fairness) belong
+        above this layer.
         """
-        event = self.get_tx_drain_event(stream_id)
+        sc_event = self.get_tx_drain_event(stream_id)
+        ring_event = self._transport.tx_ring_drain_event
         while True:
+            # Connection-global ring pressure: tx_pressure reads the
+            # SPSC TX event ring. Wait on the connection-global ring
+            # event, NOT the per-stream sc->tx event (which is only
+            # armed when sc->tx fills).
             if self.tx_pressure(stream_id) > hard_wait_at:
-                event.clear()
-                await event.wait()
+                ring_event.clear()
+                self._transport.arm_tx_ring_drain_pending()
+                if self.tx_pressure(stream_id) <= hard_wait_at:
+                    self._transport.clear_tx_ring_drain_pending()
+                    continue
+                await ring_event.wait()
                 continue
-            event.clear()
+            # Clear both events BEFORE the send. If the worker fires
+            # them during our send_stream_data call (race between the
+            # Cython arming and us catching the exception), the set
+            # will land AFTER our clear and be captured on the wait.
+            # Clearing AFTER the BufferError loses that wakeup.
+            sc_event.clear()
+            ring_event.clear()
             try:
                 self.send_stream_data(stream_id, data, end_stream=end_stream)
                 if self.tx_pressure(stream_id) > soft_yield_at:
                     await asyncio.sleep(0)
                 return
             except BufferError:
-                await event.wait()
+                # Cython side armed the appropriate signal:
+                # - sc->tx full → per-stream sc->tx_drain_pending
+                # - TX ring full → connection-global tx_ring_drain_pending
+                # Events were cleared BEFORE the call so no lost wakeup.
+                sc_wait = asyncio.create_task(sc_event.wait())
+                ring_wait = asyncio.create_task(ring_event.wait())
+                done, pending = await asyncio.wait(
+                    [sc_wait, ring_wait],
+                    return_when=asyncio.FIRST_COMPLETED)
+                for t in pending:
+                    t.cancel()
 
     def send_datagram_frame(self, data: bytes) -> None:
         """Send a datagram frame."""
@@ -663,7 +707,7 @@ class QuicEngine:
             return
         raw_events = self._transport.drain_rx()
         for (evt_type, stream_id, data, is_fin, error_code,
-             cnx_ptr, stream_ctx_ptr) in raw_events:
+             cnx_ptr, stream_ctx_ptr, _sc_ptr) in raw_events:
             if cnx_ptr == 0:
                 continue  # engine-level event, not per-cnx
             conn = self._connections.get(cnx_ptr)

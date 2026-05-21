@@ -31,6 +31,19 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <time.h>
+
+/* Inline helper for ns-resolution monotonic timestamps. CLOCK_MONOTONIC
+ * is a single time-base across worker thread and asyncio thread on
+ * Linux/macOS, making counter-event ordering directly comparable.
+ * Defined here (rather than in callback.h) because stream_ctx.h is
+ * included by callback.h — putting it here keeps the timestamp helper
+ * usable from both header trees. */
+static inline uint64_t aiopquic_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 typedef struct {
     aiopquic_stream_buf_t* tx;
@@ -54,10 +67,42 @@ typedef struct {
     _Atomic(uint32_t) tx_drain_pending;
     /* fin/reset arrived; free wrapper after final drain. */
     uint8_t  pending_destroy;
+    /* Observability counters (single-writer; relaxed semantics).
+     * Aligned with the connection-global ring_event counters in
+     * aiopquic_ctx_t so the SIGUSR2 dump can correlate per-stream
+     * sc->tx drain activity with cnx-wide ring activity at the same
+     * monotonic timestamp. */
+    uint64_t cnt_drain_arms;        /* Python armed sc->tx_drain_pending */
+    uint64_t cnt_drain_fires;       /* worker fired SPSC_EVT_STREAM_TX_DRAINED */
+    uint64_t cnt_drain_dropped;     /* CAS won but rx_ring push failed → re-arm */
+    uint64_t last_drain_arm_ns;     /* CLOCK_MONOTONIC of last arm */
+    uint64_t last_drain_fire_ns;    /* CLOCK_MONOTONIC of last fire */
 } aiopquic_stream_ctx_t;
 
 static inline aiopquic_stream_ctx_t* aiopquic_stream_ctx_create(void) {
     return (aiopquic_stream_ctx_t*)calloc(1, sizeof(aiopquic_stream_ctx_t));
+}
+
+/* Python-side arm for the per-stream sc->tx drain signal. Mirrors
+ * the connection-global aiopquic_arm_tx_ring_drain_pending in
+ * callback.h. Use when the Python writer wants to wait for sc->tx
+ * to drain at a soft threshold (e.g. a byte-budget cap below the
+ * hard sc->tx ring capacity) rather than waiting for the natural
+ * BufferError at full capacity. */
+static inline void aiopquic_arm_stream_tx_drain_pending(
+        aiopquic_stream_ctx_t* sc) {
+    if (!sc) return;
+    sc->cnt_drain_arms++;
+    sc->last_drain_arm_ns = aiopquic_now_ns();
+    atomic_store_explicit(&sc->tx_drain_pending, 1,
+                          memory_order_release);
+}
+
+static inline void aiopquic_clear_stream_tx_drain_pending(
+        aiopquic_stream_ctx_t* sc) {
+    if (!sc) return;
+    atomic_store_explicit(&sc->tx_drain_pending, 0,
+                          memory_order_release);
 }
 
 static inline int aiopquic_stream_ctx_ensure_tx(aiopquic_stream_ctx_t* sc,
@@ -150,6 +195,8 @@ static inline int aiopquic_stream_ctx_send_data(
              * SPSC_EVT_STREAM_TX_DRAINED when it next drains bytes
              * from sc->tx. Caller awaits on the matching asyncio
              * Event instead of polling sleep. */
+            sc->cnt_drain_arms++;
+            sc->last_drain_arm_ns = aiopquic_now_ns();
             atomic_store_explicit(&sc->tx_drain_pending, 1,
                                   memory_order_release);
             return 0;
