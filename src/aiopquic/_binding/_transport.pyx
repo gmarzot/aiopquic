@@ -554,13 +554,43 @@ def dump_all_counters(file=None):
     """Print counters from every live TransportContext to `file`
     (default stderr). Used by the SIGUSR2 handler in
     aiomoqt.utils.taskdump for hang-localization.
+
+    For each TransportContext, also enumerates per-stream counters
+    by walking gc-visible objects to find QuicConnection /
+    WebTransportSession instances bound to that transport — those
+    hold the `_stream_ctxs` / `_stream_tx_ctxs` maps that record
+    each stream's `aiopquic_stream_ctx_t*` pointer. Per-stream
+    counters are the load-bearing signal for diagnosing
+    per-stream sc->tx_drain_pending wake stalls: an outstanding
+    arm without matching fire on a specific stream is exactly the
+    pattern that hangs a producer in stream_write_drain.
     """
-    import sys
+    import sys, gc
     if file is None:
         file = sys.stderr
     n = 0
     for ctx in list(_TRANSPORT_REGISTRY):
-        ctx.dump_counters(file=file, label=f"ctx#{n}")
+        # Find Python session objects bound to this transport and
+        # harvest their per-stream sc_ptr maps. Walks gc-visible
+        # objects — slow but only runs during SIGUSR2.
+        sc_map = {}
+        for obj in gc.get_objects():
+            try:
+                if getattr(obj, '_transport', None) is ctx:
+                    inner = getattr(obj, '_stream_ctxs', None)
+                    if isinstance(inner, dict):
+                        sc_map.update(inner)
+                    inner = getattr(obj, '_stream_tx_ctxs', None)
+                    if isinstance(inner, dict):
+                        sc_map.update(inner)
+            except Exception:
+                # gc.get_objects() can yield objects in odd states
+                # (partial init, __del__-in-progress, weakrefs to
+                # dead objects, etc). Skip silently — we don't want
+                # SIGUSR2 to ever raise.
+                continue
+        ctx.dump_counters(file=file, label=f"ctx#{n}",
+                           stream_ctxs=sc_map)
         n += 1
     if n == 0:
         print("=== no live TransportContext instances ===",
@@ -719,14 +749,14 @@ cdef class TransportContext:
             'tx_drain_pending_now': sc.tx_drain_pending,
         }
 
-    def dump_counters(self, file=None, label=None):
+    def dump_counters(self, file=None, label=None, stream_ctxs=None):
         """Print counters to stderr (or given file). Used by SIGUSR2.
 
         Includes the connection-global counters, plus per-stream
-        counters for any streams the caller has explicitly registered
-        via the optional `_stream_ctxs` map on QuicConnection /
-        WebTransportSession (best-effort — not all transports track
-        their per-stream wrappers in Python).
+        counters when `stream_ctxs` (a dict mapping stream_id → sc_ptr)
+        is supplied. dump_all_counters() harvests this from Python
+        QuicConnection / WebTransportSession instances and passes it
+        in automatically; manual callers can pass an explicit dict.
         """
         import sys, time
         if file is None:
@@ -749,6 +779,45 @@ cdef class TransportContext:
         if arm_ns > fire_ns and arm_ns > 0:
             print(f"  ** outstanding tx_ring arm: armed {(now_ns - arm_ns) / 1e6:.1f}ms ago, "
                   f"no fire since **", file=file, flush=True)
+
+        # Per-stream counters, if a {stream_id: sc_ptr} map was passed.
+        # Each row: stream_id, drain arms/fires/dropped, current
+        # sc->tx bytes pending, pending flag, and a "STUCK" warning
+        # when the most-recent arm has no matching fire.
+        if stream_ctxs:
+            stuck = []
+            print(f"  --- per-stream ({len(stream_ctxs)} streams) ---",
+                  file=file, flush=True)
+            for sid in sorted(stream_ctxs.keys()):
+                sc_ptr = stream_ctxs[sid]
+                if not sc_ptr:
+                    continue
+                sc = self.stream_counters(sc_ptr)
+                if not sc:
+                    continue
+                arms = sc['drain_arms']
+                fires = sc['drain_fires']
+                dropped = sc['drain_dropped']
+                arm_ns = sc['last_drain_arm_ns']
+                fire_ns = sc['last_drain_fire_ns']
+                tx_used = sc['tx_used_now']
+                pending = sc['tx_drain_pending_now']
+                # Status flag — STUCK if there's an outstanding arm
+                # OR pending=1 with sc->tx still holding bytes.
+                status = ""
+                if arm_ns > fire_ns and arm_ns > 0:
+                    delta_ms = (now_ns - arm_ns) / 1e6
+                    status = f"  ** STUCK arm {delta_ms:.1f}ms ago **"
+                    stuck.append((sid, delta_ms, tx_used))
+                print(f"  sid={sid:<5} sc=0x{sc_ptr:x} "
+                      f"arms={arms} fires={fires} dropped={dropped} "
+                      f"tx_used={tx_used} pending={pending}{status}",
+                      file=file, flush=True)
+            if stuck:
+                print(f"  ** {len(stuck)} stream(s) with outstanding arm — "
+                      f"oldest {max(d for _, d, _ in stuck):.1f}ms **",
+                      file=file, flush=True)
+
         print(f"=== end counters ===", file=file, flush=True)
 
     def stream_tx_buf_used(self, uintptr_t sc_ptr):
