@@ -427,6 +427,18 @@ class QuicConnection:
             self._events.append(DatagramFrameReceived(
                 data=data if data is not None else memoryview(b""),
             ))
+        elif evt_type == _EVT_STREAM_TX_DRAINED:
+            # Engine-side mirror of _handle_raw_event's STREAM_TX_DRAINED
+            # case. Picoquic worker drained sc->tx after Python had armed
+            # tx_drain_pending; wake the blocked writer on this stream.
+            # Without this branch the engine-routed dispatch silently
+            # dropped the wake and producers parked in stream_write_drain
+            # forever.
+            event = self._stream_tx_drain_events.get(stream_id)
+            if event is None:
+                event = asyncio.Event()
+                self._stream_tx_drain_events[stream_id] = event
+            event.set()
 
     def _get_or_create_stream_ctx(self, stream_id: int) -> int:
         """Lazy-allocate the per-stream wrapper. Both TX and RX paths
