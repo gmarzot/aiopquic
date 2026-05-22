@@ -99,6 +99,8 @@ cdef extern from "picoquic.h":
     void picoquic_set_default_congestion_algorithm_by_name(
         picoquic_quic_t* quic, const char* alg_name)
 
+    void picoquic_register_all_congestion_control_algorithms()
+
     void picoquic_free(picoquic_quic_t* quic)
     uint64_t picoquic_current_time()
     void picoquic_set_null_verifier(picoquic_quic_t* quic)
@@ -1489,6 +1491,19 @@ cdef class TransportContext:
             self._wt_params.path_table_nb = 1
             default_cb_fn = h3zero_callback
             default_cb_ctx = <void*>&self._wt_params
+
+        # Register picoquic's full CC algorithm catalog. Without this,
+        # picoquic_get_congestion_algorithm() returns NULL for ANY name
+        # (the algorithm registry is empty by default), so
+        # picoquic_set_default_congestion_algorithm_by_name() silently
+        # stores NULL → new cnxs have cnx->congestion_alg == NULL →
+        # alg_init is never called → cwin stays pinned at
+        # PICOQUIC_CWIN_INITIAL (10 × MSS = 15360) for the connection's
+        # entire lifetime. picoquicdemo, pico_sim, pqbench, and every
+        # picoquic test driver all call this at startup; aiopquic
+        # didn't, which is what capped raw-QUIC loopback throughput.
+        # Idempotent — repeats just overwrite the same static array.
+        picoquic_register_all_congestion_control_algorithms()
 
         # Create picoquic context with the chosen default callback.
         self._quic = picoquic_create(
