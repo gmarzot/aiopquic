@@ -37,6 +37,13 @@ where = ["src"]
 
 [tool.setuptools_scm]
 
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]  # line length handled by formatter
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
@@ -92,8 +99,21 @@ bash build_picoquic.sh
 """
 
 [tool.cibuildwheel.linux.environment]
-CFLAGS = "-O3 -fno-strict-overflow -fPIC"
-PICOQUIC_C_FLAGS = "-O3 -DNDEBUG"
+# Arch-agnostic perf flags safe on every Linux target.
+# -flto inlines across translation units; DISABLE_DEBUG_PRINTF strips
+# debug branches in picoquic. Arch-specific tuning (x86-64-v3 baseline,
+# PTLS Fusion AES-GCM) is added per-arch via overrides below.
+CFLAGS = "-O3 -fno-strict-overflow -fPIC -flto"
+PICOQUIC_C_FLAGS = "-O3 -DNDEBUG -flto -DDISABLE_DEBUG_PRINTF"
+CMAKE_ARGS = "-DDISABLE_DEBUG_PRINTF=ON"
+
+# x86_64 only: add v3 baseline (Haswell+/2013+) and PTLS Fusion AES-GCM.
+# Fusion is safe to bake in — picotls runtime-CPUIDs AES-NI + PCLMULQDQ
+# and falls back to openssl if absent. v3 baseline covers essentially
+# every modern x86_64 CPU; older systems install via sdist.
+[[tool.cibuildwheel.overrides]]
+select = "*-manylinux_x86_64"
+environment = { CFLAGS = "-O3 -fno-strict-overflow -fPIC -flto -march=x86-64-v3", PICOQUIC_C_FLAGS = "-O3 -DNDEBUG -flto -march=x86-64-v3 -DDISABLE_DEBUG_PRINTF", CMAKE_ARGS = "-DPTLS_WITH_FUSION=ON -DDISABLE_DEBUG_PRINTF=ON" }
 
 [tool.cibuildwheel.macos]
 # delocate bundles libssl/libcrypto from Homebrew into the wheel.

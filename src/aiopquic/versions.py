@@ -5,7 +5,8 @@ Usage:
     aiopquic-versions                    # console-script entry point
 
 Prints aiopquic's installed version + the picoquic / picotls submodule
-SHAs captured at build time. SHAs come from `_build_info.py` written
+revisions captured at build time (git describe + commit date + subject,
+or raw SHA fallback for older builds). Reads `_build_info.py` written
 by setup.py during wheel/editable install.
 """
 from __future__ import annotations
@@ -16,25 +17,43 @@ import sys
 from aiopquic import __version__
 
 
-def _build_info() -> tuple[str, str]:
-    """Return (picoquic_sha, picotls_sha) — strings, never None.
-    "unknown" if the build-info module wasn't generated (e.g. an
-    older editable install rebuilt before setup.py captured SHAs)."""
+def _submodule_info(prefix: str) -> dict[str, str]:
+    """Return a {sha, describe, date, subject} dict for the named
+    submodule prefix ("PICOQUIC" or "PICOTLS"). Every field defaults
+    to "unknown" so older _build_info.py files (sha-only) still work."""
     try:
-        from aiopquic._build_info import PICOQUIC_SHA, PICOTLS_SHA
-        return PICOQUIC_SHA, PICOTLS_SHA
+        from aiopquic import _build_info as _bi
     except ImportError:
-        return "unknown", "unknown"
+        return {"sha": "unknown", "describe": "unknown",
+                "date": "unknown", "subject": "unknown"}
+    return {
+        "sha":      getattr(_bi, f"{prefix}_SHA",      "unknown"),
+        "describe": getattr(_bi, f"{prefix}_DESCRIBE", "unknown"),
+        "date":     getattr(_bi, f"{prefix}_DATE",     "unknown"),
+        "subject":  getattr(_bi, f"{prefix}_SUBJECT",  "unknown"),
+    }
+
+
+def _format_submodule(name: str, info: dict[str, str]) -> str:
+    # Prefer the human-readable describe + date; fall back to the raw
+    # SHA when older _build_info.py only captured that.
+    if info["describe"] != "unknown":
+        line = f"{name:<8} {info['describe']}"
+        if info["date"] != "unknown":
+            line += f"  ({info['date']})"
+        if info["subject"] != "unknown":
+            line += f"\n         {info['subject']}"
+        return line
+    return f"{name:<8} {info['sha']}"
 
 
 def print_versions(file=sys.stdout) -> None:
     import aiopquic
-    pico_sha, ptls_sha = _build_info()
     src = os.path.dirname(aiopquic.__file__)
     print(f"aiopquic {__version__}", file=file)
     print(f"         {src}", file=file)
-    print(f"picoquic {pico_sha}", file=file)
-    print(f"picotls  {ptls_sha}", file=file)
+    print(_format_submodule("picoquic", _submodule_info("PICOQUIC")), file=file)
+    print(_format_submodule("picotls",  _submodule_info("PICOTLS")),  file=file)
 
 
 def main() -> int:

@@ -107,6 +107,25 @@ uv pip install -e '.[dev]'    # or: pip install -e '.[dev]'
 
 On macOS, set `OPENSSL_ROOT_DIR` if Homebrew OpenSSL is not auto-detected (the build script tries `openssl@3` then `openssl@1.1`).
 
+### Reporting issues
+
+Include the full version report in any issue — it captures aiopquic plus the picoquic + picotls submodule SHAs the binding was built from:
+
+```bash
+python -m aiopquic.versions   # or the console script: aiopquic-versions
+```
+
+Sample output:
+
+```
+aiopquic 0.3.5.dev4+g2ffe8947d.d20260522
+         /path/to/aiopquic
+picoquic 2b1e14d5a46532eadf691edef5bd747da6de6557
+picotls  f350eab60742138ac62b42ee444adf04c7898b0d
+```
+
+If you're running aiomoqt on top, prefer `python -m aiomoqt.versions` — it chains through to this report and includes the aiomoqt version too.
+
 ## Usage
 
 ### Low-level Transport API
@@ -195,6 +214,44 @@ uv pip install -e '.[dev]'                 # re-cythonize with PICOQUIC_WITH_IO_
 Linux-only. Compatible CPU architectures: x86_64, ARM64. Build will hard-error if `AIOPQUIC_IO_URING=1` is set on macOS / BSD / Windows.
 
 > **ABI note:** `picoquic_network_thread_ctx_t` and `picoquic_socket_ctx_t` have conditional fields gated on `PICOQUIC_WITH_IO_URING`. The build-script + setup.py propagate the define to both picoquic-core *and* the Cython extension. A mismatch silently shifts `thread_is_ready` and other field offsets — the network thread appears to never become ready. Don't enable WITH_IO_URING in picoquic without also defining PICOQUIC_WITH_IO_URING in the Cython build.
+
+## Runtime deployment guidance
+
+These are runtime tunings, separate from build-time flags above. PyPI wheels ship with portable perf flags baked in (see [Performance build](#performance-build-opt-in)); these knobs apply on top of any binary.
+
+### jemalloc for tail-latency reduction
+
+The default `glibc` allocator's per-thread arenas + occasional coalescing show up as max-latency outliers under sustained high-throughput workloads. Preloading `jemalloc` measurably tightens the tail:
+
+```bash
+# Debian/Ubuntu:
+sudo apt install libjemalloc2
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 python -m your_app
+
+# Fedora/RHEL:
+sudo dnf install jemalloc
+LD_PRELOAD=/usr/lib64/libjemalloc.so.2 python -m your_app
+```
+
+Validated improvement on a representative aiopquic sustained workload (Ryzen 7 PRO, Linux loopback): `sd 7.1 ms → 4.3 ms`, `max 437 ms → 310 ms`, throughput unchanged. Effect is most visible at multi-Gbps over 60+ second runs; small workloads see no difference.
+
+### GSO and send-length-max
+
+GSO (UDP segmentation offload) is **already enabled by default on Linux** with `send_length_max=65535` (max kernel-coalesced stride). No user action needed. macOS / FreeBSD default to GSO off — picoquic's per-datagram `sendmsg` path is used instead. Env overrides:
+
+```bash
+AIOPQUIC_GSO=0                  # force off (diagnostic only)
+AIOPQUIC_SEND_LENGTH_MAX=8192   # cap kernel-coalesced buffer (Linux GSO on)
+```
+
+### TX wake threshold
+
+The TX SPSC event ring's drain-wake threshold defaults to 50% — producer is signalled to resume only after ≥ half the queued events have drained. Overridable to tune for latency vs. context-switch overhead:
+
+```bash
+AIOPQUIC_TX_RING_WAKE_PCT=25    # wake earlier (lower per-send latency, more context switches)
+AIOPQUIC_TX_RING_WAKE_PCT=75    # wake later (more batching, slightly higher latency)
+```
 
 ## Known Limitations
 
