@@ -12,7 +12,7 @@
 - **TX path** -- Asyncio pushes into per-stream byte ring; picoquic pulls at wire rate via `prepare_to_send`.
 - **RX path** -- picoquic pushes per-event `StreamChunk`s; ownership transfers at pop for 1-copy delivery.
 - **Cross-platform wake fd** -- Linux `eventfd` for efficient asyncio `add_reader()` notification; `pipe()` self-pipe fallback on macOS / BSD.
-- **Dedicated Network Thread** -- picoquic runs in its own thread via `picoquic_start_network_thread()`.
+- **Dedicated Network Thread** -- picoquic runs in its own thread via `picoquic_start_network_thread()`. One worker thread per `TransportContext`; multiple contexts share the asyncio event loop within a single Python process.
 - **Cython Bridge** -- Thin Cython layer over C callbacks, minimal overhead.
 - **WebTransport** -- `asyncio.webtransport.WebTransportSession` (client + server) over picoquic's `picowt_*` API and h3zero.
 
