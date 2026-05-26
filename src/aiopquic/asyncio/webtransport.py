@@ -42,6 +42,7 @@ from aiopquic.quic.events import (
 # the raw-QUIC path. Fired by the picoquic worker when sc->tx drains
 # after a Python writer was blocked, edge-trigger via tx_drain_pending.
 _EVT_STREAM_TX_DRAINED = 15
+_EVT_STREAM_DESTROY = 17
 
 # Must match spsc_ring.h SPSC_EVT_WT_* values.
 _EVT_WT_SESSION_READY = 64
@@ -506,6 +507,17 @@ class WebTransportSession:
                 event = asyncio.Event()
                 self._stream_tx_drain_events[sid] = event
             event.set()
+        elif evt_type == _EVT_STREAM_DESTROY:
+            # Stream fully retired by picoquic — drop our cached
+            # pointer so the dict doesn't accumulate stale entries.
+            # Note: WT data streams don't currently set app_stream_ctx,
+            # so picoquic_callback_stream_released won't fire for them
+            # yet; this handler is in place for when Step 5 closes the
+            # WT-side gap. Raw-QUIC streams sharing this transport will
+            # exercise the path today.
+            self._stream_tx_ctxs.pop(sid, None)
+            self._stream_tx_drain_events.pop(sid, None)
+            self._stream_inbox.pop(sid, None)
 
 
 # =====================================================================

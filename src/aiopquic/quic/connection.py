@@ -44,6 +44,7 @@ _EVT_READY = 6
 _EVT_ALMOST_READY = 7
 _EVT_DATAGRAM = 8
 _EVT_STREAM_TX_DRAINED = 15
+_EVT_STREAM_DESTROY = 17
 
 # TX event types
 _TX_STREAM_DATA = 128
@@ -301,6 +302,13 @@ class QuicConnection:
                 event = asyncio.Event()
                 self._stream_tx_drain_events[stream_id] = event
             event.set()
+        elif evt_type == _EVT_STREAM_DESTROY:
+            # Stream fully retired by picoquic — drop our cached
+            # pointer so the dict doesn't accumulate stale entries.
+            # The C side has already dropped the stream-lifetime ref
+            # by the time this fires; don't deref.
+            self._stream_ctxs.pop(stream_id, None)
+            self._stream_tx_drain_events.pop(stream_id, None)
 
     def get_tx_drain_event(self, stream_id: int) -> asyncio.Event:
         """Return the asyncio.Event signalling that the picoquic
@@ -439,6 +447,9 @@ class QuicConnection:
                 event = asyncio.Event()
                 self._stream_tx_drain_events[stream_id] = event
             event.set()
+        elif evt_type == _EVT_STREAM_DESTROY:
+            self._stream_ctxs.pop(stream_id, None)
+            self._stream_tx_drain_events.pop(stream_id, None)
 
     def _get_or_create_stream_ctx(self, stream_id: int) -> int:
         """Lazy-allocate the per-stream wrapper. Both TX and RX paths

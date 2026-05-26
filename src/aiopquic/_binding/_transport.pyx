@@ -1188,11 +1188,25 @@ cdef class TransportContext:
                 spsc_ring_pop(self._ctx.rx_ring)
                 continue
 
-            # STREAM_DESTROY is internal: raw-QUIC pure-receiver sc
-            # teardown. SPSC FIFO order guarantees all prior STREAM_DATA
-            # / STREAM_FIN / STREAM_RESET for this stream have been
-            # popped and sc->rx drained. Never emitted to user code.
+            # STREAM_DESTROY fires once per stream when picoquic
+            # considers it fully retired. Surface to user code so the
+            # consumer (QuicConnection / WebTransportSession) can pop
+            # its per-stream dicts. stream_ctx_ptr is zeroed because
+            # the stream-lifetime ref is dropped below and the consumer
+            # must not deref the pointer. SPSC FIFO order guarantees
+            # all prior STREAM_DATA / STREAM_FIN / STREAM_RESET have
+            # been popped before this event arrives.
             if entry.event_type == SPSC_EVT_STREAM_DESTROY:
+                events.append((
+                    entry.event_type,
+                    entry.stream_id,
+                    None,
+                    0,
+                    0,
+                    <uintptr_t>entry.cnx,
+                    <uintptr_t>0,
+                    <uintptr_t>0,
+                ))
                 if entry.stream_ctx is not NULL:
                     aiopquic_stream_ctx_destroy(
                         <aiopquic_stream_ctx_t*>entry.stream_ctx)
@@ -1403,6 +1417,18 @@ cdef class TransportContext:
                 continue
 
             if entry.event_type == SPSC_EVT_STREAM_DESTROY:
+                # Surface to user code before dropping the ref. See
+                # matching block in drain_rx for rationale.
+                handler(
+                    entry.event_type,
+                    entry.stream_id,
+                    None,
+                    0,
+                    0,
+                    <uintptr_t>entry.cnx,
+                    <uintptr_t>0,
+                    <uintptr_t>0,
+                )
                 if entry.stream_ctx is not NULL:
                     aiopquic_stream_ctx_destroy(
                         <aiopquic_stream_ctx_t*>entry.stream_ctx)
