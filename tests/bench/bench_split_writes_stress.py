@@ -44,19 +44,21 @@ KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
 ALPN = "hq-interop"
 
 
-def _server_config() -> QuicConfiguration:
+def _server_config(event_ring_capacity: int | None = None) -> QuicConfiguration:
     cfg = QuicConfiguration(
         is_client=False, alpn_protocols=[ALPN],
         max_data=1 << 30, max_stream_data=1 << 22,
+        event_ring_capacity=event_ring_capacity,
     )
     cfg.load_cert_chain(CERT_FILE, KEY_FILE)
     return cfg
 
 
-def _client_config() -> QuicConfiguration:
+def _client_config(event_ring_capacity: int | None = None) -> QuicConfiguration:
     return QuicConfiguration(
         is_client=True, alpn_protocols=[ALPN],
         max_data=1 << 30, max_stream_data=1 << 22,
+        event_ring_capacity=event_ring_capacity,
     )
 
 
@@ -113,9 +115,15 @@ async def _run_split_writes(n_streams: int, objs_per_stream: int,
     addresses the same race or papers over it.
     """
     port = _next_port()
+    # Size the event ring to absorb high-stream-count bursts. 16K
+    # default (0.3.5) is sized for normal workloads; 2000-stream
+    # stress saturates it (120K events in flight) → stream loss
+    # from rx_event_ring drops. 262144 mirrors the pre-0.3.5 shared
+    # default and gives the test the headroom it was designed against.
+    erc = 262144 if n_streams >= 1000 else None
     server = await serve(
         "127.0.0.1", port,
-        configuration=_server_config(),
+        configuration=_server_config(event_ring_capacity=erc),
         create_protocol=lambda quic, **kw: _RxProtocol(quic, **kw),
     )
 
@@ -130,7 +138,7 @@ async def _run_split_writes(n_streams: int, objs_per_stream: int,
     try:
         async with connect(
             "127.0.0.1", port,
-            configuration=_client_config(),
+            configuration=_client_config(event_ring_capacity=erc),
         ) as client:
             t_start = time.monotonic()
             for stream_idx in range(n_streams):
