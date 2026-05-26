@@ -145,9 +145,9 @@ cdef extern from "picoquic.h":
     uint64_t picoquic_current_time()
     uint64_t picoquic_get_quic_time(picoquic_quic_t* quic)
 
-    # Stream operations
-    int picoquic_add_to_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
-                                const uint8_t* data, size_t length, int set_fin)
+    # Stream operations (picoquic_add_to_stream removed in 0.3.5 with the
+    # push-model API; aiopquic uses mark_active + prepare_to_send pull path
+    # exclusively).
     int picoquic_mark_active_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
                                      int is_active, void* v_stream_ctx)
     uint8_t* picoquic_provide_stream_data_buffer(void* context, size_t nb_bytes,

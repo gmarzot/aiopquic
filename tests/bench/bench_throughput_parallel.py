@@ -4,7 +4,7 @@ import time
 import pytest
 
 from _helpers import (
-    SPSC_EVT_STREAM_DATA, SPSC_EVT_STREAM_FIN, SPSC_EVT_TX_STREAM_FIN,
+    SPSC_EVT_STREAM_DATA, SPSC_EVT_STREAM_FIN,
 )
 
 
@@ -24,11 +24,9 @@ def test_bench_parallel_streams(benchmark, big_ring_pair, capsys,
         sids = [base_sid + 4 * i for i in range(n_streams)]
         base_sid_box[0] += 4 * n_streams
 
-        # Push every stream's payload then wake once.
+        # Push every stream's payload (tx_send_stream coalesces wakes).
         for sid in sids:
-            client.push_tx(SPSC_EVT_TX_STREAM_FIN, sid,
-                           data=payload, cnx_ptr=client_cnx)
-        client.wake_up()
+            client.tx_send_stream(client_cnx, sid, payload, end_stream=True)
 
         per_sid_received = {sid: 0 for sid in sids}
         target_each = len(payload)

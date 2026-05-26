@@ -76,7 +76,7 @@ def big_ring_pair():
     picoquic + the wrapper, not ring-full backpressure.
     """
     port = next_port()
-    # rx_ring_cap=1MB matches AIOPQUIC_RX_RING_CAP_DEFAULT in callback.h.
+    # rx_ring_cap=1MB matches AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT in callback.h.
     # picoquic's default initial_max_stream_data is larger than our
     # per-stream ring, so without an explicit cap a slow consumer would
     # let the peer overrun the ring on raw-test paths. Setting it here

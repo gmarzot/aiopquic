@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.3.5 (unreleased)
+
+### RX flow control (release-blocker fix)
+
+- Hysteresis-gated, per-cycle FC push: `drain_rx` / `drain_rx_callback` dedupe `SPSC_EVT_TX_OPEN_FLOW_CONTROL` to at most one per stream per cycle; further skipped when `rx_consumed` hasn't advanced by `ring_cap / 16` (~256 KB at default 4 MB cap). Reduces FC events from ~280K/s to single thousands/s, eliminating the `rx_event_ring` overflow cliff.
+- `aiopquic_stream_ctx_t.bytes_pending_release` atomic + reference-counted `StreamChunk`. Worker grant = `buf_free − pending`. `AIOPQUIC_FC_RAW=1` bypasses for diagnostics.
+- Sender-side sc lifecycle gap: no terminal callback after our TX FIN; bounded by stream count, deferred to 0.3.6 (xfail test surfaces it).
+- WT-side sc destroy: `picohttp_callback_free → wt_link_destroy` not firing under MoQT subgroup workloads (`sc_destroyed_total = 0`). Bounded by stream count × ring_cap; deferred to 0.3.6.
+
+### Observability
+
+- Process-wide counters: `sc_{created,destroyed,alive}_total`, `chunks_alive_total`, `sc_rx_bytes_{pushed,popped}_total`, `sc_rx_bytes_in_flight`. Per-cnx: `fc_credit_{pushed,handled,dropped}`. All in `TransportContext.counters`.
+- `dump_all_counters` per-stream walk is opt-in via `AIOPQUIC_DUMP_PER_STREAM=1` (default ctx-level dump is safe; per-stream walks deref stale `_stream_ctxs` entries — proper cleanup deferred).
+- `TransportContext.enable_sigusr2_dump()` low-level entry; aiomoqt's `taskdump.install()` remains canonical.
+
+### CC engagement (root-cause fix)
+
+- `picoquic_register_all_congestion_control_algorithms()` now called at `TransportContext.start()`. Without it `cnx->congestion_alg` was NULL → cwin pinned at IW=15360. Raw-QUIC: ~575 Mbps → 2+ Gbps.
+
+### TX pull-model
+
+- `TransportContext.tx_send_stream(cnx, sid, data, end_stream, ring_cap)` — low-level pull primitive with per-`(cnx, sid)` sc lifecycle. Raises `BufferError` on ring-full.
+- Legacy push events `SPSC_EVT_TX_STREAM_DATA` / `_FIN` (codepoints 128/129) removed; reserved one release cycle.
+- Engine-path `_enqueue_raw` dispatches `_EVT_STREAM_TX_DRAINED` (fixes 2-proc pull-model producer hangs).
+
+### TX/RX ring caps
+
+- `aiopquic_ctx_create(tx_cap, rx_cap, low_water_pct)` — independent per-direction caps. Defaults: TX 2048, RX 16384 entries (was shared 262144). `AIOPQUIC_TX_RING_WAKE_PCT` env override.
+- `TransportContext.__cinit__` accepts `tx_ring_cap` / `rx_ring_cap` / `tx_ring_low_water_pct` (back-compat: positional `ring_capacity` still works).
+
+### Tests
+
+- `tests/bench/test_rx_fc_counters.py` (4 tests, 1 xfail for the sender-side sc gap).
+- `tests/bench/test_rx_bloat_during_load.py` — RSS-bound, parametrized over QUIC and WT.
+
+### Docs
+
+- `WAKE_PROTOCOL.md` rewritten: event-vs-data ring model, four-datapath summary, QUIC-vs-WT differences, naming intent (`tx_ring → tx_event_ring` rename deferred to 0.3.6). Existing 8 sequence diagrams + SIGUSR2 triage retained.
+
+### Tooling / observability surface
+
+- `--cc-algo` flag on `MOQTServer` / `MOQTClient` and 11 example tools; default BBR.
+- `python -m aiopquic.versions` / `aiopquic-versions` enriched with picoquic + picotls `git describe --tags --always --long` + commit date + subject.
+- `AIOPQUIC_RX_LOG=1` surfaces `rx_event_drops` and `rx_byte_ring_overflow` on stderr.
+- `[tool.ruff] line-length = 100` (matches aiomoqt).
+
+### Build
+
+- `AIOPQUIC_PERF=1` env switch in `build_picoquic.sh`: host-tuned `-O3 -march=native -flto` + Fusion AES-GCM on x86_64 + `DISABLE_DEBUG_PRINTF`. Default OFF; never used in PyPI wheels.
+- `AIOPQUIC_IO_URING=1` env switch (EXPERIMENTAL / DORMANT). Builds `picoquic_packet_loop_uring` into `libpicoquic-core.a` and statically links liburing; no runtime effect today (worker still uses portable loop). Linux-only. ABI footgun documented; setup.py mirrors `PICOQUIC_WITH_IO_URING` to picoquic build and Cython compile.
+- New patch `patches/0002-picoquic-sockloop-drop-system-io_uring-header.patch` (dead code when `WITH_IO_URING=OFF`).
+- Wheel perf flags via `[tool.cibuildwheel.linux.environment]`: `-flto` + `DISABLE_DEBUG_PRINTF` for all Linux; x86_64 adds `-march=x86-64-v3` + `PTLS_WITH_FUSION` (Haswell+; older systems install via sdist).
+- Vendored `third_party/liburing` submodule pinned at `liburing-2.7`; auto-fetched / built static-only when `AIOPQUIC_IO_URING=1`, inert otherwise.
+- `bootstrap_python.sh`: `PYTHON_VERSION="cpython-3.14"` (unambiguous GIL build); adds `setuptools_scm[toml]>=6.2` for editable installs.
+
 ## v0.3.4 (2026-05-19)
 
 ### TX stale-cnx UAF guard

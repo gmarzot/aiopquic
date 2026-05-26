@@ -20,8 +20,8 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_PATH_DELETED
         SPSC_EVT_PACING_CHANGED
         SPSC_EVT_STREAM_TX_DRAINED
-        SPSC_EVT_TX_STREAM_DATA
-        SPSC_EVT_TX_STREAM_FIN
+        SPSC_EVT_TX_RING_DRAINED
+        SPSC_EVT_STREAM_DESTROY
         SPSC_EVT_TX_DATAGRAM
         SPSC_EVT_TX_CLOSE
         SPSC_EVT_TX_STREAM_RESET
@@ -43,6 +43,8 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_WT_STREAM_RESET
         SPSC_EVT_WT_STOP_SENDING
         SPSC_EVT_WT_NEW_STREAM
+        SPSC_EVT_WT_STREAM_CREATED
+        SPSC_EVT_WT_STREAM_LINK_RELEASE
 
     ctypedef struct spsc_entry_t:
         uint64_t    stream_id

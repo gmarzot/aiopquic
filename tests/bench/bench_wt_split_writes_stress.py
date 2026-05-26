@@ -14,8 +14,10 @@ signature: head_hex starts with `01 09 20 c0 ...` decodable cleanly
 as ObjectHeader at offset 0 + valid `"<group>.<obj>|"` payload
 prefix. The aiopquic raw-QUIC stress is CLEAN at the same shape
 (committed v0.3.0). This test isolates whether the WT TX path
-(legacy `picoquic_add_to_stream` for SPSC_EVT_TX_STREAM_DATA) loses
-bytes under the same churn that raw QUIC handles cleanly.
+(pull-model `tx_send_stream` / per-stream sc->tx ring) loses bytes
+under the same churn that raw QUIC handles cleanly. (The 0.3.5
+push-API removal means there is no longer a legacy `picoquic_add_to_stream`
+fallback for stream data; this comment retains the historical context.)
 
 Pass criterion: every byte sent on every stream is received
 byte-perfect in offset order. byte[0] of every received stream must

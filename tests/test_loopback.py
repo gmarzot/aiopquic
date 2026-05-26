@@ -15,9 +15,9 @@ SPSC_EVT_APP_CLOSE = 5
 SPSC_EVT_READY = 6
 SPSC_EVT_ALMOST_READY = 7
 SPSC_EVT_DATAGRAM = 8
-# TX events (128+)
-SPSC_EVT_TX_STREAM_DATA = 128
-SPSC_EVT_TX_STREAM_FIN = 129
+# TX events (128+). SPSC_EVT_TX_STREAM_DATA / SPSC_EVT_TX_STREAM_FIN
+# (legacy push-model) removed in 0.3.5; use TransportContext.tx_send_stream
+# (the low-level pull primitive) instead.
 SPSC_EVT_TX_DATAGRAM = 130
 SPSC_EVT_TX_CLOSE = 131
 SPSC_EVT_TX_STREAM_RESET = 132
@@ -209,11 +209,7 @@ class TestLoopback:
             try:
                 # Send data on stream 0
                 test_data = b"Hello from aiopquic!"
-                client.push_tx(
-                    SPSC_EVT_TX_STREAM_DATA, 0,
-                    data=test_data, cnx_ptr=cnx_ptr,
-                )
-                client.wake_up()
+                client.tx_send_stream(cnx_ptr, 0, test_data)
 
                 # Server should receive stream data
                 server_events = drain_until(
@@ -248,11 +244,7 @@ class TestLoopback:
             try:
                 # Send data + FIN
                 test_data = b"final message"
-                client.push_tx(
-                    SPSC_EVT_TX_STREAM_FIN, 0,
-                    data=test_data, cnx_ptr=cnx_ptr,
-                )
-                client.wake_up()
+                client.tx_send_stream(cnx_ptr, 0, test_data, end_stream=True)
 
                 # Server should see FIN
                 all_events = []
@@ -289,11 +281,7 @@ class TestLoopback:
             try:
                 # Client sends data on stream 0 (client-initiated bidi)
                 request = b"ping from client"
-                client.push_tx(
-                    SPSC_EVT_TX_STREAM_DATA, 0,
-                    data=request, cnx_ptr=client_cnx,
-                )
-                client.wake_up()
+                client.tx_send_stream(client_cnx, 0, request)
 
                 # Server receives it — extract server cnx from event
                 srv_events = drain_until(
@@ -316,11 +304,7 @@ class TestLoopback:
 
                 # Server echoes back on the same stream 0
                 reply = b"pong from server"
-                server.push_tx(
-                    SPSC_EVT_TX_STREAM_DATA, 0,
-                    data=reply, cnx_ptr=srv_cnx,
-                )
-                server.wake_up()
+                server.tx_send_stream(srv_cnx, 0, reply)
 
                 # Client receives the reply
                 cli_events = drain_until(
@@ -351,11 +335,7 @@ class TestLoopback:
                     8: b"stream eight",
                 }
                 for sid, data in streams.items():
-                    client.push_tx(
-                        SPSC_EVT_TX_STREAM_DATA, sid,
-                        data=data, cnx_ptr=cnx_ptr,
-                    )
-                client.wake_up()
+                    client.tx_send_stream(cnx_ptr, sid, data)
 
                 # Collect all stream data on server
                 all_events = []
@@ -428,11 +408,7 @@ class TestLoopback:
             try:
                 # 32 KB payload
                 test_data = bytes(range(256)) * 128
-                client.push_tx(
-                    SPSC_EVT_TX_STREAM_FIN, 0,
-                    data=test_data, cnx_ptr=cnx_ptr,
-                )
-                client.wake_up()
+                client.tx_send_stream(cnx_ptr, 0, test_data, end_stream=True)
 
                 # Accumulate until we have all data or timeout
                 all_events = []
@@ -472,16 +448,8 @@ class TestLoopback:
                     assert cnx1 != cnx2, "Connections should be distinct"
 
                     # Each sends on stream 0
-                    client1.push_tx(
-                        SPSC_EVT_TX_STREAM_DATA, 0,
-                        data=b"from client 1", cnx_ptr=cnx1,
-                    )
-                    client1.wake_up()
-                    client2.push_tx(
-                        SPSC_EVT_TX_STREAM_DATA, 0,
-                        data=b"from client 2", cnx_ptr=cnx2,
-                    )
-                    client2.wake_up()
+                    client1.tx_send_stream(cnx1, 0, b"from client 1")
+                    client2.tx_send_stream(cnx2, 0, b"from client 2")
 
                     # Server should receive data from both
                     all_events = []
@@ -586,11 +554,7 @@ class TestLoopback:
 
                 # Client sends some data then resets the stream
                 stream_id = 0  # client-initiated bidi
-                client.push_tx(
-                    SPSC_EVT_TX_STREAM_DATA, stream_id,
-                    data=b"before reset", cnx_ptr=cnx_ptr,
-                )
-                client.wake_up()
+                client.tx_send_stream(cnx_ptr, stream_id, b"before reset")
                 time.sleep(0.1)
 
                 # Reset with error code 42
@@ -755,11 +719,7 @@ class TestLoopback:
         try:
             client, cnx_ptr = connect_client(port)
             try:
-                client.push_tx(
-                    SPSC_EVT_TX_STREAM_DATA, 0,
-                    data=b"x", cnx_ptr=cnx_ptr,
-                )
-                client.wake_up()
+                client.tx_send_stream(cnx_ptr, 0, b"x")
 
                 srv_events = drain_until(
                     server, SPSC_EVT_STREAM_DATA, timeout=5.0,
@@ -811,11 +771,7 @@ class TestLoopback:
                     for sid in range(0, n_streams * 4, 4)
                 }
                 for sid, data in streams.items():
-                    client.push_tx(
-                        SPSC_EVT_TX_STREAM_FIN, sid,
-                        data=data, cnx_ptr=cnx_ptr,
-                    )
-                client.wake_up()
+                    client.tx_send_stream(cnx_ptr, sid, data, end_stream=True)
 
                 received = {sid: b"" for sid in streams}
                 deadline = time.monotonic() + 10.0
@@ -856,10 +812,7 @@ class TestLoopback:
             raised = False
             for _ in range(64):
                 try:
-                    client.push_tx(
-                        SPSC_EVT_TX_STREAM_DATA, 0,
-                        data=b"x" * 256, cnx_ptr=0,
-                    )
+                    client.tx_send_stream(0, 0, b"x" * 256)
                 except builtins.BufferError:
                     raised = True
                     break

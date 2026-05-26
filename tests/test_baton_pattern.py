@@ -20,7 +20,6 @@ import time
 
 from tests.test_loopback import (
     SPSC_EVT_STREAM_DATA, SPSC_EVT_STREAM_FIN,
-    SPSC_EVT_TX_STREAM_DATA, SPSC_EVT_TX_STREAM_FIN,
     next_port, start_server, connect_client, wait_for_server_cnx,
 )
 
@@ -68,11 +67,9 @@ class TestBatonPattern:
                 for i in range(rounds):
                     sid_uni = client_uni_sid
                     client_uni_sid = _next_client_uni_sid(client_uni_sid)
-                    client.push_tx(
-                        SPSC_EVT_TX_STREAM_FIN, sid_uni,
-                        data=bytes([value]), cnx_ptr=client_cnx,
+                    client.tx_send_stream(
+                        client_cnx, sid_uni, bytes([value]), end_stream=True
                     )
-                    client.wake_up()
 
                     got = _drain_stream_payload(server, sid_uni, 1)
                     assert got == bytes([value]), (
@@ -83,11 +80,9 @@ class TestBatonPattern:
 
                     sid_bidi = client_bidi_sid
                     client_bidi_sid = _next_client_bidi_sid(client_bidi_sid)
-                    client.push_tx(
-                        SPSC_EVT_TX_STREAM_FIN, sid_bidi,
-                        data=bytes([value]), cnx_ptr=client_cnx,
-                    )
-                    client.wake_up()
+                    client.tx_send_stream(client_cnx, sid_bidi,
+                                          bytes([value]),
+                                          end_stream=True)
 
                     got = _drain_stream_payload(server, sid_bidi, 1)
                     assert got == bytes([value]), (
@@ -96,11 +91,9 @@ class TestBatonPattern:
                     )
                     value = (value + 1) & 0xFF
 
-                    server.push_tx(
-                        SPSC_EVT_TX_STREAM_FIN, sid_bidi,
-                        data=bytes([value]), cnx_ptr=server_cnx,
-                    )
-                    server.wake_up()
+                    server.tx_send_stream(server_cnx, sid_bidi,
+                                          bytes([value]),
+                                          end_stream=True)
 
                     got = _drain_stream_payload(client, sid_bidi, 1)
                     assert got == bytes([value]), (
@@ -130,12 +123,10 @@ class TestBatonPattern:
                 sid = 2
                 for i in range(n):
                     streams[sid] = i & 0xFF
-                    client.push_tx(
-                        SPSC_EVT_TX_STREAM_FIN, sid,
-                        data=bytes([i & 0xFF]), cnx_ptr=client_cnx,
-                    )
+                    client.tx_send_stream(client_cnx, sid,
+                                          bytes([i & 0xFF]),
+                                          end_stream=True)
                     sid = _next_client_uni_sid(sid)
-                client.wake_up()
 
                 received = {}
                 deadline = time.monotonic() + 10.0

@@ -18,7 +18,7 @@ import sys
 
 from cpython.buffer cimport PyBuffer_FillInfo
 from cpython.bytes cimport PyBytes_AsString, PyBytes_FromStringAndSize
-from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t, uintptr_t
+from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t, int64_t, uintptr_t
 from libc.stdlib cimport free, malloc
 from libc.string cimport memcpy, memset
 
@@ -31,12 +31,14 @@ from aiopquic._binding.spsc_ring cimport (
     spsc_entry_t,
     SPSC_EVT_STREAM_DATA, SPSC_EVT_STREAM_FIN,
     SPSC_EVT_STREAM_TX_DRAINED,
+    SPSC_EVT_STREAM_DESTROY,
     SPSC_EVT_STREAM_RESET, SPSC_EVT_STOP_SENDING,
     SPSC_EVT_CLOSE, SPSC_EVT_APP_CLOSE,
     SPSC_EVT_READY, SPSC_EVT_ALMOST_READY,
     SPSC_EVT_DATAGRAM,
     SPSC_EVT_WT_STREAM_DATA, SPSC_EVT_WT_STREAM_FIN,
-    SPSC_EVT_TX_STREAM_DATA, SPSC_EVT_TX_STREAM_FIN,
+    SPSC_EVT_WT_STREAM_LINK_RELEASE,
+    SPSC_EVT_TX_RING_DRAINED,
     SPSC_EVT_TX_DATAGRAM, SPSC_EVT_TX_CLOSE,
     SPSC_EVT_TX_MARK_ACTIVE, SPSC_EVT_TX_CONNECT,
     SPSC_EVT_TX_WT_OPEN, SPSC_EVT_TX_WT_CREATE_STREAM,
@@ -97,6 +99,8 @@ cdef extern from "picoquic.h":
     void picoquic_set_default_congestion_algorithm_by_name(
         picoquic_quic_t* quic, const char* alg_name)
 
+    void picoquic_register_all_congestion_control_algorithms()
+
     void picoquic_free(picoquic_quic_t* quic)
     uint64_t picoquic_current_time()
     void picoquic_set_null_verifier(picoquic_quic_t* quic)
@@ -114,8 +118,10 @@ cdef extern from "picoquic.h":
 cdef extern from *:
     """
     int picoquic_set_textlog(picoquic_quic_t* quic, const char* textlog_file);
+    int picoquic_set_qlog(picoquic_quic_t* quic, const char* qlog_dir);
     """
     int picoquic_set_textlog(picoquic_quic_t* quic, const char* textlog_file)
+    int picoquic_set_qlog(picoquic_quic_t* quic, const char* qlog_dir)
 
     ctypedef struct picoquic_tp_t:
         uint64_t initial_max_stream_data_bidi_local
@@ -157,8 +163,6 @@ cdef extern from *:
     int picoquic_get_cnx_state(picoquic_cnx_t* cnx)
     uint64_t picoquic_get_data_sent(picoquic_cnx_t* cnx)
     uint64_t picoquic_get_data_received(picoquic_cnx_t* cnx)
-    int picoquic_add_to_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
-                                const uint8_t* data, size_t length, int set_fin)
 
 cdef extern from "picoquic_packet_loop.h":
     ctypedef struct picoquic_packet_loop_param_t:
@@ -196,11 +200,21 @@ cdef extern from "picoquic_packet_loop.h":
 
 # C callback declarations
 cdef extern from "c/callback.h":
+    # Resource defaults — single source of truth in callback.h.
+    enum:
+        AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT
+        AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT
+        AIOPQUIC_SPSC_RING_CAPACITY_DEFAULT
+        AIOPQUIC_TX_RING_CAP_DEFAULT
+        AIOPQUIC_RX_RING_CAP_DEFAULT
+        AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT
+
     ctypedef struct aiopquic_ctx_t:
         spsc_ring_t* rx_ring
         spsc_ring_t* tx_ring
         int eventfd
         picoquic_quic_t* quic
+        picoquic_network_thread_ctx_t* thread_ctx
         uint32_t rx_ring_cap
         uint64_t worker_mark_active_processed
         uint64_t worker_prepare_to_send_calls
@@ -210,12 +224,35 @@ cdef extern from "c/callback.h":
         uint64_t worker_rx_byte_ring_overflow
         uint32_t rx_notify_pending
         uint32_t tx_wake_pending
+        uint32_t tx_ring_drain_pending
+        uint32_t tx_ring_low_water
+        # Observability counters (added without behavior change).
+        uint64_t cnt_tx_ring_pushes
+        uint64_t cnt_tx_ring_pops
+        uint64_t cnt_tx_ring_arms
+        uint64_t cnt_tx_ring_fires
+        uint64_t cnt_tx_ring_fire_dropped
+        uint64_t cnt_wake_calls
+        uint64_t cnt_wake_skipped_coalesced
+        uint64_t cnt_prepare_to_send_empty
+        uint64_t last_tx_ring_arm_ns
+        uint64_t last_tx_ring_fire_ns
+        uint64_t cnt_fc_credit_pushed
+        uint64_t cnt_fc_credit_handled
+        uint64_t cnt_fc_credit_dropped
 
-    aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity)
+    aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
+                                          uint32_t rx_cap,
+                                          uint32_t low_water_pct)
     void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx)
     void aiopquic_clear_rx(aiopquic_ctx_t* ctx)
     void aiopquic_notify_rx(aiopquic_ctx_t* ctx)
     int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx)
+    void aiopquic_arm_tx_ring_drain_pending(aiopquic_ctx_t* ctx)
+    void aiopquic_clear_tx_ring_drain_pending(aiopquic_ctx_t* ctx)
+    void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx, void* cnx,
+                                  uint64_t stream_id,
+                                  void* sc)
 
     int aiopquic_stream_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
                             uint8_t* bytes, size_t length,
@@ -255,6 +292,7 @@ cdef extern from "c/stream_buf.h":
 # state. Set as picoquic's app_stream_ctx so the same slot serves both
 # directions for bidi streams.
 cdef extern from "c/stream_ctx.h":
+    uint64_t aiopquic_now_ns()
     ctypedef struct aiopquic_stream_ctx_t:
         aiopquic_stream_buf_t* tx
         aiopquic_stream_buf_t* rx
@@ -262,21 +300,57 @@ cdef extern from "c/stream_ctx.h":
         # them via aiopquic_stream_ctx_rx_* accessors.
         uint64_t rx_consumed
         uint64_t rx_credit_limit
+        # Bytes wrapped in StreamChunk for the Python consumer but
+        # whose StreamChunk has not yet been released (last memoryview
+        # ref dropped). Atomic on the C side; the worker reads via
+        # pending_load() inside the SPSC_EVT_TX_OPEN_FLOW_CONTROL
+        # handler to compute the effective MAX_STREAM_DATA grant.
+        uint64_t bytes_pending_release
+        uint32_t tx_drain_pending
         uint8_t  pending_destroy
+        # Observability counters (single-writer; relaxed semantics).
+        uint64_t cnt_drain_arms
+        uint64_t cnt_drain_fires
+        uint64_t cnt_drain_dropped
+        uint64_t last_drain_arm_ns
+        uint64_t last_drain_fire_ns
 
     aiopquic_stream_ctx_t* aiopquic_stream_ctx_create()
     int aiopquic_stream_ctx_ensure_tx(aiopquic_stream_ctx_t* sc,
                                       uint32_t capacity)
     int aiopquic_stream_ctx_ensure_rx(aiopquic_stream_ctx_t* sc,
                                       uint32_t capacity)
+    void aiopquic_stream_ctx_ref(aiopquic_stream_ctx_t* sc)
     void aiopquic_stream_ctx_destroy(aiopquic_stream_ctx_t* sc)
     uint64_t aiopquic_stream_ctx_rx_consumed_load(aiopquic_stream_ctx_t* sc)
     void aiopquic_stream_ctx_rx_consumed_add(
         aiopquic_stream_ctx_t* sc, uint64_t delta)
+    void aiopquic_stream_ctx_pending_add(
+        aiopquic_stream_ctx_t* sc, uint64_t n)
+    void aiopquic_stream_ctx_pending_sub(
+        aiopquic_stream_ctx_t* sc, uint64_t n)
+    uint64_t aiopquic_stream_ctx_pending_load(aiopquic_stream_ctx_t* sc)
+    uint64_t aiopquic_stream_ctx_last_fc_push_consumed_load(
+        aiopquic_stream_ctx_t* sc)
+    void aiopquic_stream_ctx_last_fc_push_consumed_store(
+        aiopquic_stream_ctx_t* sc, uint64_t v)
     int aiopquic_stream_ctx_send_data(
         aiopquic_stream_ctx_t* sc,
         const uint8_t* data, uint32_t length,
         uint32_t capacity, uint8_t set_fin)
+    void aiopquic_arm_stream_tx_drain_pending(
+        aiopquic_stream_ctx_t* sc)
+    void aiopquic_clear_stream_tx_drain_pending(
+        aiopquic_stream_ctx_t* sc)
+    void aiopquic_chunks_alive_inc()
+    void aiopquic_chunks_alive_dec()
+    uint64_t aiopquic_cnt_sc_created_load()
+    uint64_t aiopquic_cnt_sc_destroyed_load()
+    int64_t  aiopquic_cnt_chunks_alive_load()
+    void aiopquic_sc_rx_bytes_pushed_add(uint64_t n)
+    void aiopquic_sc_rx_bytes_popped_add(uint64_t n)
+    uint64_t aiopquic_cnt_sc_rx_bytes_pushed_load()
+    uint64_t aiopquic_cnt_sc_rx_bytes_popped_load()
 
 
 # picoquic flow-control APIs are thread-bound to the picoquic worker
@@ -373,6 +447,14 @@ cdef extern from "c/h3wt_callback.h":
         picoquic_cnx_t* cnx, uint8_t* bytes, size_t length,
         int event,
         h3zero_stream_ctx_t* stream_ctx, void* path_app_ctx)
+    # Per-WT-stream link, owned by h3zero's stream_ctx->path_callback_ctx.
+    # We only ever destroy these from drain_rx on a LINK_RELEASE event;
+    # the worker thread allocates them in h3wt_callback.h.
+    ctypedef struct aiopquic_wt_stream_link_t:
+        aiopquic_stream_ctx_t* sc
+        uint64_t stream_id
+
+    void aiopquic_wt_stream_link_destroy(aiopquic_wt_stream_link_t* link)
 
 
 # Default ring sizing
@@ -389,33 +471,139 @@ cdef class StreamChunk:
     spsc_ring_take_data(). The buffer is freed in __dealloc__ when
     the last reference (memoryview or otherwise) is dropped.
 
+    Per-stream flow-control feedback (chunk-lifetime model):
+      - On _wrap, chunk length is added to sc->bytes_pending_release
+        AND a ref is taken on sc (so sc outlives the stream FIN if
+        chunks are still alive in the consumer's pipeline).
+      - On __dealloc__ (last memoryview ref dropped, chunk truly done),
+        length is subtracted, SPSC_EVT_TX_OPEN_FLOW_CONTROL is pushed
+        so the worker re-evaluates the effective grant, and the sc
+        ref is released. The worker's effective MAX_STREAM_DATA grant
+        is buf_free - bytes_pending_release, so chunks alive in the
+        pipeline (or held by an app archiving the memoryview) reduce
+        peer's window — that IS the backpressure mechanism.
+      - __getbuffer__ intentionally does NOT release FC: memoryview
+        construction fires __getbuffer__ immediately, which would
+        decrement before the consumer has actually finished, defeating
+        the backpressure entirely (peer floods, chunks accumulate,
+        original bloat returns).
+      - Apps that want to archive memoryviews without slowing peer
+        should COPY (bytes(memoryview)) to release the chunk
+        immediately and decouple their archive from FC.
+
+    Back-pointers (_sc, _cnx, _stream_id, _ctx) are required for the
+    release-side accounting. They are BORROWED pointers; the chunk
+    does NOT hold strong refs to picoquic state. NULL _sc skips
+    accounting (used by the RingBuffer.pop() test path where the
+    chunk is not tied to a real stream).
+
     Internal type. Public surface is memoryview(chunk).
     """
     cdef void* _buf
     cdef Py_ssize_t _len
+    cdef aiopquic_ctx_t* _ctx
+    cdef aiopquic_stream_ctx_t* _sc
+    cdef void* _cnx
+    cdef uint64_t _stream_id
+    cdef bint _delivered
 
     def __cinit__(self):
         self._buf = NULL
         self._len = 0
+        self._ctx = NULL
+        self._sc = NULL
+        self._cnx = NULL
+        self._stream_id = 0
+        self._delivered = False
 
     @staticmethod
-    cdef StreamChunk _wrap(void* buf, Py_ssize_t length):
+    cdef StreamChunk _wrap(void* buf, Py_ssize_t length,
+                            aiopquic_ctx_t* ctx,
+                            aiopquic_stream_ctx_t* sc,
+                            void* cnx,
+                            uint64_t stream_id):
         cdef StreamChunk c = StreamChunk.__new__(StreamChunk)
         c._buf = buf
         c._len = length
+        c._ctx = ctx
+        c._sc = sc
+        c._cnx = cnx
+        c._stream_id = stream_id
+        aiopquic_chunks_alive_inc()
+        if sc is not NULL:
+            # Take a ref on sc so it stays alive until this chunk
+            # is dealloc'd, even if the stream FINs (SPSC_EVT_STREAM_DESTROY
+            # drops the stream-lifetime ref) before the consumer
+            # releases the memoryview. Released in __dealloc__ via
+            # the matching aiopquic_stream_ctx_destroy (unref).
+            aiopquic_stream_ctx_ref(sc)
+            if length > 0:
+                aiopquic_stream_ctx_pending_add(sc, <uint64_t>length)
         return c
+
+    cdef inline void _release_fc(self):
+        """Idempotent pending_release accounting. Fired by __getbuffer__
+        (consumer accessed the bytes — committed to the consumer's
+        pipeline) and as a fallback by __dealloc__ when the chunk was
+        never accessed. _delivered flag makes both paths converge to a
+        single pending_sub regardless of how many memoryviews are
+        created or in what order dealloc fires.
+
+        Does NOT push fc_credit on the tx_event_ring. Per-chunk push
+        was the May-25 storm (~280K events/sec at 2 Gbps × 64KB) that
+        saturated the asyncio thread and triggered rx_event_ring
+        overflow → cliff. The credit push happens in drain_rx after
+        popping bytes from sc->rx, with hysteresis (see
+        _push_fc_credit). The worker's grant computation reads
+        bytes_pending_release at push time, so this pending_sub
+        update lands in the next push's grant automatically."""
+        if (not self._delivered and self._sc is not NULL
+                and self._len > 0):
+            self._delivered = True
+            aiopquic_stream_ctx_pending_sub(
+                self._sc, <uint64_t>self._len)
 
     def __dealloc__(self):
         if self._buf is not NULL:
+            # Fallback release: chunk dropped without consumer read.
+            # No-op when _delivered=True (FC already released at
+            # first __getbuffer__). Order matters: push fc_credit
+            # BEFORE dropping the chunk's sc ref so the pending
+            # SPSC_EVT_TX_OPEN_FLOW_CONTROL event has a valid sc
+            # to dereference when the worker handler runs (the
+            # worker handler is responsible for its own sc unref).
+            self._release_fc()
             free(self._buf)
             self._buf = NULL
+        # Drop the chunk's ref on sc. If this is the LAST ref
+        # (stream already FIN'd AND all pending fc events handled),
+        # sc is freed here. Otherwise the worker handler or another
+        # outstanding chunk holds it alive.
+        if self._sc is not NULL:
+            aiopquic_stream_ctx_destroy(self._sc)
+            self._sc = NULL
+        aiopquic_chunks_alive_dec()
 
     def __len__(self):
         return self._len
 
     def __getbuffer__(self, Py_buffer* buffer, int flags):
-        # Read-only 1-D byte view; refcount on self keeps the buffer
-        # alive for the consumer's memoryview lifetime.
+        # Release FC on first consumer access. Semantic: pending_release
+        # bounds bytes peer sent that we have NOT yet handed to the
+        # consumer. Once a memoryview exists, the bytes are committed
+        # to the consumer's pipeline — bounding memory beyond this
+        # point is the consumer's responsibility (parser queue caps,
+        # track-level limits, etc.), not QUIC FC.
+        #
+        # Releasing here breaks the parser-hoarding deadlock that
+        # __dealloc__-only release caused: parser holds chunks while
+        # accumulating bytes for an object boundary, pending stays at
+        # full ring capacity, grant = buf_free - pending = 0, peer
+        # FC-stalls, the chunk that would unblock things never arrives.
+        # _release_fc is idempotent via _delivered, so multiple
+        # getbuffer calls (e.g. slicing) and the dealloc fallback all
+        # converge to a single release.
+        self._release_fc()
         PyBuffer_FillInfo(buffer, self, self._buf, self._len, 1, flags)
 
     def __releasebuffer__(self, Py_buffer* buffer):
@@ -488,12 +676,73 @@ cdef class RingBuffer:
         if entry.data_length > 0 and entry.data_buf is not NULL:
             length = entry.data_length
             buf = spsc_ring_take_data(entry)
-            data = memoryview(StreamChunk._wrap(buf, length))
+            data = memoryview(StreamChunk._wrap(
+                buf, length, NULL, NULL, NULL, 0))
 
         result = (entry.event_type, entry.stream_id, data,
                   entry.is_fin, entry.error_code)
         spsc_ring_pop(self._ring)
         return result
+
+
+# Module-level registry of live TransportContext instances. Walked by
+# dump_all_counters() (driven from aiomoqt's SIGUSR2 taskdump handler)
+# to print forensic counters from every active context. WeakSet so
+# contexts aren't kept alive by the registry.
+import weakref as _weakref
+_TRANSPORT_REGISTRY = _weakref.WeakSet()
+
+
+def dump_all_counters(file=None):
+    """Print counters from every live TransportContext to `file`
+    (default stderr). Used by the SIGUSR2 handler in
+    aiomoqt.utils.taskdump for hang-localization.
+
+    For each TransportContext, also enumerates per-stream counters
+    by walking gc-visible objects to find QuicConnection /
+    WebTransportSession instances bound to that transport — those
+    hold the `_stream_ctxs` / `_stream_tx_ctxs` maps that record
+    each stream's `aiopquic_stream_ctx_t*` pointer. Per-stream
+    counters are the load-bearing signal for diagnosing
+    per-stream sc->tx_drain_pending wake stalls: an outstanding
+    arm without matching fire on a specific stream is exactly the
+    pattern that hangs a producer in stream_write_drain.
+    """
+    import os, sys, gc
+    if file is None:
+        file = sys.stderr
+    # Per-stream walk dereferences sc_ptr from the QuicConnection /
+    # WebTransportSession _stream_ctxs / _stream_tx_ctxs dicts. Those
+    # dicts are not cleaned up when sc is destroyed by drain_rx's
+    # internal STREAM_DESTROY handler — stale pointers accumulate
+    # and dereferencing them in dump_counters causes UAF / SEGV.
+    # Default OFF; opt in with AIOPQUIC_DUMP_PER_STREAM=1 for cases
+    # where you know the dicts are clean (small synthetic tests).
+    # Proper fix: surface STREAM_DESTROY to QuicConnection so it can
+    # del the dict entry. Tracked separately.
+    per_stream_enabled = (os.environ.get("AIOPQUIC_DUMP_PER_STREAM")
+                          == "1")
+    n = 0
+    for ctx in list(_TRANSPORT_REGISTRY):
+        sc_map = {}
+        if per_stream_enabled:
+            for obj in gc.get_objects():
+                try:
+                    if getattr(obj, '_transport', None) is ctx:
+                        inner = getattr(obj, '_stream_ctxs', None)
+                        if isinstance(inner, dict):
+                            sc_map.update(inner)
+                        inner = getattr(obj, '_stream_tx_ctxs', None)
+                        if isinstance(inner, dict):
+                            sc_map.update(inner)
+                except Exception:
+                    continue
+        ctx.dump_counters(file=file, label=f"ctx#{n}",
+                           stream_ctxs=sc_map if per_stream_enabled else None)
+        n += 1
+    if n == 0:
+        print("=== no live TransportContext instances ===",
+              file=file, flush=True)
 
 
 cdef class TransportContext:
@@ -503,6 +752,11 @@ cdef class TransportContext:
     This is the core bridge between the C picoquic library and Python.
     It owns the SPSC rings and the eventfd used for async notification.
     """
+    # Make cdef class weakref-able so the SIGUSR2 counter-dump registry
+    # (_TRANSPORT_REGISTRY at module level above) can hold WeakRef
+    # references without keeping ctx objects alive past their natural
+    # lifetime.
+    cdef object __weakref__
     cdef aiopquic_ctx_t* _ctx
     cdef picoquic_quic_t* _quic
     cdef picoquic_network_thread_ctx_t* _thread_ctx
@@ -519,9 +773,34 @@ cdef class TransportContext:
     cdef uint64_t _send_busy_event_ring
     cdef uint64_t _send_busy_stream_ring
     cdef uint64_t _send_alloc_fail
+    # Connection-global TX-ring drain wakeup. Lazy-allocated on first
+    # access (needs a running event loop); see tx_ring_drain_event.
+    cdef object _tx_ring_drain_event
+    # Test-friendly low-level pull primitive: per-(cnx, sid) sc_ptr
+    # tracker for tx_send_stream(). Production code uses
+    # QuicConnection.send_stream_data which manages its own per-cnx
+    # _stream_ctxs dict; this dict is for the bare-TransportContext
+    # test path where there's no QuicConnection wrapper.
+    cdef object _test_stream_ctxs
 
-    def __cinit__(self, uint32_t ring_capacity=DEFAULT_RING_CAPACITY):
-        self._ctx = aiopquic_ctx_create(ring_capacity)
+    def __cinit__(self,
+                  uint32_t ring_capacity=0,
+                  uint32_t tx_ring_cap=0,
+                  uint32_t rx_ring_cap=0,
+                  uint32_t tx_ring_low_water_pct=0):
+        # Resolution order for each SPSC cap:
+        #   1. Explicit per-direction kwarg (tx_ring_cap / rx_ring_cap)
+        #   2. Legacy shared ring_capacity (positional or kwarg)
+        #   3. 0 → C-side picks AIOPQUIC_{TX,RX}_RING_CAP_DEFAULT
+        # ring_capacity preserves the pre-0.3.5 positional signature
+        # (TransportContext(262144) still works).
+        cdef uint32_t tx_cap = tx_ring_cap if tx_ring_cap > 0 else ring_capacity
+        cdef uint32_t rx_cap = rx_ring_cap if rx_ring_cap > 0 else ring_capacity
+        if tx_cap > 0:
+            tx_cap = aiopquic_ceil_pow2_u32(tx_cap)
+        if rx_cap > 0:
+            rx_cap = aiopquic_ceil_pow2_u32(rx_cap)
+        self._ctx = aiopquic_ctx_create(tx_cap, rx_cap, tx_ring_low_water_pct)
         self._quic = NULL
         self._thread_ctx = NULL
         self._started = False
@@ -529,18 +808,27 @@ cdef class TransportContext:
         self._send_busy_event_ring = 0
         self._send_busy_stream_ring = 0
         self._send_alloc_fail = 0
+        self._tx_ring_drain_event = None
+        self._test_stream_ctxs = {}
         if self._ctx is NULL:
             raise MemoryError("Failed to create transport context")
+        # Register for module-level SIGUSR2 counter dump.
+        _TRANSPORT_REGISTRY.add(self)
 
     def __dealloc__(self):
         self._shutdown()
         if self._ctx is not NULL:
             aiopquic_ctx_destroy(self._ctx)
             self._ctx = NULL
+        # WeakSet auto-removes; no explicit discard needed.
 
     cdef void _shutdown(self):
         """Stop the network thread and free picoquic context."""
         if self._thread_ctx is not NULL:
+            # Clear the C-side mirror BEFORE freeing so any in-flight
+            # aiopquic_push_fc_credit calls see NULL and skip wake.
+            if self._ctx is not NULL:
+                self._ctx.thread_ctx = NULL
             picoquic_delete_network_thread(self._thread_ctx)
             self._thread_ctx = NULL
         if self._quic is not NULL:
@@ -568,13 +856,273 @@ cdef class TransportContext:
         """Aggregate bytes across all in-flight TX-ring entries (the
         sum of `data_length` over events currently queued). For latency-
         targeted backpressure: callers can cap publish rate against a
-        bytes budget independent of ring entry capacity or object size."""
+        bytes budget independent of ring entry capacity or object size.
+
+        Pull-model note: TX-ring entries are mostly MARK_ACTIVE with
+        `data_length=0`; the actual bytes live in per-stream sc->tx
+        rings. So this aggregate is ~0 for pull-model streams. Use
+        `stream_tx_buf_used(sc_ptr)` for per-stream sc->tx accounting."""
         return spsc_ring_bytes_pending(self._ctx.tx_ring)
+
+    @property
+    def counters(self):
+        """Snapshot of forensic counters from the C-side context.
+
+        Counter names mirror callback.h fields. Use for hang-diagnosis
+        via SIGUSR2 dump (aiomoqt taskdump wires this up). The dict
+        also includes live ring counts for quick comparison against
+        cumulative push/pop totals.
+
+        Key counters and what mismatches reveal:
+          tx_ring_pushes vs tx_ring_pops: drain lag
+          tx_ring_arms vs tx_ring_fires: missed ring-drain wakes
+          tx_ring_fire_dropped > 0: rx_ring full at fire time (re-arm path)
+          wake_calls vs wake_skipped_coalesced: wake-coalescing efficiency
+          prepare_to_send_calls vs prepare_to_send_pulled_bytes: worker
+            actually drained sc->tx vs ran with nothing to send
+          last_tx_ring_arm_ns > last_tx_ring_fire_ns: an arm without
+            matching fire is currently pending (still in flight or lost)
+        """
+        if self._ctx is NULL:
+            return {}
+        return {
+            'tx_ring_pushes': self._ctx.cnt_tx_ring_pushes,
+            'tx_ring_pops': self._ctx.cnt_tx_ring_pops,
+            'tx_ring_arms': self._ctx.cnt_tx_ring_arms,
+            'tx_ring_fires': self._ctx.cnt_tx_ring_fires,
+            'tx_ring_fire_dropped': self._ctx.cnt_tx_ring_fire_dropped,
+            'wake_calls': self._ctx.cnt_wake_calls,
+            'wake_skipped_coalesced': self._ctx.cnt_wake_skipped_coalesced,
+            'prepare_to_send_calls': self._ctx.worker_prepare_to_send_calls,
+            'prepare_to_send_pulled_bytes': self._ctx.worker_prepare_to_send_pulled_bytes,
+            'prepare_to_send_empty': self._ctx.cnt_prepare_to_send_empty,
+            'mark_active_processed': self._ctx.worker_mark_active_processed,
+            'rx_event_drops': self._ctx.worker_rx_event_drops,
+            'rx_event_drops_stream_data': self._ctx.worker_rx_event_drops_stream_data,
+            'rx_byte_ring_overflow': self._ctx.worker_rx_byte_ring_overflow,
+            'last_tx_ring_arm_ns': self._ctx.last_tx_ring_arm_ns,
+            'last_tx_ring_fire_ns': self._ctx.last_tx_ring_fire_ns,
+            'tx_ring_count_now': spsc_ring_count(self._ctx.tx_ring),
+            'rx_ring_count_now': spsc_ring_count(self._ctx.rx_ring),
+            'tx_ring_drain_pending_now': self._ctx.tx_ring_drain_pending,
+            'tx_wake_pending_now': self._ctx.tx_wake_pending,
+            # RX flow-control observability (added 2026-05-25)
+            'fc_credit_pushed': self._ctx.cnt_fc_credit_pushed,
+            'fc_credit_handled': self._ctx.cnt_fc_credit_handled,
+            'fc_credit_dropped': self._ctx.cnt_fc_credit_dropped,
+            # Process-wide stream / chunk lifecycle (leak detection)
+            'sc_created_total': aiopquic_cnt_sc_created_load(),
+            'sc_destroyed_total': aiopquic_cnt_sc_destroyed_load(),
+            'sc_alive_total': (aiopquic_cnt_sc_created_load()
+                               - aiopquic_cnt_sc_destroyed_load()),
+            'chunks_alive_total': aiopquic_cnt_chunks_alive_load(),
+            'sc_rx_bytes_pushed_total':
+                aiopquic_cnt_sc_rx_bytes_pushed_load(),
+            'sc_rx_bytes_popped_total':
+                aiopquic_cnt_sc_rx_bytes_popped_load(),
+            'sc_rx_bytes_in_flight': (
+                aiopquic_cnt_sc_rx_bytes_pushed_load()
+                - aiopquic_cnt_sc_rx_bytes_popped_load()),
+        }
+
+
+    def stream_counters(self, uintptr_t sc_ptr):
+        """Snapshot of per-stream sc->tx drain counters for the
+        stream_ctx at sc_ptr. Returns {} for NULL pointer."""
+        if sc_ptr == 0:
+            return {}
+        cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*><void*>sc_ptr
+        return {
+            'drain_arms': sc.cnt_drain_arms,
+            'drain_fires': sc.cnt_drain_fires,
+            'drain_dropped': sc.cnt_drain_dropped,
+            'last_drain_arm_ns': sc.last_drain_arm_ns,
+            'last_drain_fire_ns': sc.last_drain_fire_ns,
+            'tx_used_now': aiopquic_stream_buf_used(sc.tx) if sc.tx is not NULL else 0,
+            'tx_drain_pending_now': sc.tx_drain_pending,
+        }
+
+    def dump_counters(self, file=None, label=None, stream_ctxs=None):
+        """Print counters to stderr (or given file). Used by SIGUSR2.
+
+        Includes the connection-global counters, plus per-stream
+        counters when `stream_ctxs` (a dict mapping stream_id → sc_ptr)
+        is supplied. dump_all_counters() harvests this from Python
+        QuicConnection / WebTransportSession instances and passes it
+        in automatically; manual callers can pass an explicit dict.
+        """
+        import sys, time
+        if file is None:
+            file = sys.stderr
+        prefix = f"[{label}] " if label else ""
+        now_ns = aiopquic_now_ns()
+        print(f"=== {prefix}aiopquic counters (now_ns={now_ns}) ===",
+              file=file, flush=True)
+        cdef dict c = self.counters
+        for k in sorted(c.keys()):
+            print(f"  {k:32s} = {c[k]}", file=file, flush=True)
+        # Derived: arm/fire delta
+        arms = c.get('tx_ring_arms', 0)
+        fires = c.get('tx_ring_fires', 0)
+        if arms != fires:
+            print(f"  ** tx_ring arm/fire delta: arms={arms} fires={fires} "
+                  f"diff={arms - fires} **", file=file, flush=True)
+        arm_ns = c.get('last_tx_ring_arm_ns', 0)
+        fire_ns = c.get('last_tx_ring_fire_ns', 0)
+        if arm_ns > fire_ns and arm_ns > 0:
+            print(f"  ** outstanding tx_ring arm: armed {(now_ns - arm_ns) / 1e6:.1f}ms ago, "
+                  f"no fire since **", file=file, flush=True)
+
+        # Per-stream counters, if a {stream_id: sc_ptr} map was passed.
+        # Each row: stream_id, drain arms/fires/dropped, current
+        # sc->tx bytes pending, pending flag, and a "STUCK" warning
+        # when the most-recent arm has no matching fire.
+        if stream_ctxs:
+            stuck = []
+            print(f"  --- per-stream ({len(stream_ctxs)} streams) ---",
+                  file=file, flush=True)
+            for sid in sorted(stream_ctxs.keys()):
+                sc_ptr = stream_ctxs[sid]
+                if not sc_ptr:
+                    continue
+                sc = self.stream_counters(sc_ptr)
+                if not sc:
+                    continue
+                arms = sc['drain_arms']
+                fires = sc['drain_fires']
+                dropped = sc['drain_dropped']
+                arm_ns = sc['last_drain_arm_ns']
+                fire_ns = sc['last_drain_fire_ns']
+                tx_used = sc['tx_used_now']
+                pending = sc['tx_drain_pending_now']
+                # Status flag — STUCK if there's an outstanding arm
+                # OR pending=1 with sc->tx still holding bytes.
+                status = ""
+                if arm_ns > fire_ns and arm_ns > 0:
+                    delta_ms = (now_ns - arm_ns) / 1e6
+                    status = f"  ** STUCK arm {delta_ms:.1f}ms ago **"
+                    stuck.append((sid, delta_ms, tx_used))
+                print(f"  sid={sid:<5} sc=0x{sc_ptr:x} "
+                      f"arms={arms} fires={fires} dropped={dropped} "
+                      f"tx_used={tx_used} pending={pending}{status}",
+                      file=file, flush=True)
+            if stuck:
+                print(f"  ** {len(stuck)} stream(s) with outstanding arm — "
+                      f"oldest {max(d for _, d, _ in stuck):.1f}ms **",
+                      file=file, flush=True)
+
+        print(f"=== end counters ===", file=file, flush=True)
+
+    def enable_sigusr2_dump(self, stream_ctxs_callable=None):
+        """Install a SIGUSR2 handler that calls dump_counters().
+
+        Must be called from the main thread (signal.signal limitation).
+        If a handler is already installed for SIGUSR2, it is replaced.
+        Returns the previous handler so the caller can chain if desired.
+
+        `stream_ctxs_callable`, if provided, is invoked at signal time
+        to gather a {stream_id: sc_ptr} dict (usually `lambda:
+        my_conn._stream_ctxs.copy()`). Without it the dump shows only
+        connection-global counters."""
+        import signal
+        def _handler(*_args):
+            stream_ctxs = stream_ctxs_callable() if stream_ctxs_callable else None
+            self.dump_counters(stream_ctxs=stream_ctxs)
+        prev = signal.signal(signal.SIGUSR2, _handler)
+        return prev
+
+    def stream_tx_buf_used(self, uintptr_t sc_ptr):
+        """Bytes currently sitting in a given stream's sc->tx ring,
+        not yet consumed by the picoquic worker's prepare_to_send.
+
+        For the pull model this is the load-bearing back-pressure
+        signal — `tx_bytes_pending` is ~0 because MARK_ACTIVE entries
+        carry no payload. Callers can compare this against an absolute
+        byte budget (latency-bound queue depth) on a per-stream basis.
+
+        sc_ptr is the opaque pointer kept in the Python connection's
+        per-stream wrapper map (`_stream_ctxs[stream_id]`). Returns 0
+        for NULL or a stream that has not yet allocated sc->tx.
+        """
+        if sc_ptr == 0:
+            return 0
+        cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*><void*>sc_ptr
+        if sc.tx is NULL:
+            return 0
+        return aiopquic_stream_buf_used(sc.tx)
+
+    def arm_stream_tx_drain_pending(self, uintptr_t sc_ptr):
+        """Arm the per-stream sc->tx drain signal so the next worker
+        drain of sc->tx (in prepare_to_send) fires SPSC_EVT_STREAM_TX_DRAINED
+        and wakes the producer waiting on the per-stream asyncio.Event.
+
+        Use with the clear-arm-recheck-wait pattern on the per-stream
+        event when waiting on a soft byte threshold below sc->tx full —
+        e.g. a tx_max_inflight_bytes cap whose wakeup must align with
+        sc->tx drain, NOT the connection-global SPSC ring drain. Pairs
+        with `stream_tx_buf_used(sc_ptr)` for the byte measurement.
+        """
+        if sc_ptr == 0:
+            return
+        cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*><void*>sc_ptr
+        aiopquic_arm_stream_tx_drain_pending(sc)
+
+    def clear_stream_tx_drain_pending(self, uintptr_t sc_ptr):
+        """Clear the per-stream sc->tx drain signal. Called by the
+        producer when a recheck shows pressure dropped between arm and
+        wait, to avoid spurious wakes."""
+        if sc_ptr == 0:
+            return
+        cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*><void*>sc_ptr
+        aiopquic_clear_stream_tx_drain_pending(sc)
 
     @property
     def tx_capacity(self):
         """TX ring entry capacity (constant; for free-space pre-checks)."""
         return self._ctx.tx_ring.capacity
+
+    @property
+    def tx_ring_drain_event(self):
+        """Connection-global asyncio.Event signaled when the worker
+        observes the TX SPSC ring fill drop to/below the low-water
+        mark while a Python writer has armed tx_ring_drain_pending.
+
+        Used by stream_write_drain / send_stream_data_drained to
+        avoid the per-stream-event hard-wait deadlock at the
+        connection-global pressure threshold (the per-stream
+        STREAM_TX_DRAINED only fires when sc->tx is full, NOT when
+        the SPSC ring is full — so awaiting it under a
+        ring-pressure check could hang forever).
+
+        Lazy-allocated on first access so __cinit__ doesn't require
+        a running event loop. """
+        import asyncio
+        if self._tx_ring_drain_event is None:
+            self._tx_ring_drain_event = asyncio.Event()
+        return self._tx_ring_drain_event
+
+    def arm_tx_ring_drain_pending(self):
+        """Atomically set tx_ring_drain_pending = 1. The worker's
+        post-pop check (aiopquic_maybe_fire_tx_ring_drained in
+        callback.h) CAS-clears this and fires SPSC_EVT_TX_RING_DRAINED
+        when ring count drops to/below tx_ring_low_water.
+
+        Use pattern (caller side):
+            event = tx.tx_ring_drain_event
+            event.clear()
+            tx.arm_tx_ring_drain_pending()
+            if tx_pressure > wait_threshold:
+                await event.wait()       # safe: worker will fire
+            else:
+                tx.clear_tx_ring_drain_pending()  # raced, clear arm
+        """
+        aiopquic_arm_tx_ring_drain_pending(self._ctx)
+
+    def clear_tx_ring_drain_pending(self):
+        """Clear the arm without waiting. Use when the producer
+        re-checks pressure after arming and finds it has already
+        dropped below the wait threshold (raced with worker drain)."""
+        aiopquic_clear_tx_ring_drain_pending(self._ctx)
 
     def drain_rx(self, int max_events=256):
         """
@@ -582,17 +1130,26 @@ cdef class TransportContext:
 
         Returns a list of
             (event_type, stream_id, data, is_fin, error_code,
-             cnx_ptr, stream_ctx_ptr).
+             cnx_ptr, stream_ctx_ptr, sc_ptr).
+
+        sc_ptr is the BORROWED per-stream aiopquic_stream_ctx_t pointer
+        (as uintptr_t) for events that carry one — STREAM_DATA,
+        STREAM_FIN, STREAM_CREATED, NEW_STREAM. 0 otherwise. WT callers
+        stash this in their _stream_tx_ctxs[sid] dict to feed back into
+        push_stream_data; raw-QUIC callers can ignore it (their sc is
+        already on entry.stream_ctx).
+
         `data` is a memoryview over an internal StreamChunk, or None for
         events without payload. The chunk owns its buffer; the memoryview
         keeps it alive via PEP 3118 buffer protocol refcount. No copy
         after picoquic.
 
-        For raw-QUIC events: cnx_ptr is the picoquic_cnx_t*, stream_ctx
-        is whatever picoquic set on the stream (often NULL).
-        For WebTransport events: cnx_ptr is the picoquic_cnx_t*,
-        stream_ctx_ptr is the aiopquic_wt_session_t* — used for routing
-        events to the right WT session in the asyncio side.
+        SPSC_EVT_WT_STREAM_LINK_RELEASE is handled internally and never
+        emitted: drain_rx calls aiopquic_wt_stream_link_destroy on the
+        link pointer carried in data_buf. The SPSC ring's FIFO order
+        guarantees every preceding STREAM_DATA/FIN/RESET event for this
+        stream has been popped (and sc->rx drained) before the link
+        is freed — that's the lifetime invariant for BORROWED-sc.
 
         Order matters: drain entries FIRST, then call aiopquic_clear_rx
         which atomically (a) clears the producer-skip flag, (b) drains
@@ -606,28 +1163,69 @@ cdef class TransportContext:
         cdef spsc_entry_t* entry
         cdef void* buf
         cdef Py_ssize_t length
+        cdef uintptr_t sc_ptr
 
         cdef aiopquic_stream_ctx_t* sc
         cdef aiopquic_stream_buf_t* rx_sb
         cdef uint32_t avail
+        # Per-cycle FC dedupe: collect (sc_ptr → (cnx_ptr, stream_id))
+        # while draining; emit at most one OPEN_FLOW_CONTROL push per
+        # stream per cycle, after the loop. Combined with the
+        # hysteresis check inside _push_fc_credit, this keeps
+        # tx_event_ring traffic at ~max(streams_per_cycle, advance_rate
+        # / hysteresis_bytes) instead of per-chunk.
+        cdef dict pending_fc = {}
         for i in range(max_events):
             entry = spsc_ring_peek(self._ctx.rx_ring)
             if entry is NULL:
                 break
 
+            # LINK_RELEASE is internal: free the link, never emit.
+            if entry.event_type == SPSC_EVT_WT_STREAM_LINK_RELEASE:
+                if entry.data_buf is not NULL:
+                    aiopquic_wt_stream_link_destroy(
+                        <aiopquic_wt_stream_link_t*>entry.data_buf)
+                spsc_ring_pop(self._ctx.rx_ring)
+                continue
+
+            # STREAM_DESTROY is internal: raw-QUIC pure-receiver sc
+            # teardown. SPSC FIFO order guarantees all prior STREAM_DATA
+            # / STREAM_FIN / STREAM_RESET for this stream have been
+            # popped and sc->rx drained. Never emitted to user code.
+            if entry.event_type == SPSC_EVT_STREAM_DESTROY:
+                if entry.stream_ctx is not NULL:
+                    aiopquic_stream_ctx_destroy(
+                        <aiopquic_stream_ctx_t*>entry.stream_ctx)
+                spsc_ring_pop(self._ctx.rx_ring)
+                continue
+
+            # TX_RING_DRAINED is internal: set the connection-global
+            # asyncio.Event so any awaiting writer wakes. Worker fired
+            # this because tx_ring_drain_pending was armed and the
+            # ring count just dropped below tx_ring_low_water.
+            if entry.event_type == SPSC_EVT_TX_RING_DRAINED:
+                if self._tx_ring_drain_event is not None:
+                    self._tx_ring_drain_event.set()
+                spsc_ring_pop(self._ctx.rx_ring)
+                continue
+
             data = None
+            sc_ptr = 0
             if entry.data_length > 0 and entry.data_buf is not NULL:
+                # Inline-payload path (datagrams, NEW_SESSION path bytes,
+                # etc.) — not tied to a per-stream sc, no FC accounting.
                 length = entry.data_length
                 buf = spsc_ring_take_data(entry)
-                data = memoryview(StreamChunk._wrap(buf, length))
+                data = memoryview(StreamChunk._wrap(
+                    buf, length, NULL, NULL, NULL, 0))
             elif (entry.event_type == SPSC_EVT_STREAM_DATA or
                   entry.event_type == SPSC_EVT_STREAM_FIN) and \
                   entry.stream_ctx is not NULL:
-                # Canonical RX path: bytes live on the per-stream ring
-                # attached to the wrapper. Pop them here so callers see
-                # the same `data` shape as before. The wrapper pointer
-                # is also returned so the caller can advance MAX_STREAM_DATA
-                # via picoquic_open_flow_control after consuming.
+                # Canonical raw-QUIC RX path: bytes live on the per-stream
+                # ring. Pop into a StreamChunk wired with sc back-pointer
+                # so __dealloc__ can re-open peer FC when the consumer
+                # releases. Per-stream backpressure: peer's effective
+                # window = sc->rx_buf_free - sc->bytes_pending_release.
                 sc = <aiopquic_stream_ctx_t*>entry.stream_ctx
                 rx_sb = sc.rx
                 if rx_sb is not NULL:
@@ -638,39 +1236,41 @@ cdef class TransportContext:
                         if buf is not NULL:
                             aiopquic_stream_buf_pop(
                                 rx_sb, <uint8_t*>buf, <uint32_t>length)
-                            data = memoryview(
-                                StreamChunk._wrap(buf, length))
-                            # Atomic advance — picoquic worker reads this
-                            # in its next stream_data callback to decide
-                            # when to extend MAX_STREAM_DATA. No SPSC
-                            # dispatch, no wake_up, no thread crossing.
+                            aiopquic_sc_rx_bytes_popped_add(<uint64_t>length)
+                            data = memoryview(StreamChunk._wrap(
+                                buf, length, self._ctx, sc,
+                                <void*>entry.cnx, entry.stream_id))
                             aiopquic_stream_ctx_rx_consumed_add(
                                 sc, <uint64_t>length)
-            elif (entry.event_type == SPSC_EVT_WT_STREAM_DATA or
-                  entry.event_type == SPSC_EVT_WT_STREAM_FIN) and \
-                  entry.data_buf is not NULL and entry.data_length == 0:
-                # Phase B WT RX path: data_buf is a borrowed pointer to
-                # the per-stream aiopquic_stream_ctx_t owned by the WT
-                # session (entry.stream_ctx is the session itself, used
-                # by the asyncio dispatcher for routing). Bytes live in
-                # sc->rx; pop and return them as a memoryview so the
-                # caller sees the same `data` shape as the legacy inline
-                # path. data_length=0 keeps spsc_ring_pop from freeing
-                # the borrowed pointer.
+                            pending_fc[<uintptr_t>sc] = (
+                                <uintptr_t>entry.cnx, entry.stream_id)
+            elif entry.data_buf is not NULL and entry.data_length == 0:
+                # BORROWED-sc convention: data_buf is an aiopquic_stream_ctx_t*
+                # we don't own. Used by WT STREAM_DATA / STREAM_FIN (bytes
+                # in sc->rx) and by NEW_STREAM / STREAM_CREATED (sc passed
+                # up so Python can stash it in _stream_tx_ctxs[sid]).
+                # Expose sc_ptr in the tuple for all of them.
                 sc = <aiopquic_stream_ctx_t*>entry.data_buf
-                rx_sb = sc.rx
-                if rx_sb is not NULL:
-                    avail = aiopquic_stream_buf_used(rx_sb)
-                    if avail > 0:
-                        length = avail
-                        buf = malloc(<size_t>length)
-                        if buf is not NULL:
-                            aiopquic_stream_buf_pop(
-                                rx_sb, <uint8_t*>buf, <uint32_t>length)
-                            data = memoryview(
-                                StreamChunk._wrap(buf, length))
-                            aiopquic_stream_ctx_rx_consumed_add(
-                                sc, <uint64_t>length)
+                sc_ptr = <uintptr_t>sc
+                if (entry.event_type == SPSC_EVT_WT_STREAM_DATA or
+                        entry.event_type == SPSC_EVT_WT_STREAM_FIN):
+                    rx_sb = sc.rx
+                    if rx_sb is not NULL:
+                        avail = aiopquic_stream_buf_used(rx_sb)
+                        if avail > 0:
+                            length = avail
+                            buf = malloc(<size_t>length)
+                            if buf is not NULL:
+                                aiopquic_stream_buf_pop(
+                                    rx_sb, <uint8_t*>buf, <uint32_t>length)
+                                aiopquic_sc_rx_bytes_popped_add(<uint64_t>length)
+                                data = memoryview(StreamChunk._wrap(
+                                    buf, length, self._ctx, sc,
+                                    <void*>entry.cnx, entry.stream_id))
+                                aiopquic_stream_ctx_rx_consumed_add(
+                                    sc, <uint64_t>length)
+                                pending_fc[<uintptr_t>sc] = (
+                                    <uintptr_t>entry.cnx, entry.stream_id)
 
             # Cython-side coalescing: when the picoquic worker fires
             # multiple stream_data callbacks for the same stream
@@ -693,11 +1293,69 @@ cdef class TransportContext:
                 entry.error_code,
                 <uintptr_t>entry.cnx,
                 <uintptr_t>entry.stream_ctx,
+                sc_ptr,
             ))
             spsc_ring_pop(self._ctx.rx_ring)
 
+        # Per-cycle FC dedupe flush: emit at most one push per stream
+        # for the work just performed. Hysteresis inside
+        # _push_fc_credit filters further.
+        cdef uintptr_t sc_uint
+        cdef uintptr_t cnx_uint
+        cdef uint64_t sid_uint
+        for sc_uint, (cnx_uint, sid_uint) in pending_fc.items():
+            self._push_fc_credit(
+                <void*><uintptr_t>cnx_uint, sid_uint,
+                <aiopquic_stream_ctx_t*><void*><uintptr_t>sc_uint)
         aiopquic_clear_rx(self._ctx)
         return events
+
+    cdef inline void _push_fc_credit(self, void* cnx,
+                                       uint64_t stream_id,
+                                       aiopquic_stream_ctx_t* sc):
+        """Push SPSC_EVT_TX_OPEN_FLOW_CONTROL onto tx_event_ring so
+        the picoquic worker re-evaluates peer's MAX_STREAM_DATA for
+        this stream.
+
+        Hysteresis gate: skip the push if the stream's rx_consumed has
+        not advanced by AIOPQUIC_RX_FC_HYSTERESIS_BYTES since the last
+        push (default = sc->rx ring capacity / 4). Prevents the
+        per-chunk FC storm — at 2 Gbps × 64KB objects we were emitting
+        ~280K OPEN_FLOW_CONTROL events/sec, saturating the asyncio
+        thread which then could not drain the rx_event_ring, causing
+        STREAM_DATA event drops (the cliff).
+
+        Hysteresis cost: peer's MAX_STREAM_DATA advances in chunks of
+        HYSTERESIS_BYTES instead of continuously. Peer has full
+        ring_cap of headroom at all times; advancing every quarter-ring
+        means peer never actually waits at our typical rates.
+
+        The worker (in the SPSC handler) computes effective_free
+        = sc->rx_buf_free - sc->bytes_pending_release and calls
+        picoquic_open_flow_control(grant). picoquic itself is
+        monotonic — passing a value that doesn't advance is a no-op.
+
+        Called only from drain_rx data paths (regular credit
+        replenishment as peer data lands). StreamChunk.__getbuffer__
+        used to also push, but per-chunk pushes were the storm root
+        cause; getbuffer now only accounts pending_sub. """
+        # Hysteresis: require rx_consumed to advance by at least
+        # HYSTERESIS_BYTES (1/16 of advertise_cap, ~256KB at default
+        # 4MB cap) before pushing. Tighter than ring_cap/4 so latency
+        # stays low under continuous load (peer's window advances in
+        # ~256KB steps = ~0.8ms at 2.5Gbps, well under typical p99
+        # targets). Still ~256× lower event rate than per-chunk push.
+        cdef uint64_t consumed = aiopquic_stream_ctx_rx_consumed_load(sc)
+        cdef uint64_t last_push = aiopquic_stream_ctx_last_fc_push_consumed_load(sc)
+        cdef uint64_t hysteresis = self._ctx.rx_ring_cap
+        if hysteresis > 0:
+            hysteresis >>= 4  # 1/16 of advertise_cap (~256KB default)
+        else:
+            hysteresis = 1 << 18  # 256 KB fallback
+        if consumed - last_push < hysteresis:
+            return
+        aiopquic_stream_ctx_last_fc_push_consumed_store(sc, consumed)
+        aiopquic_push_fc_credit(self._ctx, cnx, stream_id, <void*>sc)
 
     def drain_rx_callback(self, handler, int max_events=256):
         """Drain events and call handler() per entry — zero list/tuple
@@ -705,32 +1363,67 @@ cdef class TransportContext:
 
         handler is a callable invoked per ring entry as:
             handler(evt_type, stream_id, data, is_fin, error_code,
-                    cnx_ptr, stream_ctx_ptr)
+                    cnx_ptr, stream_ctx_ptr, sc_ptr)
 
-        Returns the number of entries drained. Same per-entry semantics
-        as drain_rx (StreamChunk memoryview construction, byte-ring pop,
-        rx_consumed advance, no-data coalescing). Use this when the
-        caller appends directly to its own event list — skips the
-        intermediate list-of-tuples that drain_rx builds.
+        sc_ptr is the BORROWED per-stream aiopquic_stream_ctx_t pointer
+        (uintptr_t) for events that carry one (WT STREAM_DATA/FIN,
+        NEW_STREAM, STREAM_CREATED); 0 otherwise.
+
+        SPSC_EVT_WT_STREAM_LINK_RELEASE is handled internally: drain_rx
+        calls aiopquic_wt_stream_link_destroy and never invokes the
+        handler. SPSC FIFO ordering guarantees every preceding
+        STREAM_DATA/FIN/RESET for that stream has been processed first.
+
+        Returns the number of entries drained (LINK_RELEASE counted).
+        Same per-entry semantics as drain_rx (StreamChunk memoryview
+        construction, byte-ring pop, rx_consumed advance, no-data
+        coalescing).
         """
         cdef int i
         cdef int count = 0
         cdef spsc_entry_t* entry
         cdef void* buf
         cdef Py_ssize_t length
+        cdef uintptr_t sc_ptr
         cdef aiopquic_stream_ctx_t* sc
         cdef aiopquic_stream_buf_t* rx_sb
         cdef uint32_t avail
+        cdef dict pending_fc = {}
         for i in range(max_events):
             entry = spsc_ring_peek(self._ctx.rx_ring)
             if entry is NULL:
                 break
 
+            if entry.event_type == SPSC_EVT_WT_STREAM_LINK_RELEASE:
+                if entry.data_buf is not NULL:
+                    aiopquic_wt_stream_link_destroy(
+                        <aiopquic_wt_stream_link_t*>entry.data_buf)
+                spsc_ring_pop(self._ctx.rx_ring)
+                count += 1
+                continue
+
+            if entry.event_type == SPSC_EVT_STREAM_DESTROY:
+                if entry.stream_ctx is not NULL:
+                    aiopquic_stream_ctx_destroy(
+                        <aiopquic_stream_ctx_t*>entry.stream_ctx)
+                spsc_ring_pop(self._ctx.rx_ring)
+                count += 1
+                continue
+
+            if entry.event_type == SPSC_EVT_TX_RING_DRAINED:
+                if self._tx_ring_drain_event is not None:
+                    self._tx_ring_drain_event.set()
+                spsc_ring_pop(self._ctx.rx_ring)
+                count += 1
+                continue
+
             data = None
+            sc_ptr = 0
             if entry.data_length > 0 and entry.data_buf is not NULL:
                 length = entry.data_length
                 buf = spsc_ring_take_data(entry)
-                data = memoryview(StreamChunk._wrap(buf, length))
+                data = memoryview(StreamChunk._wrap(
+                    buf, length, NULL, NULL, NULL, 0))
             elif (entry.event_type == SPSC_EVT_STREAM_DATA or
                   entry.event_type == SPSC_EVT_STREAM_FIN) and \
                   entry.stream_ctx is not NULL:
@@ -744,27 +1437,36 @@ cdef class TransportContext:
                         if buf is not NULL:
                             aiopquic_stream_buf_pop(
                                 rx_sb, <uint8_t*>buf, <uint32_t>length)
-                            data = memoryview(
-                                StreamChunk._wrap(buf, length))
+                            aiopquic_sc_rx_bytes_popped_add(<uint64_t>length)
+                            data = memoryview(StreamChunk._wrap(
+                                buf, length, self._ctx, sc,
+                                <void*>entry.cnx, entry.stream_id))
                             aiopquic_stream_ctx_rx_consumed_add(
                                 sc, <uint64_t>length)
-            elif (entry.event_type == SPSC_EVT_WT_STREAM_DATA or
-                  entry.event_type == SPSC_EVT_WT_STREAM_FIN) and \
-                  entry.data_buf is not NULL and entry.data_length == 0:
+                            pending_fc[<uintptr_t>sc] = (
+                                <uintptr_t>entry.cnx, entry.stream_id)
+            elif entry.data_buf is not NULL and entry.data_length == 0:
                 sc = <aiopquic_stream_ctx_t*>entry.data_buf
-                rx_sb = sc.rx
-                if rx_sb is not NULL:
-                    avail = aiopquic_stream_buf_used(rx_sb)
-                    if avail > 0:
-                        length = avail
-                        buf = malloc(<size_t>length)
-                        if buf is not NULL:
-                            aiopquic_stream_buf_pop(
-                                rx_sb, <uint8_t*>buf, <uint32_t>length)
-                            data = memoryview(
-                                StreamChunk._wrap(buf, length))
-                            aiopquic_stream_ctx_rx_consumed_add(
-                                sc, <uint64_t>length)
+                sc_ptr = <uintptr_t>sc
+                if (entry.event_type == SPSC_EVT_WT_STREAM_DATA or
+                        entry.event_type == SPSC_EVT_WT_STREAM_FIN):
+                    rx_sb = sc.rx
+                    if rx_sb is not NULL:
+                        avail = aiopquic_stream_buf_used(rx_sb)
+                        if avail > 0:
+                            length = avail
+                            buf = malloc(<size_t>length)
+                            if buf is not NULL:
+                                aiopquic_stream_buf_pop(
+                                    rx_sb, <uint8_t*>buf, <uint32_t>length)
+                                aiopquic_sc_rx_bytes_popped_add(<uint64_t>length)
+                                data = memoryview(StreamChunk._wrap(
+                                    buf, length, self._ctx, sc,
+                                    <void*>entry.cnx, entry.stream_id))
+                                aiopquic_stream_ctx_rx_consumed_add(
+                                    sc, <uint64_t>length)
+                                pending_fc[<uintptr_t>sc] = (
+                                    <uintptr_t>entry.cnx, entry.stream_id)
 
             if (data is None and
                 (entry.event_type == SPSC_EVT_STREAM_DATA or
@@ -780,10 +1482,19 @@ cdef class TransportContext:
                 entry.error_code,
                 <uintptr_t>entry.cnx,
                 <uintptr_t>entry.stream_ctx,
+                sc_ptr,
             )
             spsc_ring_pop(self._ctx.rx_ring)
             count += 1
 
+        # Per-cycle FC dedupe flush (same pattern as drain_rx).
+        cdef uintptr_t sc_uint
+        cdef uintptr_t cnx_uint
+        cdef uint64_t sid_uint
+        for sc_uint, (cnx_uint, sid_uint) in pending_fc.items():
+            self._push_fc_credit(
+                <void*><uintptr_t>cnx_uint, sid_uint,
+                <aiopquic_stream_ctx_t*><void*><uintptr_t>sc_uint)
         aiopquic_clear_rx(self._ctx)
         return count
 
@@ -820,7 +1531,9 @@ cdef class TransportContext:
             data_len = <uint32_t>len(data)
 
         cdef int ret = spsc_ring_push(self._ctx.tx_ring, &entry, data_ptr, data_len)
-        if ret != 0:
+        if ret == 0:
+            self._ctx.cnt_tx_ring_pushes += 1
+        else:
             raise BufferError("TX ring buffer is full")
 
     def tx_send_atomic(self, uint64_t stream_id, bytes data,
@@ -864,6 +1577,11 @@ cdef class TransportContext:
         # Without this, retry semantics duplicate bytes on the wire.
         # Single-producer (asyncio thread) ⇒ no TOCTOU window.
         if spsc_ring_count(self._ctx.tx_ring) >= self._ctx.tx_ring.capacity:
+            # Arm the connection-global drain wakeup BEFORE returning
+            # rc=1 so the caller can await tx_ring_drain_event without
+            # losing the wakeup. Worker fires SPSC_EVT_TX_RING_DRAINED
+            # when the ring drops to/below low_water.
+            aiopquic_arm_tx_ring_drain_pending(self._ctx)
             self._send_busy_event_ring += 1
             return 1
 
@@ -878,18 +1596,24 @@ cdef class TransportContext:
             self._send_alloc_fail += 1
             return -1
 
-        # Push MARK_ACTIVE event. Pre-check above guarantees room.
+        # Push MARK_ACTIVE event. Pre-check above guarantees room
+        # under the single-producer asyncio invariant. The post-check
+        # below catches invariant violations rather than masking them.
         memset(&entry, 0, sizeof(entry))
         entry.event_type = SPSC_EVT_TX_MARK_ACTIVE
         entry.stream_id = stream_id
         entry.cnx = <void*>cnx_ptr
         entry.stream_ctx = <void*>sc
         rc = spsc_ring_push(self._ctx.tx_ring, &entry, NULL, 0)
-        if rc != 0:
-            # Should never happen given the pre-check (single producer)
-            # — but if it does, bytes are already in sc->tx and event
-            # didn't post. Surface as a real error rather than silent
-            # corruption.
+        if rc == 0:
+            self._ctx.cnt_tx_ring_pushes += 1
+        else:
+            # Single-producer invariant violated — bytes are committed
+            # to sc->tx but MARK_ACTIVE didn't post. Caller's retry
+            # would re-commit and duplicate bytes. Arm the drain
+            # signal so the caller wakes; the rc=1 path will trigger
+            # again until the producer invariant is restored.
+            aiopquic_arm_tx_ring_drain_pending(self._ctx)
             self._send_busy_event_ring += 1
             return 1
 
@@ -905,6 +1629,60 @@ cdef class TransportContext:
                 picoquic_wake_up_network_thread(self._thread_ctx)
 
         return 0
+
+    def tx_send_stream(self, uintptr_t cnx_ptr, uint64_t stream_id,
+                        bytes data, bint end_stream=False,
+                        uint32_t stream_ring_cap=AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT):
+        """Test-friendly low-level pull-model send primitive.
+
+        Wraps tx_send_atomic with per-(cnx, sid) stream-context lifecycle
+        management. The first call for a given (cnx_ptr, stream_id)
+        allocates an aiopquic_stream_ctx_t via the C helper; subsequent
+        calls reuse it. The dict is process-local to this TransportContext.
+
+        Production code should use QuicConnection.send_stream_data, which
+        manages its own per-cnx _stream_ctxs dict and exposes a richer
+        BufferError-based backpressure API. This method exists for the
+        bare-TransportContext test path (tests/test_loopback.py and
+        derived integration / bench tests) so tests don't need to wrap
+        every TransportContext in a QuicConnection.
+
+        Raises:
+            BufferError: TX event ring or per-stream send ring is full
+                — caller may retry the SAME data without risk of
+                duplicating bytes on the wire (tx_send_atomic guarantees
+                all-or-nothing on retryable failures).
+            MemoryError: per-stream send ring allocation failed, or
+                aiopquic_stream_ctx_create returned NULL on first use.
+        """
+        cdef aiopquic_stream_ctx_t* sc
+        cdef uintptr_t sc_ptr
+        cdef int rc
+        key = (cnx_ptr, stream_id)
+        cached = self._test_stream_ctxs.get(key)
+        if cached is None:
+            sc = aiopquic_stream_ctx_create()
+            if sc is NULL:
+                raise MemoryError("aiopquic_stream_ctx_create returned NULL")
+            sc_ptr = <uintptr_t>sc
+            self._test_stream_ctxs[key] = sc_ptr
+        else:
+            sc_ptr = <uintptr_t>cached
+        rc = self.tx_send_atomic(stream_id, data, end_stream,
+                                  cnx_ptr, sc_ptr, stream_ring_cap)
+        if rc == 1:
+            raise BufferError(
+                f"TX event ring full (stream={stream_id})"
+            )
+        if rc == 2:
+            raise BufferError(
+                f"per-stream send ring full "
+                f"(stream={stream_id}, need={len(data) if data else 0})"
+            )
+        if rc < 0:
+            raise MemoryError(
+                f"tx_send_stream alloc failed (stream={stream_id})"
+            )
 
     @property
     def send_calls(self):
@@ -979,7 +1757,7 @@ cdef class TransportContext:
               uint32_t max_datagram_frame_size=0,
               wt_path=None, debug_log=None, keylog_filename=None,
               uint32_t rx_ring_cap=0, congestion_control_algorithm=None,
-              uint64_t initial_max_data=0):
+              uint64_t initial_max_data=0, qlog_dir=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -1045,6 +1823,19 @@ cdef class TransportContext:
             default_cb_fn = h3zero_callback
             default_cb_ctx = <void*>&self._wt_params
 
+        # Register picoquic's full CC algorithm catalog. Without this,
+        # picoquic_get_congestion_algorithm() returns NULL for ANY name
+        # (the algorithm registry is empty by default), so
+        # picoquic_set_default_congestion_algorithm_by_name() silently
+        # stores NULL → new cnxs have cnx->congestion_alg == NULL →
+        # alg_init is never called → cwin stays pinned at
+        # PICOQUIC_CWIN_INITIAL (10 × MSS = 15360) for the connection's
+        # entire lifetime. picoquicdemo, pico_sim, pqbench, and every
+        # picoquic test driver all call this at startup; aiopquic
+        # didn't, which is what capped raw-QUIC loopback throughput.
+        # Idempotent — repeats just overwrite the same static array.
+        picoquic_register_all_congestion_control_algorithms()
+
         # Create picoquic context with the chosen default callback.
         self._quic = picoquic_create(
             256,            # max connections
@@ -1078,9 +1869,19 @@ cdef class TransportContext:
                 self._quic, _c_cc)
 
         cdef bytes _b_log
-        if debug_log is not None:
+        # Textlog: per-cnx human-readable log of every packet, ACK, FC
+        # frame, CC state. Tiny vs qlog, perfect for "what was the
+        # worker last doing." Explicit debug_log arg wins; otherwise
+        # AIOPQUIC_TEXTLOG_FILE env var.
+        _textlog = debug_log
+        if _textlog is None:
+            import os
+            _env_log = os.environ.get("AIOPQUIC_TEXTLOG_FILE")
+            if _env_log:
+                _textlog = _env_log
+        if _textlog is not None:
             picoquic_set_log_level(self._quic, 1)
-            _b_log = debug_log.encode() if isinstance(debug_log, str) else debug_log
+            _b_log = _textlog.encode() if isinstance(_textlog, str) else _textlog
             picoquic_set_textlog(self._quic, _b_log)
 
         cdef bytes _b_keylog
@@ -1090,6 +1891,25 @@ cdef class TransportContext:
                          else keylog_filename)
             picoquic_enable_sslkeylog(self._quic, 1)
             picoquic_set_key_log_file(self._quic, _b_keylog)
+
+        # qlog: per-cnx JSON traces of CC state, RTT, FC frames, etc.
+        # picoquic writes one .qlog file per connection (named by initial
+        # CID) into the given directory. Explicit qlog_dir arg wins; if
+        # not provided, fall back to AIOPQUIC_QLOG_DIR env var so qlog
+        # can be enabled from the shell without code changes. Directory
+        # must already exist; picoquic doesn't create it.
+        cdef bytes _b_qlog
+        _qlog_dir = qlog_dir
+        if _qlog_dir is None:
+            import os
+            _env_qlog = os.environ.get("AIOPQUIC_QLOG_DIR")
+            if _env_qlog:
+                _qlog_dir = _env_qlog
+        if _qlog_dir is not None:
+            _b_qlog = (_qlog_dir.encode()
+                       if isinstance(_qlog_dir, str)
+                       else _qlog_dir)
+            picoquic_set_qlog(self._quic, _b_qlog)
 
         if is_client:
             picoquic_set_null_verifier(self._quic)
@@ -1183,6 +2003,13 @@ cdef class TransportContext:
             picoquic_free(self._quic)
             self._quic = NULL
             raise RuntimeError(f"Failed to start network thread (ret={ret})")
+
+        # Mirror the thread_ctx into the C-level ctx so C-side helpers
+        # (aiopquic_push_fc_credit etc.) can wake the worker without
+        # round-tripping through Python. picoquic_wake_up_network_thread
+        # requires picoquic_network_thread_ctx_t*, NOT picoquic_quic_t*
+        # — a type mismatch here is a silent UAF-class corruption.
+        self._ctx.thread_ctx = self._thread_ctx
 
         self._started = True
 
@@ -1483,36 +2310,118 @@ cdef class WebTransportSessionState:
             raise BufferError("TX ring full (WT_DRAIN)")
         self._transport.wake_up()
 
-    def push_stream_data(self, uint64_t stream_id, bytes data,
-                          bint end_stream=False):
-        """Send bytes on a WT data stream.
+    def push_stream_data(self, uint64_t stream_id, uintptr_t sc_ptr,
+                          bytes data,
+                          bint end_stream=False,
+                          uint32_t stream_ring_cap=AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT):
+        """Send bytes on a WT data stream — pull model.
 
-        WT data streams are real QUIC streams once created, so we
-        reuse the raw-QUIC TX_STREAM_DATA / TX_STREAM_FIN path with
-        the session's underlying cnx pointer. This keeps cnx_ptr
-        encapsulated inside the cdef class instead of leaking to
-        the Python WebTransportClient."""
+        sc_ptr is the per-stream aiopquic_stream_ctx_t pointer the
+        caller stashed from a STREAM_CREATED (we initiated) or
+        NEW_STREAM (peer initiated) event. The worker owns the link
+        + sc lifetime via h3zero's stream_ctx; Python only borrows
+        the pointer for writes and must drop its reference on
+        FIN/RESET/STOP_SENDING.
+
+        Atomic from the asyncio thread's perspective:
+          1. PRE-CHECK the SPSC TX-event ring has room for the
+             MARK_ACTIVE event we'll need to push.
+          2. Atomically commit bytes into sc->tx (lazy-allocates the
+             ring at stream_ring_cap on first push). All-or-nothing —
+             on ring-full no bytes are committed; tx_drain_pending is
+             armed so the picoquic worker emits one
+             SPSC_EVT_STREAM_TX_DRAINED when it next drains.
+          3. Push TX_MARK_ACTIVE (guaranteed room from step 1 under
+             the single-producer asyncio model). Worker pops it,
+             calls picoquic_mark_active_stream(cnx, sid, 1, NULL) —
+             passing NULL so picoquic's app_stream_ctx doesn't clobber
+             h3zero's stream lookup. picoquic then asks h3zero for
+             bytes via prepare_to_send; h3zero invokes our
+             aiopquic_wt_path_callback(provide_data) which drains
+             sc->tx and emits the drain event via the same edge-
+             triggered pattern raw-QUIC uses.
+
+        Raises:
+          BufferError: TX-event ring or sc->tx is full. Bytes from
+              the failed call were NOT committed; caller can retry
+              the SAME data buffer without risk of duplicating bytes.
+          RuntimeError: WT session not yet open, or sc_ptr is 0.
+          MemoryError: sc->tx ring allocation failed.
+        """
         cdef picoquic_cnx_t* cnx = NULL
         if self._wt is not NULL:
             cnx = <picoquic_cnx_t*>self._wt.cnx
         if cnx is NULL:
             raise RuntimeError("WT session not yet open")
 
-        cdef spsc_entry_t entry
-        memset(&entry, 0, sizeof(entry))
-        entry.event_type = (SPSC_EVT_TX_STREAM_FIN if end_stream
-                             else SPSC_EVT_TX_STREAM_DATA)
-        entry.stream_id = stream_id
-        entry.cnx = <void*>cnx
+        cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
+        if sc is NULL:
+            raise RuntimeError(
+                f"WT stream {stream_id} has no sc (closed or never created)"
+            )
+
         cdef const uint8_t* data_ptr = NULL
         cdef uint32_t data_len = 0
         if data:
             data_ptr = <const uint8_t*>data
             data_len = <uint32_t>len(data)
+
+        # PRE-CHECK 1: TX event ring must have room for the
+        # MARK_ACTIVE event we'll push after committing bytes.
+        # Without this, retry semantics could duplicate bytes.
+        # Single-producer (asyncio thread) ⇒ no TOCTOU window.
+        if (spsc_ring_count(self._transport._ctx.tx_ring) >=
+                self._transport._ctx.tx_ring.capacity):
+            # Arm the connection-global drain wakeup BEFORE raising so
+            # the caller can await tx_ring_drain_event without losing
+            # the wakeup. Worker fires SPSC_EVT_TX_RING_DRAINED when
+            # the ring drops to/below low_water.
+            aiopquic_arm_tx_ring_drain_pending(self._transport._ctx)
+            raise BufferError(
+                f"TX event ring full (WT stream={stream_id})"
+            )
+
+        # COMMIT: push bytes to per-stream sc->tx (lazy-allocates
+        # ring at stream_ring_cap if absent; atomic / all-or-nothing).
+        cdef int rc = aiopquic_stream_ctx_send_data(
+            sc, data_ptr, data_len, stream_ring_cap,
+            <uint8_t>(1 if end_stream else 0))
+        if rc == 0:
+            # sc->tx full; tx_drain_pending armed inside helper.
+            raise BufferError(
+                f"WT TX ring full (stream={stream_id}, "
+                f"need={data_len})"
+            )
+        if rc < 0:
+            raise MemoryError(
+                f"WT sc->tx alloc failed (stream={stream_id})"
+            )
+
+        # MARK_ACTIVE: stream_ctx=NULL preserves h3zero's lookup-by-
+        # sid behavior. h3zero handles NULL app_stream_ctx safely on
+        # both prepare_to_send (h3zero_common.c:1640) and stream_data
+        # (h3zero_common.c:1492) paths.
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_MARK_ACTIVE
+        entry.stream_id = stream_id
+        entry.cnx = <void*>cnx
+        entry.stream_ctx = NULL
         cdef int ret = spsc_ring_push(
-            self._transport._ctx.tx_ring, &entry, data_ptr, data_len)
+            self._transport._ctx.tx_ring, &entry, NULL, 0)
         if ret != 0:
-            raise BufferError("TX ring full (WT stream data)")
+            # Single-producer invariant violated. Arm the connection-
+            # global drain signal so the caller's BufferError handler
+            # waking on tx_ring_drain_event will fire when the ring
+            # drains. Bytes are already in sc->tx; caller's retry must
+            # check rc semantics so as not to duplicate. send_data is
+            # all-or-nothing per call so the SAME buffer can be retried
+            # without doubling, but pre-check + caller-retry should
+            # converge to MARK_ACTIVE landing.
+            aiopquic_arm_tx_ring_drain_pending(self._transport._ctx)
+            raise BufferError(
+                f"TX event ring full (WT MARK_ACTIVE stream={stream_id})"
+            )
         self._transport.wake_up()
 
     def push_reset_stream(self, uint64_t stream_id, uint64_t error_code):

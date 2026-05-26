@@ -21,17 +21,71 @@
 #include <picoquic.h>
 #include <picoquic_packet_loop.h>
 
-/* Fallback per-stream RX byte ring capacity when the configured
- * max_stream_data hasn't been threaded through (e.g., raw transport
- * tests bypassing QuicConfiguration). Production code paths use the
- * configured window via aiopquic_ctx_t.rx_ring_cap. Power of two. */
-#define AIOPQUIC_RX_RING_CAP_DEFAULT (1u << 20)
+/* =====================================================================
+ * Resource defaults — single source of truth for aiopquic tunables.
+ *
+ * Per-stream byte rings double as peer's max in-flight window (RX) and
+ * Python's local TX staging buffer. Buffer size has two effects:
+ *   - max throughput (FC-limited) = buffer / RTT
+ *   - max queueing latency under drain stall = buffer / drain_rate
+ * For live-media workloads (MoQT) prefer buffer ≈ BDP at target RTT;
+ * going larger doesn't gain throughput (network-limited) but adds
+ * latency-spike potential. Override per-cnx via QuicConfiguration.
+ * ===================================================================== */
 
-/* MAX_STREAM_DATA hysteresis: advance peer credit when ≥ 1/4 of the
- * ring has been drained since the last update. Matches picoquic's
- * own receive_window_threshold cadence and bounds the rate of
- * MAX_STREAM_DATA frames under sustained drain. */
+/* Per-stream RX byte ring fallback. 4 MB covers 1 Gbps × 32 ms or
+ * 2.5 Gbps × 13 ms cleanly. For 2.5 Gbps × 100 ms WAN set ~32 MB via
+ * QuicConfiguration.rx_ring_cap; for 10 Gbps × 100 ms set ~128 MB.
+ * Memory cost scales with concurrent stream count. Power of two. */
+#define AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT (1u << 22)
+
+/* Per-stream TX byte ring fallback. Holds bytes between Python's
+ * send_stream_data and picoquic's worker drain. Doesn't need to
+ * be BDP-sized (picoquic drains continuously); 4 MB matches RX
+ * for symmetry and gives ample staging headroom. */
+#define AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT (1u << 22)
+
+/* Legacy shared SPSC ring default — preserved for backward-compat
+ * callers (Python QuicConfiguration.event_ring_capacity fallback).
+ * New code should size tx and rx independently via the two macros
+ * below. */
+#define AIOPQUIC_SPSC_RING_CAPACITY_DEFAULT 262144
+
+/* TX SPSC event ring default. Carries producer→worker notifications:
+ * one MARK_ACTIVE per send_stream_data call in pull-model (bytes
+ * live in sc->tx, not here), plus control msgs / WT commands / push-
+ * model byte-bearing entries. 2048 entries = ~20 ms of producer
+ * headroom at 100k events/s — small enough to backpressure early,
+ * large enough to absorb command bursts without starving the data
+ * path. Drainage threshold controlled by AIOPQUIC_TX_RING_WAKE_PCT.
+ * Power of two. */
+#define AIOPQUIC_TX_RING_CAP_DEFAULT 2048
+
+/* RX SPSC event ring default. Carries worker→asyncio notifications:
+ * stream_data / stream_fin / stream_open / connection events + the
+ * STREAM_TX_DRAINED and TX_RING_DRAINED wake events. Worker push
+ * rate is peer-paced, not producer-paced — undersizing causes
+ * silent event drops on multi-Gbps stream-churn workloads (see
+ * worker_rx_event_drops counter; aiopquic_rx_log_enabled stderr).
+ * 16384 entries chosen as the floor at which sustained MoQT
+ * subgroup churn at multi-Gbps stops triggering drops in lab.
+ * Power of two. */
+#define AIOPQUIC_RX_RING_CAP_DEFAULT 16384
+
+/* MAX_STREAM_DATA hysteresis: advance peer credit when ≥ 1/4 of
+ * the ring has been drained since the last update. Matches
+ * picoquic's own receive_window_threshold cadence and bounds the
+ * rate of MAX_STREAM_DATA frames under sustained drain. */
 #define AIOPQUIC_RX_FC_THRESHOLD_DIV 4
+
+/* TX SPSC ring drain-wake low-water mark, as percent of ring
+ * capacity. Worker fires SPSC_EVT_TX_RING_DRAINED when count
+ * drops to/below this fraction while a Python writer has armed
+ * tx_ring_drain_pending. 50% leaves the producer half-empty
+ * headroom on wake. Overridable via AIOPQUIC_TX_RING_WAKE_PCT
+ * env var at ctx_create time. (Temporarily reverted from 75%
+ * while investigating control-stream delivery regression.) */
+#define AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT 50
 
 #include <fcntl.h>
 #include <stdatomic.h>
@@ -87,6 +141,23 @@ static inline int aiopquic_rx_log_enabled(void) {
     return v;
 }
 
+/* AIOPQUIC_FC_RAW=1 forces the FC handler to grant raw buf_free
+ * (ignoring bytes_pending_release). Diagnostic only — disables the
+ * Python-pipeline backpressure that bounds RSS. Default OFF. */
+static _Atomic(int) _aiopquic_fc_raw_cached = -1;
+
+static inline int aiopquic_fc_raw_enabled(void) {
+    int v = atomic_load_explicit(&_aiopquic_fc_raw_cached,
+                                  memory_order_relaxed);
+    if (v < 0) {
+        const char* s = getenv("AIOPQUIC_FC_RAW");
+        v = (s && *s && *s != '0') ? 1 : 0;
+        atomic_store_explicit(&_aiopquic_fc_raw_cached, v,
+                              memory_order_relaxed);
+    }
+    return v;
+}
+
 #ifdef __linux__
 #include <sys/eventfd.h>
 #endif
@@ -115,6 +186,17 @@ typedef struct {
                                        (== eventfd on Linux; pipe write end
                                        elsewhere) */
     picoquic_quic_t* quic;
+    /* Network-thread handle returned by picoquic_start_network_thread.
+     * Set by Python's start() after the thread is up; used by C-side
+     * helpers (aiopquic_push_fc_credit, etc.) that need to wake the
+     * worker without round-tripping through Python. NULL during early
+     * init and after thread teardown.
+     *
+     * IMPORTANT: picoquic_wake_up_network_thread takes this struct
+     * pointer, NOT the picoquic_quic_t*. Passing the wrong type is
+     * a UAF-class bug — the function dereferences fields that don't
+     * exist at the same offsets. */
+    picoquic_network_thread_ctx_t* thread_ctx;
     /* Per-stream RX byte ring capacity. Set at start() time from the
      * QuicConfiguration's max_stream_data so the ring can hold the
      * full peer-allowed in-flight window (the spec promises peer
@@ -161,19 +243,84 @@ typedef struct {
      * under load. Set AIOPQUIC_RX_LOG=1 in the env to re-enable a
      * one-shot stderr line per overflow event. */
     uint64_t        worker_rx_byte_ring_overflow;
+    /* TX ring drain wakeup. Python writers blocked on a full SPSC TX
+     * event ring arm tx_ring_drain_pending=1 (clear-arm-recheck-wait
+     * pattern); worker fires SPSC_EVT_TX_RING_DRAINED via CAS-clear
+     * once spsc_ring_count(tx_ring) <= tx_ring_low_water. Default
+     * low_water = 50% of ring capacity, overridable via
+     * AIOPQUIC_TX_RING_WAKE_PCT env var at ctx_create time. */
+    uint32_t        tx_ring_drain_pending;
+    uint32_t        tx_ring_low_water;
+
+    /* ============================================================
+     * Observability counters (added without behavior change).
+     * All single-writer per cell; reads from asyncio thread via
+     * Cython properties. Plain uint64_t with relaxed semantics
+     * because correctness doesn't depend on these — they exist to
+     * answer "which side of the wake chain stalled" by inspection.
+     *
+     * Timestamps use CLOCK_MONOTONIC ns to align worker- and
+     * asyncio-thread events on a single comparable time-base.
+     * ============================================================ */
+    uint64_t        cnt_tx_ring_pushes;            /* Python push into tx_ring */
+    uint64_t        cnt_tx_ring_pops;              /* worker pop from tx_ring */
+    uint64_t        cnt_tx_ring_arms;              /* Python armed tx_ring_drain_pending */
+    uint64_t        cnt_tx_ring_fires;             /* worker fired SPSC_EVT_TX_RING_DRAINED */
+    uint64_t        cnt_tx_ring_fire_dropped;      /* fire CAS won but rx_ring push failed → re-armed */
+    uint64_t        cnt_wake_calls;                /* picoquic_wake_up_network_thread invoked */
+    uint64_t        cnt_wake_skipped_coalesced;    /* wake skipped (tx_wake_pending already 1) */
+    uint64_t        cnt_prepare_to_send_empty;     /* prepare_to_send invoked with avail==0 */
+    uint64_t        last_tx_ring_arm_ns;           /* CLOCK_MONOTONIC of last arm */
+    uint64_t        last_tx_ring_fire_ns;          /* CLOCK_MONOTONIC of last fire */
+    /* RX flow-control observability (added 2026-05-25). Drain side
+     * (asyncio) pushes OPEN_FLOW_CONTROL events; worker handles them.
+     * cnt_fc_credit_pushed must equal cnt_fc_credit_handled + cnt_fc_credit_dropped
+     * in steady state — otherwise events are leaking on the worker side. */
+    uint64_t        cnt_fc_credit_pushed;          /* asyncio push of SPSC_EVT_TX_OPEN_FLOW_CONTROL */
+    uint64_t        cnt_fc_credit_handled;         /* worker processed SPSC_EVT_TX_OPEN_FLOW_CONTROL */
+    uint64_t        cnt_fc_credit_dropped;         /* push failed (tx_ring full) */
 } aiopquic_ctx_t;
 
-static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity) {
+/* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
+
+/* Create a TransportContext with independent TX and RX SPSC ring
+ * sizes and an explicit drain-wake low-water percent. Pass 0 for
+ * any of the three to take the compile-time default
+ * (AIOPQUIC_TX_RING_CAP_DEFAULT / AIOPQUIC_RX_RING_CAP_DEFAULT /
+ * AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT). Ring caps must be powers of
+ * two — the caller (Cython binding) is responsible for rounding. */
+static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
+                                                   uint32_t rx_cap,
+                                                   uint32_t low_water_pct) {
+    if (tx_cap == 0) tx_cap = AIOPQUIC_TX_RING_CAP_DEFAULT;
+    if (rx_cap == 0) rx_cap = AIOPQUIC_RX_RING_CAP_DEFAULT;
+    if (low_water_pct == 0 || low_water_pct >= 100) {
+        low_water_pct = AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT;
+    }
+
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)calloc(1, sizeof(aiopquic_ctx_t));
     if (!ctx) return NULL;
 
-    ctx->rx_ring = spsc_ring_create(ring_capacity);
-    ctx->tx_ring = spsc_ring_create(ring_capacity);
+    ctx->rx_ring = spsc_ring_create(rx_cap);
+    ctx->tx_ring = spsc_ring_create(tx_cap);
     if (!ctx->rx_ring || !ctx->tx_ring) {
         spsc_ring_destroy(ctx->rx_ring);
         spsc_ring_destroy(ctx->tx_ring);
         free(ctx);
         return NULL;
+    }
+
+    /* TX ring drain wake threshold: explicit param wins, then env
+     * override (AIOPQUIC_TX_RING_WAKE_PCT), then the macro default.
+     * Computed against tx_cap, not the legacy single-cap. */
+    {
+        uint32_t lw_pct = low_water_pct;
+        const char* env_lw = getenv("AIOPQUIC_TX_RING_WAKE_PCT");
+        if (env_lw && *env_lw) {
+            int v = atoi(env_lw);
+            if (v > 0 && v < 100) lw_pct = (uint32_t)v;
+        }
+        ctx->tx_ring_low_water = (tx_cap * lw_pct) / 100;
     }
 
 #ifdef __linux__
@@ -227,8 +374,141 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
  * back to 0 when it finishes draining the TX ring. Single-producer
  * (asyncio thread) so atomic exchange is sufficient. */
 static inline int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx) {
-    return __atomic_exchange_n(&ctx->tx_wake_pending, 1,
-                                 __ATOMIC_RELEASE);
+    uint32_t prev = __atomic_exchange_n(&ctx->tx_wake_pending, 1,
+                                         __ATOMIC_RELEASE);
+    if (prev == 0) {
+        ctx->cnt_wake_calls++;  /* this caller WILL invoke wake_up */
+    } else {
+        ctx->cnt_wake_skipped_coalesced++;  /* coalesced under prior wake */
+    }
+    return (int)prev;
+}
+
+/* Forward decl: aiopquic_maybe_fire_tx_ring_drained pushes
+ * SPSC_EVT_TX_RING_DRAINED into rx_ring and calls aiopquic_notify_rx
+ * which is defined further down in this header. */
+static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx);
+
+/* Python-side helpers for the TX ring drain wakeup protocol. The
+ * producer (asyncio thread) calls arm() before awaiting the event,
+ * and clear() if it raced with a worker drain. Worker side does
+ * the CAS-clear+fire inside aiopquic_maybe_fire_tx_ring_drained. */
+static inline void aiopquic_arm_tx_ring_drain_pending(aiopquic_ctx_t* ctx) {
+    ctx->cnt_tx_ring_arms++;
+    ctx->last_tx_ring_arm_ns = aiopquic_now_ns();
+    __atomic_store_n(&ctx->tx_ring_drain_pending, 1,
+                      __ATOMIC_RELEASE);
+}
+
+static inline void aiopquic_clear_tx_ring_drain_pending(aiopquic_ctx_t* ctx) {
+    __atomic_store_n(&ctx->tx_ring_drain_pending, 0,
+                      __ATOMIC_RELEASE);
+}
+
+/* Push an SPSC_EVT_TX_OPEN_FLOW_CONTROL event onto the TX ring so
+ * the picoquic worker re-evaluates the per-stream MAX_STREAM_DATA
+ * grant. Called from two sites:
+ *   - drain_rx data paths after popping bytes from sc->rx (normal
+ *     credit replenishment as peer data is consumed).
+ *   - StreamChunk.__dealloc__ when a chunk's bytes are released
+ *     back to aiopquic, so peer credit reopens when the Python
+ *     pipeline drains. This is the closed-loop signal that breaks
+ *     the FC-stall deadlock: peer doesn't need to send anything
+ *     for credit to resume; releasing a chunk is sufficient.
+ *
+ * entry.stream_ctx carries the BORROWED aiopquic_stream_ctx_t* so
+ * the worker can read both sc->rx_buf_free and sc->bytes_pending_release
+ * when computing the effective grant. Wake is coalesced via
+ * tx_wake_pending — many back-to-back pushes collapse to one wake. */
+static inline void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx,
+                                            void* cnx,
+                                            uint64_t stream_id,
+                                            aiopquic_stream_ctx_t* sc) {
+    if (!ctx || !cnx || !sc) return;
+    /* Take a ref on sc so the worker handler (which runs later,
+     * possibly after the caller's chunk has been dealloc'd) can
+     * safely deref sc->rx and sc->bytes_pending_release. The
+     * handler is responsible for the matching unref via
+     * aiopquic_stream_ctx_destroy. */
+    aiopquic_stream_ctx_ref(sc);
+    spsc_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.event_type = SPSC_EVT_TX_OPEN_FLOW_CONTROL;
+    entry.stream_id = stream_id;
+    entry.cnx = (picoquic_cnx_t*)cnx;
+    entry.stream_ctx = sc;
+    if (spsc_ring_push(ctx->tx_ring, &entry, NULL, 0) == 0) {
+        ctx->cnt_tx_ring_pushes++;
+        ctx->cnt_fc_credit_pushed++;
+        /* Wake only if the thread is running. Coalesced via
+         * tx_wake_pending so back-to-back pushes collapse to one
+         * syscall. CRITICAL: picoquic_wake_up_network_thread takes
+         * picoquic_network_thread_ctx_t*, NOT picoquic_quic_t* —
+         * passing the wrong type is a UAF-class bug that silently
+         * corrupts picoquic state. */
+        if (ctx->thread_ctx != NULL &&
+            aiopquic_tx_wake_set_pending(ctx) == 0) {
+            picoquic_wake_up_network_thread(ctx->thread_ctx);
+        }
+    } else {
+        /* tx_ring push failed (ring full). Drop the ref we just
+         * took since no worker handler will run for this push. */
+        ctx->cnt_fc_credit_dropped++;
+        aiopquic_stream_ctx_destroy(sc);
+    }
+}
+
+/* Worker-side: if a Python writer armed tx_ring_drain_pending and the
+ * TX SPSC event ring has now drained to or below the low-water mark,
+ * fire SPSC_EVT_TX_RING_DRAINED to wake the writer. CAS-clear ensures
+ * exactly one event per arm.
+ *
+ * Called after every spsc_ring_pop(tx_ring) in the worker's drain
+ * loop so the wake fires at the moment the count crosses below
+ * low_water — gives the producer concurrent runway rather than
+ * waiting for full drain.
+ *
+ * The arm itself is the producer-side "clear-arm-recheck-wait"
+ * pattern: producer clears event, arms pending, re-checks pressure
+ * (if dropped below high_water during the arm window, producer
+ * proceeds without waiting; otherwise awaits the event).
+ *
+ * No lost wakeup: if producer armed and pressure is still high,
+ * worker WILL fire at the next crossing of low_water (CAS-clear is
+ * single-shot per arm; pending=1 persists until worker observes it
+ * AND ring is below low_water). */
+static inline void aiopquic_maybe_fire_tx_ring_drained(aiopquic_ctx_t* ctx) {
+    if (__atomic_load_n(&ctx->tx_ring_drain_pending,
+                         __ATOMIC_ACQUIRE) != 1) {
+        return;
+    }
+    if (spsc_ring_count(ctx->tx_ring) > ctx->tx_ring_low_water) {
+        return;
+    }
+    uint32_t expected = 1;
+    if (!__atomic_compare_exchange_n(
+            &ctx->tx_ring_drain_pending, &expected, 0,
+            0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        return;  /* another caller beat us; their fire is sufficient */
+    }
+    spsc_entry_t entry = {0};
+    entry.event_type = SPSC_EVT_TX_RING_DRAINED;
+    if (spsc_ring_push(ctx->rx_ring, &entry, NULL, 0) == 0) {
+        ctx->cnt_tx_ring_fires++;
+        ctx->last_tx_ring_fire_ns = aiopquic_now_ns();
+        aiopquic_notify_rx(ctx);
+    } else {
+        /* rx_ring full — re-arm tx_ring_drain_pending so the next pop
+         * (or post-drain re-check in the wake_up handler) retries
+         * once Python catches up. Mirrors the STREAM_TX_DRAINED
+         * handling at callback.h:496-507 and the WT analog at
+         * h3wt_callback.h:649-664. Without this re-arm the wake is
+         * lost (CAS-clear is already committed) and the producer
+         * awaiting ring_event deadlocks. */
+        ctx->cnt_tx_ring_fire_dropped++;
+        __atomic_store_n(&ctx->tx_ring_drain_pending, 1,
+                          __ATOMIC_RELEASE);
+    }
 }
 
 /* Signal asyncio that there are RX events.
@@ -333,20 +613,15 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)callback_ctx;
     if (!ctx) return -1;
 
-    /* TX-side callback. Two paths:
-     *
-     * (1) PULL model: stream_ctx is a aiopquic_stream_buf_t* set by
-     *     picoquic_mark_active_stream(cnx, sid, 1, sb). Drain bytes
-     *     from the ring into picoquic's frame buffer up to the budget.
-     *     If the ring drains to empty AND fin_pending is set, signal
-     *     FIN; else keep the stream active.
-     *
-     * (2) PUSH model (legacy): stream_ctx is NULL. Drain a single
-     *     SPSC TX entry (whatever is at the head of the shared TX
-     *     ring). Only matches if the entry is for this stream_id.
-     *     This path has no upstream backpressure — caller is
-     *     responsible for not over-pushing into picoquic's internal
-     *     queue. Retained for the existing send_stream_data API.
+    /* TX-side callback. PULL model only: stream_ctx is an
+     * aiopquic_stream_ctx_t* set by picoquic_mark_active_stream
+     * (queued via SPSC_EVT_TX_MARK_ACTIVE). Drain bytes from the
+     * stream's sc->tx ring into picoquic's frame buffer up to the
+     * caller's budget. If sc->tx drains to empty AND fin_pending
+     * is set, signal FIN; else keep the stream active. The legacy
+     * push-model fallback (stream_ctx==NULL → drain a single
+     * SPSC_EVT_TX_STREAM_DATA/FIN entry from the shared TX ring)
+     * was removed in 0.3.5; mark_active never passes NULL.
      */
     if (fin_or_event == picoquic_callback_prepare_to_send) {
         ctx->worker_prepare_to_send_calls++;
@@ -369,56 +644,66 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             if (buf && to_send > 0) {
                 aiopquic_stream_buf_pop(sb, buf, to_send);
                 ctx->worker_prepare_to_send_pulled_bytes += to_send;
-                /* Edge-trigger TX backpressure: if a Python writer
-                 * was blocked (set tx_drain_pending=1 after seeing
-                 * sc->tx full), CAS-clear and emit one SPSC event
-                 * so it can wake and retry. Single-shot per cycle —
-                 * only the CAS winner pushes the event. */
-                uint32_t expected = 1;
-                if (atomic_compare_exchange_strong_explicit(
-                        &sc->tx_drain_pending, &expected, 0,
-                        memory_order_acq_rel, memory_order_relaxed)) {
-                    spsc_entry_t drain_entry = {0};
-                    drain_entry.event_type = SPSC_EVT_STREAM_TX_DRAINED;
-                    drain_entry.stream_id = stream_id;
-                    drain_entry.cnx = cnx;
-                    drain_entry.stream_ctx = sc;
-                    if (spsc_ring_push(ctx->rx_ring,
-                                       &drain_entry, NULL, 0) == 0) {
-                        aiopquic_notify_rx(ctx);
-                    } else {
-                        /* RX ring full — re-arm so Python re-attempts
-                         * once it drains; the worker will retry next
-                         * prepare_to_send. Better than losing the
-                         * wakeup. */
-                        atomic_store_explicit(
-                            &sc->tx_drain_pending, 1,
-                            memory_order_release);
-                    }
+            } else {
+                /* prepare_to_send invoked with no bytes to pull —
+                 * either sc->tx empty (worker faster than producer)
+                 * or picoquic offered length==0 (out of packet space).
+                 * Tracked separately from the bytes-pulled case so the
+                 * counter dump can tell idle from productive cycles. */
+                ctx->cnt_prepare_to_send_empty++;
+            }
+            /* No sender-side STREAM_DESTROY here: picoquic may still
+             * callback with stream_ctx=sc after our FIN (retransmit
+             * / ACK), so early destroy is a UAF. Deferred to 0.3.6. */
+            /* Edge-trigger TX backpressure: if a Python writer was
+             * blocked (set tx_drain_pending=1 after seeing sc->tx
+             * full OR via the soft byte-budget arm in path B),
+             * CAS-clear and emit one SPSC event so it can wake and
+             * retry. Single-shot per cycle — only the CAS winner
+             * pushes the event.
+             *
+             * Hoisted OUTSIDE the to_send > 0 guard: prepare_to_send
+             * may legitimately arrive with to_send == 0 (sc->tx drained
+             * by a prior call, picoquic still calling us to ask) yet
+             * the writer's "wait for sc->tx room" precondition is in
+             * fact satisfied (avail == 0 means maximum room). Keeping
+             * the fire inside the guard caused a deterministic miss
+             * after the LAST drain emptied sc->tx — pending stayed
+             * at 1 forever, sc_event never fired. Mirrors the WT
+             * fix at h3wt_callback.h. */
+            uint32_t expected = 1;
+            if (atomic_compare_exchange_strong_explicit(
+                    &sc->tx_drain_pending, &expected, 0,
+                    memory_order_acq_rel, memory_order_relaxed)) {
+                spsc_entry_t drain_entry = {0};
+                drain_entry.event_type = SPSC_EVT_STREAM_TX_DRAINED;
+                drain_entry.stream_id = stream_id;
+                drain_entry.cnx = cnx;
+                drain_entry.stream_ctx = sc;
+                if (spsc_ring_push(ctx->rx_ring,
+                                   &drain_entry, NULL, 0) == 0) {
+                    sc->cnt_drain_fires++;
+                    sc->last_drain_fire_ns = aiopquic_now_ns();
+                    aiopquic_notify_rx(ctx);
+                } else {
+                    /* RX ring full — re-arm so Python re-attempts
+                     * once it drains; the worker will retry next
+                     * prepare_to_send. Better than losing the
+                     * wakeup. */
+                    sc->cnt_drain_dropped++;
+                    atomic_store_explicit(
+                        &sc->tx_drain_pending, 1,
+                        memory_order_release);
                 }
             }
             return 0;
         }
 
-        spsc_entry_t* tx_entry = spsc_ring_peek(ctx->tx_ring);
-        if (tx_entry && tx_entry->stream_id == stream_id &&
-            (tx_entry->event_type == SPSC_EVT_TX_STREAM_DATA ||
-             tx_entry->event_type == SPSC_EVT_TX_STREAM_FIN)) {
-            const uint8_t* data = (const uint8_t*)tx_entry->data_buf;
-            uint32_t to_send = tx_entry->data_length;
-            if (to_send > length) to_send = (uint32_t)length;
-
-            int is_fin = (tx_entry->event_type == SPSC_EVT_TX_STREAM_FIN);
-            int is_still_active = !is_fin;
-
-            uint8_t* buf = picoquic_provide_stream_data_buffer(
-                bytes, to_send, is_fin, is_still_active);
-            if (buf && data) {
-                memcpy(buf, data, to_send);
-            }
-            spsc_ring_pop(ctx->tx_ring);
-            return 0;
-        }
+        /* stream_ctx==NULL on prepare_to_send is unexpected in pull-model
+         * 0.3.5+: mark_active is always called with a stream_ctx, so
+         * picoquic should never invoke this callback with a null ctx.
+         * Defensive: signal "no data" and return without consuming
+         * anything from the shared TX ring. */
         (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
         return 0;
     }
@@ -478,10 +763,11 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
          * spec-correct FLOW_CONTROL_ERROR connection close. */
         uint32_t advertise_cap = ctx->rx_ring_cap > 0
             ? ctx->rx_ring_cap
-            : AIOPQUIC_RX_RING_CAP_DEFAULT;
+            : AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT;
         uint32_t physical_cap = advertise_cap;
         uint32_t fc_threshold = advertise_cap / AIOPQUIC_RX_FC_THRESHOLD_DIV;
         aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)stream_ctx;
+        int rx_first_touch = 0;
         if (!sc) {
             sc = aiopquic_stream_ctx_create();
             if (!sc) {
@@ -489,17 +775,22 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             }
             picoquic_set_app_stream_ctx(cnx, stream_id, sc);
             entry.stream_ctx = sc;
-            /* Opt into application-driven flow control. Initial credit
-             * advertised to peer = advertise_cap. */
+            /* Opt into application-driven flow control on this stream.
+             * The MAX_STREAM_DATA grant itself is issued via
+             * picoquic_open_flow_control AFTER we push the just-
+             * delivered bytes so the grant reflects actual free space —
+             * see the FC block below. */
             (void)picoquic_set_app_flow_control(cnx, stream_id, 1);
-            (void)picoquic_open_flow_control(cnx, stream_id, advertise_cap);
-            aiopquic_stream_ctx_rx_credit_store(sc, advertise_cap);
+            rx_first_touch = 1;
         }
         if (aiopquic_stream_ctx_ensure_rx(sc, physical_cap) != 0) {
             return -1;
         }
         uint32_t pushed = aiopquic_stream_buf_push(
             sc->rx, bytes, (uint32_t)length);
+        if (pushed > 0) {
+            aiopquic_sc_rx_bytes_pushed_add(pushed);
+        }
         if (pushed != length) {
             /* Per-stream RX byte-ring overflow. Means the peer sent
              * more than its advertised flow-control window allowed —
@@ -523,19 +814,63 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         if (fin_or_event == picoquic_callback_stream_fin) {
             aiopquic_stream_buf_set_fin(sc->rx);
         }
-        uint64_t consumed = aiopquic_stream_ctx_rx_consumed_load(sc);
-        uint64_t want_limit = consumed + advertise_cap;
-        uint64_t cur_limit = aiopquic_stream_ctx_rx_credit_load(sc);
-        if (want_limit > cur_limit + fc_threshold) {
-            (void)picoquic_open_flow_control(cnx, stream_id, want_limit);
-            aiopquic_stream_ctx_rx_credit_store(sc, want_limit);
+        /* FC management: first-touch grants initial buffer capacity to
+         * peer via open_flow_control(buf_free post-push). Subsequent
+         * replenishment is consumer-driven — Python's drain pushes
+         * SPSC_EVT_TX_OPEN_FLOW_CONTROL with the popped byte count as
+         * an incremental credit, mirroring picoquic's own
+         * flow_control_test pattern. Worker-side extension inside
+         * post_data can't unblock an FC-stalled peer. */
+        if (rx_first_touch) {
+            uint32_t buf_free = aiopquic_stream_buf_free(sc->rx);
+            (void)picoquic_open_flow_control(cnx, stream_id, buf_free);
+            aiopquic_stream_ctx_rx_credit_store(sc, advertise_cap);
         }
+        (void)fc_threshold;
         ret = spsc_ring_push(ctx->rx_ring, &entry, NULL, 0);
     } else {
         ret = spsc_ring_push(ctx->rx_ring, &entry, bytes, (uint32_t)length);
     }
     if (ret == 0) {
         aiopquic_notify_rx(ctx);
+
+        /* Deferred destroy: emit SPSC_EVT_STREAM_DESTROY as the LAST
+         * event for a raw-QUIC stream once picoquic delivers its
+         * terminal RX callback (FIN or RESET) AND the sc is pure
+         * receiver (sc->tx == NULL means we never opened a TX ring,
+         * i.e. uni-from-peer like a MoQT subgroup stream). FIFO
+         * ordering on the SPSC ring guarantees drain_rx pops the
+         * just-pushed FIN/RESET and drains sc->rx before the destroy
+         * runs. Only fired when the preceding event push succeeded —
+         * if FIN/RESET was dropped, Python never knows the stream
+         * ended, so we'd risk UAF on the drain side. Leaking sc is
+         * the safer failure mode in that case, matching the WT
+         * LINK_RELEASE policy. */
+        aiopquic_stream_ctx_t* terminate_sc =
+            (aiopquic_stream_ctx_t*)entry.stream_ctx;
+        if ((fin_or_event == picoquic_callback_stream_fin ||
+             fin_or_event == picoquic_callback_stream_reset) &&
+            terminate_sc != NULL && terminate_sc->tx == NULL) {
+            spsc_entry_t destroy_entry = {0};
+            destroy_entry.event_type = SPSC_EVT_STREAM_DESTROY;
+            destroy_entry.stream_id = stream_id;
+            destroy_entry.cnx = cnx;
+            destroy_entry.stream_ctx = terminate_sc;
+            int dret = spsc_ring_push(ctx->rx_ring, &destroy_entry,
+                                       NULL, 0);
+            if (dret == 0) {
+                aiopquic_notify_rx(ctx);
+            } else {
+                ctx->worker_rx_event_drops++;
+                if (aiopquic_rx_log_enabled()
+                        && ctx->worker_rx_event_drops <= 100) {
+                    fprintf(stderr,
+                        "[aiopquic_rx] STREAM_DESTROY drop on full "
+                        "rx_ring: leaking sc for stream=%llu\n",
+                        (unsigned long long)stream_id);
+                }
+            }
+        }
     } else {
         /* RX EVENT RING FULL — the data is already in sc->rx (for
          * stream_data) but the notification event is gone. asyncio
@@ -638,7 +973,8 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                             aiopquic_notify_rx(ctx);
                         }
                     }
-                    spsc_ring_pop(ctx->tx_ring);
+                    ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
+                    aiopquic_maybe_fire_tx_ring_drained(ctx);
                     continue;
                 }
 
@@ -654,7 +990,8 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                 if (entry->event_type >= SPSC_EVT_TX_WT_OPEN &&
                     entry->event_type <= SPSC_EVT_TX_WT_STOP_SENDING) {
                     (void)aiopquic_wt_handle_tx(quic, ctx, entry);
-                    spsc_ring_pop(ctx->tx_ring);
+                    ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
+                    aiopquic_maybe_fire_tx_ring_drained(ctx);
                     continue;
                 }
 
@@ -663,7 +1000,8 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                  * any picoquic_* call below UAFs. See
                  * aiopquic_cnx_is_alive() comment for cost notes. */
                 if (!cnx || !aiopquic_cnx_is_alive(quic, cnx)) {
-                    spsc_ring_pop(ctx->tx_ring);
+                    ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
+                    aiopquic_maybe_fire_tx_ring_drained(ctx);
                     continue;
                 }
 
@@ -672,63 +1010,116 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         picoquic_mark_active_stream(cnx, entry->stream_id,
                                                      1, entry->stream_ctx);
                         ctx->worker_mark_active_processed++;
-                        spsc_ring_pop(ctx->tx_ring);
+                        ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
+                        aiopquic_maybe_fire_tx_ring_drained(ctx);
                         break;
                     }
-                    case SPSC_EVT_TX_STREAM_DATA:
-                    case SPSC_EVT_TX_STREAM_FIN: {
-                        const uint8_t* data = (const uint8_t*)entry->data_buf;
-                        int is_fin = (entry->event_type == SPSC_EVT_TX_STREAM_FIN);
-                        picoquic_add_to_stream(cnx, entry->stream_id,
-                                                data, entry->data_length, is_fin);
-                        spsc_ring_pop(ctx->tx_ring);
-                        break;
-                    }
+                    /* SPSC_EVT_TX_STREAM_DATA / SPSC_EVT_TX_STREAM_FIN
+                     * (push-model byte-bearing events) were removed in
+                     * 0.3.5. All stream writes now flow through the
+                     * pull-model path: producer commits to sc->tx and
+                     * pushes a MARK_ACTIVE event; picoquic later drains
+                     * via the prepare_to_send callback. */
                     case SPSC_EVT_TX_DATAGRAM: {
                         const uint8_t* data = (const uint8_t*)entry->data_buf;
                         picoquic_queue_datagram_frame(cnx, entry->data_length, data);
-                        spsc_ring_pop(ctx->tx_ring);
+                        ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
+                        aiopquic_maybe_fire_tx_ring_drained(ctx);
                         break;
                     }
                     case SPSC_EVT_TX_CLOSE: {
                         /* cnx liveness already verified by the outer
                          * aiopquic_cnx_is_alive() guard above. */
                         picoquic_close(cnx, entry->error_code);
-                        spsc_ring_pop(ctx->tx_ring);
+                        ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
+                        aiopquic_maybe_fire_tx_ring_drained(ctx);
                         break;
                     }
                     case SPSC_EVT_TX_STREAM_RESET: {
                         picoquic_reset_stream(cnx, entry->stream_id, entry->error_code);
-                        spsc_ring_pop(ctx->tx_ring);
+                        ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
+                        aiopquic_maybe_fire_tx_ring_drained(ctx);
                         break;
                     }
                     case SPSC_EVT_TX_STOP_SENDING: {
                         picoquic_stop_sending(cnx, entry->stream_id, entry->error_code);
-                        spsc_ring_pop(ctx->tx_ring);
+                        ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
+                        aiopquic_maybe_fire_tx_ring_drained(ctx);
                         break;
                     }
                     case SPSC_EVT_TX_OPEN_FLOW_CONTROL: {
-                        /* Asyncio thread asks us to advance the peer's
-                         * MAX_STREAM_DATA limit for this stream. error_code
-                         * carries the new absolute byte limit. Returns
-                         * non-zero if stream not found or cnx not in ready
-                         * state — both transient/recoverable. */
-                        (void)picoquic_open_flow_control(
-                            cnx, entry->stream_id, entry->error_code);
-                        spsc_ring_pop(ctx->tx_ring);
+                        /* Asyncio thread asks us to advance peer's
+                         * MAX_STREAM_DATA. entry->stream_ctx carries a
+                         * borrowed pointer to the per-stream wrapper
+                         * (aiopquic_stream_ctx_t*); we compute the
+                         * effective grant HERE rather than relying on
+                         * a value Python snapshotted at push time.
+                         *
+                         * Effective grant accounts for BOTH sc->rx
+                         * ring fullness AND bytes that drain_rx has
+                         * dispatched to Python (StreamChunks) but the
+                         * consumer hasn't released yet (sc->bytes_pending_release).
+                         * Over-granting ignores the Python pipeline
+                         * backlog and lets peer flood beyond what the
+                         * end-to-end consumer can absorb. The min/sub
+                         * here is the application-aware backpressure
+                         * point: peer's window grows only as Python
+                         * actually releases chunks.
+                         *
+                         * effective_free = max(0, sc->rx_buf_free
+                         *                          - bytes_pending_release)
+                         *
+                         * StreamChunk.__dealloc__ pushes a fresh event
+                         * here on every chunk release, so when peer
+                         * stalls on FC, the next release reopens
+                         * credit — no asyncio polling required. */
+                        ctx->cnt_fc_credit_handled++;
+                        aiopquic_stream_ctx_t* sc =
+                            (aiopquic_stream_ctx_t*)entry->stream_ctx;
+                        if (sc != NULL && sc->rx != NULL) {
+                            uint32_t buf_free =
+                                aiopquic_stream_buf_free(sc->rx);
+                            uint32_t grant;
+                            if (aiopquic_fc_raw_enabled()) {
+                                grant = buf_free;
+                            } else {
+                                uint64_t pending =
+                                    aiopquic_stream_ctx_pending_load(sc);
+                                grant = (pending >= buf_free)
+                                    ? 0
+                                    : (uint32_t)(buf_free - pending);
+                            }
+                            if (grant > 0) {
+                                (void)picoquic_open_flow_control(
+                                    cnx, entry->stream_id, grant);
+                            }
+                        }
+                        /* Drop the ref aiopquic_push_fc_credit took
+                         * on our behalf. sc may be freed here if this
+                         * was the last reference (chunks all dealloc'd
+                         * AND stream FIN'd AND no other pending fc
+                         * events). Safe — we accessed sc above; this
+                         * is the very last touch. */
+                        if (sc != NULL) {
+                            aiopquic_stream_ctx_destroy(sc);
+                        }
+                        ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
+                        aiopquic_maybe_fire_tx_ring_drained(ctx);
                         break;
                     }
                     case SPSC_EVT_TX_SET_APP_FLOW_CONTROL: {
                         (void)picoquic_set_app_flow_control(
                             cnx, entry->stream_id, (int)entry->is_fin);
-                        spsc_ring_pop(ctx->tx_ring);
+                        ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
+                        aiopquic_maybe_fire_tx_ring_drained(ctx);
                         break;
                     }
                     default:
                         /* Unknown for raw-QUIC; route to WT dispatch
                          * which handles WT-specific TX commands. */
                         (void)aiopquic_wt_handle_tx(quic, ctx, entry);
-                        spsc_ring_pop(ctx->tx_ring);
+                        ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
+                        aiopquic_maybe_fire_tx_ring_drained(ctx);
                         break;
                 }
             }

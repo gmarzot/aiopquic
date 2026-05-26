@@ -10,11 +10,15 @@ COLOR_RED="\033[0;31m"
 COLOR_OFF="\033[0m"
 
 $ECHO "${COLOR_GREEN}Setting up Python/Cython test environment... ${COLOR_OFF}"
-PYTHON_VERSION="3.14"   # CPython 3.14 stable (GIL build) — matches the
-                        # default wheels we ship to PyPI. Use 3.14t for
-                        # the free-threaded variant (PEP 779) when
-                        # validating no-GIL behavior; it builds and runs
-                        # against this codebase.
+PYTHON_VERSION="cpython-3.14"   # CPython 3.14 stable (GIL build) — matches
+                        # the default wheels we ship to PyPI. The
+                        # `cpython-` prefix is uv's unambiguous spelling;
+                        # bare "3.14" can resolve to the free-threaded
+                        # variant when both flavors are managed locally.
+                        # For PEP 779 free-threaded validation, override
+                        # with PYTHON_VERSION=cpython-3.14t (no-GIL
+                        # behavior). Both build and run against this
+                        # codebase.
 CYTHON_VERSION="3.2.4"  # Latest on PyPI; supports both 3.14 and 3.14t.
 
 PLATFORM="$(uname -s)"
@@ -69,8 +73,12 @@ ${UV_PIP_INSTALL} uv
 uv python install --no-config --force "${PYTHON_VERSION}"
 uv python pin --no-config "${PYTHON_VERSION}"
 
-# Install required packages
-${UV_PIP_INSTALL} build wheel setuptools
+# Install required packages.
+# setuptools_scm is needed in the venv (not just in build-isolation)
+# because `pip install -e . --no-build-isolation` skips the build-system
+# requires; without it the version falls back to 0.0.0 instead of being
+# derived from git tags via [tool.setuptools_scm].
+${UV_PIP_INSTALL} build wheel setuptools "setuptools_scm[toml]>=6.2"
 #${UV_PIP_INSTALL} "git+https://github.com/cython/cython.git"
 ${UV_PIP_INSTALL} "cython==${CYTHON_VERSION}"
 ${UV_PIP_INSTALL} pytest pytest-asyncio pytest-cov pytest-xdist

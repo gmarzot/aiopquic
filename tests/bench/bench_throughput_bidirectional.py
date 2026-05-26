@@ -4,7 +4,7 @@ import time
 import pytest
 
 from _helpers import (
-    SPSC_EVT_STREAM_DATA, SPSC_EVT_STREAM_FIN, SPSC_EVT_TX_STREAM_FIN,
+    SPSC_EVT_STREAM_DATA, SPSC_EVT_STREAM_FIN,
 )
 
 
@@ -24,12 +24,8 @@ def test_bench_bidirectional(benchmark, big_ring_pair, capsys, size_kb):
         cli_sid_box[0] += 4
         srv_sid_box[0] += 4
 
-        client.push_tx(SPSC_EVT_TX_STREAM_FIN, cli_sid,
-                       data=payload, cnx_ptr=client_cnx)
-        server.push_tx(SPSC_EVT_TX_STREAM_FIN, srv_sid,
-                       data=payload, cnx_ptr=server_cnx)
-        client.wake_up()
-        server.wake_up()
+        client.tx_send_stream(client_cnx, cli_sid, payload, end_stream=True)
+        server.tx_send_stream(server_cnx, srv_sid, payload, end_stream=True)
 
         cli_received = 0  # bytes server got from client
         srv_received = 0  # bytes client got from server

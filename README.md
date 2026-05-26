@@ -12,7 +12,7 @@
 - **TX path** -- Asyncio pushes into per-stream byte ring; picoquic pulls at wire rate via `prepare_to_send`.
 - **RX path** -- picoquic pushes per-event `StreamChunk`s; ownership transfers at pop for 1-copy delivery.
 - **Cross-platform wake fd** -- Linux `eventfd` for efficient asyncio `add_reader()` notification; `pipe()` self-pipe fallback on macOS / BSD.
-- **Dedicated Network Thread** -- picoquic runs in its own thread via `picoquic_start_network_thread()`.
+- **Dedicated Network Thread** -- picoquic runs in its own thread via `picoquic_start_network_thread()`. One worker thread per `TransportContext`; multiple contexts share the asyncio event loop within a single Python process.
 - **Cython Bridge** -- Thin Cython layer over C callbacks, minimal overhead.
 - **WebTransport** -- `asyncio.webtransport.WebTransportSession` (client + server) over picoquic's `picowt_*` API and h3zero.
 
@@ -107,6 +107,25 @@ uv pip install -e '.[dev]'    # or: pip install -e '.[dev]'
 
 On macOS, set `OPENSSL_ROOT_DIR` if Homebrew OpenSSL is not auto-detected (the build script tries `openssl@3` then `openssl@1.1`).
 
+### Reporting issues
+
+Include the full version report in any issue — it captures aiopquic plus the picoquic + picotls submodule SHAs the binding was built from:
+
+```bash
+python -m aiopquic.versions   # or the console script: aiopquic-versions
+```
+
+Sample output:
+
+```
+aiopquic 0.3.5.dev4+g2ffe8947d.d20260522
+         /path/to/aiopquic
+picoquic 2b1e14d5a46532eadf691edef5bd747da6de6557
+picotls  f350eab60742138ac62b42ee444adf04c7898b0d
+```
+
+If you're running aiomoqt on top, prefer `python -m aiomoqt.versions` — it chains through to this report and includes the aiomoqt version too.
+
 ## Usage
 
 ### Low-level Transport API
@@ -160,6 +179,78 @@ python -m pytest tests/ -v -m "not interop and not native"
 
 # Microbenches (opt-in)
 python -m pytest tests/bench
+```
+
+## Performance build (opt-in)
+
+Default builds use `CMAKE_BUILD_TYPE=Release` (`-O3 -DNDEBUG`), portable across hosts. Two opt-in env vars layer on host-tuned optimizations for local benching — neither is enabled in PyPI wheels:
+
+```bash
+# Host-tuned: Fusion AES-GCM (x86_64), DISABLE_DEBUG_PRINTF,
+# -O3 -march=native -flto. Binary becomes machine-specific.
+AIOPQUIC_PERF=1 ./build_picoquic.sh
+```
+
+Per-platform behavior:
+
+| Knob                          | Linux x86_64 | Linux ARM64 | macOS arm64 | macOS x86_64 |
+|-------------------------------|:------------:|:-----------:|:-----------:|:------------:|
+| `-O3 -DNDEBUG` (always on)    |      ✓       |      ✓      |      ✓      |      ✓       |
+| `DISABLE_DEBUG_PRINTF`        |      ✓       |      ✓      |      ✓      |      ✓       |
+| Fusion AES-GCM (CPUID-dispatched) | ✓        |      –      |      –      |      ✓       |
+| `-march=native` / `-mcpu=native` + `-flto` | ✓ | ✓     |      ✓      |      ✓       |
+
+### Experimental: `AIOPQUIC_IO_URING=1` (DORMANT)
+
+io_uring scaffolding is in the tree (`third_party/liburing` submodule, picoquic patch, setup.py linkage). Enabling it builds `picoquic_packet_loop_uring` into `libpicoquic-core.a` and statically links `liburing.a` into the Cython extension:
+
+```bash
+AIOPQUIC_IO_URING=1 ./build_picoquic.sh   # auto-fetches + builds liburing-2.7
+uv pip install -e '.[dev]'                 # re-cythonize with PICOQUIC_WITH_IO_URING define
+```
+
+**This currently has no runtime effect.** aiopquic's worker thread uses its own callback/SPSC-ring path and does not invoke `picoquic_packet_loop_uring`. The scaffolding is preserved so the worker can be migrated to io_uring later without re-discovering the build recipe (liburing submodule pin, picoquic header patch for kernel-uapi conflicts, ABI-critical define propagation through setup.py).
+
+Linux-only. Compatible CPU architectures: x86_64, ARM64. Build will hard-error if `AIOPQUIC_IO_URING=1` is set on macOS / BSD / Windows.
+
+> **ABI note:** `picoquic_network_thread_ctx_t` and `picoquic_socket_ctx_t` have conditional fields gated on `PICOQUIC_WITH_IO_URING`. The build-script + setup.py propagate the define to both picoquic-core *and* the Cython extension. A mismatch silently shifts `thread_is_ready` and other field offsets — the network thread appears to never become ready. Don't enable WITH_IO_URING in picoquic without also defining PICOQUIC_WITH_IO_URING in the Cython build.
+
+## Runtime deployment guidance
+
+These are runtime tunings, separate from build-time flags above. PyPI wheels ship with portable perf flags baked in (see [Performance build](#performance-build-opt-in)); these knobs apply on top of any binary.
+
+### jemalloc for tail-latency reduction
+
+The default `glibc` allocator's per-thread arenas + occasional coalescing show up as max-latency outliers under sustained high-throughput workloads. Preloading `jemalloc` measurably tightens the tail:
+
+```bash
+# Debian/Ubuntu:
+sudo apt install libjemalloc2
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 python -m your_app
+
+# Fedora/RHEL:
+sudo dnf install jemalloc
+LD_PRELOAD=/usr/lib64/libjemalloc.so.2 python -m your_app
+```
+
+Validated improvement on a representative aiopquic sustained workload (Ryzen 7 PRO, Linux loopback): `sd 7.1 ms → 4.3 ms`, `max 437 ms → 310 ms`, throughput unchanged. Effect is most visible at multi-Gbps over 60+ second runs; small workloads see no difference.
+
+### GSO and send-length-max
+
+GSO (UDP segmentation offload) is **already enabled by default on Linux** with `send_length_max=65535` (max kernel-coalesced stride). No user action needed. macOS / FreeBSD default to GSO off — picoquic's per-datagram `sendmsg` path is used instead. Env overrides:
+
+```bash
+AIOPQUIC_GSO=0                  # force off (diagnostic only)
+AIOPQUIC_SEND_LENGTH_MAX=8192   # cap kernel-coalesced buffer (Linux GSO on)
+```
+
+### TX wake threshold
+
+The TX SPSC event ring's drain-wake threshold defaults to 50% — producer is signalled to resume only after ≥ half the queued events have drained. Overridable to tune for latency vs. context-switch overhead:
+
+```bash
+AIOPQUIC_TX_RING_WAKE_PCT=25    # wake earlier (lower per-send latency, more context switches)
+AIOPQUIC_TX_RING_WAKE_PCT=75    # wake later (more batching, slightly higher latency)
 ```
 
 ## Known Limitations
