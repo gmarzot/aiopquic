@@ -171,11 +171,6 @@ def test_chunks_alive_drains_after_stream_close(big_ring_pair):
 
 
 @pytest.mark.bench
-@pytest.mark.xfail(
-    reason="Sender-side sc lifecycle gap — no terminal callback after "
-           "our TX FIN; bounded by stream-count, deferred to 0.3.6.",
-    strict=False,
-)
 def test_sc_alive_returns_to_baseline_across_streams(big_ring_pair):
     """Open and close 50 streams sequentially. sc_alive_total should
     return to its starting value once all streams are FIN'd and
@@ -188,8 +183,14 @@ def test_sc_alive_returns_to_baseline_across_streams(big_ring_pair):
     n_streams = 50
     payload = b"d" * 1024
 
+    # Use client-initiated uni streams (sid % 4 == 2). picoquic
+    # considers uni streams closed when our FIN is ACKed; bidi
+    # requires BOTH directions to FIN (and the test server never
+    # sends FIN back, so bidi streams stay half-open forever and
+    # never trigger picoquic_callback_stream_released). UNI matches
+    # how real MoQT subgroups flow anyway.
     for i in range(n_streams):
-        sid = i * 4    # client-initiated bidi
+        sid = i * 4 + 2
         client.tx_send_stream(client_cnx, sid, payload, end_stream=True)
 
     # Drain all bytes + FINs. Both sides — server gets STREAM_DESTROY

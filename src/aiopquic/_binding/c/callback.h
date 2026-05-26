@@ -708,6 +708,30 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         return 0;
     }
 
+    /* Local picoquic patch (patches/0003-...): fires once per stream
+     * when picoquic considers it fully retired (pure receivers on
+     * FIN/RESET; senders/bidi when all sent data ACKed). Universal
+     * sc-destroy signal; covers cases the old pure-receiver-only
+     * STREAM_DESTROY emit (further down) didn't. picoquic won't call
+     * back with this stream_ctx again, so dropping the stream-
+     * lifetime ref is safe. */
+    if (fin_or_event == picoquic_callback_stream_released) {
+        if (stream_ctx != NULL) {
+            spsc_entry_t destroy_entry = {0};
+            destroy_entry.event_type = SPSC_EVT_STREAM_DESTROY;
+            destroy_entry.stream_id = stream_id;
+            destroy_entry.cnx = cnx;
+            destroy_entry.stream_ctx = stream_ctx;
+            if (spsc_ring_push(ctx->rx_ring, &destroy_entry,
+                               NULL, 0) == 0) {
+                aiopquic_notify_rx(ctx);
+            } else {
+                ctx->worker_rx_event_drops++;
+            }
+        }
+        return 0;
+    }
+
     int evt = aiopquic_map_event(fin_or_event);
     if (evt < 0) {
         return 0;
@@ -833,44 +857,13 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     }
     if (ret == 0) {
         aiopquic_notify_rx(ctx);
-
-        /* Deferred destroy: emit SPSC_EVT_STREAM_DESTROY as the LAST
-         * event for a raw-QUIC stream once picoquic delivers its
-         * terminal RX callback (FIN or RESET) AND the sc is pure
-         * receiver (sc->tx == NULL means we never opened a TX ring,
-         * i.e. uni-from-peer like a MoQT subgroup stream). FIFO
-         * ordering on the SPSC ring guarantees drain_rx pops the
-         * just-pushed FIN/RESET and drains sc->rx before the destroy
-         * runs. Only fired when the preceding event push succeeded —
-         * if FIN/RESET was dropped, Python never knows the stream
-         * ended, so we'd risk UAF on the drain side. Leaking sc is
-         * the safer failure mode in that case, matching the WT
-         * LINK_RELEASE policy. */
-        aiopquic_stream_ctx_t* terminate_sc =
-            (aiopquic_stream_ctx_t*)entry.stream_ctx;
-        if ((fin_or_event == picoquic_callback_stream_fin ||
-             fin_or_event == picoquic_callback_stream_reset) &&
-            terminate_sc != NULL && terminate_sc->tx == NULL) {
-            spsc_entry_t destroy_entry = {0};
-            destroy_entry.event_type = SPSC_EVT_STREAM_DESTROY;
-            destroy_entry.stream_id = stream_id;
-            destroy_entry.cnx = cnx;
-            destroy_entry.stream_ctx = terminate_sc;
-            int dret = spsc_ring_push(ctx->rx_ring, &destroy_entry,
-                                       NULL, 0);
-            if (dret == 0) {
-                aiopquic_notify_rx(ctx);
-            } else {
-                ctx->worker_rx_event_drops++;
-                if (aiopquic_rx_log_enabled()
-                        && ctx->worker_rx_event_drops <= 100) {
-                    fprintf(stderr,
-                        "[aiopquic_rx] STREAM_DESTROY drop on full "
-                        "rx_ring: leaking sc for stream=%llu\n",
-                        (unsigned long long)stream_id);
-                }
-            }
-        }
+        /* Note: the pure-receiver STREAM_DESTROY emit that used to
+         * live here is removed in 0.3.6. The new
+         * picoquic_callback_stream_released path (handled near the
+         * top of this function) is universal — it covers pure
+         * receivers AND senders AND bidi at the right moment
+         * (immediately for pure receivers, after FIN+ACK for
+         * senders). */
     } else {
         /* RX EVENT RING FULL — the data is already in sc->rx (for
          * stream_data) but the notification event is gone. asyncio
