@@ -267,7 +267,7 @@ class QuicConnection:
             # wakes, loops, observes _closed and exits cleanly.
             for ev in self._stream_tx_drain_events.values():
                 ev.set()
-            ring_ev = getattr(self._transport, '_tx_ring_drain_event', None)
+            ring_ev = getattr(self._transport, '_tx_event_ring_drain_event', None)
             if ring_ev is not None:
                 ring_ev.set()
             # picoquic's close callback has fired — worker has stopped
@@ -422,7 +422,7 @@ class QuicConnection:
             # Wake parked drain waiters — see matching block ~line 256.
             for ev in self._stream_tx_drain_events.values():
                 ev.set()
-            ring_ev = getattr(self._transport, '_tx_ring_drain_event', None)
+            ring_ev = getattr(self._transport, '_tx_event_ring_drain_event', None)
             if ring_ev is not None:
                 ring_ev.set()
             self._destroy_stream_ctxs()
@@ -519,13 +519,13 @@ class QuicConnection:
         """Send with built-in TX-ring backpressure for raw QUIC.
 
         Composes send_stream_data + get_tx_drain_event + tx_pressure
-        and the connection-global tx_ring_drain_event so every caller
+        and the connection-global tx_event_ring_drain_event so every caller
         gets worker-thread-aware pacing without copying the heuristic.
         Mirrors aiopquic.asyncio.WebTransportSession.send_stream_data_drained.
 
         Layers:
           - hard ring-saturation guard: await the connection-global
-            tx_ring_drain_event when tx_pressure > hard_wait_at
+            tx_event_ring_drain_event when tx_pressure > hard_wait_at
             (default 0.9). Uses the clear-arm-recheck-wait pattern so
             there is no lost wakeup if the worker drains the ring
             between our threshold check and the wait.
@@ -541,7 +541,7 @@ class QuicConnection:
         above this layer.
         """
         sc_event = self.get_tx_drain_event(stream_id)
-        ring_event = self._transport.tx_ring_drain_event
+        ring_event = self._transport.tx_event_ring_drain_event
         while True:
             # Connection-global ring pressure: tx_pressure reads the
             # SPSC TX event ring. Wait on the connection-global ring
@@ -549,9 +549,9 @@ class QuicConnection:
             # armed when sc->tx fills).
             if self.tx_pressure(stream_id) > hard_wait_at:
                 ring_event.clear()
-                self._transport.arm_tx_ring_drain_pending()
+                self._transport.arm_tx_event_ring_drain_pending()
                 if self.tx_pressure(stream_id) <= hard_wait_at:
-                    self._transport.clear_tx_ring_drain_pending()
+                    self._transport.clear_tx_event_ring_drain_pending()
                     continue
                 await ring_event.wait()
                 continue
@@ -570,7 +570,7 @@ class QuicConnection:
             except BufferError:
                 # Cython side armed the appropriate signal:
                 # - sc->tx full → per-stream sc->tx_drain_pending
-                # - TX ring full → connection-global tx_ring_drain_pending
+                # - TX event ring full → connection-global tx_event_ring_drain_pending
                 # Events were cleared BEFORE the call so no lost wakeup.
                 sc_wait = asyncio.create_task(sc_event.wait())
                 ring_wait = asyncio.create_task(ring_event.wait())

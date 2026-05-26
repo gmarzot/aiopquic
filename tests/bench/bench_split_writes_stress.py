@@ -215,7 +215,7 @@ async def _run_split_writes(n_streams: int, objs_per_stream: int,
                 transport, "worker_prepare_to_send_calls", -1)
             worker_pulled = getattr(
                 transport, "worker_prepare_to_send_pulled_bytes", -1)
-            # ROOT-CAUSE COUNTERS: receiver-side rx_ring overflow drops.
+            # ROOT-CAUSE COUNTERS: receiver-side rx_event_ring overflow drops.
             # The receiver is the SERVER side in this test; client and
             # server share the same _engine in single-process bench.
             # Pull from the server's TransportContext if accessible.

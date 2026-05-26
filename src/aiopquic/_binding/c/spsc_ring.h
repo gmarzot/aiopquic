@@ -67,14 +67,14 @@ typedef enum {
     SPSC_EVT_PATH_DELETED = 13,
     SPSC_EVT_PACING_CHANGED = 14,
     SPSC_EVT_STREAM_TX_DRAINED = 15,    /* edge: sc->tx had a waiter and worker just drained */
-    SPSC_EVT_TX_RING_DRAINED = 16,      /* edge: connection-global TX event ring
-                                           fill dropped below low_water while a
-                                           Python writer had armed
-                                           tx_ring_drain_pending. Fired by worker
-                                           CAS-clear pattern, mirrors the per-
-                                           stream STREAM_TX_DRAINED design but
-                                           tracks the SPSC ring count, not
-                                           per-sc byte ring fullness. */
+    SPSC_EVT_TX_EVENT_RING_DRAINED = 16, /* edge: connection-global TX event ring
+                                            fill dropped below low_water while a
+                                            Python writer had armed
+                                            tx_event_ring_drain_pending. Fired by
+                                            worker CAS-clear pattern, mirrors the
+                                            per-stream STREAM_TX_DRAINED design
+                                            but tracks the SPSC ring count, not
+                                            per-sc byte ring fullness. */
     SPSC_EVT_STREAM_DESTROY = 17,       /* Cython-internal: pushed by the worker
                                            after the LAST RX event on a raw-QUIC
                                            stream whose sc->tx is NULL (i.e.

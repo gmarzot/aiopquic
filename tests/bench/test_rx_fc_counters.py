@@ -10,7 +10,7 @@ Counter signatures asserted:
 
   - fc_credit_pushed   = SPSC_EVT_TX_OPEN_FLOW_CONTROL events asyncio queued
   - fc_credit_handled  = events the worker processed
-  - fc_credit_dropped  = events the worker could not process (tx_ring full)
+  - fc_credit_dropped  = events the worker could not process (tx_event_ring full)
   - sc_alive_total     = process-wide sc_created - sc_destroyed
   - chunks_alive_total = process-wide StreamChunk wrap - dealloc
 

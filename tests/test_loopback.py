@@ -800,8 +800,8 @@ class TestLoopback:
         finally:
             server.stop()
 
-    def test_tx_ring_overflow_raises(self):
-        """Filling the TX ring without a wake-up surfaces a clean error."""
+    def test_tx_event_ring_overflow_raises(self):
+        """Filling the TX event ring without a wake-up surfaces a clean error."""
         # Small ring so we can actually fill it. The branch's
         # TransportContext takes only ring_capacity (no arena_size).
         client = TransportContext(ring_capacity=8)

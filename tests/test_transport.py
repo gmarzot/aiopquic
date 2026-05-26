@@ -79,8 +79,8 @@ class TestTransportLifecycle:
         ctx.wake_up()  # Should not raise
         ctx.stop()
 
-    def test_rx_ring_receives_ready_event(self):
-        """The network thread should push a READY event to RX ring."""
+    def test_rx_event_ring_receives_ready_event(self):
+        """The network thread should push a READY event to RX event ring."""
         ctx = TransportContext()
         ctx.start(alpn="h3")
 

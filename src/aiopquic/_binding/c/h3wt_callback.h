@@ -264,7 +264,7 @@ static inline void aiopquic_wt_push_event_with_sc(
     entry.data_buf = sc;      /* borrowed; freed by link_destroy */
     entry.data_length = 0;    /* sentinel: do not free on pop */
     entry.is_fin = is_fin;
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_ring, &entry);
+    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
     } else {
@@ -276,15 +276,15 @@ static inline void aiopquic_wt_push_event_with_sc(
                 && s->bridge->worker_rx_event_drops <= 100) {
             fprintf(stderr,
                 "[aiopquic_rx] WT EVENT RING FULL (sc): drop "
-                "stream=%llu evt=%u (rx_ring entries=%u)\n",
+                "stream=%llu evt=%u (rx_event_ring entries=%u)\n",
                 (unsigned long long)stream_id, event_type,
-                spsc_ring_count(s->bridge->rx_ring));
+                spsc_ring_count(s->bridge->rx_event_ring));
         }
     }
 }
 
 /*
- * Push a WT event to the bridge's rx_ring. data may be NULL/0 for
+ * Push a WT event to the bridge's rx_event_ring. data may be NULL/0 for
  * pure events. Caller (picoquic thread) must ensure session is set.
  */
 static inline void aiopquic_wt_push_event(
@@ -300,7 +300,7 @@ static inline void aiopquic_wt_push_event(
     entry.error_code = error_code;
     entry.cnx = s->cnx;
     entry.stream_ctx = s;       /* session ptr for demux */
-    int ret = spsc_ring_push(s->bridge->rx_ring, &entry, data, data_len);
+    int ret = spsc_ring_push(s->bridge->rx_event_ring, &entry, data, data_len);
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
     } else {
@@ -312,9 +312,9 @@ static inline void aiopquic_wt_push_event(
                 && s->bridge->worker_rx_event_drops <= 100) {
             fprintf(stderr,
                 "[aiopquic_rx] WT EVENT RING FULL: drop "
-                "stream=%llu evt=%u (rx_ring entries=%u)\n",
+                "stream=%llu evt=%u (rx_event_ring entries=%u)\n",
                 (unsigned long long)stream_id, event_type,
-                spsc_ring_count(s->bridge->rx_ring));
+                spsc_ring_count(s->bridge->rx_event_ring));
         }
     }
 }
@@ -335,7 +335,7 @@ static inline void aiopquic_wt_push_new_stream(
     entry.stream_ctx = s;
     entry.data_buf = sc;     /* BORROWED */
     entry.data_length = 0;   /* sentinel: do not free on pop */
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_ring, &entry);
+    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
     } else {
@@ -365,7 +365,7 @@ static inline void aiopquic_wt_push_link_release(
     entry.stream_ctx = s;
     entry.data_buf = link;
     entry.data_length = 0;
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_ring, &entry);
+    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
     } else {
@@ -379,7 +379,7 @@ static inline void aiopquic_wt_push_link_release(
         if (aiopquic_rx_log_enabled()
                 && s->bridge->worker_rx_event_drops <= 100) {
             fprintf(stderr,
-                "[aiopquic_rx] LINK_RELEASE drop on full rx_ring: "
+                "[aiopquic_rx] LINK_RELEASE drop on full rx_event_ring: "
                 "leaking link for stream=%llu\n",
                 (unsigned long long)stream_id);
         }
@@ -404,7 +404,7 @@ static inline void aiopquic_wt_push_stream_created(
     entry.stream_ctx = s;
     entry.data_buf = sc;     /* BORROWED, NULL on error */
     entry.data_length = 0;
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_ring, &entry);
+    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
     } else {
@@ -417,7 +417,7 @@ static inline void aiopquic_wt_push_stream_created(
  * Runs in the picoquic network thread.
  *
  * Translates picohttp_call_back_event_t → SPSC_EVT_WT_* and pushes
- * to rx_ring. Special-cases the control stream: data on the control
+ * to rx_event_ring. Special-cases the control stream: data on the control
  * stream is capsule bytes; we feed it to picowt_receive_capsule and
  * surface CLOSE/DRAIN as session events instead of stream events.
  *
@@ -661,7 +661,7 @@ static int aiopquic_wt_path_callback(
                 drain_entry.stream_id = sid;
                 drain_entry.cnx = s->cnx;
                 drain_entry.stream_ctx = s;
-                if (spsc_ring_push(s->bridge->rx_ring,
+                if (spsc_ring_push(s->bridge->rx_event_ring,
                                    &drain_entry, NULL, 0) == 0) {
                     sc->cnt_drain_fires++;
                     sc->last_drain_fire_ns = aiopquic_now_ns();
@@ -686,13 +686,13 @@ static int aiopquic_wt_path_callback(
         break;
 
     case picohttp_callback_provide_datagram: {
-        spsc_entry_t* tx = spsc_ring_peek(s->bridge->tx_ring);
+        spsc_entry_t* tx = spsc_ring_peek(s->bridge->tx_event_ring);
         if (tx && tx->event_type == SPSC_EVT_TX_DATAGRAM) {
             uint32_t to_send = tx->data_length;
             if (to_send > length) to_send = (uint32_t)length;
             void* buf = h3zero_provide_datagram_buffer(stream_ctx, to_send, 0);
             if (buf && tx->data_buf) memcpy(buf, tx->data_buf, to_send);
-            spsc_ring_pop(s->bridge->tx_ring);
+            spsc_ring_pop(s->bridge->tx_event_ring);
         }
         break;
     }
@@ -835,7 +835,7 @@ static int aiopquic_wt_server_path_callback(
     entry.stream_id = s->control_stream_id;
     entry.cnx = cnx;
     entry.stream_ctx = s;
-    int rc = spsc_ring_push(bridge->rx_ring, &entry,
+    int rc = spsc_ring_push(bridge->rx_event_ring, &entry,
                              path_bytes, (uint32_t)path_len);
     if (rc == 0) aiopquic_notify_rx(bridge);
     return 0;

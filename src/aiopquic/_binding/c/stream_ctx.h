@@ -105,7 +105,7 @@ typedef struct {
      * monotonic timestamp. */
     uint64_t cnt_drain_arms;        /* Python armed sc->tx_drain_pending */
     uint64_t cnt_drain_fires;       /* worker fired SPSC_EVT_STREAM_TX_DRAINED */
-    uint64_t cnt_drain_dropped;     /* CAS won but rx_ring push failed → re-arm */
+    uint64_t cnt_drain_dropped;     /* CAS won but rx_event_ring push failed → re-arm */
     uint64_t last_drain_arm_ns;     /* CLOCK_MONOTONIC of last arm */
     uint64_t last_drain_fire_ns;    /* CLOCK_MONOTONIC of last fire */
     /* Reference count for lifecycle management. Starts at 1 (the
@@ -203,7 +203,7 @@ static inline void aiopquic_stream_ctx_ref(aiopquic_stream_ctx_t* sc) {
 }
 
 /* Python-side arm for the per-stream sc->tx drain signal. Mirrors
- * the connection-global aiopquic_arm_tx_ring_drain_pending in
+ * the connection-global aiopquic_arm_tx_event_ring_drain_pending in
  * callback.h. Use when the Python writer wants to wait for sc->tx
  * to drain at a soft threshold (e.g. a byte-budget cap below the
  * hard sc->tx ring capacity) rather than waiting for the natural

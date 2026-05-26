@@ -269,7 +269,7 @@ class WebTransportSession:
 
         Layers:
           - hard ring-saturation guard: await the connection-global
-            tx_ring_drain_event when `tx_pressure > hard_wait_at`
+            tx_event_ring_drain_event when `tx_pressure > hard_wait_at`
             (default 0.9). Uses the clear-arm-recheck-wait pattern so
             there is no lost wakeup if the worker drains the ring
             between our threshold check and the wait.
@@ -285,7 +285,7 @@ class WebTransportSession:
         above this layer.
         """
         sc_event = self.get_tx_drain_event(stream_id)
-        ring_event = self._transport.tx_ring_drain_event
+        ring_event = self._transport.tx_event_ring_drain_event
         while True:
             # Connection-global ring pressure: tx_pressure reads the
             # SPSC TX event ring. Wait on the connection-global ring
@@ -293,10 +293,10 @@ class WebTransportSession:
             # armed when sc->tx fills).
             if self.tx_pressure(stream_id) > hard_wait_at:
                 ring_event.clear()
-                self._transport.arm_tx_ring_drain_pending()
+                self._transport.arm_tx_event_ring_drain_pending()
                 if self.tx_pressure(stream_id) <= hard_wait_at:
                     # Raced — worker drained between checks.
-                    self._transport.clear_tx_ring_drain_pending()
+                    self._transport.clear_tx_event_ring_drain_pending()
                     continue
                 await ring_event.wait()
                 continue
@@ -316,7 +316,7 @@ class WebTransportSession:
             except BufferError:
                 # Cython side armed the appropriate signal:
                 # - sc->tx full → per-stream sc->tx_drain_pending
-                # - TX ring full → connection-global tx_ring_drain_pending
+                # - TX event ring full → connection-global tx_event_ring_drain_pending
                 # Events were cleared BEFORE the call so no lost wakeup.
                 sc_wait = asyncio.create_task(sc_event.wait())
                 ring_wait = asyncio.create_task(ring_event.wait())
@@ -433,7 +433,7 @@ class WebTransportSession:
             for tx_ev in self._stream_tx_drain_events.values():
                 tx_ev.set()
             ring_ev = getattr(self._transport,
-                                '_tx_ring_drain_event', None)
+                                '_tx_event_ring_drain_event', None)
             if ring_ev is not None:
                 ring_ev.set()
             self._event_queue.put_nowait(ev)
@@ -583,7 +583,7 @@ class WebTransportServerSession(WebTransportSession):
 
     The C-side bridge has already allocated the underlying
     aiopquic_wt_session_t and registered the WT prefix; this Python
-    object just wraps it and routes events from the rx_ring."""
+    object just wraps it and routes events from the rx_event_ring."""
 
     def __init__(self, transport: TransportContext,
                  state: WebTransportSessionState):
