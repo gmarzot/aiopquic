@@ -32,6 +32,7 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_STREAM_DATA, SPSC_EVT_STREAM_FIN,
     SPSC_EVT_STREAM_TX_DRAINED,
     SPSC_EVT_STREAM_DESTROY,
+    SPSC_EVT_WT_STREAM_DESTROY,
     SPSC_EVT_STREAM_RESET, SPSC_EVT_STOP_SENDING,
     SPSC_EVT_CLOSE, SPSC_EVT_APP_CLOSE,
     SPSC_EVT_READY, SPSC_EVT_ALMOST_READY,
@@ -1188,6 +1189,25 @@ cdef class TransportContext:
                 spsc_ring_pop(self._ctx.rx_event_ring)
                 continue
 
+            # WT_STREAM_DESTROY: surface to user code for dict cleanup.
+            # Pushed just before LINK_RELEASE so Python sees it while
+            # the link + sc are still alive. stream_ctx carries the
+            # session pointer for dispatcher routing (NOT an sc), so
+            # no internal destroy — LINK_RELEASE owns the sc ref drop.
+            if entry.event_type == SPSC_EVT_WT_STREAM_DESTROY:
+                events.append((
+                    entry.event_type,
+                    entry.stream_id,
+                    None,
+                    0,
+                    0,
+                    <uintptr_t>entry.cnx,
+                    <uintptr_t>entry.stream_ctx,
+                    <uintptr_t>0,
+                ))
+                spsc_ring_pop(self._ctx.rx_event_ring)
+                continue
+
             # STREAM_DESTROY fires once per stream when picoquic
             # considers it fully retired. Surface to user code so the
             # consumer (QuicConnection / WebTransportSession) can pop
@@ -1412,6 +1432,22 @@ cdef class TransportContext:
                 if entry.data_buf is not NULL:
                     aiopquic_wt_stream_link_destroy(
                         <aiopquic_wt_stream_link_t*>entry.data_buf)
+                spsc_ring_pop(self._ctx.rx_event_ring)
+                count += 1
+                continue
+
+            if entry.event_type == SPSC_EVT_WT_STREAM_DESTROY:
+                # See matching block in drain_rx for rationale.
+                handler(
+                    entry.event_type,
+                    entry.stream_id,
+                    None,
+                    0,
+                    0,
+                    <uintptr_t>entry.cnx,
+                    <uintptr_t>entry.stream_ctx,
+                    <uintptr_t>0,
+                )
                 spsc_ring_pop(self._ctx.rx_event_ring)
                 count += 1
                 continue

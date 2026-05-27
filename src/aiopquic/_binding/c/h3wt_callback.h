@@ -354,6 +354,34 @@ static inline void aiopquic_wt_push_new_stream(
  * Ordering is the load-bearing property: this is the mechanism that
  * prevents the BORROWED-sc UAF that motivated the LINK_RELEASE pattern.
  */
+/*
+ * Push WT_STREAM_DESTROY — surfaces "stream is fully retired" to the
+ * WebTransportSession dispatcher so it can pop _stream_tx_ctxs[sid]
+ * etc. Must be pushed BEFORE link_release so the FIFO order on the
+ * SPSC ring guarantees Python sees the destroy event while the link
+ * (and its sc) are still alive. drain_rx surfaces this and does NOT
+ * call any destroy — LINK_RELEASE owns the sc ref drop.
+ */
+static inline void aiopquic_wt_push_stream_destroy(
+        aiopquic_wt_session_t* s,
+        uint64_t stream_id) {
+    spsc_entry_t entry = {0};
+    entry.event_type = SPSC_EVT_WT_STREAM_DESTROY;
+    entry.stream_id = stream_id;
+    entry.cnx = s->cnx;
+    entry.stream_ctx = s;  /* session ptr for asyncio routing */
+    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
+    if (ret == 0) {
+        aiopquic_notify_rx(s->bridge);
+    } else {
+        /* RX ring full. The Python dict will retain a stale entry
+         * for this stream until session close clears it. Bounded
+         * by per-cnx stream count; surface via the existing drop
+         * counter so sustained drops are visible. */
+        s->bridge->worker_rx_event_drops++;
+    }
+}
+
 static inline void aiopquic_wt_push_link_release(
         aiopquic_wt_session_t* s,
         uint64_t stream_id,
@@ -770,6 +798,10 @@ static int aiopquic_wt_path_callback(
         if (link && stream_ctx
                 && stream_ctx->path_callback_ctx == link) {
             stream_ctx->path_callback_ctx = NULL;
+            /* Order: STREAM_DESTROY first (Python dict cleanup),
+             * then LINK_RELEASE (link + sc ref drop). FIFO on the
+             * SPSC ring preserves this ordering at the consumer. */
+            aiopquic_wt_push_stream_destroy(s, sid);
             aiopquic_wt_push_link_release(s, sid, link);
         }
         break;

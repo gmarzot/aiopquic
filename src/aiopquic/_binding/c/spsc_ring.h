@@ -75,6 +75,14 @@ typedef enum {
                                             per-stream STREAM_TX_DRAINED design
                                             but tracks the SPSC ring count, not
                                             per-sc byte ring fullness. */
+    SPSC_EVT_WT_STREAM_DESTROY = 18,    /* WT-side parallel of STREAM_DESTROY:
+                                           pushed from picohttp_callback_free
+                                           with stream_ctx = session ptr for
+                                           dispatcher routing, stream_id = sid.
+                                           Surfaced to user code (no internal
+                                           destroy — LINK_RELEASE owns the sc
+                                           ref drop) so WebTransportSession can
+                                           pop its per-stream dicts. */
     SPSC_EVT_STREAM_DESTROY = 17,       /* Cython-internal: pushed by the worker
                                            after the LAST RX event on a raw-QUIC
                                            stream whose sc->tx is NULL (i.e.

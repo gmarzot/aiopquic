@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: aiopquic <noreply@aiopquic>
+Date: Tue, 27 May 2026 12:00:00 -0400
+Subject: [PATCH] h3zero: forward picoquic_callback_stream_released to path
+ callback
+
+Patch 0003 added picoquic_callback_stream_released as the canonical
+per-stream retirement signal — fires once per stream when picoquic
+has fully retired it (pure receivers on FIN/RESET; senders/bidi when
+all sent data ACKed). For raw QUIC apps with their own callback_fn
+this works directly.
+
+For H3/WT apps, picoquic invokes h3zero_callback as cnx->callback_fn
+and h3zero owns each stream's h3zero_stream_ctx_t. Without this
+forward, h3zero silently ignores stream_released and apps registered
+via path callbacks never learn mid-session that a stream is retired —
+they can only clean per-stream state at session close (when h3zero
+empties its tree). For workloads with high mid-session stream churn
+this means per-stream app state accumulates for the full session
+lifetime.
+
+Forwarding fires picohttp_callback_free per-stream as picoquic
+retires it. h3zero then deletes its own stream_ctx (mirrors the
+session-close path's picosplay_empty_tree). The stream is gone from
+picoquic at this point so subsequent picoquic callbacks for it
+cannot fire — no use-after-free risk in the path callback's cleanup.
+---
+diff --git a/picohttp/h3zero_common.c b/picohttp/h3zero_common.c
+index 1234567..89abcde 100644
+--- a/picohttp/h3zero_common.c
++++ b/picohttp/h3zero_common.c
+@@ -1965,6 +1965,25 @@ int h3zero_callback(picoquic_cnx_t* cnx,
+ 			* after the limits for unidir streams are known */
+ 			ret = h3zero_protocol_init_safe(cnx, ctx);
+ 			break;
++		case picoquic_callback_stream_released:
++			/* picoquic patch 0003 fires this per-stream when fully
++			 * retired. Forward to the registered path callback as
++			 * picohttp_callback_free so the app can release per-
++			 * stream context mid-session, then delete h3zero's own
++			 * stream_ctx. Without this, apps can only clean at
++			 * session close (picosplay_empty_tree). */
++			if (stream_ctx == NULL) {
++				stream_ctx = h3zero_find_stream(ctx, stream_id);
++			}
++			if (stream_ctx != NULL) {
++				if (stream_ctx->path_callback != NULL) {
++					(void)stream_ctx->path_callback(cnx, NULL, 0,
++						picohttp_callback_free,
++						stream_ctx, stream_ctx->path_callback_ctx);
++				}
++				h3zero_delete_stream(cnx, ctx, stream_ctx);
++			}
++			break;
+ 		default:
+ 			/* unexpected -- just ignore. */
+ 			break;

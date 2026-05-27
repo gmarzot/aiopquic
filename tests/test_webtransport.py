@@ -169,3 +169,61 @@ async def test_wt_uni_client_to_server():
             assert data == b"unidata"
     finally:
         server.close()
+
+
+@pytest.mark.xfail(
+    reason="picoquic does not call delete_stream_if_closed in the "
+           "FIN-ack handler for outgoing uni TX-only streams, so "
+           "picoquic_callback_stream_released never fires on the "
+           "sender side. Step 5 h3zero patch correctly forwards the "
+           "event when picoquic DOES fire it (peer-receive path), but "
+           "outgoing-side retirement requires an additional picoquic "
+           "patch.")
+@pytest.mark.asyncio
+async def test_wt_stream_tx_ctxs_drains_on_stream_close():
+    """After N WT uni streams complete and picohttp_callback_free
+    fires, the client's _stream_tx_ctxs dict should drain back to
+    empty. Otherwise the dict leaks borrowed sc pointers that the
+    C side has already freed via LINK_RELEASE.
+
+    Parallel to test_sc_alive_returns_to_baseline_across_streams
+    in tests/bench/test_rx_fc_counters.py (raw QUIC variant). The
+    raw QUIC dict self-cleans via STREAM_DESTROY surfacing landed
+    in 0.3.6 Step 3; this is the WT side."""
+    port = next_port()
+    n_streams = 50
+    server_drained = asyncio.get_event_loop().create_future()
+    drained_count = 0
+
+    async def handler(session):
+        async def _recv():
+            nonlocal drained_count
+            async for ev in session.events():
+                if isinstance(ev, WebTransportNewStream):
+                    await _drain_stream(
+                        session, ev.stream_id, timeout=5.0)
+                    drained_count += 1
+                    if (drained_count >= n_streams
+                            and not server_drained.done()):
+                        server_drained.set_result(True)
+                        return
+        asyncio.create_task(_recv())
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            for _ in range(n_streams):
+                sid = await wt.create_stream(bidir=False)
+                wt.send_stream_data(sid, b"x", end_stream=True)
+            await asyncio.wait_for(server_drained, timeout=10.0)
+            # Give picohttp_callback_free time to fire and the SPSC
+            # WT_STREAM_DESTROY event to surface to the dispatcher.
+            await asyncio.sleep(3.0)
+            leaked = len(wt._stream_tx_ctxs)
+            assert leaked == 0, (
+                f"_stream_tx_ctxs leaked: {leaked} stale entries "
+                f"after {n_streams} streams completed")
+    finally:
+        server.close()
