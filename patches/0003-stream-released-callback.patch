@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: aiopquic <noreply@aiopquic>
+Date: Tue, 27 May 2026 14:00:00 -0400
+Subject: [PATCH] Per-stream retirement callback (picoquic + h3zero forwarding)
+
+Adds picoquic_callback_stream_released — a "stream is fully retired"
+signal so apps with per-stream context can release it at the right
+time. Universal across stream directions and types.
+
+Why apps need this: without an explicit signal, an application that
+owns per-stream state (allocator, byte rings, refcounts) has no way
+to learn WHEN that state can be freed. picoquic_unlink_app_stream_ctx
+only nulls the pointer; doesn't tell the app WHEN. Polling
+alternatives don't exist (picoquic_is_stream_acked is internal to
+frames.c). Best the app can do today is wait for picoquic_callback_close
+and bulk-free on connection close, which means accumulated state for
+the full connection lifetime — pathological for workloads with high
+mid-session stream churn.
+
+Two-part change:
+
+  1. picoquic core (picoquic.h, frames.c): add the enum value and
+     fire it from picoquic_delete_stream_if_closed, just before
+     picoquic_delete_stream. Fired only if app_stream_ctx is
+     non-NULL (apps that didn't take ownership don't need
+     notification). Callback return value is ignored: the stream
+     is about to be deleted regardless.
+
+  2. h3zero (h3zero_common.c): h3zero owns each h3zero_stream_ctx_t
+     and sets it as picoquic's app_stream_ctx. Without explicit
+     forwarding, h3zero_callback silently ignores stream_released
+     and apps registered via path callbacks never learn mid-session
+     that a stream is retired — they can only clean per-stream
+     state at session close (when h3zero empties its tree).
+     Forward as picohttp_callback_free to the registered path
+     callback, then delete h3zero's own stream_ctx (mirrors the
+     session-close path's picosplay_empty_tree).
+---
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+index 4a159c27..435bf6eb 100644
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -351,7 +351,10 @@ typedef enum {
+     picoquic_callback_path_quality_changed, /* Some path quality parameters have changed */
+     picoquic_callback_path_address_observed, /* The peer has reported an address for the path */
+     picoquic_callback_app_wakeup, /* wakeup timer set by application has expired */
+-    picoquic_callback_next_path_allowed /* There are enough path_id and connection ID available for the next path */
++    picoquic_callback_next_path_allowed, /* There are enough path_id and connection ID available for the next path */
++    picoquic_callback_stream_released /* Stream fully retired: bytes=NULL, len=0,
++                                       * stream_ctx = the app_stream_ctx the app set;
++                                       * picoquic will not call back with this stream_ctx again. */
+ } picoquic_call_back_event_t;
+
+ typedef struct st_picoquic_tp_preferred_address_t {
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index 57412e47..61273155 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -149,6 +149,15 @@ int picoquic_delete_stream_if_closed(picoquic_cnx_t* cnx, picoquic_stream_head_t
+     if (stream->is_closed && (
+         (!IS_BIDIR_STREAM_ID(stream->stream_id) && !IS_LOCAL_STREAM_ID(stream->stream_id, cnx->client_mode)) ||
+         picoquic_is_stream_acked(stream))) {
++        /* Notify application that the stream is fully retired and any
++         * per-stream app context tied to this stream_id can be freed.
++         * Fired only if the app took ownership (non-NULL ctx). Return
++         * value ignored: stream is about to be deleted regardless. */
++        if (stream->app_stream_ctx != NULL && cnx->callback_fn != NULL) {
++            (void)cnx->callback_fn(cnx, stream->stream_id, NULL, 0,
++                picoquic_callback_stream_released,
++                cnx->callback_ctx, stream->app_stream_ctx);
++        }
+         picoquic_delete_stream(cnx, stream);
+     }
+
+diff --git a/picohttp/h3zero_common.c b/picohttp/h3zero_common.c
+index 1234567..89abcde 100644
+--- a/picohttp/h3zero_common.c
++++ b/picohttp/h3zero_common.c
+@@ -1965,6 +1965,25 @@ int h3zero_callback(picoquic_cnx_t* cnx,
+ 			* after the limits for unidir streams are known */
+ 			ret = h3zero_protocol_init_safe(cnx, ctx);
+ 			break;
++		case picoquic_callback_stream_released:
++			/* picoquic patch 0003 fires this per-stream when fully
++			 * retired. Forward to the registered path callback as
++			 * picohttp_callback_free so the app can release per-
++			 * stream context mid-session, then delete h3zero's own
++			 * stream_ctx. Without this, apps can only clean at
++			 * session close (picosplay_empty_tree). */
++			if (stream_ctx == NULL) {
++				stream_ctx = h3zero_find_stream(ctx, stream_id);
++			}
++			if (stream_ctx != NULL) {
++				if (stream_ctx->path_callback != NULL) {
++					(void)stream_ctx->path_callback(cnx, NULL, 0,
++						picohttp_callback_free,
++						stream_ctx, stream_ctx->path_callback_ctx);
++				}
++				h3zero_delete_stream(cnx, ctx, stream_ctx);
++			}
++			break;
+ 		default:
+ 			/* unexpected -- just ignore. */
+ 			break;
