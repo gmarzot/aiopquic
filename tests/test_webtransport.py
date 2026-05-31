@@ -171,19 +171,6 @@ async def test_wt_uni_client_to_server():
         server.close()
 
 
-@pytest.mark.xfail(
-    reason="On the sender side, stream->app_stream_ctx is NULL by "
-           "the time picoquic_delete_stream_if_closed enters the "
-           "delete branch (verified via diagnostic printf: dsic IS "
-           "called with acked=-1 i.e. fully acked, but the "
-           "stream_released-firing guard `app_stream_ctx != NULL` "
-           "fails). picowt_create_stream_ctx sets app_stream_ctx at "
-           "create time and picoquic_unlink_app_stream_ctx is never "
-           "called on the client side per diagnostic — so something "
-           "else clears it between create and the FIN-ack delete. "
-           "Step 5 h3zero forward works correctly when picoquic does "
-           "fire stream_released (peer-receive path). Sender-side "
-           "fix requires deeper picoquic investigation.")
 @pytest.mark.asyncio
 async def test_wt_stream_tx_ctxs_drains_on_stream_close():
     """After N WT uni streams complete and picohttp_callback_free
