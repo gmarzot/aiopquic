@@ -219,3 +219,65 @@ async def test_wt_stream_tx_ctxs_drains_on_stream_close():
                 f"after {n_streams} streams completed")
     finally:
         server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_sender_side_sc_returns_to_baseline_across_streams():
+    """N WT uni streams (client-initiated, sender side) — after all
+    complete and picohttp_callback_free + LINK_RELEASE fire, process-
+    wide sc_alive_total must return to its starting value.
+
+    Tier 1 verification: confirms patch 0004 (mark_active_stream NULL
+    preserves app_stream_ctx) cured publisher-side memory accumulation
+    under stream churn. Without 0004 the sender side's app_stream_ctx
+    is zeroed mid-session so stream_released never fires on the
+    sender, the link's sc ref is never dropped, and sc_alive_total
+    grows linearly with stream count for the session's lifetime.
+
+    Parallel to test_sc_alive_returns_to_baseline_across_streams in
+    tests/bench/test_rx_fc_counters.py (raw-QUIC version)."""
+    port = next_port()
+    n_streams = 200
+    server_drained = asyncio.get_event_loop().create_future()
+    drained_count = 0
+
+    async def handler(session):
+        async def _recv():
+            nonlocal drained_count
+            async for ev in session.events():
+                if isinstance(ev, WebTransportNewStream):
+                    await _drain_stream(
+                        session, ev.stream_id, timeout=5.0)
+                    drained_count += 1
+                    if (drained_count >= n_streams
+                            and not server_drained.done()):
+                        server_drained.set_result(True)
+                        return
+        asyncio.create_task(_recv())
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            # Capture baseline AFTER session setup so control/CONNECT
+            # streams are already accounted for.
+            baseline = wt._transport.counters['sc_alive_total']
+
+            for _ in range(n_streams):
+                sid = await wt.create_stream(bidir=False)
+                wt.send_stream_data(sid, b"x", end_stream=True)
+            await asyncio.wait_for(server_drained, timeout=15.0)
+            # Give picohttp_callback_free + LINK_RELEASE time to
+            # propagate and StreamChunks to dealloc.
+            await asyncio.sleep(3.0)
+
+            final = wt._transport.counters['sc_alive_total']
+            delta = final - baseline
+            assert delta == 0, (
+                f"sc_alive_total leaked across {n_streams} sender-side "
+                f"streams: baseline={baseline} final={final} "
+                f"(delta={delta})\n"
+                f"counters: {wt._transport.counters}")
+    finally:
+        server.close()
