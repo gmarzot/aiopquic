@@ -103,6 +103,10 @@ bash build_picoquic.sh
 # -flto inlines across translation units; DISABLE_DEBUG_PRINTF strips
 # debug branches in picoquic. Arch-specific tuning (x86-64-v3 baseline,
 # PTLS Fusion AES-GCM) is added per-arch via overrides below.
+# AIOPQUIC_WHEEL_BUILD=1 suppresses build_picoquic.sh's default
+# host-tuned -march=native so wheels stay portable (caller-provided
+# PICOQUIC_C_FLAGS / CMAKE_ARGS below drive the build).
+AIOPQUIC_WHEEL_BUILD = "1"
 CFLAGS = "-O3 -fno-strict-overflow -fPIC -flto"
 PICOQUIC_C_FLAGS = "-O3 -DNDEBUG -flto -DDISABLE_DEBUG_PRINTF"
 CMAKE_ARGS = "-DDISABLE_DEBUG_PRINTF=ON"
@@ -113,7 +117,7 @@ CMAKE_ARGS = "-DDISABLE_DEBUG_PRINTF=ON"
 # every modern x86_64 CPU; older systems install via sdist.
 [[tool.cibuildwheel.overrides]]
 select = "*-manylinux_x86_64"
-environment = { CFLAGS = "-O3 -fno-strict-overflow -fPIC -flto -march=x86-64-v3", PICOQUIC_C_FLAGS = "-O3 -DNDEBUG -flto -march=x86-64-v3 -DDISABLE_DEBUG_PRINTF", CMAKE_ARGS = "-DPTLS_WITH_FUSION=ON -DDISABLE_DEBUG_PRINTF=ON" }
+environment = { AIOPQUIC_WHEEL_BUILD = "1", CFLAGS = "-O3 -fno-strict-overflow -fPIC -flto -march=x86-64-v3", PICOQUIC_C_FLAGS = "-O3 -DNDEBUG -flto -march=x86-64-v3 -DDISABLE_DEBUG_PRINTF", CMAKE_ARGS = "-DPTLS_WITH_FUSION=ON -DDISABLE_DEBUG_PRINTF=ON" }
 
 [tool.cibuildwheel.macos]
 # delocate bundles libssl/libcrypto from Homebrew into the wheel.
@@ -128,3 +132,8 @@ before-all = """
 brew install cmake openssl@3
 bash build_picoquic.sh
 """
+
+[tool.cibuildwheel.macos.environment]
+# Portable wheel build — suppress build_picoquic.sh's default
+# host-tuned -march=native (which would make the wheel non-portable).
+AIOPQUIC_WHEEL_BUILD = "1"

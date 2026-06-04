@@ -71,6 +71,12 @@ runs:
     - name: Build picoquic
       if: steps.picoquic-cache.outputs.cache-hit != 'true'
       shell: bash
+      env:
+        # CI runners may rotate between CPU generations; -march=native
+        # cached binaries could fail. Use the same suppression flag
+        # cibuildwheel sets so the CI test build is portable and
+        # cache-safe across runner instances.
+        AIOPQUIC_WHEEL_BUILD: "1"
       run: |
         ./build_picoquic.sh
         if [ "${{ inputs.with-native-tests }}" = "true" ]; then

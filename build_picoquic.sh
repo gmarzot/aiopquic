@@ -154,21 +154,26 @@ if [ "${AIOPQUIC_IO_URING:-0}" = "1" ]; then
     export CFLAGS="-I${LIBURING_INSTALL}/include${CFLAGS:+ ${CFLAGS}}"
 fi
 
-# Optional: host-tuned performance flags. AIOPQUIC_PERF=1 enables
-# every portable optimization safe for LOCAL builds:
+# Host-tuned performance flags. Enabled by DEFAULT for source builds:
 #   - DISABLE_DEBUG_PRINTF (every platform; strips dbg branches)
 #   - PTLS Fusion AES-GCM (x86_64 only; picotls runtime-CPUIDs
 #     AES-NI + PCLMULQDQ so the lib is safe to bake in even on
 #     hosts that lack them — runtime falls back to picotls openssl)
 #   - -O3 -march=native -flto (every platform; host-tuned ISA)
 #
-# Default OFF: -march=native produces machine-specific binaries
-# unsuitable for distributable wheels. Wheel builds get a separate,
-# portable baseline (e.g. -march=x86-64-v3) via cibuildwheel env.
+# Knobs:
+#   AIOPQUIC_PERF=0         — explicit opt-out (debug / unoptimized builds)
+#   AIOPQUIC_WHEEL_BUILD=1  — suppress host-tuned flags entirely so the
+#                             caller-provided PICOQUIC_C_FLAGS /
+#                             CMAKE_ARGS env (e.g. -march=x86-64-v3) drive
+#                             the build. cibuildwheel sets this in
+#                             pyproject.toml so wheels stay portable.
 PICOQUIC_PERF_ARGS=()
 PICOTLS_PERF_ARGS=()
-if [ "${AIOPQUIC_PERF:-0}" = "1" ]; then
-    echo -e "${COLOR_GREEN}AIOPQUIC_PERF=1: host-tuned perf flags enabled (Fusion if x86_64, DISABLE_DEBUG_PRINTF, -O3 -march=native -flto)${COLOR_OFF}"
+if [ "${AIOPQUIC_WHEEL_BUILD:-0}" = "1" ]; then
+    echo -e "${COLOR_GREEN}AIOPQUIC_WHEEL_BUILD=1: portable build, host-tuned flags suppressed (caller drives PICOQUIC_C_FLAGS / CMAKE_ARGS)${COLOR_OFF}"
+elif [ "${AIOPQUIC_PERF:-1}" = "1" ]; then
+    echo -e "${COLOR_GREEN}AIOPQUIC_PERF=1 (default): host-tuned perf flags enabled (Fusion if x86_64, DISABLE_DEBUG_PRINTF, -O3 -march=native -flto)${COLOR_OFF}"
     PICOQUIC_PERF_ARGS+=("-DDISABLE_DEBUG_PRINTF=ON")
     PERF_ARCH="$(uname -m)"
     if [ "${PERF_ARCH}" = "x86_64" ] || [ "${PERF_ARCH}" = "amd64" ]; then
