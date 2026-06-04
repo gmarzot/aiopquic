@@ -1000,8 +1000,18 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
 
                 switch (entry->event_type) {
                     case SPSC_EVT_TX_MARK_ACTIVE: {
-                        picoquic_mark_active_stream(cnx, entry->stream_id,
-                                                     1, entry->stream_ctx);
+                        /* Raw QUIC pushes stream_ctx = sc so picoquic's
+                         * app_stream_ctx routes sc into subsequent
+                         * stream callbacks. WT pushes stream_ctx = NULL
+                         * (h3zero owns app_stream_ctx) — use v2 so the
+                         * h3zero pointer isn't clobbered. */
+                        if (entry->stream_ctx != NULL) {
+                            picoquic_mark_active_stream(cnx, entry->stream_id,
+                                                         1, entry->stream_ctx);
+                        } else {
+                            picoquic_mark_active_stream_v2(cnx, entry->stream_id,
+                                                            1);
+                        }
                         ctx->worker_mark_active_processed++;
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);

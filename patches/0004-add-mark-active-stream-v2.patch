@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: aiopquic <noreply@aiopquic>
+Date: Tue, 02 Jun 2026 14:00:00 -0400
+Subject: [PATCH] Add picoquic_mark_active_stream_v2 (no ctx parameter)
+
+Companion to patch 0003. picoquic_mark_active_stream's unconditional
+assign of stream->app_stream_ctx clobbers any pointer set by a
+lower layer (h3zero/picowt) when a higher layer wakes the worker
+with NULL. v2 omits the ctx parameter entirely so the intent ("just
+toggle active state, don't touch the ctx") is obvious at the call
+site.
+
+This patch mirrors the second commit of upstream PR
+https://github.com/private-octopus/picoquic/pull/2113. Drop this
+patch when that PR merges.
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+index 9ab5e6f4..f4f20738 100644
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -1409,6 +1409,16 @@ void picoquic_unlink_app_stream_ctx(picoquic_cnx_t* cnx, uint64_t stream_id);
+ int picoquic_mark_active_stream(picoquic_cnx_t* cnx,
+     uint64_t stream_id, int is_active, void* v_stream_ctx);
+ 
++/* Mark stream as active without touching app_stream_ctx. Use when the
++ * caller has no opinion on the ctx (e.g. a layered stack where a lower
++ * layer like h3zero already set app_stream_ctx, and a higher layer
++ * uses prepare_to_send for byte transfer and only needs to wake the
++ * worker). picoquic_set_app_stream_ctx / picoquic_unlink_app_stream_ctx
++ * remain the explicit set / clear APIs.
++ */
++int picoquic_mark_active_stream_v2(picoquic_cnx_t* cnx,
++    uint64_t stream_id, int is_active);
++
+ /* Handling of stream packetisation and head-of-line blocking:
+ * 
+ * When preparing a packet, if a stream is available, picoquic will fill the
+diff --git a/picoquic/streams.c b/picoquic/streams.c
+index 966de9d4..ebdc9a9e 100644
+--- a/picoquic/streams.c
++++ b/picoquic/streams.c
+@@ -246,6 +246,36 @@ int picoquic_mark_active_stream(picoquic_cnx_t* cnx,
+     return ret;
+ }
+ 
++int picoquic_mark_active_stream_v2(picoquic_cnx_t* cnx,
++    uint64_t stream_id, int is_active)
++{
++    int ret = 0;
++    picoquic_stream_head_t* stream;
++    PICOQUIC_THREAD_CHECK(cnx->quic);
++
++    stream = picoquic_find_stream_for_writing(cnx, stream_id, &ret);
++    if (ret == 0) {
++        if (is_active) {
++            if (!stream->fin_requested &&
++                (!stream->reset_requested || picoquic_check_sack_list(&stream->sack_list, 0, stream->reliable_size) == 0) &&
++                cnx->callback_fn != NULL) {
++                if (!stream->is_active) {
++                    stream->is_active = 1;
++                    picoquic_reinsert_by_wake_time(cnx->quic, cnx, picoquic_get_quic_time(cnx->quic));
++                }
++            }
++            else {
++                ret = PICOQUIC_ERROR_CANNOT_SET_ACTIVE_STREAM;
++            }
++        }
++        else {
++            stream->is_active = 0;
++        }
++    }
++
++    return ret;
++}
++
+ int picoquic_set_stream_not_coalesced(picoquic_cnx_t* cnx, uint64_t stream_id, int is_not_coalesced)
+ {
+     int ret = 0;

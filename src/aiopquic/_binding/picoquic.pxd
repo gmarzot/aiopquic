@@ -150,6 +150,8 @@ cdef extern from "picoquic.h":
     # exclusively).
     int picoquic_mark_active_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
                                      int is_active, void* v_stream_ctx)
+    int picoquic_mark_active_stream_v2(picoquic_cnx_t* cnx, uint64_t stream_id,
+                                        int is_active)
     uint8_t* picoquic_provide_stream_data_buffer(void* context, size_t nb_bytes,
                                                    int is_fin, int is_still_active)
     int picoquic_set_app_stream_ctx(picoquic_cnx_t* cnx, uint64_t stream_id,
