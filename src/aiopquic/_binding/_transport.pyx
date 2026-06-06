@@ -24,7 +24,7 @@ from libc.string cimport memcpy, memset
 
 from aiopquic._binding.spsc_ring cimport (
     spsc_ring_t, spsc_ring_create, spsc_ring_destroy,
-    spsc_ring_count, spsc_ring_bytes_pending,
+    spsc_ring_count,
     spsc_ring_empty, spsc_ring_peek,
     spsc_ring_entry_data, spsc_ring_pop, spsc_ring_push,
     spsc_ring_take_data,
@@ -164,6 +164,30 @@ cdef extern from *:
     int picoquic_get_cnx_state(picoquic_cnx_t* cnx)
     uint64_t picoquic_get_data_sent(picoquic_cnx_t* cnx)
     uint64_t picoquic_get_data_received(picoquic_cnx_t* cnx)
+
+    # Path quality snapshot — the load-bearing CC/FC observability
+    # primitive. Fields documented in picoquic.h ~ line 1129.
+    ctypedef struct picoquic_path_quality_t:
+        uint64_t receive_rate_estimate    # bytes/sec
+        uint64_t pacing_rate              # bytes/sec
+        uint64_t cwin                     # cwnd bytes
+        uint64_t rtt                      # smoothed RTT us
+        uint64_t rtt_sample               # latest sample us
+        uint64_t rtt_variant              # RTT variability us
+        uint64_t rtt_min
+        uint64_t rtt_max
+        uint64_t sent                     # packets sent
+        uint64_t lost                     # packets considered lost
+        uint64_t timer_losses             # losses from timer expiry
+        uint64_t spurious_losses          # later-acked
+        uint64_t max_spurious_rtt
+        uint64_t max_reorder_delay
+        uint64_t max_reorder_gap
+        uint64_t bytes_in_transit         # in-flight bytes
+        uint64_t bytes_sent
+        uint64_t bytes_received
+    void picoquic_get_default_path_quality(
+        picoquic_cnx_t* cnx, picoquic_path_quality_t* quality)
 
 cdef extern from "picoquic_packet_loop.h":
     ctypedef struct picoquic_packet_loop_param_t:
@@ -726,20 +750,38 @@ def dump_all_counters(file=None):
     n = 0
     for ctx in list(_TRANSPORT_REGISTRY):
         sc_map = {}
-        if per_stream_enabled:
-            for obj in gc.get_objects():
-                try:
-                    if getattr(obj, '_transport', None) is ctx:
-                        inner = getattr(obj, '_stream_ctxs', None)
-                        if isinstance(inner, dict):
-                            sc_map.update(inner)
-                        inner = getattr(obj, '_stream_tx_ctxs', None)
-                        if isinstance(inner, dict):
-                            sc_map.update(inner)
-                except Exception:
+        cnx_ptrs = []
+        # Walk gc-visible objects ONCE per ctx; harvest per-stream
+        # ctxs (gated, UAF risk on stale sc_ptrs) AND per-cnx ptrs
+        # (always safe — cnx is alive for as long as the wrapper is
+        # GC-visible, no UAF window).
+        for obj in gc.get_objects():
+            try:
+                if getattr(obj, '_transport', None) is not ctx:
                     continue
-        ctx.dump_counters(file=file, label=f"ctx#{n}",
-                           stream_ctxs=sc_map if per_stream_enabled else None)
+                # cnx_ptr collection: QuicConnection has _cnx_ptr,
+                # WebTransportSession exposes cnx_ptr (a property
+                # reading _state.cnx_ptr). Both yield a non-zero int
+                # only once the cnx is open.
+                cnx_ptr = getattr(obj, '_cnx_ptr', None)
+                if cnx_ptr is None:
+                    cnx_ptr = getattr(obj, 'cnx_ptr', None)
+                if isinstance(cnx_ptr, int) and cnx_ptr:
+                    cnx_ptrs.append(cnx_ptr)
+                if per_stream_enabled:
+                    inner = getattr(obj, '_stream_ctxs', None)
+                    if isinstance(inner, dict):
+                        sc_map.update(inner)
+                    inner = getattr(obj, '_stream_tx_ctxs', None)
+                    if isinstance(inner, dict):
+                        sc_map.update(inner)
+            except Exception:
+                continue
+        ctx.dump_counters(
+            file=file, label=f"ctx#{n}",
+            stream_ctxs=sc_map if per_stream_enabled else None,
+            cnx_ptrs=cnx_ptrs if cnx_ptrs else None,
+        )
         n += 1
     if n == 0:
         print("=== no live TransportContext instances ===",
@@ -853,19 +895,6 @@ cdef class TransportContext:
         return spsc_ring_count(self._ctx.tx_event_ring)
 
     @property
-    def tx_bytes_pending(self):
-        """Aggregate bytes across all in-flight TX-ring entries (the
-        sum of `data_length` over events currently queued). For latency-
-        targeted backpressure: callers can cap publish rate against a
-        bytes budget independent of ring entry capacity or object size.
-
-        Pull-model note: TX-ring entries are mostly MARK_ACTIVE with
-        `data_length=0`; the actual bytes live in per-stream sc->tx
-        rings. So this aggregate is ~0 for pull-model streams. Use
-        `stream_tx_buf_used(sc_ptr)` for per-stream sc->tx accounting."""
-        return spsc_ring_bytes_pending(self._ctx.tx_event_ring)
-
-    @property
     def counters(self):
         """Snapshot of forensic counters from the C-side context.
 
@@ -943,14 +972,22 @@ cdef class TransportContext:
             'tx_drain_pending_now': sc.tx_drain_pending,
         }
 
-    def dump_counters(self, file=None, label=None, stream_ctxs=None):
+    def dump_counters(self, file=None, label=None, stream_ctxs=None, cnx_ptrs=None):
         """Print counters to stderr (or given file). Used by SIGUSR2.
 
         Includes the connection-global counters, plus per-stream
         counters when `stream_ctxs` (a dict mapping stream_id → sc_ptr)
-        is supplied. dump_all_counters() harvests this from Python
-        QuicConnection / WebTransportSession instances and passes it
-        in automatically; manual callers can pass an explicit dict.
+        is supplied, plus per-cnx picoquic path_quality (cwin, bif,
+        sRTT, pacing_rate, loss counts, bytes sent/received) when
+        `cnx_ptrs` (an iterable of picoquic_cnx_t* uintptrs) is
+        supplied. dump_all_counters() harvests both maps from
+        gc-visible QuicConnection / WebTransportSession instances and
+        passes them in automatically; manual callers can pass explicit
+        arguments.
+
+        Per-cnx output flags suspect BBR freeze when cwin is small
+        and bytes_in_transit pegs at cwin — the diagnostic signature
+        of the picoquic-internal #2118 cwnd-lock on low-RTT loopback.
         """
         import sys, time
         if file is None:
@@ -1012,6 +1049,47 @@ cdef class TransportContext:
                       f"oldest {max(d for _, d, _ in stuck):.1f}ms **",
                       file=file, flush=True)
 
+        # Per-cnx picoquic path_quality snapshot, if cnx_ptrs supplied.
+        # Each row: cwin / bif / sRTT / pacing_rate / loss / data sent
+        # and received. Flag suspect freeze when cwin is small AND
+        # bytes_in_transit pegs at cwin — the BBR-cwnd-lock signature
+        # of picoquic upstream issue #2118 on low-RTT loopback.
+        if cnx_ptrs:
+            cnx_list = [p for p in cnx_ptrs if p]
+            if cnx_list:
+                print(f"  --- per-cnx path_quality "
+                      f"({len(cnx_list)} cnx) ---",
+                      file=file, flush=True)
+                for ptr in cnx_list:
+                    q = self.path_quality(ptr)
+                    if not q:
+                        continue
+                    cwin = q['cwin']
+                    bif = q['bytes_in_transit']
+                    rtt_us = q['rtt']
+                    pacing_bps = q['pacing_rate']
+                    pacing_mbps = (pacing_bps * 8 / 1e6
+                                    if pacing_bps else 0.0)
+                    lost = q['lost']
+                    sent = q['bytes_sent']
+                    recv = q['bytes_received']
+                    suspect = ""
+                    # Heuristic: cwin under 10 typical MSS (14 KB) AND
+                    # bif/cwin > 0.9 → BBR is cwnd-pinned. The freeze
+                    # signature observed in picoquic #2118.
+                    if (cwin > 0 and cwin < 14400
+                            and bif / cwin > 0.9):
+                        suspect = (
+                            f"  ** SUSPECT BBR FREEZE: "
+                            f"cwin={cwin} bif={bif} "
+                            f"bif/cwin={bif/cwin:.2f} "
+                            f"(picoquic #2118) **")
+                    print(f"  cnx=0x{ptr:x} cwin={cwin} bif={bif} "
+                          f"sRTT={rtt_us}us "
+                          f"pacing={pacing_mbps:.1f}Mbps "
+                          f"lost={lost} sent={sent} recv={recv}"
+                          f"{suspect}", file=file, flush=True)
+
         print(f"=== end counters ===", file=file, flush=True)
 
     def enable_sigusr2_dump(self, stream_ctxs_callable=None):
@@ -1033,13 +1111,16 @@ cdef class TransportContext:
         return prev
 
     def stream_tx_buf_used(self, uintptr_t sc_ptr):
-        """Bytes currently sitting in a given stream's sc->tx ring,
-        not yet consumed by the picoquic worker's prepare_to_send.
+        """Bytes currently sitting in a given stream's sc->tx data
+        ring, not yet consumed by the picoquic worker's
+        prepare_to_send.
 
-        For the pull model this is the load-bearing back-pressure
-        signal — `tx_bytes_pending` is ~0 because MARK_ACTIVE entries
-        carry no payload. Callers can compare this against an absolute
-        byte budget (latency-bound queue depth) on a per-stream basis.
+        This is the load-bearing back-pressure signal in the pull
+        model: payload bytes live in the per-stream data ring;
+        connection-global event-ring metrics describe MARK_ACTIVE
+        notifications and carry no payload. Callers can compare this
+        against an absolute byte budget (latency-bound queue depth)
+        on a per-stream basis.
 
         sc_ptr is the opaque pointer kept in the Python connection's
         per-stream wrapper map (`_stream_ctxs[stream_id]`). Returns 0
@@ -1076,6 +1157,46 @@ cdef class TransportContext:
             return
         cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*><void*>sc_ptr
         aiopquic_clear_stream_tx_drain_pending(sc)
+
+    def path_quality(self, uintptr_t cnx_ptr):
+        """Snapshot of picoquic's path-quality metrics for the cnx.
+
+        Returns a dict matching picoquic_path_quality_t. The
+        load-bearing CC + FC observability surface: cwnd, in-flight
+        bytes, smoothed RTT, pacing rate, loss counts, bytes
+        sent/received. Use to detect BBR/CC pathologies (e.g. cwnd
+        frozen at minimal value while bif tracks it 1:1 — the
+        diagnostic signature of the BBR Startup-exit freeze observed
+        on raw-QUIC P=1 loopback).
+
+        Returns an empty dict on NULL cnx_ptr (cnx already torn down
+        or never opened); callers should treat empty as 'no data'.
+        """
+        if cnx_ptr == 0:
+            return {}
+        cdef picoquic_cnx_t* cnx = <picoquic_cnx_t*><void*>cnx_ptr
+        cdef picoquic_path_quality_t q
+        picoquic_get_default_path_quality(cnx, &q)
+        return {
+            'receive_rate_estimate': q.receive_rate_estimate,
+            'pacing_rate': q.pacing_rate,
+            'cwin': q.cwin,
+            'rtt': q.rtt,
+            'rtt_sample': q.rtt_sample,
+            'rtt_variant': q.rtt_variant,
+            'rtt_min': q.rtt_min,
+            'rtt_max': q.rtt_max,
+            'sent': q.sent,
+            'lost': q.lost,
+            'timer_losses': q.timer_losses,
+            'spurious_losses': q.spurious_losses,
+            'max_spurious_rtt': q.max_spurious_rtt,
+            'max_reorder_delay': q.max_reorder_delay,
+            'max_reorder_gap': q.max_reorder_gap,
+            'bytes_in_transit': q.bytes_in_transit,
+            'bytes_sent': q.bytes_sent,
+            'bytes_received': q.bytes_received,
+        }
 
     @property
     def tx_capacity(self):
