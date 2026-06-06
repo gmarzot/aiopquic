@@ -279,6 +279,13 @@ typedef struct {
     uint64_t        cnt_fc_credit_pushed;          /* asyncio push of SPSC_EVT_TX_OPEN_FLOW_CONTROL */
     uint64_t        cnt_fc_credit_handled;         /* worker processed SPSC_EVT_TX_OPEN_FLOW_CONTROL */
     uint64_t        cnt_fc_credit_dropped;         /* push failed (tx_event_ring full) */
+    /* WT-side sc/link leak diagnostic. Incremented when
+     * picohttp_callback_free fires with a non-NULL link but
+     * stream_ctx->path_callback_ctx no longer matches — the
+     * "skipped cleanup" path that may correlate with the May-23
+     * sub-side sc retention. Zero in healthy steady-state; growth
+     * rate = sc leak rate per cnx. */
+    uint64_t        cnt_wt_callback_free_skipped;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */

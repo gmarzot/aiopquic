@@ -803,6 +803,23 @@ static int aiopquic_wt_path_callback(
              * SPSC ring preserves this ordering at the consumer. */
             aiopquic_wt_push_stream_destroy(s, sid);
             aiopquic_wt_push_link_release(s, sid, link);
+        } else if (link) {
+            /* Diagnostic: cleanup skipped despite a link being
+             * provided via path_app_ctx. Tracks the leak signature
+             * for the May-23 sub-side retention investigation. */
+            s->bridge->cnt_wt_callback_free_skipped++;
+            if (aiopquic_wt_diag_enabled()) {
+                fprintf(stderr,
+                    "[wt-diag] callback_free SKIP sid=%llu link=%p "
+                    "stream_ctx=%p path_ctx=%p match=%d\n",
+                    (unsigned long long)sid,
+                    (void*)link,
+                    (void*)stream_ctx,
+                    stream_ctx ? stream_ctx->path_callback_ctx : NULL,
+                    stream_ctx
+                        ? (stream_ctx->path_callback_ctx == link) : 0);
+                fflush(stderr);
+            }
         }
         break;
 
