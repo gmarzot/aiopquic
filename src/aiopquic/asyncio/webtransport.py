@@ -870,6 +870,17 @@ async def connect_webtransport(
                 transport.stop()
             except Exception:
                 pass
+            # After stop() joins the worker, picosplay_empty_tree has
+            # fired callback_free for every remaining stream, pushing
+            # STREAM_DESTROY + LINK_RELEASE pairs into rx_event_ring.
+            # The dispatcher reader was detached above so nothing
+            # drained them. Pop them now — drain_rx handles
+            # LINK_RELEASE internally and frees the dangling links.
+            try:
+                while transport.drain_rx():
+                    pass
+            except Exception:
+                pass
 
 
 # =====================================================================
