@@ -870,17 +870,6 @@ async def connect_webtransport(
                 transport.stop()
             except Exception:
                 pass
-            # After stop() joins the worker, picosplay_empty_tree has
-            # fired callback_free for every remaining stream, pushing
-            # STREAM_DESTROY + LINK_RELEASE pairs into rx_event_ring.
-            # The dispatcher reader was detached above so nothing
-            # drained them. Pop them now — drain_rx handles
-            # LINK_RELEASE internally and frees the dangling links.
-            try:
-                while transport.drain_rx():
-                    pass
-            except Exception:
-                pass
 
 
 # =====================================================================
@@ -906,19 +895,6 @@ class WebTransportServer:
         if self._own_transport:
             try:
                 self._transport.stop()
-            except Exception:
-                pass
-            # After stop() joins the worker, picoquic's cnx-close path
-            # has fired picosplay_empty_tree → picohttp_callback_free
-            # for every remaining stream, pushing STREAM_DESTROY +
-            # LINK_RELEASE pairs into rx_event_ring. The eventfd reader
-            # was detached above so nothing drained those events. Pop
-            # them now: drain_rx handles LINK_RELEASE internally
-            # (calls aiopquic_wt_stream_link_destroy), so this loop
-            # frees the dangling links + their sc refs.
-            try:
-                while self._transport.drain_rx():
-                    pass
             except Exception:
                 pass
 

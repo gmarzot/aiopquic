@@ -178,12 +178,13 @@ static inline aiopquic_wt_stream_link_t* aiopquic_wt_stream_link_create(
 static inline void aiopquic_wt_stream_link_destroy(
         aiopquic_wt_stream_link_t* link) {
     if (!link) return;
-    if (link->sc) {
-        if (link->session && link->session->bridge) {
-            link->session->bridge->cnt_sc_destroy_wt_link++;
-        }
-        aiopquic_stream_ctx_destroy(link->sc);
-    }
+    /* No session/bridge deref here: at cnx-teardown, session is freed
+     * (h3wt_callback.h:~1115 / TX_WT_DEREGISTER) BEFORE every pending
+     * LINK_RELEASE has been popped from rx_event_ring. Touching
+     * link->session in this function = UAF on shutdown. The destroy
+     * count is captured at call sites (close walker + drain_rx
+     * LINK_RELEASE pop) where session validity is guaranteed. */
+    if (link->sc) aiopquic_stream_ctx_destroy(link->sc);
     link->kind = 0;  /* clear canary */
     free(link);
 }

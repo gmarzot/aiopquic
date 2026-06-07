@@ -269,7 +269,6 @@ cdef extern from "c/callback.h":
         uint64_t cnt_sc_create_raw_quic
         uint64_t cnt_sc_create_wt_link
         uint64_t cnt_sc_ref_fc_credit
-        uint64_t cnt_sc_destroy_wt_link
         uint64_t cnt_sc_destroy_wt_link_callback_free
         uint64_t cnt_sc_destroy_wt_link_close_walker
         uint64_t cnt_sc_destroy_fc_credit_pushfail
@@ -969,7 +968,6 @@ cdef class TransportContext:
             'sc_create_raw_quic': self._ctx.cnt_sc_create_raw_quic,
             'sc_create_wt_link': self._ctx.cnt_sc_create_wt_link,
             'sc_ref_fc_credit': self._ctx.cnt_sc_ref_fc_credit,
-            'sc_destroy_wt_link': self._ctx.cnt_sc_destroy_wt_link,
             'sc_destroy_wt_link_callback_free': self._ctx.cnt_sc_destroy_wt_link_callback_free,
             'sc_destroy_wt_link_close_walker': self._ctx.cnt_sc_destroy_wt_link_close_walker,
             'sc_destroy_fc_credit_pushfail': self._ctx.cnt_sc_destroy_fc_credit_pushfail,
