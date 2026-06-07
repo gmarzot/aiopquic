@@ -90,6 +90,11 @@ jobs:
       with:
         python-version: "3.14"
     - name: Build sdist
+      env:
+        # Forces setuptools_scm to emit the requested version verbatim,
+        # bypassing all git/tree state detection. Without this, dirty
+        # tree at the tagged commit produces .post1.devN suffixes.
+        SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOPQUIC: ${{ needs.tag.outputs.version }}
       run: |
         python -m pip install --upgrade pip build
         python -m build --sdist
@@ -123,10 +128,14 @@ jobs:
     - name: Build wheels
       uses: pypa/cibuildwheel@v3.1.4
       env:
-        # Forward submodule paths into the manylinux container so
-        # build_picoquic.sh can find them (cibuildwheel mounts the
-        # checkout at /project but submodules need to be present).
-        CIBW_ENVIRONMENT_PASS_LINUX: GITHUB_WORKSPACE
+        # Forward submodule paths AND the version override into the
+        # manylinux container. SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOPQUIC
+        # forces setuptools_scm to emit the requested version verbatim,
+        # bypassing all git/tree state detection — required because
+        # cibuildwheel's before-all (build_picoquic.sh) dirties the
+        # working tree and the default scheme would emit .post1.devN.
+        CIBW_ENVIRONMENT_PASS_LINUX: GITHUB_WORKSPACE SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOPQUIC
+        SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOPQUIC: ${{ needs.tag.outputs.version }}
         # Per-runner macOS deployment target — Homebrew dylibs are built
         # against the runner's native macOS, so the wheel target must
         # match (else delocate rejects bundling higher-min dylibs into
