@@ -970,6 +970,11 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         s->h3_ctx = h3_ctx;
         s->control_stream = control_stream;
         s->control_stream_id = control_stream->stream_id;
+        /* Suppress h3zero's stdout banner on client-side cnx close
+         * ("Received a connection close request"). h3zero_common.c
+         * gates on !ctx->no_print; raw-QUIC has no equivalent print
+         * so this matches WT to raw-QUIC behavior. */
+        h3_ctx->no_print = 1;
 
         rc = picowt_connect(cnx, h3_ctx, control_stream,
                               sni_buf, path_buf,
