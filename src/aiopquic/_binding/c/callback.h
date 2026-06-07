@@ -286,6 +286,15 @@ typedef struct {
      * sub-side sc retention. Zero in healthy steady-state; growth
      * rate = sc leak rate per cnx. */
     uint64_t        cnt_wt_callback_free_skipped;
+    /* Per-site sc create/ref/destroy counters (added 2026-06-06).
+     * Invariant: Σ create + Σ ref == Σ destroy at process end.
+     * Per-site imbalance localizes the May-23 sub-side retention. */
+    uint64_t        cnt_sc_create_raw_quic;         /* callback.h ~803 first-touch */
+    uint64_t        cnt_sc_create_wt_link;          /* h3wt_callback.h ~163 link create */
+    uint64_t        cnt_sc_ref_fc_credit;           /* callback.h ~440 FC credit push ref */
+    uint64_t        cnt_sc_destroy_wt_link;         /* h3wt_callback.h ~178 link destroy */
+    uint64_t        cnt_sc_destroy_fc_credit_pushfail; /* callback.h ~464 push-fail unref */
+    uint64_t        cnt_sc_destroy_fc_credit_worker;   /* callback.h ~1114 worker unref */
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -438,6 +447,7 @@ static inline void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx,
      * handler is responsible for the matching unref via
      * aiopquic_stream_ctx_destroy. */
     aiopquic_stream_ctx_ref(sc);
+    ctx->cnt_sc_ref_fc_credit++;
     spsc_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     entry.event_type = SPSC_EVT_TX_OPEN_FLOW_CONTROL;
@@ -461,6 +471,7 @@ static inline void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx,
         /* tx_event_ring push failed (ring full). Drop the ref we just
          * took since no worker handler will run for this push. */
         ctx->cnt_fc_credit_dropped++;
+        ctx->cnt_sc_destroy_fc_credit_pushfail++;
         aiopquic_stream_ctx_destroy(sc);
     }
 }
@@ -804,6 +815,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             if (!sc) {
                 return -1;
             }
+            ctx->cnt_sc_create_raw_quic++;
             picoquic_set_app_stream_ctx(cnx, stream_id, sc);
             entry.stream_ctx = sc;
             /* Opt into application-driven flow control on this stream.
@@ -1111,6 +1123,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                          * events). Safe — we accessed sc above; this
                          * is the very last touch. */
                         if (sc != NULL) {
+                            ctx->cnt_sc_destroy_fc_credit_worker++;
                             aiopquic_stream_ctx_destroy(sc);
                         }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);

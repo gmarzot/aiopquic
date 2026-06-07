@@ -165,6 +165,9 @@ static inline aiopquic_wt_stream_link_t* aiopquic_wt_stream_link_create(
         free(link);
         return NULL;
     }
+    if (s && s->bridge) {
+        s->bridge->cnt_sc_create_wt_link++;
+    }
     link->kind = AIOPQUIC_WT_CTX_LINK;
     link->session = s;
     link->sc = sc;
@@ -175,7 +178,12 @@ static inline aiopquic_wt_stream_link_t* aiopquic_wt_stream_link_create(
 static inline void aiopquic_wt_stream_link_destroy(
         aiopquic_wt_stream_link_t* link) {
     if (!link) return;
-    if (link->sc) aiopquic_stream_ctx_destroy(link->sc);
+    if (link->sc) {
+        if (link->session && link->session->bridge) {
+            link->session->bridge->cnt_sc_destroy_wt_link++;
+        }
+        aiopquic_stream_ctx_destroy(link->sc);
+    }
     link->kind = 0;  /* clear canary */
     free(link);
 }

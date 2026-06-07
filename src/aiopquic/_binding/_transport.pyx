@@ -266,6 +266,12 @@ cdef extern from "c/callback.h":
         uint64_t cnt_fc_credit_handled
         uint64_t cnt_fc_credit_dropped
         uint64_t cnt_wt_callback_free_skipped
+        uint64_t cnt_sc_create_raw_quic
+        uint64_t cnt_sc_create_wt_link
+        uint64_t cnt_sc_ref_fc_credit
+        uint64_t cnt_sc_destroy_wt_link
+        uint64_t cnt_sc_destroy_fc_credit_pushfail
+        uint64_t cnt_sc_destroy_fc_credit_worker
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
                                           uint32_t rx_cap,
@@ -373,6 +379,16 @@ cdef extern from "c/stream_ctx.h":
     uint64_t aiopquic_cnt_sc_created_load()
     uint64_t aiopquic_cnt_sc_destroyed_load()
     int64_t  aiopquic_cnt_chunks_alive_load()
+    void aiopquic_cnt_sc_ref_chunk_wrap_inc()
+    void aiopquic_cnt_sc_destroy_chunk_dealloc_inc()
+    void aiopquic_cnt_sc_destroy_rx_event_inc()
+    void aiopquic_cnt_sc_create_python_helper_inc()
+    void aiopquic_cnt_sc_destroy_python_helper_inc()
+    uint64_t aiopquic_cnt_sc_ref_chunk_wrap_load()
+    uint64_t aiopquic_cnt_sc_destroy_chunk_dealloc_load()
+    uint64_t aiopquic_cnt_sc_destroy_rx_event_load()
+    uint64_t aiopquic_cnt_sc_create_python_helper_load()
+    uint64_t aiopquic_cnt_sc_destroy_python_helper_load()
     void aiopquic_sc_rx_bytes_pushed_add(uint64_t n)
     void aiopquic_sc_rx_bytes_popped_add(uint64_t n)
     uint64_t aiopquic_cnt_sc_rx_bytes_pushed_load()
@@ -563,6 +579,7 @@ cdef class StreamChunk:
             # releases the memoryview. Released in __dealloc__ via
             # the matching aiopquic_stream_ctx_destroy (unref).
             aiopquic_stream_ctx_ref(sc)
+            aiopquic_cnt_sc_ref_chunk_wrap_inc()
             if length > 0:
                 aiopquic_stream_ctx_pending_add(sc, <uint64_t>length)
         return c
@@ -606,6 +623,7 @@ cdef class StreamChunk:
         # sc is freed here. Otherwise the worker handler or another
         # outstanding chunk holds it alive.
         if self._sc is not NULL:
+            aiopquic_cnt_sc_destroy_chunk_dealloc_inc()
             aiopquic_stream_ctx_destroy(self._sc)
             self._sc = NULL
         aiopquic_chunks_alive_dec()
@@ -944,6 +962,19 @@ cdef class TransportContext:
             # WT sc/link leak diagnostic (added 2026-06-06).
             # Growth rate ~ sc leak rate per cnx.
             'wt_callback_free_skipped': self._ctx.cnt_wt_callback_free_skipped,
+            # Per-site sc create/ref/destroy counters (added 2026-06-06).
+            # See stream_ctx.h block comment for the balance invariant.
+            'sc_create_raw_quic': self._ctx.cnt_sc_create_raw_quic,
+            'sc_create_wt_link': self._ctx.cnt_sc_create_wt_link,
+            'sc_ref_fc_credit': self._ctx.cnt_sc_ref_fc_credit,
+            'sc_destroy_wt_link': self._ctx.cnt_sc_destroy_wt_link,
+            'sc_destroy_fc_credit_pushfail': self._ctx.cnt_sc_destroy_fc_credit_pushfail,
+            'sc_destroy_fc_credit_worker': self._ctx.cnt_sc_destroy_fc_credit_worker,
+            'sc_ref_chunk_wrap_total': aiopquic_cnt_sc_ref_chunk_wrap_load(),
+            'sc_destroy_chunk_dealloc_total': aiopquic_cnt_sc_destroy_chunk_dealloc_load(),
+            'sc_destroy_rx_event_total': aiopquic_cnt_sc_destroy_rx_event_load(),
+            'sc_create_python_helper_total': aiopquic_cnt_sc_create_python_helper_load(),
+            'sc_destroy_python_helper_total': aiopquic_cnt_sc_destroy_python_helper_load(),
             # Process-wide stream / chunk lifecycle (leak detection)
             'sc_created_total': aiopquic_cnt_sc_created_load(),
             'sc_destroyed_total': aiopquic_cnt_sc_destroyed_load(),
@@ -1353,6 +1384,7 @@ cdef class TransportContext:
                     <uintptr_t>0,
                 ))
                 if entry.stream_ctx is not NULL:
+                    aiopquic_cnt_sc_destroy_rx_event_inc()
                     aiopquic_stream_ctx_destroy(
                         <aiopquic_stream_ctx_t*>entry.stream_ctx)
                 spsc_ring_pop(self._ctx.rx_event_ring)
@@ -1591,6 +1623,7 @@ cdef class TransportContext:
                     <uintptr_t>0,
                 )
                 if entry.stream_ctx is not NULL:
+                    aiopquic_cnt_sc_destroy_rx_event_inc()
                     aiopquic_stream_ctx_destroy(
                         <aiopquic_stream_ctx_t*>entry.stream_ctx)
                 spsc_ring_pop(self._ctx.rx_event_ring)
@@ -1851,6 +1884,7 @@ cdef class TransportContext:
             sc = aiopquic_stream_ctx_create()
             if sc is NULL:
                 raise MemoryError("aiopquic_stream_ctx_create returned NULL")
+            aiopquic_cnt_sc_create_python_helper_inc()
             sc_ptr = <uintptr_t>sc
             self._test_stream_ctxs[key] = sc_ptr
         else:
@@ -2796,6 +2830,7 @@ def stream_ctx_create():
     cdef aiopquic_stream_ctx_t* sc = aiopquic_stream_ctx_create()
     if not sc:
         raise MemoryError("aiopquic_stream_ctx_create returned NULL")
+    aiopquic_cnt_sc_create_python_helper_inc()
     return <uintptr_t>sc
 
 
@@ -2807,6 +2842,7 @@ def stream_ctx_destroy(uintptr_t sc_ptr):
     the picoquic worker thread."""
     if sc_ptr == 0:
         return
+    aiopquic_cnt_sc_destroy_python_helper_inc()
     aiopquic_stream_ctx_destroy(<aiopquic_stream_ctx_t*>sc_ptr)
 
 

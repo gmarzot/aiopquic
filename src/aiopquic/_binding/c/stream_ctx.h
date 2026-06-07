@@ -153,6 +153,64 @@ static inline int64_t aiopquic_cnt_chunks_alive_load(void) {
                                  memory_order_relaxed);
 }
 
+/* Per-site sc create/ref/destroy counters for Python-side call sites
+ * (added 2026-06-06). C-side counters live on aiopquic_ctx_t (per cnx).
+ * Process-wide here because chunk dealloc, rx_event drain, and the
+ * Python create/destroy helpers don't reliably have ctx in scope.
+ * Invariant at process end:
+ *   sc_created == sc_destroyed
+ *   (cnt_sc_create_raw_quic + cnt_sc_create_wt_link + cnt_sc_create_python_helper
+ *    + cnt_sc_ref_fc_credit + cnt_sc_ref_chunk_wrap)
+ *   == (cnt_sc_destroy_wt_link + cnt_sc_destroy_fc_credit_pushfail
+ *       + cnt_sc_destroy_fc_credit_worker + cnt_sc_destroy_chunk_dealloc
+ *       + cnt_sc_destroy_rx_event + cnt_sc_destroy_python_helper) */
+static _Atomic(uint64_t) aiopquic_cnt_sc_ref_chunk_wrap = 0;
+static _Atomic(uint64_t) aiopquic_cnt_sc_destroy_chunk_dealloc = 0;
+static _Atomic(uint64_t) aiopquic_cnt_sc_destroy_rx_event = 0;
+static _Atomic(uint64_t) aiopquic_cnt_sc_create_python_helper = 0;
+static _Atomic(uint64_t) aiopquic_cnt_sc_destroy_python_helper = 0;
+
+static inline void aiopquic_cnt_sc_ref_chunk_wrap_inc(void) {
+    atomic_fetch_add_explicit(&aiopquic_cnt_sc_ref_chunk_wrap, 1,
+                               memory_order_relaxed);
+}
+static inline void aiopquic_cnt_sc_destroy_chunk_dealloc_inc(void) {
+    atomic_fetch_add_explicit(&aiopquic_cnt_sc_destroy_chunk_dealloc, 1,
+                               memory_order_relaxed);
+}
+static inline void aiopquic_cnt_sc_destroy_rx_event_inc(void) {
+    atomic_fetch_add_explicit(&aiopquic_cnt_sc_destroy_rx_event, 1,
+                               memory_order_relaxed);
+}
+static inline void aiopquic_cnt_sc_create_python_helper_inc(void) {
+    atomic_fetch_add_explicit(&aiopquic_cnt_sc_create_python_helper, 1,
+                               memory_order_relaxed);
+}
+static inline void aiopquic_cnt_sc_destroy_python_helper_inc(void) {
+    atomic_fetch_add_explicit(&aiopquic_cnt_sc_destroy_python_helper, 1,
+                               memory_order_relaxed);
+}
+static inline uint64_t aiopquic_cnt_sc_ref_chunk_wrap_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_sc_ref_chunk_wrap,
+                                 memory_order_relaxed);
+}
+static inline uint64_t aiopquic_cnt_sc_destroy_chunk_dealloc_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_sc_destroy_chunk_dealloc,
+                                 memory_order_relaxed);
+}
+static inline uint64_t aiopquic_cnt_sc_destroy_rx_event_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_sc_destroy_rx_event,
+                                 memory_order_relaxed);
+}
+static inline uint64_t aiopquic_cnt_sc_create_python_helper_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_sc_create_python_helper,
+                                 memory_order_relaxed);
+}
+static inline uint64_t aiopquic_cnt_sc_destroy_python_helper_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_sc_destroy_python_helper,
+                                 memory_order_relaxed);
+}
+
 /* sc->rx byte-ring in-flight tracker. Worker thread bumps on push;
  * Cython asyncio drain bumps on pop. Delta = bytes currently sitting
  * in sc->rx rings across ALL streams in the process. Reveals when
