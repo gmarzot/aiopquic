@@ -36,6 +36,10 @@ dev = [
 where = ["src"]
 
 [tool.setuptools_scm]
+# Clean tag versions for release wheels (cibuildwheel dirties the
+# tree; defaults would emit .devN+gSHA.dDATE which PyPI rejects).
+version_scheme = "no-guess-dev"
+local_scheme = "no-local-version"
 
 [tool.ruff]
 line-length = 100
