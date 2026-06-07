@@ -292,7 +292,9 @@ typedef struct {
     uint64_t        cnt_sc_create_raw_quic;         /* callback.h ~803 first-touch */
     uint64_t        cnt_sc_create_wt_link;          /* h3wt_callback.h ~163 link create */
     uint64_t        cnt_sc_ref_fc_credit;           /* callback.h ~440 FC credit push ref */
-    uint64_t        cnt_sc_destroy_wt_link;         /* h3wt_callback.h ~178 link destroy */
+    uint64_t        cnt_sc_destroy_wt_link;         /* h3wt_callback.h ~178 link destroy (TOTAL) */
+    uint64_t        cnt_sc_destroy_wt_link_callback_free; /* via picohttp_callback_free cleanup */
+    uint64_t        cnt_sc_destroy_wt_link_close_walker;  /* via session-close walker sweep */
     uint64_t        cnt_sc_destroy_fc_credit_pushfail; /* callback.h ~464 push-fail unref */
     uint64_t        cnt_sc_destroy_fc_credit_worker;   /* callback.h ~1114 worker unref */
 } aiopquic_ctx_t;

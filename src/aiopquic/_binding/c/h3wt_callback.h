@@ -1095,6 +1095,9 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                             if (lk->session == s) {
                                 st->path_callback = NULL;
                                 st->path_callback_ctx = NULL;
+                                if (s->bridge) {
+                                    s->bridge->cnt_sc_destroy_wt_link_close_walker++;
+                                }
                                 aiopquic_wt_stream_link_destroy(lk);
                             }
                         }

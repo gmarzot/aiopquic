@@ -270,6 +270,8 @@ cdef extern from "c/callback.h":
         uint64_t cnt_sc_create_wt_link
         uint64_t cnt_sc_ref_fc_credit
         uint64_t cnt_sc_destroy_wt_link
+        uint64_t cnt_sc_destroy_wt_link_callback_free
+        uint64_t cnt_sc_destroy_wt_link_close_walker
         uint64_t cnt_sc_destroy_fc_credit_pushfail
         uint64_t cnt_sc_destroy_fc_credit_worker
 
@@ -968,6 +970,8 @@ cdef class TransportContext:
             'sc_create_wt_link': self._ctx.cnt_sc_create_wt_link,
             'sc_ref_fc_credit': self._ctx.cnt_sc_ref_fc_credit,
             'sc_destroy_wt_link': self._ctx.cnt_sc_destroy_wt_link,
+            'sc_destroy_wt_link_callback_free': self._ctx.cnt_sc_destroy_wt_link_callback_free,
+            'sc_destroy_wt_link_close_walker': self._ctx.cnt_sc_destroy_wt_link_close_walker,
             'sc_destroy_fc_credit_pushfail': self._ctx.cnt_sc_destroy_fc_credit_pushfail,
             'sc_destroy_fc_credit_worker': self._ctx.cnt_sc_destroy_fc_credit_worker,
             'sc_ref_chunk_wrap_total': aiopquic_cnt_sc_ref_chunk_wrap_load(),
@@ -1340,6 +1344,7 @@ cdef class TransportContext:
             # LINK_RELEASE is internal: free the link, never emit.
             if entry.event_type == SPSC_EVT_WT_STREAM_LINK_RELEASE:
                 if entry.data_buf is not NULL:
+                    self._ctx.cnt_sc_destroy_wt_link_callback_free += 1
                     aiopquic_wt_stream_link_destroy(
                         <aiopquic_wt_stream_link_t*>entry.data_buf)
                 spsc_ring_pop(self._ctx.rx_event_ring)
@@ -1587,6 +1592,7 @@ cdef class TransportContext:
 
             if entry.event_type == SPSC_EVT_WT_STREAM_LINK_RELEASE:
                 if entry.data_buf is not NULL:
+                    self._ctx.cnt_sc_destroy_wt_link_callback_free += 1
                     aiopquic_wt_stream_link_destroy(
                         <aiopquic_wt_stream_link_t*>entry.data_buf)
                 spsc_ring_pop(self._ctx.rx_event_ring)
