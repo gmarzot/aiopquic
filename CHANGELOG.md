@@ -1,6 +1,60 @@
 # Changelog
 
-## v0.3.5 (unreleased)
+## v0.3.6 (unreleased)
+
+### WT pull-model migration (parity with raw-QUIC)
+
+- WT data streams now use per-stream `sc->tx` byte ring + `picoquic_mark_active_stream_v2` (preserves `app_stream_ctx`), matching the raw-QUIC pull-model lifecycle. Eliminates per-callback `h3zero_find_stream` splay-tree lookup on every send.
+- `WebTransportSession.send_stream_data_drained` symmetric to `QuicConnection.send_stream_data_drained`: edge-trigger backpressure via per-stream `tx_drain_pending`.
+- `STREAM_DESTROY` event surfaced to user code so per-stream dicts (`_data_streams`, `_stream_tx_ctxs`) self-clean without explicit teardown.
+- `picohttp_callback_free` forwards stream-released → universal sc destroy on raw-QUIC + WT. WT-side sc destroy gap from 0.3.5 closed for normal lifecycle (saturation orphan deferred — see Known Issues).
+
+### Perf delta vs 0.3.5
+
+- 5-run WT loopback at saturation (`-P 1 -s 4096 -g 10000 -r 0 -t 30 -i 30`): **2540 Mbps / p99 35.8 ms** vs 0.3.5 baseline 2233 Mbps / p99 49.7 ms. **+14% throughput / −28% p99.** Run-to-run variance also tighter post-session. Root cause: patch 0004 below.
+
+### picoquic submodule advance + drop all local patches
+
+- Pin advanced through `6a147578` → `eee50c1d` → `d6c5653d` (PR #2107 merged upstream). All four local patches landed in upstream picoquic — **`third_party/picoquic` is now vanilla upstream**.
+- Patch 0003 (h3zero forwards `picoquic_callback_stream_released` as `picohttp_callback_free` so apps can release per-stream context mid-session) — upstream.
+- Patch 0004 (`picoquic_mark_active_stream` with NULL `app_stream_ctx` preserves the existing value via `picoquic_mark_active_stream_v2`) — upstream; eliminates per-callback h3zero lookup; primary driver of the +14% / −28% delta.
+
+### Lens B primitives + observability
+
+- Per-stream typed pressure primitives: `stream_tx_buf_used(sid)`, `arm_stream_tx_drain_pending(sid)`, `clear_stream_tx_drain_pending(sid)`. Lets higher layers express "wait until per-stream sc->tx drains below N bytes" without leaking sc internals.
+- `path_quality()` bridge exposing `picoquic_get_default_path_quality` (`cwin`, `bytes_in_transit`, `smoothed_rtt`, `pacing_rate`, `bytes_lost`, `bytes_sent`, `bytes_received`).
+- `SIGUSR2` dump extension: per-cnx `path_quality` block with **BBR FREEZE SUSPECT** marker when `cwin ≈ 5 MSS` AND `pacing_rate` drops sharply (highlights picoquic#2118 reproduction).
+- `send_stream_data_drained` robustness: catch up to picoquic's `wt_callback_free` change in `worker_callback_close` (rather than NULL-deref); propagate cancellations through `tx_drain_pending` so callers don't hang.
+
+### Per-site sc lifecycle counters
+
+- 12 counters across all sc create / ref / destroy call sites, exposed in `TransportContext.counters`:
+  - Per-ctx: `sc_create_raw_quic`, `sc_create_wt_link`, `sc_ref_fc_credit`, `sc_destroy_wt_link_callback_free`, `sc_destroy_wt_link_close_walker`, `sc_destroy_fc_credit_pushfail`, `sc_destroy_fc_credit_worker`, `wt_callback_free_skipped`.
+  - Process-wide: `sc_ref_chunk_wrap_total`, `sc_destroy_chunk_dealloc_total`, `sc_destroy_rx_event_total`, `sc_create_python_helper_total`, `sc_destroy_python_helper_total`.
+- Invariant: `Σ creates + Σ refs == Σ destroys` at process end. Per-site imbalance localizes leaks. The split `cnt_sc_destroy_wt_link_{callback_free, close_walker}` is set at call sites (not inside `aiopquic_wt_stream_link_destroy`) so they remain safe under cnx-teardown when `link->session` may already be freed.
+
+### Nomenclature pass (partial)
+
+- `tx_ring` / `rx_ring` → `tx_event_ring` / `rx_event_ring` everywhere. SPSC event-rings now consistently distinguished from per-stream data byte-rings (`sc->tx`, `sc->rx`).
+- `tx_pressure` / `tx_count` / `tx_capacity` and `get_tx_drain_event` renames to follow (deferred to 0.3.7 / 0.4.0).
+
+### Build
+
+- `AIOPQUIC_PERF=1` is now the **default** in `build_picoquic.sh` (host-tuned `-O3 -march=native -flto -fno-plt`). Bare `./build_picoquic.sh` now produces fast builds.
+- `AIOPQUIC_WHEEL_BUILD=1` is the escape hatch: suppresses host tuning for portable wheel / CI builds.
+
+### Cosmetic
+
+- Suppress h3zero "Received a connection close request" stdout banner on WT clients (`h3_ctx->no_print = 1`). Raw-QUIC has no equivalent print; this matches WT logging to raw-QUIC.
+
+### Known issues (deferred)
+
+- **Pub-stream orphan at saturation.** Under sustained max-rate sends (typically `-P 1 -g 200 -r 0`), ~30% of publisher-side WT streams have their `picoquic_callback_stream_released` callback deferred until session close. All orphans clear at session close, so the leak is bounded, not permanent. Sub-saturation workloads (`-r ≤ 80K obj/s`, even at `-g 100 -P 8`) are completely clean. Per-leaked-link memory cost is bounded by `AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT = 4 MiB`. Localized to picoquic-side `delete_stream_if_closed` timing under high churn; root cause investigation continues in 0.3.7.
+- **Shutdown rx_event_ring drain miss.** At cnx-teardown picoquic's `picosplay_empty_tree` cascade fires `callback_free` for every remaining stream, pushing `STREAM_DESTROY + LINK_RELEASE` pairs into `rx_event_ring` after the dispatcher reader has detached. These events sit unprocessed until process exit. Bounded by `(stream count at close) × event size`. Correct fix is worker-side flush before join; deferred.
+- **Double-free at `-P 8 -g 200`.** ASan-confirmed (2026-05-31), runtime crash signature. Same family as the orphan + drain-miss above. Deferred.
+- **picoquic #2118 BBR ProbeBW_UP cwnd freeze on sub-128 µs RTT loopback.** Operator-overridable workaround: `--cc-algo newreno` or `bbr1`, or use Christian's purpose-built `c4` algorithm (1 ms RTT floor specifically for low-delay paths). Adaptive `MINRTT_THRESHOLD` PR pending upstream; Christian green-lit the design ("the relative comparison proposal makes sense").
+
+## v0.3.5 (2026-05-25)
 
 ### RX flow control (release-blocker fix)
 
