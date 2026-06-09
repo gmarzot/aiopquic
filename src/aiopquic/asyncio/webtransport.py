@@ -59,6 +59,10 @@ _EVT_WT_NEW_STREAM = 73
 _EVT_WT_STREAM_CREATED = 74
 _EVT_WT_NEW_SESSION = 75
 
+# Application-error code surfaced on RESET_STREAM for WT data streams when
+# the WT session itself terminates. Per draft-ietf-webtrans-http3 §6, §9.5.
+WT_SESSION_GONE = 0x170d7b68
+
 
 class WebTransportError(Exception):
     """Raised when a WebTransport session fails."""
@@ -158,6 +162,15 @@ class WebTransportSession:
 
     @property
     def cnx_ptr(self) -> int:
+        # Returns 0 once SESSION_CLOSED has been observed so the
+        # dump_all_counters harvest sees a sentinel rather than the
+        # dangling C ptr — picoquic may have already freed the cnx by
+        # this point. Residual race: picoquic_delete_cnx returns
+        # (freed) before this asyncio handler runs (gap = SPSC drain
+        # latency, microseconds). Vastly narrower than the prior
+        # "freed seconds ago" UAF in dump_all_counters.
+        if self._session_closed.is_set():
+            return 0
         return self._state.cnx_ptr
 
     # --- dispatcher attach (called by subclass setup paths) -----------
@@ -183,6 +196,8 @@ class WebTransportSession:
         the id internally. Multiple concurrent callers are safe:
         each appends a future to a FIFO and picoquic responds in
         the same order TX events were pushed."""
+        if self.session_closed:
+            raise WebTransportError("WT session closed")
         if not self.session_ready:
             raise WebTransportError("session not ready")
         fut = self._loop.create_future()
@@ -510,11 +525,16 @@ class WebTransportSession:
                 if not fut.done():
                     fut.set_exception(WebTransportError(
                         "WT session closed"))
-            # All borrowed sc pointers are invalidated by session close
-            # (the C side will free links via LINK_RELEASE events as
-            # picoquic retires the cnx). Drop our references now so
-            # send_stream_data raises cleanly rather than handing a
-            # soon-to-be-freed pointer back into Cython.
+            # Bulk-free this session's wt_link sc's via a single
+            # worker-thread splay-tree walk (TX_WT_SESSION_CLEANUP).
+            # Worker-local; no wire frames, so it succeeds even when
+            # the cnx is stalled (cwin pinned post-disconnect, BBR
+            # #2118, etc.) and per-sid RESETs can't be transmitted.
+            # O(1) ring cost — does not depend on stream count.
+            try:
+                self._state.push_session_cleanup()
+            except BufferError:
+                pass
             self._stream_tx_ctxs.clear()
             # Wake any producer parked in send_stream_data_drained
             # awaiting per-stream sc_event or connection-global
@@ -529,11 +549,38 @@ class WebTransportSession:
                                 '_tx_event_ring_drain_event', None)
             if ring_ev is not None:
                 ring_ev.set()
+            # Stream-inbox queues are only popped on per-stream
+            # STREAM_DESTROY; without an explicit reclaim here, every
+            # WT data stream that arrived and was fully drained leaks
+            # its asyncio.Queue (plus any undrained payloads pinning
+            # Cython chunk buffers) for the lifetime of this session
+            # object. Drain each queue to release pinned chunks, then
+            # clear the dict.
+            for q in self._stream_inbox.values():
+                while True:
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+            self._stream_inbox.clear()
             self._event_queue.put_nowait(ev)
         elif evt_type == _EVT_WT_SESSION_DRAINING:
             self._draining = True
             self._event_queue.put_nowait(WebTransportSessionDraining())
         elif evt_type == _EVT_WT_STREAM_CREATED:
+            # Race tail: SESSION_CLOSED may have been processed before
+            # the worker finished allocating this stream. In that case
+            # the corresponding pending_create future is already errored
+            # and _stream_tx_ctxs was cleared; stashing sc_ptr would
+            # orphan it. Push a reset so picoquic retires the stream
+            # and the callback chain frees the link.
+            if self._session_closed.is_set():
+                if sc_ptr and error_code == 0 and sid:
+                    try:
+                        self._state.push_reset_stream(sid, WT_SESSION_GONE)
+                    except BufferError:
+                        pass
+                return
             # Stash the sc pointer the C side allocated for this
             # outbound stream so send_stream_data has it on first use.
             if sc_ptr and error_code == 0:
@@ -584,6 +631,18 @@ class WebTransportSession:
             self._event_queue.put_nowait(
                 WebTransportDatagramReceived(data=payload))
         elif evt_type == _EVT_WT_NEW_STREAM:
+            # Mirror of the _EVT_WT_STREAM_CREATED race: SESSION_CLOSED
+            # may have been processed before this peer-initiated NEW
+            # event arrived. Without a guard, sc_ptr would be re-stashed
+            # into the cleared _stream_tx_ctxs and a NewStream event
+            # delivered to an application that no longer has a session.
+            if self._session_closed.is_set():
+                if sc_ptr and sid:
+                    try:
+                        self._state.push_reset_stream(sid, WT_SESSION_GONE)
+                    except BufferError:
+                        pass
+                return
             # Peer opened a new stream — for bidi we may want to reply,
             # so stash the sc pointer here too.
             if sc_ptr:

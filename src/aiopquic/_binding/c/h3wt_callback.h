@@ -1059,6 +1059,46 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         return 1;
     }
 
+    case SPSC_EVT_TX_WT_SESSION_CLEANUP: {
+        /* Bulk-free this session's per-stream wt_links without
+         * tearing down the session itself. Mirrors step 1 of
+         * TX_WT_DEREGISTER. Used by SESSION_CLOSED handler when the
+         * cnx is stalled (cwin pinned, peer disconnected, BBR #2118
+         * freeze) and per-sid RESETs can't be transmitted. The
+         * session object survives so the Python wrapper's __dealloc__
+         * can later push TX_WT_DEREGISTER for full teardown.
+         *
+         * Idempotent: subsequent calls find empty splay tree and
+         * no-op. */
+        if (s && s->cnx && s->h3_ctx) {
+            picosplay_node_t* node =
+                picosplay_first(&s->h3_ctx->h3_stream_tree);
+            while (node != NULL) {
+                h3zero_stream_ctx_t* st =
+                    (h3zero_stream_ctx_t*)picohttp_stream_node_value(node);
+                picosplay_node_t* next = picosplay_next(node);
+                if (st != NULL && st->path_callback_ctx != NULL) {
+                    uint32_t kind = *(uint32_t*)st->path_callback_ctx;
+                    if (kind == AIOPQUIC_WT_CTX_LINK) {
+                        aiopquic_wt_stream_link_t* lk =
+                            (aiopquic_wt_stream_link_t*)
+                                st->path_callback_ctx;
+                        if (lk->session == s) {
+                            st->path_callback = NULL;
+                            st->path_callback_ctx = NULL;
+                            if (s->bridge) {
+                                s->bridge->cnt_sc_destroy_wt_link_close_walker++;
+                            }
+                            aiopquic_wt_stream_link_destroy(lk);
+                        }
+                    }
+                }
+                node = next;
+            }
+        }
+        return 1;
+    }
+
     case SPSC_EVT_TX_WT_DEREGISTER: {
         /* Python is releasing this session. Cleanup has three steps
          * that MUST happen in order, all on the worker thread:

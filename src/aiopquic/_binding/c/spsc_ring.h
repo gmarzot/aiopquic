@@ -128,6 +128,15 @@ typedef enum {
     SPSC_EVT_TX_OPEN_FLOW_CONTROL = 143,
     SPSC_EVT_TX_SET_APP_FLOW_CONTROL = 144,
 
+    /* WT session bulk-cleanup of per-stream wt_links — the splay-tree
+     * walk subset of TX_WT_DEREGISTER without the picowt_deregister +
+     * session_destroy steps. Used by SESSION_CLOSED handler to reap
+     * orphan wt_link sc's when the cnx is stalled (BBR freeze, cwin
+     * pinned post-disconnect, etc.) and per-sid RESETs can't get on
+     * the wire. The session object survives so the Python wrapper's
+     * __dealloc__ can later push TX_WT_DEREGISTER for full teardown. */
+    SPSC_EVT_TX_WT_SESSION_CLEANUP = 145,
+
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
      * WT control stream for session events, or the WT stream for

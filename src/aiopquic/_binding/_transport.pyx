@@ -48,6 +48,7 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_WT_STOP_SENDING,
     SPSC_EVT_TX_OPEN_FLOW_CONTROL,
     SPSC_EVT_TX_SET_APP_FLOW_CONTROL,
+    SPSC_EVT_TX_WT_SESSION_CLEANUP,
 )
 
 # Socket address helpers (needed by picoquic declarations)
@@ -293,6 +294,9 @@ cdef extern from "c/callback.h":
                             void* callback_ctx, void* stream_ctx)
     int aiopquic_loop_cb(picoquic_quic_t* quic, int cb_mode,
                           void* callback_ctx, void* callback_argv)
+
+    # picoquic-side audit loaders (defined in third_party/picoquic/
+    # picoquic/frames.c). Forward-declared in callback.h above.
 
 
 # Per-stream byte ring (PULL-model send path). Allocated by Python,
@@ -1052,7 +1056,7 @@ cdef class TransportContext:
         # Each row: stream_id, drain arms/fires/dropped, current
         # sc->tx bytes pending, pending flag, and a "STUCK" warning
         # when the most-recent arm has no matching fire.
-        if stream_ctxs:
+        if stream_ctxs and self._quic is not NULL:
             stuck = []
             print(f"  --- per-stream ({len(stream_ctxs)} streams) ---",
                   file=file, flush=True)
@@ -1091,7 +1095,7 @@ cdef class TransportContext:
         # and received. Flag suspect freeze when cwin is small AND
         # bytes_in_transit pegs at cwin — the BBR-cwnd-lock signature
         # of picoquic upstream issue #2118 on low-RTT loopback.
-        if cnx_ptrs:
+        if cnx_ptrs and self._quic is not NULL:
             cnx_list = [p for p in cnx_ptrs if p]
             if cnx_list:
                 print(f"  --- per-cnx path_quality "
@@ -1112,15 +1116,20 @@ cdef class TransportContext:
                     recv = q['bytes_received']
                     suspect = ""
                     # Heuristic: cwin under 10 typical MSS (14 KB) AND
-                    # bif/cwin > 0.9 → BBR is cwnd-pinned. The freeze
-                    # signature observed in picoquic #2118.
+                    # bif/cwin > 0.9. Possible causes (not exclusive):
+                    # peer gone post-disconnect (no acks → cwin can't
+                    # grow), picoquic #2118 BBR loopback freeze on
+                    # sub-128µs RTT, fast-retransmit pinning, or other
+                    # stalled-cnx condition. The bif/cwin ratio
+                    # distinguishes "tight at cwin" (~1.0) from "stuck
+                    # with backlog" (>>1.0).
                     if (cwin > 0 and cwin < 14400
                             and bif / cwin > 0.9):
                         suspect = (
-                            f"  ** SUSPECT BBR FREEZE: "
+                            f"  ** SUSPECT CWIN PINNED: "
                             f"cwin={cwin} bif={bif} "
                             f"bif/cwin={bif/cwin:.2f} "
-                            f"(picoquic #2118) **")
+                            f"(stalled cnx) **")
                     print(f"  cnx=0x{ptr:x} cwin={cwin} bif={bif} "
                           f"sRTT={rtt_us}us "
                           f"pacing={pacing_mbps:.1f}Mbps "
@@ -1982,7 +1991,10 @@ cdef class TransportContext:
               uint32_t max_datagram_frame_size=0,
               wt_path=None, debug_log=None, keylog_filename=None,
               uint32_t rx_ring_cap=0, congestion_control_algorithm=None,
-              uint64_t initial_max_data=0, qlog_dir=None):
+              uint64_t initial_max_data=0,
+              uint64_t initial_max_streams_uni=0,
+              uint64_t initial_max_streams_bidi=0,
+              qlog_dir=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -2155,7 +2167,9 @@ cdef class TransportContext:
         cdef picoquic_tp_t tp
         cdef const picoquic_tp_t* cur_tp
         if (max_datagram_frame_size > 0 or rx_ring_cap > 0
-                or initial_max_data > 0):
+                or initial_max_data > 0
+                or initial_max_streams_uni > 0
+                or initial_max_streams_bidi > 0):
             cur_tp = picoquic_get_default_tp(self._quic)
             if cur_tp != NULL:
                 tp = cur_tp[0]
@@ -2173,6 +2187,18 @@ cdef class TransportContext:
                     # at ~1 MiB / RTT. Pass cfg.max_data here to size
                     # the connection window for sustained workloads.
                     tp.initial_max_data = initial_max_data
+                if initial_max_streams_uni > 0:
+                    # Per RFC 9000 §4.6 / §18.2: initial_max_streams_uni
+                    # advertised to peer. Picoquic's struct uses
+                    # initial_max_stream_id_unidir which is the
+                    # equivalent field (max concurrent uni streams the
+                    # peer may open against us). Picoquic enforces our
+                    # outbound stream count against the peer's
+                    # reciprocal advertisement, so this also indirectly
+                    # bounds our open_uni_stream success rate.
+                    tp.initial_max_stream_id_unidir = initial_max_streams_uni
+                if initial_max_streams_bidi > 0:
+                    tp.initial_max_stream_id_bidir = initial_max_streams_bidi
                 picoquic_set_default_tp(self._quic, &tp)
 
         # Configure packet loop parameters (must persist — picoquic stores a pointer)
@@ -2661,6 +2687,28 @@ cdef class WebTransportSessionState:
             self._transport._ctx.tx_event_ring, &entry, NULL, 0)
         if ret != 0:
             raise BufferError("TX ring full (WT_RESET_STREAM)")
+        self._transport.wake_up()
+
+    def push_session_cleanup(self):
+        """Bulk-free this session's per-stream wt_link sc's via the
+        worker-thread splay-tree walk. Single SPSC slot vs N RESETs;
+        bypasses the wire path so it works under cwin-pinned / stalled
+        cnx conditions where per-sid RESETs can't be transmitted.
+
+        Idempotent: subsequent calls find empty splay tree, no-op.
+        Does NOT tear down the session itself — __dealloc__ still
+        pushes TX_WT_DEREGISTER for the full close + free."""
+        cdef spsc_entry_t entry
+        if self._wt is NULL:
+            return
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_WT_SESSION_CLEANUP
+        entry.cnx = <void*>self._wt
+        entry.stream_ctx = <void*>self._wt
+        cdef int ret = spsc_ring_push(
+            self._transport._ctx.tx_event_ring, &entry, NULL, 0)
+        if ret != 0:
+            raise BufferError("TX ring full (WT_SESSION_CLEANUP)")
         self._transport.wake_up()
 
     def push_stop_sending(self, uint64_t stream_id, uint64_t error_code):

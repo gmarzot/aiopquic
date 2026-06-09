@@ -32,6 +32,12 @@ from aiopquic._binding._transport import (
 # Per-stream send-ring capacity for the PULL-model send path.
 # 1 MiB gives ~5-10ms of in-flight data at 1-2 Gbps which is enough
 # pipelining headroom without unbounded queueing. Power of two required.
+# Per-stream sc->tx data-ring capacity (bytes). Fallback default when
+# the QuicConnection's configuration does not override via
+# QuicConfiguration.stream_ring_cap. Hard cap on bytes Python may push
+# to a single stream's send queue before send_stream_data raises
+# BufferError. Preserves QUIC per-stream independence (HOLB-free
+# backpressure): a slow stream parks ITS producer only, not others.
 _STREAM_RING_CAP = 1 << 20
 
 # SPSC event type constants (must match spsc_ring.h)
@@ -177,6 +183,8 @@ class QuicConnection:
             rx_ring_cap=cfg.max_stream_data,
             congestion_control_algorithm=cfg.congestion_control_algorithm,
             initial_max_data=cfg.max_data,
+            initial_max_streams_uni=getattr(cfg, 'max_streams_uni', 0) or 0,
+            initial_max_streams_bidi=getattr(cfg, 'max_streams_bidi', 0) or 0,
         )
 
     def connect(self, addr: tuple[str, int], now: float = 0.0) -> None:
@@ -276,6 +284,12 @@ class QuicConnection:
             # free per-stream wrappers; without this they'd leak until
             # process exit.
             self._destroy_stream_ctxs()
+            # Zero the cached cnx ptr; picoquic frees the cnx_t shortly
+            # after this callback. cnx_data_sent / cnx_data_received /
+            # path_quality already short-circuit on cnx_ptr == 0, so
+            # any subsequent observer call returns cleanly rather than
+            # dereferencing a freed pointer.
+            self._cnx_ptr = 0
         elif evt_type == _EVT_READY:
             if cnx_ptr != 0:
                 self._cnx_ptr = cnx_ptr
@@ -478,6 +492,9 @@ class QuicConnection:
             if ring_ev is not None:
                 ring_ev.set()
             self._destroy_stream_ctxs()
+            # See companion block: zero cnx ptr so observer accessors
+            # short-circuit cleanly rather than UAF on the freed cnx.
+            self._cnx_ptr = 0
         elif evt_type == _EVT_READY:
             alpn = (self._configuration.alpn_protocols[0]
                     if self._configuration.alpn_protocols else None)
@@ -506,6 +523,12 @@ class QuicConnection:
     def _get_or_create_stream_ctx(self, stream_id: int) -> int:
         """Lazy-allocate the per-stream wrapper. Both TX and RX paths
         funnel through here so a single wrapper covers bidi streams."""
+        # Post-close: do not lazy-allocate. _destroy_stream_ctxs ran in
+        # the close handler and any fresh sc inserted here has no
+        # cleanup path (the close handler won't fire again). Returning
+        # 0 signals the caller to short-circuit cleanly.
+        if self._closed:
+            return 0
         sc = self._stream_ctxs.get(stream_id)
         if sc is None:
             sc = stream_ctx_create()
@@ -539,15 +562,24 @@ class QuicConnection:
         Raises BufferError on any retryable backpressure (TX event ring
         full or per-stream send ring full); raises MemoryError on
         allocation failure.
+
+        Post-close: returns cleanly without committing or raising.
+        Mirrors the WT-side self-protective gate so producers racing
+        teardown do not orphan a fresh sc per call.
         """
+        if self._closed:
+            return
         sc = self._get_or_create_stream_ctx(stream_id)
+        if sc == 0:
+            return
         rc = self._transport.tx_send_atomic(
             stream_id,
             data if data is not None else b"",
             end_stream,
             self._cnx_ptr,
             sc,
-            _STREAM_RING_CAP,
+            getattr(self._configuration, 'stream_ring_cap',
+                    _STREAM_RING_CAP),
         )
         if rc == 1:
             raise BufferError(
@@ -787,6 +819,8 @@ class QuicEngine:
             rx_ring_cap=cfg.max_stream_data,
             congestion_control_algorithm=cfg.congestion_control_algorithm,
             initial_max_data=cfg.max_data,
+            initial_max_streams_uni=getattr(cfg, 'max_streams_uni', 0) or 0,
+            initial_max_streams_bidi=getattr(cfg, 'max_streams_bidi', 0) or 0,
         )
 
     @property

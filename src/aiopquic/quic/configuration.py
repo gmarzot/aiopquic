@@ -11,6 +11,12 @@ class QuicConfiguration:
     individual fields where a different policy is needed.
     """
     alpn_protocols: list[str] | None = None
+    # QUIC idle timeout (seconds). 60s is the historic working default
+    # that doesn't fire spuriously under loop-starved setup paths
+    # (e.g. -r 0 max-rate producer hogging asyncio during MoQT
+    # SUBSCRIBE / SubscribeOk handshake). Override downward if rapid
+    # peer-dead detection is needed; only safe when the application
+    # cannot starve setup-phase scheduling.
     idle_timeout: float = 60.0
     is_client: bool = True
     # Initial flow-control windows advertised to the peer at handshake.
@@ -60,6 +66,30 @@ class QuicConfiguration:
     # is never notified about them, so short streams whose only
     # notifications fall in the overflow window are silently lost.
     event_ring_capacity: int | None = None
+    # Per-stream sc->tx data-ring capacity (bytes). Hard cap on bytes
+    # Python may push to a single stream's send queue before
+    # send_stream_data raises BufferError. Preserves QUIC stream
+    # independence (HOLB-free backpressure). Default 16 MiB sized to
+    # accommodate per-stream BDP on Internet-grade paths: 500 Mbps
+    # per-stream × 200 ms RTT = 12.5 MB BDP, plus jitter headroom.
+    # Constraint: must be >= max object size on this connection.
+    # App-layer soft caps (aiomoqt tx_max_inflight_bytes) MUST be
+    # below this to engage; matching ring_cap = max_stream_data
+    # keeps the Python queue and picoquic per-stream FC ceiling
+    # symmetric.
+    stream_ring_cap: int = 4 * 1024 * 1024
+    # Initial MAX_STREAMS advertised to peer at handshake — RFC 9000
+    # §4.6 / §19.11: cumulative cap on highest stream ID the peer may
+    # open (the peer extends with new MAX_STREAMS frames as streams
+    # complete on its side). So 256 is INITIAL credit; healthy
+    # operation flows freely as the peer extends. The cap only bites
+    # when the peer stops extending (blackhole disconnect): then
+    # picoquic rejects further opens after 256 unique IDs are used,
+    # bounding stream-count growth during the idle_timeout window.
+    # Lower for memory-constrained multi-tenant servers; raise for
+    # workloads with very high stream-churn rates.
+    max_streams_uni: int = 512
+    max_streams_bidi: int = 512
 
     def load_cert_chain(self, certfile: str, keyfile: str | None = None,
                         password: str | None = None) -> None:
