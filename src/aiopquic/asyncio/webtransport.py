@@ -194,7 +194,12 @@ class WebTransportSession:
     # Class default matches the configuration default; instance attr
     # set by connect_webtransport / serve_webtransport when a
     # configuration is supplied. None/0 disables the gate.
-    tx_max_queued_bytes: int | None = 8 * 1024 * 1024
+    tx_max_queued_bytes: int | None = 4 * 1024 * 1024
+    # Per-stream sc->tx ring cap forwarded to push_stream_data
+    # (QuicConfiguration.stream_ring_cap). Class default matches the
+    # C compile-time default; instance attr set by the entry points
+    # when a configuration is supplied.
+    stream_ring_cap: int = 4 * 1024 * 1024
 
     async def _await_tx_queued_capacity(self) -> None:
         """Park while aggregate TX-queued bytes exceed the budget.
@@ -265,7 +270,8 @@ class WebTransportSession:
             raise WebTransportError(
                 f"WT stream {stream_id} not available "
                 "(never opened, closed, or reset)")
-        self._state.push_stream_data(stream_id, sc_ptr, data, end_stream)
+        self._state.push_stream_data(stream_id, sc_ptr, data, end_stream,
+                                     stream_ring_cap=self.stream_ring_cap)
 
     def get_tx_drain_event(self, stream_id: int) -> asyncio.Event:
         """asyncio.Event signalled when the picoquic worker drains
@@ -941,20 +947,27 @@ async def connect_webtransport(
         path = "/"
     own_transport = transport is None
     if own_transport:
-        transport = TransportContext()
+        if (configuration is not None
+                and configuration.event_ring_capacity is not None):
+            transport = TransportContext(
+                ring_capacity=configuration.event_ring_capacity)
+        else:
+            transport = TransportContext()
         start_kwargs = dict(is_client=True, alpn="h3",
                             max_datagram_frame_size=64 * 1024)
         if configuration is not None:
-            # Thread FC sizing + stream caps through to picoquic
-            # transport params. Without this, peer advertises picoquic
-            # defaults (1 MiB MAX_DATA, default MAX_STREAM_DATA) which
-            # caps sustained loopback throughput and distorts FC-driven
-            # backpressure measurements.
+            # Thread FC sizing, stream caps, idle timeout, and the CC
+            # algorithm through to picoquic. Without this the peer
+            # advertises picoquic defaults and the connection runs the
+            # compile-time CC regardless of configuration.
             start_kwargs.update(
                 rx_ring_cap=configuration.max_stream_data,
                 initial_max_data=configuration.max_data,
                 initial_max_streams_uni=configuration.max_streams_uni,
                 initial_max_streams_bidi=configuration.max_streams_bidi,
+                idle_timeout_ms=int(configuration.idle_timeout * 1000),
+                congestion_control_algorithm=(
+                    configuration.congestion_control_algorithm),
             )
         transport.start(**start_kwargs)
 
@@ -962,6 +975,7 @@ async def connect_webtransport(
                                   wt_available_protocols=wt_available_protocols)
     if configuration is not None:
         client.tx_max_queued_bytes = configuration.tx_max_queued_bytes
+        client.stream_ring_cap = configuration.stream_ring_cap
     try:
         await client.open(timeout=timeout)
         yield client
@@ -1031,7 +1045,12 @@ async def serve_webtransport(
         path = "/"
     own_transport = transport is None
     if own_transport:
-        transport = TransportContext()
+        if (configuration is not None
+                and configuration.event_ring_capacity is not None):
+            transport = TransportContext(
+                ring_capacity=configuration.event_ring_capacity)
+        else:
+            transport = TransportContext()
         start_kwargs = dict(
             port=port,
             cert_file=cert_file, key_file=key_file,
@@ -1041,17 +1060,18 @@ async def serve_webtransport(
             wt_path=path,
         )
         if configuration is not None:
-            # Thread FC sizing + stream caps through to picoquic
-            # transport params. Without this, server advertises
-            # picoquic defaults (1 MiB MAX_DATA, default
-            # MAX_STREAM_DATA) which caps sustained loopback
-            # throughput and distorts FC-driven backpressure
-            # measurements.
+            # Thread FC sizing, stream caps, idle timeout, and the CC
+            # algorithm through to picoquic. Without this the server
+            # advertises picoquic defaults and the connection runs the
+            # compile-time CC regardless of configuration.
             start_kwargs.update(
                 rx_ring_cap=configuration.max_stream_data,
                 initial_max_data=configuration.max_data,
                 initial_max_streams_uni=configuration.max_streams_uni,
                 initial_max_streams_bidi=configuration.max_streams_bidi,
+                idle_timeout_ms=int(configuration.idle_timeout * 1000),
+                congestion_control_algorithm=(
+                    configuration.congestion_control_algorithm),
             )
         transport.start(**start_kwargs)
 
@@ -1065,12 +1085,15 @@ async def serve_webtransport(
         cap = configuration.tx_max_queued_bytes
         inner_factory = session_factory
 
+        ring_cap = configuration.stream_ring_cap
+
         def _budget_factory(transport_, state):
             if inner_factory is not None:
                 session = inner_factory(transport_, state)
             else:
                 session = WebTransportServerSession(transport_, state)
             session.tx_max_queued_bytes = cap
+            session.stream_ring_cap = ring_cap
             return session
 
         dispatcher.set_session_factory(_budget_factory)

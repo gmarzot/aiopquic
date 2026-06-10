@@ -663,7 +663,7 @@ class QuicConnection:
         # miss under short-stream churn (fresh stream = fresh budget).
         if stream_id not in self._stream_ctxs:
             cap = getattr(self._configuration, 'tx_max_queued_bytes',
-                          16 * 1024 * 1024)
+                          4 * 1024 * 1024)
             if cap and tx_data_bytes_queued() > cap:
                 low = cap // 2
                 while not self._closed and tx_data_bytes_queued() > low:
