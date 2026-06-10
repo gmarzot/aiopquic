@@ -7,6 +7,7 @@ events into QuicEvent objects that match qh3's event interface.
 import asyncio
 import contextlib
 import os
+from collections import deque
 from enum import IntEnum
 
 from .configuration import QuicConfiguration
@@ -122,7 +123,12 @@ class QuicConnection:
             self._cnx_ptr = 0
             self._connected = False
             self._closed = False
-        self._events: list[QuicEvent] = []
+        # deque, not list: next_event() pops from the head per event
+        # while the consumer parses — list.pop(0) is O(n) memmove,
+        # which under a receive backlog turns consumption quadratic
+        # (434K-entry list measured 15s+ delivery latency and a
+        # GC/memmove death spiral on the 2-process subscriber).
+        self._events: deque[QuicEvent] = deque()
         self._next_bidi_id: int = 0 if configuration.is_client else 1
         self._next_uni_id: int = 2 if configuration.is_client else 3
         # H3Connection compatibility
@@ -443,11 +449,24 @@ class QuicConnection:
         return self._transport.tx_count / cap
 
     def next_event(self) -> QuicEvent | None:
-        """Dequeue next event from the connection."""
-        if self._engine is None:
+        """Dequeue next event from the connection.
+
+        Drains the SPSC ring only when the local queue is EMPTY —
+        consume-to-empty before re-ingesting. Draining on every call
+        let the worker refill _events faster than the consumer parsed
+        whenever wire-rate exceeded parse-rate, growing the queue
+        without bound (each StreamDataReceived pins its chunk: ~4 GB
+        measured on a 2-process subscriber). Bounding ingest to one
+        drain batch per empty also lets the dormant FC chain engage:
+        un-popped bytes stay in sc->rx, rx_consumed stalls, the worker
+        stops extending MAX_STREAM_DATA, and the peer slows to the
+        consumer's actual parse rate. No lost wakeups: the worker
+        notifies the eventfd per push and clear_rx re-arms when
+        entries remain after a drain."""
+        if self._engine is None and not self._events:
             self._drain_and_convert()
         if self._events:
-            return self._events.pop(0)
+            return self._events.popleft()
         return None
 
     def _enqueue_raw(self, evt_type: int, stream_id: int, data,
