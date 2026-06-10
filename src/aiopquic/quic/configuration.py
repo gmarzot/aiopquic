@@ -102,9 +102,12 @@ class QuicConfiguration:
     # Enforced at stream-creation boundaries (WT create_stream, raw
     # QUIC first write to a new stream) with park/resume hysteresis
     # (park above cap, resume below cap/2). Steady-state added
-    # latency ≈ cap / drain rate (16 MiB ≈ 55 ms at 2.4 Gbps); size
-    # ≥ path BDP to avoid starving the wire. None or 0 disables.
-    tx_max_queued_bytes: int | None = 16 * 1024 * 1024
+    # latency ≈ cap / drain rate: 8 MiB ≈ 11-22 ms at ~3 Gbps
+    # (measured p50 35 ms at 16 MiB on the 2-process churn bench).
+    # Size ≥ path BDP to avoid starving the wire; raise for
+    # high-BDP WAN paths, lower for tighter latency budgets.
+    # None or 0 disables.
+    tx_max_queued_bytes: int | None = 8 * 1024 * 1024
 
     def load_cert_chain(self, certfile: str, keyfile: str | None = None,
                         password: str | None = None) -> None:

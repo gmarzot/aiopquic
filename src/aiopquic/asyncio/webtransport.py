@@ -194,7 +194,7 @@ class WebTransportSession:
     # Class default matches the configuration default; instance attr
     # set by connect_webtransport / serve_webtransport when a
     # configuration is supplied. None/0 disables the gate.
-    tx_max_queued_bytes: int | None = 16 * 1024 * 1024
+    tx_max_queued_bytes: int | None = 8 * 1024 * 1024
 
     async def _await_tx_queued_capacity(self) -> None:
         """Park while aggregate TX-queued bytes exceed the budget.
