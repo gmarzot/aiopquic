@@ -26,8 +26,10 @@ from collections import deque
 from contextlib import asynccontextmanager, suppress
 from typing import AsyncGenerator
 
+from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic._binding._transport import (
     TransportContext, WebTransportSessionState,
+    tx_data_bytes_queued,
 )
 from aiopquic.quic.events import (
     WebTransportSessionRefused,
@@ -188,6 +190,31 @@ class WebTransportSession:
 
     # --- stream management --------------------------------------------
 
+    # Aggregate TX gate budget (QuicConfiguration.tx_max_queued_bytes).
+    # Class default matches the configuration default; instance attr
+    # set by connect_webtransport / serve_webtransport when a
+    # configuration is supplied. None/0 disables the gate.
+    tx_max_queued_bytes: int | None = 16 * 1024 * 1024
+
+    async def _await_tx_queued_capacity(self) -> None:
+        """Park while aggregate TX-queued bytes exceed the budget.
+
+        The green-light is connection-drain capacity (any stream's
+        drain frees budget), not any single stream's state — one
+        wedged stream costs at most its own queued bytes against the
+        budget and can never stall the gate by itself. Hysteresis:
+        park above cap, resume below cap/2. 2 ms poll on three
+        relaxed atomic loads; the producer is far ahead of the wire
+        whenever this engages, so poll granularity is immaterial.
+        Session close exits the park (queued also drains to the
+        discarded sink as streams tear down)."""
+        cap = self.tx_max_queued_bytes
+        if not cap or tx_data_bytes_queued() <= cap:
+            return
+        low = cap // 2
+        while not self.session_closed and tx_data_bytes_queued() > low:
+            await asyncio.sleep(0.002)
+
     async def create_stream(self, bidir: bool = True,
                               timeout: float = 5.0) -> int:
         """Open a new WT stream. Returns the assigned stream_id.
@@ -195,11 +222,18 @@ class WebTransportSession:
         Round-trips to the picoquic thread because picowt allocates
         the id internally. Multiple concurrent callers are safe:
         each appends a future to a FIFO and picoquic responds in
-        the same order TX events were pushed."""
+        the same order TX events were pushed.
+
+        Parks first while the aggregate TX-queued budget is exceeded
+        (_await_tx_queued_capacity) — the stream-creation boundary is
+        the one point short-stream churn cannot bypass."""
         if self.session_closed:
             raise WebTransportError("WT session closed")
         if not self.session_ready:
             raise WebTransportError("session not ready")
+        await self._await_tx_queued_capacity()
+        if self.session_closed:
+            raise WebTransportError("WT session closed")
         fut = self._loop.create_future()
         self._pending_creates.append(fut)
         self._state.push_create_stream(bidir)
@@ -883,6 +917,7 @@ async def connect_webtransport(
         wt_available_protocols: list[str] | None = None,
         transport: TransportContext | None = None,
         timeout: float = 10.0,
+        configuration: QuicConfiguration | None = None,
 ) -> AsyncGenerator[WebTransportClient, None]:
     """Open a WebTransport session.
 
@@ -907,11 +942,26 @@ async def connect_webtransport(
     own_transport = transport is None
     if own_transport:
         transport = TransportContext()
-        transport.start(is_client=True, alpn="h3",
-                          max_datagram_frame_size=64 * 1024)
+        start_kwargs = dict(is_client=True, alpn="h3",
+                            max_datagram_frame_size=64 * 1024)
+        if configuration is not None:
+            # Thread FC sizing + stream caps through to picoquic
+            # transport params. Without this, peer advertises picoquic
+            # defaults (1 MiB MAX_DATA, default MAX_STREAM_DATA) which
+            # caps sustained loopback throughput and distorts FC-driven
+            # backpressure measurements.
+            start_kwargs.update(
+                rx_ring_cap=configuration.max_stream_data,
+                initial_max_data=configuration.max_data,
+                initial_max_streams_uni=configuration.max_streams_uni,
+                initial_max_streams_bidi=configuration.max_streams_bidi,
+            )
+        transport.start(**start_kwargs)
 
     client = WebTransportClient(transport, host, port, path, sni=sni,
                                   wt_available_protocols=wt_available_protocols)
+    if configuration is not None:
+        client.tx_max_queued_bytes = configuration.tx_max_queued_bytes
     try:
         await client.open(timeout=timeout)
         yield client
@@ -964,6 +1014,7 @@ async def serve_webtransport(
         cert_file: str, key_file: str,
         transport: TransportContext | None = None,
         session_factory=None,
+        configuration: QuicConfiguration | None = None,
 ) -> WebTransportServer:
     """Start a WebTransport server listening on (host, port) at path.
 
@@ -981,7 +1032,7 @@ async def serve_webtransport(
     own_transport = transport is None
     if own_transport:
         transport = TransportContext()
-        transport.start(
+        start_kwargs = dict(
             port=port,
             cert_file=cert_file, key_file=key_file,
             alpn="h3",
@@ -989,10 +1040,40 @@ async def serve_webtransport(
             max_datagram_frame_size=64 * 1024,
             wt_path=path,
         )
+        if configuration is not None:
+            # Thread FC sizing + stream caps through to picoquic
+            # transport params. Without this, server advertises
+            # picoquic defaults (1 MiB MAX_DATA, default
+            # MAX_STREAM_DATA) which caps sustained loopback
+            # throughput and distorts FC-driven backpressure
+            # measurements.
+            start_kwargs.update(
+                rx_ring_cap=configuration.max_stream_data,
+                initial_max_data=configuration.max_data,
+                initial_max_streams_uni=configuration.max_streams_uni,
+                initial_max_streams_bidi=configuration.max_streams_bidi,
+            )
+        transport.start(**start_kwargs)
 
     loop = asyncio.get_event_loop()
     dispatcher = _get_dispatcher_registry().attach_acceptor(
         loop, transport, handler)
-    if session_factory is not None:
+    if configuration is not None:
+        # Stamp the aggregate TX budget on every accepted session —
+        # the dispatcher's factory is the only per-session hook on
+        # the server side.
+        cap = configuration.tx_max_queued_bytes
+        inner_factory = session_factory
+
+        def _budget_factory(transport_, state):
+            if inner_factory is not None:
+                session = inner_factory(transport_, state)
+            else:
+                session = WebTransportServerSession(transport_, state)
+            session.tx_max_queued_bytes = cap
+            return session
+
+        dispatcher.set_session_factory(_budget_factory)
+    elif session_factory is not None:
         dispatcher.set_session_factory(session_factory)
     return WebTransportServer(transport, dispatcher, own_transport)

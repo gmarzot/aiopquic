@@ -247,6 +247,7 @@ cdef extern from "c/callback.h":
         uint64_t worker_prepare_to_send_pulled_bytes
         uint64_t worker_rx_event_drops
         uint64_t worker_rx_event_drops_stream_data
+        uint64_t cnt_rx_data_event_coalesced
         uint64_t worker_rx_byte_ring_overflow
         uint32_t rx_notify_pending
         uint32_t tx_wake_pending
@@ -371,6 +372,13 @@ cdef extern from "c/stream_ctx.h":
         aiopquic_stream_ctx_t* sc)
     void aiopquic_stream_ctx_last_fc_push_consumed_store(
         aiopquic_stream_ctx_t* sc, uint64_t v)
+    int aiopquic_stream_ctx_rx_event_pending_arm(aiopquic_stream_ctx_t* sc)
+    void aiopquic_stream_ctx_rx_event_pending_clear(aiopquic_stream_ctx_t* sc)
+    void aiopquic_tx_data_bytes_pushed_add(uint64_t n)
+    uint64_t aiopquic_tx_data_bytes_pushed_load()
+    uint64_t aiopquic_tx_data_bytes_pulled_load()
+    uint64_t aiopquic_tx_data_bytes_discarded_load()
+    uint64_t aiopquic_tx_data_bytes_queued()
     int aiopquic_stream_ctx_send_data(
         aiopquic_stream_ctx_t* sc,
         const uint8_t* data, uint32_t length,
@@ -506,6 +514,16 @@ cdef extern from "c/h3wt_callback.h":
 
 # Default ring sizing
 DEF DEFAULT_RING_CAPACITY = 262144
+
+
+def tx_data_bytes_queued():
+    """Process-wide bytes committed to per-stream sc->tx data rings
+    and not yet pulled by a picoquic worker (nor discarded at stream
+    teardown): pushed - pulled - discarded, three relaxed atomic
+    loads. The O(1) primitive behind the aggregate TX gate — bounds
+    producer run-ahead that per-stream caps can't see because
+    short-stream churn resets the per-stream budget every rollover."""
+    return aiopquic_tx_data_bytes_queued()
 
 
 cdef class StreamChunk:
@@ -953,6 +971,7 @@ cdef class TransportContext:
             'mark_active_processed': self._ctx.worker_mark_active_processed,
             'rx_event_drops': self._ctx.worker_rx_event_drops,
             'rx_event_drops_stream_data': self._ctx.worker_rx_event_drops_stream_data,
+            'rx_data_event_coalesced': self._ctx.cnt_rx_data_event_coalesced,
             'rx_byte_ring_overflow': self._ctx.worker_rx_byte_ring_overflow,
             'last_tx_event_ring_arm_ns': self._ctx.last_tx_event_ring_arm_ns,
             'last_tx_event_ring_fire_ns': self._ctx.last_tx_event_ring_fire_ns,
@@ -994,6 +1013,15 @@ cdef class TransportContext:
             'sc_rx_bytes_in_flight': (
                 aiopquic_cnt_sc_rx_bytes_pushed_load()
                 - aiopquic_cnt_sc_rx_bytes_popped_load()),
+            # Aggregate TX data-ring flow (process-wide). queued =
+            # pushed - pulled - discarded; the gate primitive.
+            'tx_data_bytes_pushed_total':
+                aiopquic_tx_data_bytes_pushed_load(),
+            'tx_data_bytes_pulled_total':
+                aiopquic_tx_data_bytes_pulled_load(),
+            'tx_data_bytes_discarded_total':
+                aiopquic_tx_data_bytes_discarded_load(),
+            'tx_data_bytes_queued': aiopquic_tx_data_bytes_queued(),
         }
 
 
@@ -1430,6 +1458,10 @@ cdef class TransportContext:
                 # releases. Per-stream backpressure: peer's effective
                 # window = sc->rx_buf_free - sc->bytes_pending_release.
                 sc = <aiopquic_stream_ctx_t*>entry.stream_ctx
+                # RX data-event coalescing: clear BEFORE popping so a
+                # worker arrival racing the pop re-arms a fresh
+                # notification (worst case one harmless empty event).
+                aiopquic_stream_ctx_rx_event_pending_clear(sc)
                 rx_sb = sc.rx
                 if rx_sb is not NULL:
                     avail = aiopquic_stream_buf_used(rx_sb)
@@ -1457,6 +1489,10 @@ cdef class TransportContext:
                 sc_ptr = <uintptr_t>sc
                 if (entry.event_type == SPSC_EVT_WT_STREAM_DATA or
                         entry.event_type == SPSC_EVT_WT_STREAM_FIN):
+                    # RX data-event coalescing: clear BEFORE popping so a
+                    # worker arrival racing the pop re-arms a fresh
+                    # notification.
+                    aiopquic_stream_ctx_rx_event_pending_clear(sc)
                     rx_sb = sc.rx
                     if rx_sb is not NULL:
                         avail = aiopquic_stream_buf_used(rx_sb)
@@ -1661,6 +1697,9 @@ cdef class TransportContext:
                   entry.event_type == SPSC_EVT_STREAM_FIN) and \
                   entry.stream_ctx is not NULL:
                 sc = <aiopquic_stream_ctx_t*>entry.stream_ctx
+                # RX data-event coalescing: clear BEFORE popping (see
+                # drain_rx twin).
+                aiopquic_stream_ctx_rx_event_pending_clear(sc)
                 rx_sb = sc.rx
                 if rx_sb is not NULL:
                     avail = aiopquic_stream_buf_used(rx_sb)
@@ -1683,6 +1722,10 @@ cdef class TransportContext:
                 sc_ptr = <uintptr_t>sc
                 if (entry.event_type == SPSC_EVT_WT_STREAM_DATA or
                         entry.event_type == SPSC_EVT_WT_STREAM_FIN):
+                    # RX data-event coalescing: clear BEFORE popping so a
+                    # worker arrival racing the pop re-arms a fresh
+                    # notification.
+                    aiopquic_stream_ctx_rx_event_pending_clear(sc)
                     rx_sb = sc.rx
                     if rx_sb is not NULL:
                         avail = aiopquic_stream_buf_used(rx_sb)
@@ -1828,6 +1871,8 @@ cdef class TransportContext:
         if rc < 0:
             self._send_alloc_fail += 1
             return -1
+        if data_len > 0:
+            aiopquic_tx_data_bytes_pushed_add(<uint64_t>data_len)
 
         # Push MARK_ACTIVE event. Pre-check above guarantees room
         # under the single-producer asyncio invariant. The post-check
@@ -2647,6 +2692,8 @@ cdef class WebTransportSessionState:
             raise MemoryError(
                 f"WT sc->tx alloc failed (stream={stream_id})"
             )
+        if data_len > 0:
+            aiopquic_tx_data_bytes_pushed_add(<uint64_t>data_len)
 
         # MARK_ACTIVE: stream_ctx=NULL preserves h3zero's lookup-by-
         # sid behavior. h3zero handles NULL app_stream_ctx safely on

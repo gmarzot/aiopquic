@@ -218,6 +218,7 @@ typedef struct {
      * are silently lost. THIS WAS THE STREAM-LOSS BUG ROOT CAUSE. */
     uint64_t        worker_rx_event_drops;
     uint64_t        worker_rx_event_drops_stream_data;
+    uint64_t        cnt_rx_data_event_coalesced;     /* data events skipped: notification already in flight */
     /* Notify-coalescing state. eventfd is level-triggered; multiple
      * write()s coalesce to one wake-up at the consumer, but each
      * write is still a syscall. At 250K events/sec on a stream-churn
@@ -667,6 +668,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             if (buf && to_send > 0) {
                 aiopquic_stream_buf_pop(sb, buf, to_send);
                 ctx->worker_prepare_to_send_pulled_bytes += to_send;
+                aiopquic_tx_data_bytes_pulled_add(to_send);
             } else {
                 /* prepare_to_send invoked with no bytes to pull —
                  * either sc->tx empty (worker faster than producer)
@@ -794,6 +796,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                        fin_or_event == picoquic_callback_stream_fin)
                       && bytes != NULL && length > 0;
     int ret;
+    aiopquic_stream_ctx_t* coalesce_sc = NULL;
     if (has_payload) {
         /* Physical RX ring sized at exactly the advertised window
          * (1x). picoquic's auto-FC extension is gated by
@@ -875,6 +878,22 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             aiopquic_stream_ctx_rx_credit_store(sc, advertise_cap);
         }
         (void)fc_threshold;
+        /* RX data-event coalescing: at most ONE outstanding STREAM_DATA
+         * notification per stream. The event carries no payload —
+         * drain pops ALL available sc->rx bytes per notification — so
+         * extra notifications are pure ring traffic that, under flood,
+         * overflow the ring and get DROPPED, stranding bytes already
+         * sitting in sc->rx. Only the CAS winner pushes; losers
+         * return knowing the in-flight notification's drain picks up
+         * their bytes. FIN always pushes — end-of-stream is a
+         * distinct signal the drain must see. */
+        if (entry.event_type == SPSC_EVT_STREAM_DATA) {
+            if (!aiopquic_stream_ctx_rx_event_pending_arm(sc)) {
+                ctx->cnt_rx_data_event_coalesced++;
+                return 0;
+            }
+            coalesce_sc = sc;
+        }
         ret = spsc_ring_push(ctx->rx_event_ring, &entry, NULL, 0);
     } else {
         ret = spsc_ring_push(ctx->rx_event_ring, &entry, bytes, (uint32_t)length);
@@ -899,6 +918,14 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         ctx->worker_rx_event_drops++;
         if (has_payload) {
             ctx->worker_rx_event_drops_stream_data++;
+        }
+        if (coalesce_sc != NULL) {
+            /* Notification push failed after arming: clear so the next
+             * arrival re-arms and retries; bytes wait in sc->rx
+             * meanwhile (same exposure as the pre-coalescing drop
+             * path, now vastly rarer since data events can no
+             * longer flood the ring). */
+            aiopquic_stream_ctx_rx_event_pending_clear(coalesce_sc);
         }
         if (aiopquic_rx_log_enabled()
                 && ctx->worker_rx_event_drops <= 100) {

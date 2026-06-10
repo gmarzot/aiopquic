@@ -90,6 +90,21 @@ class QuicConfiguration:
     # workloads with very high stream-churn rates.
     max_streams_uni: int = 512
     max_streams_bidi: int = 512
+    # Aggregate cap on bytes committed to per-stream TX data rings but
+    # not yet pulled by the picoquic worker (process-wide; see
+    # aiopquic._binding._transport.tx_data_bytes_queued). Bounds
+    # producer run-ahead that per-stream caps structurally miss:
+    # short-stream churn resets the per-stream budget every rollover,
+    # so an unpaced producer can spread unbounded backlog across
+    # thousands of fresh streams while QUIC's own throttles (CC, FC,
+    # MAX_STREAMS) all read green — CC paces the wire, not the app;
+    # peer FC credits track delivery, which keeps up with the wire.
+    # Enforced at stream-creation boundaries (WT create_stream, raw
+    # QUIC first write to a new stream) with park/resume hysteresis
+    # (park above cap, resume below cap/2). Steady-state added
+    # latency ≈ cap / drain rate (16 MiB ≈ 55 ms at 2.4 Gbps); size
+    # ≥ path BDP to avoid starving the wire. None or 0 disables.
+    tx_max_queued_bytes: int | None = 16 * 1024 * 1024
 
     def load_cert_chain(self, certfile: str, keyfile: str | None = None,
                         password: str | None = None) -> None:

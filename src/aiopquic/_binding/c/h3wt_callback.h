@@ -265,6 +265,16 @@ static inline void aiopquic_wt_push_event_with_sc(
         uint64_t stream_id,
         aiopquic_stream_ctx_t* sc,
         uint8_t is_fin) {
+    /* RX data-event coalescing — see the raw-QUIC twin in callback.h.
+     * At most one outstanding WT_STREAM_DATA notification per
+     * stream; losers skip (the in-flight notification's drain pops all
+     * available sc->rx bytes). FIN always pushes. */
+    if (event_type == SPSC_EVT_WT_STREAM_DATA) {
+        if (!aiopquic_stream_ctx_rx_event_pending_arm(sc)) {
+            s->bridge->cnt_rx_data_event_coalesced++;
+            return;
+        }
+    }
     spsc_entry_t entry = {0};
     entry.event_type = event_type;
     entry.stream_id = stream_id;
@@ -280,6 +290,8 @@ static inline void aiopquic_wt_push_event_with_sc(
         s->bridge->worker_rx_event_drops++;
         if (event_type == SPSC_EVT_WT_STREAM_DATA) {
             s->bridge->worker_rx_event_drops_stream_data++;
+            /* Clear rx_event_pending so the next arrival retries. */
+            aiopquic_stream_ctx_rx_event_pending_clear(sc);
         }
         if (aiopquic_rx_log_enabled()
                 && s->bridge->worker_rx_event_drops <= 100) {
@@ -667,6 +679,7 @@ static int aiopquic_wt_path_callback(
             bytes, to_send, is_fin, still_active);
         if (buf && to_send > 0) {
             aiopquic_stream_buf_pop(sb, buf, to_send);
+            aiopquic_tx_data_bytes_pulled_add(to_send);
             if (getenv("AIOPQUIC_WT_DEBUG") != NULL) {
                 fprintf(stderr, "[wt-debug] provide sid=%llu len=%u "
                         "is_fin=%d still_active=%d hex=",

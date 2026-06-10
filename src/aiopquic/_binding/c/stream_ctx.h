@@ -96,6 +96,17 @@ typedef struct {
      * blocked Python writer wakes and retries. Only one event fires
      * per fill->drain cycle. */
     _Atomic(uint32_t) tx_drain_pending;
+    /* RX data-event coalescing: 1 while a STREAM_DATA notification for
+     * this stream is outstanding on the rx_event_ring. The worker
+     * CAS-arms 0->1 before pushing; losers skip the push (the
+     * in-flight notification's drain pops ALL available sc->rx bytes,
+     * including theirs). drain_rx clears BEFORE popping so an
+     * arrival racing the pop re-arms a fresh notification. Bounds
+     * data-event ring occupancy at one per live stream — ring
+     * overflow (which silently DROPS notifications and strands bytes
+     * in sc->rx) becomes structurally impossible for the dominant
+     * event type. FIN/RESET events are never coalesced. */
+    _Atomic(uint32_t) rx_event_pending;
     /* fin/reset arrived; free wrapper after final drain. */
     uint8_t  pending_destroy;
     /* Observability counters (single-writer; relaxed semantics).
@@ -136,6 +147,50 @@ static inline void aiopquic_chunks_alive_inc(void) {
     atomic_fetch_add_explicit(&aiopquic_cnt_chunks_alive, 1,
                                memory_order_relaxed);
 }
+/* Aggregate TX data-ring byte flow (process-wide). pushed is
+ * incremented by the Cython push sites (asyncio thread) on every
+ * successful sc->tx commit; pulled by the worker prepare/provide
+ * drain paths (single writer per transport worker thread);
+ * discarded by stream_ctx final-free when an sc->tx ring still
+ * holds bytes (reset/abandon — those bytes will never be pulled).
+ * Live queued bytes across all streams and transports:
+ *   queued = pushed - pulled - discarded
+ * This is the O(1) primitive behind the aiopquic aggregate TX gate
+ * (QuicConfiguration.tx_max_queued_bytes). Per-stream caps are
+ * structurally bypassed by short-stream churn — each fresh stream
+ * resets the per-stream budget — so saturation hardening needs an
+ * aggregate measure that survives stream rollover. */
+static _Atomic(uint64_t) aiopquic_cnt_tx_data_bytes_pushed = 0;
+static _Atomic(uint64_t) aiopquic_cnt_tx_data_bytes_pulled = 0;
+static _Atomic(uint64_t) aiopquic_cnt_tx_data_bytes_discarded = 0;
+
+static inline void aiopquic_tx_data_bytes_pushed_add(uint64_t n) {
+    atomic_fetch_add_explicit(&aiopquic_cnt_tx_data_bytes_pushed, n,
+                               memory_order_relaxed);
+}
+static inline void aiopquic_tx_data_bytes_pulled_add(uint64_t n) {
+    atomic_fetch_add_explicit(&aiopquic_cnt_tx_data_bytes_pulled, n,
+                               memory_order_relaxed);
+}
+static inline uint64_t aiopquic_tx_data_bytes_pushed_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_tx_data_bytes_pushed,
+                                 memory_order_relaxed);
+}
+static inline uint64_t aiopquic_tx_data_bytes_pulled_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_tx_data_bytes_pulled,
+                                 memory_order_relaxed);
+}
+static inline uint64_t aiopquic_tx_data_bytes_discarded_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_tx_data_bytes_discarded,
+                                 memory_order_relaxed);
+}
+static inline uint64_t aiopquic_tx_data_bytes_queued(void) {
+    uint64_t consumed = aiopquic_tx_data_bytes_pulled_load()
+                      + aiopquic_tx_data_bytes_discarded_load();
+    uint64_t pushed = aiopquic_tx_data_bytes_pushed_load();
+    return (pushed > consumed) ? (pushed - consumed) : 0;
+}
+
 static inline void aiopquic_chunks_alive_dec(void) {
     atomic_fetch_sub_explicit(&aiopquic_cnt_chunks_alive, 1,
                                memory_order_relaxed);
@@ -316,7 +371,19 @@ static inline void aiopquic_stream_ctx_destroy(aiopquic_stream_ctx_t* sc) {
          * each drop in turn. */
         return;
     }
-    if (sc->tx) aiopquic_stream_buf_destroy(sc->tx);
+    if (sc->tx) {
+        /* Bytes still queued at final free will never be pulled by
+         * the worker (reset/abandon/close). Credit them to the
+         * discarded sink so aggregate queued accounting can't drift
+         * upward across stream teardown. */
+        uint32_t remaining = aiopquic_stream_buf_used(sc->tx);
+        if (remaining > 0) {
+            atomic_fetch_add_explicit(
+                &aiopquic_cnt_tx_data_bytes_discarded,
+                (uint64_t)remaining, memory_order_relaxed);
+        }
+        aiopquic_stream_buf_destroy(sc->tx);
+    }
     if (sc->rx) aiopquic_stream_buf_destroy(sc->rx);
     free(sc);
     atomic_fetch_add_explicit(&aiopquic_cnt_sc_destroyed, 1,
@@ -384,6 +451,25 @@ static inline void aiopquic_stream_ctx_last_fc_push_consumed_store(
     if (!sc) return;
     atomic_store_explicit(&sc->last_fc_push_consumed, v,
                           memory_order_relaxed);
+}
+
+/* rx_event_pending arm/clear. Arm is CAS 0->1: returns 1 iff THIS caller
+ * won and must push the notification event; 0 means one is already in
+ * flight. Clear is a plain release store, done by the drain side
+ * BEFORE it pops sc->rx (so a concurrent post-clear arrival re-arms;
+ * worst case one harmless empty notification). */
+static inline int aiopquic_stream_ctx_rx_event_pending_arm(
+        aiopquic_stream_ctx_t* sc) {
+    uint32_t expected = 0;
+    return atomic_compare_exchange_strong_explicit(
+        &sc->rx_event_pending, &expected, 1,
+        memory_order_acq_rel, memory_order_relaxed) ? 1 : 0;
+}
+
+static inline void aiopquic_stream_ctx_rx_event_pending_clear(
+        aiopquic_stream_ctx_t* sc) {
+    atomic_store_explicit(&sc->rx_event_pending, 0,
+                          memory_order_release);
 }
 
 /* Combined send-data fast path. Atomic from Python's perspective:

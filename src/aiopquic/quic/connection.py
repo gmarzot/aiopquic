@@ -17,6 +17,7 @@ from .events import (
 )
 from aiopquic._binding._transport import (
     TransportContext,
+    tx_data_bytes_queued,
     stream_buf_create, stream_buf_destroy,
     stream_buf_push, stream_buf_used, stream_buf_free, stream_buf_set_fin,
     stream_buf_stats,
@@ -632,6 +633,24 @@ class QuicConnection:
         Pair these in a clear-arm-recheck-wait loop above the call
         to this helper.
         """
+        # Aggregate TX gate at the stream-creation boundary: raw QUIC
+        # creates the per-stream sc lazily on first write, so "sid not
+        # yet in _stream_ctxs" IS stream creation. Park while the
+        # process-wide queued-TX budget (QuicConfiguration.
+        # tx_max_queued_bytes) is exceeded; resume below cap/2. The
+        # green-light is connection drain capacity — any stream's
+        # drain frees budget — so one wedged stream can never stall
+        # the gate. Bounds producer run-ahead that per-stream caps
+        # miss under short-stream churn (fresh stream = fresh budget).
+        if stream_id not in self._stream_ctxs:
+            cap = getattr(self._configuration, 'tx_max_queued_bytes',
+                          16 * 1024 * 1024)
+            if cap and tx_data_bytes_queued() > cap:
+                low = cap // 2
+                while not self._closed and tx_data_bytes_queued() > low:
+                    await asyncio.sleep(0.002)
+            if self._closed:
+                return
         sc_event = self.get_tx_drain_event(stream_id)
         ring_event = self._transport.tx_event_ring_drain_event
         while True:
