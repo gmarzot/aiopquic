@@ -113,8 +113,8 @@ Latency contributed by a queue = its depth ÷ drain rate.
 
 | # | Layer | Trigger | Park / resume | Scope |
 |---|---|---|---|---|
-| 1 | `tx_max_queued_bytes` (8 MiB, `QuicConfiguration`) | aggregate `pushed − pulled − discarded` over cap | park at stream creation; resume < cap/2; 2 ms poll | all streams — the only bound short-stream churn cannot bypass |
-| 2 | `tx_max_inflight_bytes` (2 MiB, aiomoqt `MOQTPeer`) | one stream's `sc->tx` used over cap | park mid-stream on drain event; resume < cap/2 | per stream — fairness + binds on long-lived streams |
+| 1 | `tx_max_queued_bytes` (4 MiB, `QuicConfiguration`) | aggregate `pushed − pulled − discarded` over cap | park at stream creation; resume < cap/2; 2 ms poll | all streams — the only bound short-stream churn cannot bypass |
+| 2 | `tx_max_inflight_bytes` (1 MiB, aiomoqt `MOQTPeer`) | one stream's `sc->tx` used over cap | park mid-stream on drain event; resume < cap/2 | per stream — fairness + binds on long-lived streams |
 | 3 | `sc->tx` ring full (4 MiB) | commit doesn't fit | `BufferError` → dual-event wait → retry | per stream, hard |
 | 4 | `tx_event_ring` pressure | > 90% → hard wait; > 50% → post-send `sleep(0)` | ring-drained event at ≤ 50% low-water | connection, command channel |
 
@@ -217,8 +217,8 @@ Counter signature: `*_arms = 0`, `rx_event_drops = 0`,
 
 - **TX, unpaced producer**: ladder #1 parks producers at stream
   rollover; standing queue oscillates in the [cap/2, cap] band, so
-  steady-state e2e latency ≈ `cap ÷ drain rate` (8 MiB ≈ 11–22 ms at
-  ~3 Gbps). The floor below the aggregate knob is the rollover
+  steady-state e2e latency ≈ `0.75 × cap ÷ drain rate` (4 MiB ≈ 8 ms
+  at ~3 Gbps). The floor below the aggregate knob is the rollover
   overshoot `P × min(per-stream cap, bytes-per-stream)`; the
   per-stream knob (#2) governs below that floor.
 - **RX, slow consumer**: per-stream FC stalls the peer at the
@@ -238,18 +238,16 @@ Counter signature: `*_arms = 0`, `rx_event_drops = 0`,
 |---|---|---|---|
 | `QuicConfiguration.max_data` | 16 MiB | cnx-level inbound FC (initial; picoquic auto-extends) | both transports |
 | `QuicConfiguration.max_stream_data` | 16 MiB | per-stream inbound window AND `sc->rx` size | both |
-| `QuicConfiguration.stream_ring_cap` | 4 MiB | per-stream `sc->tx` hard cap | **raw QUIC only** (WT uses the 4 MiB compile default) |
-| `QuicConfiguration.tx_max_queued_bytes` | 8 MiB (0/None off) | aggregate outbound queue (ladder #1) | both |
+| `QuicConfiguration.stream_ring_cap` | 4 MiB | per-stream `sc->tx` hard cap | both |
+| `QuicConfiguration.tx_max_queued_bytes` | 4 MiB (0/None off) | aggregate outbound queue (ladder #1) | both |
 | `QuicConfiguration.max_streams_uni/bidi` | 512 | initial MAX_STREAMS credit | both |
-| `QuicConfiguration.event_ring_capacity` | None → 2048/16384 | both event rings | **raw QUIC only** |
-| `QuicConfiguration.idle_timeout` | 60 s | QUIC idle timeout | **raw QUIC only** (WT fixed at 30 s today) |
-| `QuicConfiguration.congestion_control_algorithm` | None → newreno | CC algorithm | **raw QUIC only** (WT entry points do not forward it — WT runs newreno today) |
-| aiomoqt `tx_max_inflight_bytes` | 2 MiB (None off) | one stream's outbound queue (ladder #2) | both, via `stream_write_drain` |
+| `QuicConfiguration.event_ring_capacity` | None → 2048/16384 | both event rings | both |
+| `QuicConfiguration.idle_timeout` | 10 s | QUIC idle timeout | both |
+| `QuicConfiguration.congestion_control_algorithm` | "bbr1" | CC algorithm | both |
+| aiomoqt `tx_max_inflight_bytes` | 1 MiB (None off) | one stream's outbound queue (ladder #2) | both, via `stream_write_drain` |
 | CLI `--max-queued-bytes` | (cfg default) | ladder #1 | pub_server, pub_bench, loopback_bench |
 | CLI `--max-inflight-bytes` | (aiomoqt default) | ladder #2 | pub_server, loopback_bench |
 
-The four "raw QUIC only" gaps on the WT path are known plumbing debt,
-not design intent.
 
 ---
 
