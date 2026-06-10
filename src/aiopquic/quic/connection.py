@@ -651,6 +651,17 @@ class QuicConnection:
                     await asyncio.sleep(0.002)
             if self._closed:
                 return
+            # Cooperative yield at the stream-creation boundary — the
+            # raw-QUIC mirror of WT create_stream's worker round-trip
+            # suspension. The raw send path otherwise never truly
+            # suspends under an unpaced producer, so this process's
+            # OWN eventfd drain starves: housekeeping events
+            # (STREAM_DESTROY/released) drop off the full ring and
+            # scs leak — measured 110K alive / 94K dropped destroy
+            # events on a 2-process publisher. One loop turn per
+            # stream (~600/s at full churn) services the drain and
+            # any co-located consumer.
+            await asyncio.sleep(0)
         sc_event = self.get_tx_drain_event(stream_id)
         ring_event = self._transport.tx_event_ring_drain_event
         while True:
