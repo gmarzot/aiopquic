@@ -72,12 +72,6 @@
  * Power of two. */
 #define AIOPQUIC_RX_RING_CAP_DEFAULT 16384
 
-/* MAX_STREAM_DATA hysteresis: advance peer credit when ≥ 1/4 of
- * the ring has been drained since the last update. Matches
- * picoquic's own receive_window_threshold cadence and bounds the
- * rate of MAX_STREAM_DATA frames under sustained drain. */
-#define AIOPQUIC_RX_FC_THRESHOLD_DIV 4
-
 /* TX SPSC ring drain-wake low-water mark, as percent of ring
  * capacity. Worker fires SPSC_EVT_TX_EVENT_RING_DRAINED when count
  * drops to/below this fraction while a Python writer has armed
@@ -815,7 +809,6 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             ? ctx->rx_ring_cap
             : AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT;
         uint32_t physical_cap = advertise_cap;
-        uint32_t fc_threshold = advertise_cap / AIOPQUIC_RX_FC_THRESHOLD_DIV;
         aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)stream_ctx;
         int rx_first_touch = 0;
         if (!sc) {
@@ -877,7 +870,6 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             (void)picoquic_open_flow_control(cnx, stream_id, buf_free);
             aiopquic_stream_ctx_rx_credit_store(sc, advertise_cap);
         }
-        (void)fc_threshold;
         /* RX data-event coalescing: at most ONE outstanding STREAM_DATA
          * notification per stream. The event carries no payload —
          * drain pops ALL available sc->rx bytes per notification — so

@@ -83,11 +83,11 @@ typedef struct {
     /* Hysteresis gate for asyncio-side fc_credit push: peer's
      * consumed_offset (sc->rx_consumed) the last time we actually
      * pushed an SPSC_EVT_TX_OPEN_FLOW_CONTROL. Skip subsequent
-     * pushes until consumed advances by at least
-     * AIOPQUIC_RX_FC_HYSTERESIS_BYTES (default = ring_cap / 4).
-     * Asyncio thread reads + writes; relaxed semantics OK because
-     * a missed push just defers credit by one event — the next
-     * event will catch up. */
+     * pushes until consumed advances by at least ring_cap >> 4
+     * (see _push_fc_credit in _transport.pyx). Asyncio thread
+     * reads + writes; relaxed semantics OK because a missed push
+     * just defers credit by one event — the next event will
+     * catch up. */
     _Atomic(uint64_t) last_fc_push_consumed;
     /* Edge-triggered TX backpressure signal. Python sets this to 1
      * when a send_data attempt returns 0 (sc->tx full). The picoquic

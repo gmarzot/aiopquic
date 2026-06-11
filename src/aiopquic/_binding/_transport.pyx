@@ -540,21 +540,23 @@ cdef class StreamChunk:
       - On _wrap, chunk length is added to sc->bytes_pending_release
         AND a ref is taken on sc (so sc outlives the stream FIN if
         chunks are still alive in the consumer's pipeline).
-      - On __dealloc__ (last memoryview ref dropped, chunk truly done),
-        length is subtracted, SPSC_EVT_TX_OPEN_FLOW_CONTROL is pushed
-        so the worker re-evaluates the effective grant, and the sc
-        ref is released. The worker's effective MAX_STREAM_DATA grant
-        is buf_free - bytes_pending_release, so chunks alive in the
-        pipeline (or held by an app archiving the memoryview) reduce
-        peer's window — that IS the backpressure mechanism.
-      - __getbuffer__ intentionally does NOT release FC: memoryview
-        construction fires __getbuffer__ immediately, which would
-        decrement before the consumer has actually finished, defeating
-        the backpressure entirely (peer floods, chunks accumulate,
-        original bloat returns).
-      - Apps that want to archive memoryviews without slowing peer
-        should COPY (bytes(memoryview)) to release the chunk
-        immediately and decouple their archive from FC.
+      - pending_release is subtracted at the consumer's FIRST buffer
+        access (__getbuffer__ → _release_fc): once a memoryview
+        exists the bytes are committed to the consumer's pipeline,
+        and bounding memory beyond that point is the application's
+        job (parser commit cadence, app-level caps), not QUIC FC.
+        Releasing at first access avoids the parser-hoarding
+        deadlock a release-at-dealloc design suffers (parser holds
+        chunks waiting for an object boundary, pending pins the
+        grant at zero, the completing chunk can never arrive).
+      - __dealloc__ (last memoryview ref dropped) is the fallback
+        release for chunks that were never accessed; it frees the
+        buffer and drops the chunk's sc ref.
+      - Neither path pushes an FC event (per-chunk pushes were an
+        event storm at high rate). Credit pushes happen in drain_rx
+        with per-cycle dedupe + hysteresis; the worker's grant
+        (buf_free - bytes_pending_release) reads pending at handle
+        time, so releases land in the next push's grant.
 
     Back-pointers (_sc, _cnx, _stream_id, _ctx) are required for the
     release-side accounting. They are BORROWED pointers; the chunk

@@ -383,7 +383,7 @@ static inline void aiopquic_wt_push_new_stream(
  * (and its sc) are still alive. drain_rx surfaces this and does NOT
  * call any destroy — LINK_RELEASE owns the sc ref drop.
  */
-static inline void aiopquic_wt_push_stream_destroy(
+static inline int aiopquic_wt_push_stream_destroy(
         aiopquic_wt_session_t* s,
         uint64_t stream_id) {
     spsc_entry_t entry = {0};
@@ -395,12 +395,16 @@ static inline void aiopquic_wt_push_stream_destroy(
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
     } else {
-        /* RX ring full. The Python dict will retain a stale entry
-         * for this stream until session close clears it. Bounded
-         * by per-cnx stream count; surface via the existing drop
+        /* RX ring full. The Python dict retains a stale entry for
+         * this stream until session close clears it. The CALLER
+         * must skip the paired link_release when this fails —
+         * freeing the sc while Python's dict still maps the sid
+         * would leave a dangling pointer for any sid-keyed access.
+         * Bounded by per-cnx stream count; surfaced via the drop
          * counter so sustained drops are visible. */
         s->bridge->worker_rx_event_drops++;
     }
+    return ret;
 }
 
 static inline void aiopquic_wt_push_link_release(
@@ -543,7 +547,6 @@ static int aiopquic_wt_path_callback(
                 s->bridge->rx_ring_cap > 0
                     ? s->bridge->rx_ring_cap
                     : AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT;
-            uint32_t fc_threshold = advertise_cap / AIOPQUIC_RX_FC_THRESHOLD_DIV;
             int rx_first = (sc->rx == NULL);
             if (rx_first) {
                 /* Switch picoquic to app-controlled FC on this stream.
@@ -587,7 +590,6 @@ static int aiopquic_wt_path_callback(
                 (void)picoquic_open_flow_control(cnx, sid, buf_free);
                 aiopquic_stream_ctx_rx_credit_store(sc, advertise_cap);
             }
-            (void)fc_threshold;  /* still computed for future hysteresis */
             if (first_touch) {
                 aiopquic_wt_push_new_stream(s, sid, sc);
             }
@@ -822,9 +824,17 @@ static int aiopquic_wt_path_callback(
             stream_ctx->path_callback_ctx = NULL;
             /* Order: STREAM_DESTROY first (Python dict cleanup),
              * then LINK_RELEASE (link + sc ref drop). FIFO on the
-             * SPSC ring preserves this ordering at the consumer. */
-            aiopquic_wt_push_stream_destroy(s, sid);
-            aiopquic_wt_push_link_release(s, sid, link);
+             * SPSC ring preserves this ordering at the consumer.
+             * PAIRED: if the destroy push fails (ring full), skip
+             * the release too — otherwise drain_rx frees the sc
+             * while Python's dict still maps the sid, leaving a
+             * dangling pointer for any sid-keyed access. Leaking
+             * the link+sc instead preserves "present in dict ⇒ sc
+             * alive"; bounded by per-cnx stream count and swept at
+             * session close. */
+            if (aiopquic_wt_push_stream_destroy(s, sid) == 0) {
+                aiopquic_wt_push_link_release(s, sid, link);
+            }
         } else if (link) {
             /* Diagnostic: cleanup skipped despite a link being
              * provided via path_app_ctx. Tracks the leak signature
