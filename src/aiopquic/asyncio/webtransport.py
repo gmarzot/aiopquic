@@ -538,7 +538,36 @@ class WebTransportSession:
                     cnx_ptr, stream_ctx_ptr, sc_ptr)."""
         evt_type, sid, data, _is_fin, error_code, _cnx_ptr, _, sc_ptr = (
             ev_tuple)
-        if evt_type == _EVT_WT_SESSION_READY:
+        # Hot branches first: data, FIN, and TX-drain wakes dominate
+        # the event stream; session-lifecycle events are rare.
+        if evt_type == _EVT_WT_STREAM_DATA:
+            payload = data if data is not None else memoryview(b"")
+            ev = WebTransportStreamDataReceived(
+                stream_id=sid, data=payload, end_stream=False)
+            q = self._stream_inbox.get(sid)
+            if q is None:
+                self._stream_inbox[sid] = q = asyncio.Queue()
+            q.put_nowait(ev)
+        elif evt_type == _EVT_WT_STREAM_FIN:
+            payload = data if data is not None else memoryview(b"")
+            ev = WebTransportStreamDataReceived(
+                stream_id=sid, data=payload, end_stream=True)
+            q = self._stream_inbox.get(sid)
+            if q is None:
+                self._stream_inbox[sid] = q = asyncio.Queue()
+            q.put_nowait(ev)
+            # Peer FINed the stream — no further reads, but we may
+            # still be writing on a bidi until our own FIN goes out.
+            # Don't drop tx_ctx here; that's owned by the writer side.
+        elif evt_type == _EVT_STREAM_TX_DRAINED:
+            # Picoquic worker drained bytes from this stream's sc->tx
+            # and the edge-trigger CAS won. Wake any blocked writer.
+            event = self._stream_tx_drain_events.get(sid)
+            if event is None:
+                event = asyncio.Event()
+                self._stream_tx_drain_events[sid] = event
+            event.set()
+        elif evt_type == _EVT_WT_SESSION_READY:
             if self._session_ready and not self._session_ready.done():
                 self._session_ready.set_result(None)
         elif evt_type == _EVT_WT_SESSION_REFUSED:
@@ -630,25 +659,6 @@ class WebTransportSession:
                 if not fut.done():
                     fut.set_result(0 if error_code != 0 else sid)
                     break
-        elif evt_type == _EVT_WT_STREAM_DATA:
-            payload = data if data is not None else memoryview(b"")
-            ev = WebTransportStreamDataReceived(
-                stream_id=sid, data=payload, end_stream=False)
-            q = self._stream_inbox.get(sid)
-            if q is None:
-                self._stream_inbox[sid] = q = asyncio.Queue()
-            q.put_nowait(ev)
-        elif evt_type == _EVT_WT_STREAM_FIN:
-            payload = data if data is not None else memoryview(b"")
-            ev = WebTransportStreamDataReceived(
-                stream_id=sid, data=payload, end_stream=True)
-            q = self._stream_inbox.get(sid)
-            if q is None:
-                self._stream_inbox[sid] = q = asyncio.Queue()
-            q.put_nowait(ev)
-            # Peer FINed the stream — no further reads, but we may
-            # still be writing on a bidi until our own FIN goes out.
-            # Don't drop tx_ctx here; that's owned by the writer side.
         elif evt_type == _EVT_WT_STREAM_RESET:
             ev = WebTransportStreamReset(stream_id=sid,
                                             error_code=error_code)
@@ -687,14 +697,6 @@ class WebTransportSession:
                 self._stream_tx_ctxs[sid] = sc_ptr
             self._event_queue.put_nowait(
                 WebTransportNewStream(stream_id=sid))
-        elif evt_type == _EVT_STREAM_TX_DRAINED:
-            # Picoquic worker drained bytes from this stream's sc->tx
-            # and the edge-trigger CAS won. Wake any blocked writer.
-            event = self._stream_tx_drain_events.get(sid)
-            if event is None:
-                event = asyncio.Event()
-                self._stream_tx_drain_events[sid] = event
-            event.set()
         elif evt_type == _EVT_STREAM_DESTROY:
             # Universal raw-QUIC STREAM_DESTROY — fired for raw-QUIC
             # streams that share this transport. WT data streams use
