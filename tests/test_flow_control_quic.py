@@ -5,7 +5,7 @@ producer:
 
   - send_stream_data raises BufferError when the stream can't accept
     more bytes right now (per-stream backpressure surfaces).
-  - get_tx_drain_event(stream_id) returns an asyncio.Event that fires
+  - get_tx_data_drain_event(stream_id) returns an asyncio.Event that fires
     when the writer can retry.
   - send_stream_data_drained() composes the two so the caller never
     sees a BufferError and never strands bytes — push rate naturally
@@ -101,7 +101,7 @@ async def test_buffer_error_under_sustained_push():
             configuration=_client_cfg(),
         ) as client:
             stream_id = client._quic.get_next_available_stream_id()
-            event = client._quic.get_tx_drain_event(stream_id)
+            event = client._quic.get_tx_data_drain_event(stream_id)
 
             push_ok = 0
             push_err = 0

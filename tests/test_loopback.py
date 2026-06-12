@@ -370,7 +370,7 @@ class TestLoopback:
             client, cnx_ptr = connect_client(port)
             try:
                 # Client closes with error code 0 (clean close)
-                client.push_tx(
+                client.push_tx_event(
                     SPSC_EVT_TX_CLOSE, 0,
                     error_code=0, cnx_ptr=cnx_ptr,
                 )
@@ -492,7 +492,7 @@ class TestLoopback:
 
                 # Client sends datagram
                 payload = b"hello datagram"
-                client.push_tx(
+                client.push_tx_event(
                     SPSC_EVT_TX_DATAGRAM, 0,
                     data=payload, cnx_ptr=cnx_ptr,
                 )
@@ -516,7 +516,7 @@ class TestLoopback:
 
                 # Server sends datagram back
                 reply = b"datagram reply"
-                server.push_tx(
+                server.push_tx_event(
                     SPSC_EVT_TX_DATAGRAM, 0,
                     data=reply, cnx_ptr=srv_cnx,
                 )
@@ -558,7 +558,7 @@ class TestLoopback:
                 time.sleep(0.1)
 
                 # Reset with error code 42
-                client.push_tx(
+                client.push_tx_event(
                     SPSC_EVT_TX_STREAM_RESET, stream_id,
                     error_code=42, cnx_ptr=cnx_ptr,
                 )
@@ -676,7 +676,7 @@ class TestLoopback:
                 _, srv_cnx = wait_for_server_cnx(server)
                 assert srv_cnx != 0
 
-                client.push_tx(
+                client.push_tx_event(
                     SPSC_EVT_TX_CLOSE, 0,
                     error_code=0xCAFE, cnx_ptr=cnx_ptr,
                 )
@@ -731,7 +731,7 @@ class TestLoopback:
                         break
                 assert srv_cnx != 0, "No server cnx"
 
-                server.push_tx(
+                server.push_tx_event(
                     SPSC_EVT_TX_STOP_SENDING, 0,
                     error_code=99, cnx_ptr=srv_cnx,
                 )

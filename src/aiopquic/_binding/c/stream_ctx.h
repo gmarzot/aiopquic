@@ -321,7 +321,7 @@ static inline void aiopquic_stream_ctx_ref(aiopquic_stream_ctx_t* sc) {
  * to drain at a soft threshold (e.g. a byte-budget cap below the
  * hard sc->tx ring capacity) rather than waiting for the natural
  * BufferError at full capacity. */
-static inline void aiopquic_arm_stream_tx_drain_pending(
+static inline void aiopquic_set_tx_data_drain_pending(
         aiopquic_stream_ctx_t* sc) {
     if (!sc) return;
     sc->cnt_drain_arms++;
@@ -330,7 +330,7 @@ static inline void aiopquic_arm_stream_tx_drain_pending(
                           memory_order_release);
 }
 
-static inline void aiopquic_clear_stream_tx_drain_pending(
+static inline void aiopquic_clear_tx_data_drain_pending(
         aiopquic_stream_ctx_t* sc) {
     if (!sc) return;
     atomic_store_explicit(&sc->tx_drain_pending, 0,

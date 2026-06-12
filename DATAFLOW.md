@@ -52,7 +52,7 @@ sequenceDiagram
 
     Note over App,API: NEW STREAM only — gates before creation
     alt aggregate queued exceeds tx_max_queued_bytes (8 MiB)
-        API->>API: park, 2 ms poll, resume below cap/2<br/>raw: send_stream_data_drained new-stream branch<br/>WT: create_stream calls _await_tx_queued_capacity
+        API->>API: park, 2 ms poll, resume below cap/2<br/>raw: send_stream_data_drained new-stream branch<br/>WT: create_stream calls _await_tx_data_capacity
     end
     opt raw QUIC, every new stream
         API->>API: await sleep(0) — cooperative yield<br/>(mirror of WT create_stream suspension)

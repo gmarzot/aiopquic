@@ -68,7 +68,7 @@ def test_bench_small_object_rate(big_ring_pair, obj_size, duration_s, capsys):
     stream_ctx_ensure_tx(sc, RING_CAPACITY)
     sb = stream_ctx_get_tx(sc)
     try:
-        client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+        client.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, sid,
                        cnx_ptr=client_cnx, stream_ctx=sc)
         client.wake_up()
 
@@ -126,7 +126,7 @@ def test_bench_small_object_rate(big_ring_pair, obj_size, duration_s, capsys):
                 # pushes, deactivating the stream; without unconditional
                 # MARK_ACTIVE we never re-arm). picoquic_mark_active_stream
                 # is idempotent so the cost is one SPSC push.
-                client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+                client.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, sid,
                                cnx_ptr=client_cnx, stream_ctx=sc)
                 client.wake_up()
             else:

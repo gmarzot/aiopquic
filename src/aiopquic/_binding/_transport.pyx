@@ -383,9 +383,9 @@ cdef extern from "c/stream_ctx.h":
         aiopquic_stream_ctx_t* sc,
         const uint8_t* data, uint32_t length,
         uint32_t capacity, uint8_t set_fin)
-    void aiopquic_arm_stream_tx_drain_pending(
+    void aiopquic_set_tx_data_drain_pending(
         aiopquic_stream_ctx_t* sc)
-    void aiopquic_clear_stream_tx_drain_pending(
+    void aiopquic_clear_tx_data_drain_pending(
         aiopquic_stream_ctx_t* sc)
     void aiopquic_chunks_alive_inc()
     void aiopquic_chunks_alive_dec()
@@ -929,12 +929,12 @@ cdef class TransportContext:
         return self._ctx.eventfd
 
     @property
-    def rx_count(self):
+    def rx_event_ring_count(self):
         """Number of events pending in the RX ring."""
         return spsc_ring_count(self._ctx.rx_event_ring)
 
     @property
-    def tx_count(self):
+    def tx_event_ring_count(self):
         """Number of events pending in the TX ring."""
         return spsc_ring_count(self._ctx.tx_event_ring)
 
@@ -1186,7 +1186,7 @@ cdef class TransportContext:
         prev = signal.signal(signal.SIGUSR2, _handler)
         return prev
 
-    def stream_tx_buf_used(self, uintptr_t sc_ptr):
+    def tx_data_ring_used(self, uintptr_t sc_ptr):
         """Bytes currently sitting in a given stream's sc->tx data
         ring, not yet consumed by the picoquic worker's
         prepare_to_send.
@@ -1209,7 +1209,7 @@ cdef class TransportContext:
             return 0
         return aiopquic_stream_buf_used(sc.tx)
 
-    def arm_stream_tx_drain_pending(self, uintptr_t sc_ptr):
+    def set_tx_data_drain_pending(self, uintptr_t sc_ptr):
         """Arm the per-stream sc->tx drain signal so the next worker
         drain of sc->tx (in prepare_to_send) fires SPSC_EVT_STREAM_TX_DRAINED
         and wakes the producer waiting on the per-stream asyncio.Event.
@@ -1218,21 +1218,21 @@ cdef class TransportContext:
         event when waiting on a soft byte threshold below sc->tx full —
         e.g. a tx_max_inflight_bytes cap whose wakeup must align with
         sc->tx drain, NOT the connection-global SPSC ring drain. Pairs
-        with `stream_tx_buf_used(sc_ptr)` for the byte measurement.
+        with `tx_data_ring_used(sc_ptr)` for the byte measurement.
         """
         if sc_ptr == 0:
             return
         cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*><void*>sc_ptr
-        aiopquic_arm_stream_tx_drain_pending(sc)
+        aiopquic_set_tx_data_drain_pending(sc)
 
-    def clear_stream_tx_drain_pending(self, uintptr_t sc_ptr):
+    def clear_tx_data_drain_pending(self, uintptr_t sc_ptr):
         """Clear the per-stream sc->tx drain signal. Called by the
         producer when a recheck shows pressure dropped between arm and
         wait, to avoid spurious wakes."""
         if sc_ptr == 0:
             return
         cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*><void*>sc_ptr
-        aiopquic_clear_stream_tx_drain_pending(sc)
+        aiopquic_clear_tx_data_drain_pending(sc)
 
     def path_quality(self, uintptr_t cnx_ptr):
         """Snapshot of picoquic's path-quality metrics for the cnx.
@@ -1275,7 +1275,7 @@ cdef class TransportContext:
         }
 
     @property
-    def tx_capacity(self):
+    def tx_event_ring_capacity(self):
         """TX ring entry capacity (constant; for free-space pre-checks)."""
         return self._ctx.tx_event_ring.capacity
 
@@ -1309,7 +1309,7 @@ cdef class TransportContext:
             event = tx.tx_event_ring_drain_event
             event.clear()
             tx.arm_tx_event_ring_drain_pending()
-            if tx_pressure > wait_threshold:
+            if tx_event_ring_fill > wait_threshold:
                 await event.wait()       # safe: worker will fire
             else:
                 tx.clear_tx_event_ring_drain_pending()  # raced, clear arm
@@ -1776,7 +1776,7 @@ cdef class TransportContext:
         aiopquic_clear_rx(self._ctx)
         return count
 
-    def push_tx(self, uint32_t event_type, uint64_t stream_id,
+    def push_tx_event(self, uint32_t event_type, uint64_t stream_id,
                 bytes data=None, uint64_t error_code=0,
                 uintptr_t cnx_ptr=0, uintptr_t stream_ctx=0,
                 uint8_t is_fin=0):
@@ -2805,13 +2805,13 @@ def cnx_data_received(uintptr_t cnx_ptr):
 #
 # Lifecycle:
 #   sb = stream_buf_create(capacity)         # capacity must be power of 2
-#   transport.push_tx(SPSC_EVT_TX_MARK_ACTIVE,
+#   transport.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE,
 #                     stream_id, cnx_ptr=cnx, stream_ctx=sb)
 #   transport.wake_up()
 #   stream_buf_push(sb, data)                # producer; returns bytes accepted
 #   ...
 #   stream_buf_set_fin(sb)                   # mark FIN follows on drain
-#   transport.push_tx(SPSC_EVT_TX_MARK_ACTIVE,
+#   transport.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE,
 #                     stream_id, cnx_ptr=cnx, stream_ctx=sb)  # ensure active
 #   transport.wake_up()
 #   ... wait for ring to drain ...
@@ -2822,7 +2822,7 @@ def stream_buf_create(uint32_t capacity):
     """Allocate a per-stream send buffer of `capacity` bytes (power of 2).
 
     Returns an integer pointer (uintptr_t) that should be passed as
-    stream_ctx to push_tx(SPSC_EVT_TX_MARK_ACTIVE, ...) and freed via
+    stream_ctx to push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, ...) and freed via
     stream_buf_destroy() when the stream is done.
     """
     cdef aiopquic_stream_buf_t* sb = aiopquic_stream_buf_create(capacity)
@@ -3025,8 +3025,8 @@ def stream_ctx_send_data(uintptr_t sc_ptr, bytes data,
 
 
 # Note: set_max_stream_data and enable_app_flow_control are issued from
-# the connection.py drain path via push_tx(SPSC_EVT_TX_OPEN_FLOW_CONTROL,
-# error_code=new_max) and push_tx(SPSC_EVT_TX_SET_APP_FLOW_CONTROL,
-# is_fin=1). No direct Python wrappers needed — the existing push_tx
+# the connection.py drain path via push_tx_event(SPSC_EVT_TX_OPEN_FLOW_CONTROL,
+# error_code=new_max) and push_tx_event(SPSC_EVT_TX_SET_APP_FLOW_CONTROL,
+# is_fin=1). No direct Python wrappers needed — the existing push_tx_event
 # API already delivers events to the picoquic worker thread.
 

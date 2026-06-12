@@ -64,7 +64,7 @@ def test_bench_pull_sustained(big_ring_pair, duration_s, capsys):
         # Activate the stream with the wrapper pointer as stream_ctx.
         # picoquic stores it as app_stream_ctx; the prepare_to_send
         # callback dereferences ->tx to find this byte ring.
-        client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+        client.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, sid,
                        cnx_ptr=client_cnx, stream_ctx=sc)
         client.wake_up()
 
@@ -84,7 +84,7 @@ def test_bench_pull_sustained(big_ring_pair, duration_s, capsys):
         last_seen_seq = -1
 
         ring_used_samples = []   # (t_rel, used_bytes) — producer-side
-        rx_count_samples = []    # (t_rel, rx_count)   — consumer-side
+        rx_count_samples = []    # (t_rel, rx_event_ring_count)   — consumer-side
 
         def _consume_and_verify(events):
             nonlocal last_seen_seq, out_of_order, duplicates, bad_magic
@@ -132,7 +132,7 @@ def test_bench_pull_sustained(big_ring_pair, duration_s, capsys):
                 # ring is already producing for picoquic, mark_active is
                 # idempotent overhead — skip it.
                 if used_before == 0:
-                    client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+                    client.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, sid,
                                    cnx_ptr=client_cnx, stream_ctx=sc)
                 client.wake_up()
             if accepted == len(pending_chunk):
@@ -152,7 +152,7 @@ def test_bench_pull_sustained(big_ring_pair, duration_s, capsys):
             now = time.monotonic()
             if now - last_sample >= 0.1:
                 ring_used_samples.append((now - t_start, stream_buf_used(sb)))
-                rx_count_samples.append((now - t_start, server.rx_count))
+                rx_count_samples.append((now - t_start, server.rx_event_ring_count))
                 last_sample = now
 
         # Stop producing; drain anything remaining.

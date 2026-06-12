@@ -6,7 +6,7 @@ QuicConnection:
 
   - send_stream_data raises BufferError when the WT stream can't
     accept more bytes right now (per-stream backpressure).
-  - get_tx_drain_event(stream_id) returns an asyncio.Event that
+  - get_tx_data_drain_event(stream_id) returns an asyncio.Event that
     fires when the writer can retry.
   - send_stream_data_drained() composes the two so the caller never
     sees a BufferError and never strands bytes.
@@ -83,7 +83,7 @@ async def test_buffer_error_under_sustained_push():
     try:
         async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
             sid = await wt.create_stream(bidir=False)
-            event = wt.get_tx_drain_event(sid)
+            event = wt.get_tx_data_drain_event(sid)
 
             push_ok = 0
             push_err = 0

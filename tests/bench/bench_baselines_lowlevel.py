@@ -93,7 +93,7 @@ def test_bench_sustained_baseline(big_ring_pair, obj_size, bench_duration):
     stream_ctx_ensure_tx(sc, RING_CAPACITY)
     sb = stream_ctx_get_tx(sc)
     try:
-        client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+        client.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, sid,
                        cnx_ptr=client_cnx, stream_ctx=sc)
         client.wake_up()
 
@@ -160,7 +160,7 @@ def test_bench_sustained_baseline(big_ring_pair, obj_size, bench_duration):
             if accepted == len(pending):
                 pending = None
                 sent_objs += 1
-                client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+                client.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, sid,
                                cnx_ptr=client_cnx, stream_ctx=sc)
                 client.wake_up()
             else:

@@ -97,7 +97,7 @@ def test_bench_single_object_rtt(big_ring_pair, obj_size, n_iter, capsys):
     stream_ctx_ensure_tx(sc, RING_CAPACITY)
     sb = stream_ctx_get_tx(sc)
     try:
-        client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+        client.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, sid,
                        cnx_ptr=client_cnx, stream_ctx=sc)
         client.wake_up()
 
@@ -114,7 +114,7 @@ def test_bench_single_object_rtt(big_ring_pair, obj_size, n_iter, capsys):
                 if stream_buf_push(sb, obj) == len(obj):
                     break
                 time.sleep(0.0)
-            client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+            client.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, sid,
                            cnx_ptr=client_cnx, stream_ctx=sc)
             client.wake_up()
 
@@ -167,7 +167,7 @@ def test_bench_sub_saturation_sustained(big_ring_pair, target_mbps,
     stream_ctx_ensure_tx(sc, RING_CAPACITY)
     sb = stream_ctx_get_tx(sc)
     try:
-        client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+        client.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, sid,
                        cnx_ptr=client_cnx, stream_ctx=sc)
         client.wake_up()
 
@@ -190,7 +190,7 @@ def test_bench_sub_saturation_sustained(big_ring_pair, target_mbps,
                 obj = _build(sent, obj_size)
                 if stream_buf_push(sb, obj) == len(obj):
                     sent += 1
-                    client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+                    client.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, sid,
                                    cnx_ptr=client_cnx, stream_ctx=sc)
                     client.wake_up()
                     next_send_ns += period_ns
@@ -261,7 +261,7 @@ def test_bench_latency_vs_rate(big_ring_pair, capsys):
           f"{'p50':>5}  {'p90':>5}  {'p99':>5}  {'ring_avg':>9}")
 
     try:
-        client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+        client.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, sid,
                        cnx_ptr=client_cnx, stream_ctx=sc)
         client.wake_up()
 
@@ -286,7 +286,7 @@ def test_bench_latency_vs_rate(big_ring_pair, capsys):
                     accepted = stream_buf_push(sb, obj)
                     if accepted == len(obj):
                         sent += 1
-                        client.push_tx(SPSC_EVT_TX_MARK_ACTIVE, sid,
+                        client.push_tx_event(SPSC_EVT_TX_MARK_ACTIVE, sid,
                                        cnx_ptr=client_cnx, stream_ctx=sc)
                         client.wake_up()
                         next_send_ns += period_ns

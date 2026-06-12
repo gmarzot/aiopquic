@@ -21,7 +21,7 @@ def test_bench_datagram_throughput(benchmark, datagram_pair, count):
 
     def fire_and_count():
         for _ in range(count):
-            client.push_tx(SPSC_EVT_TX_DATAGRAM, 0,
+            client.push_tx_event(SPSC_EVT_TX_DATAGRAM, 0,
                            data=payload, cnx_ptr=client_cnx)
         client.wake_up()
         deadline = time.monotonic() + 5.0

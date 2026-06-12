@@ -219,5 +219,5 @@ def test_transport_context_create():
     from aiopquic._binding._transport import TransportContext
     ctx = TransportContext()
     assert ctx.eventfd >= 0  # valid fd on Linux
-    assert ctx.rx_count == 0
+    assert ctx.rx_event_ring_count == 0
     del ctx  # should not crash

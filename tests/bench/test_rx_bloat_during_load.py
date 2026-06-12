@@ -156,7 +156,7 @@ async def _push_quic(srv_quic, sid):
         try:
             srv_quic.send_stream_data(sid, CHUNK, end_stream=False)
         except BufferError:
-            ev = srv_quic.get_tx_drain_event(sid)
+            ev = srv_quic.get_tx_data_drain_event(sid)
             try:
                 await asyncio.wait_for(ev.wait(), 1.0)
                 ev.clear()
@@ -185,7 +185,7 @@ async def test_rx_bloat_during_load_wt():
                     try:
                         session.send_stream_data(sid, CHUNK, end_stream=False)
                     except BufferError:
-                        ev = session.get_tx_drain_event(sid)
+                        ev = session.get_tx_data_drain_event(sid)
                         try:
                             await asyncio.wait_for(ev.wait(), 1.0)
                             ev.clear()
