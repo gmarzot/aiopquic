@@ -4,8 +4,8 @@ How bytes move between the application API and the NIC, in both
 directions, and every mechanism that throttles them. Code references
 name files and functions — line numbers move, names don't.
 Companion: aiomoqt sits above
-the client API shown here; its per-stream policy knob is noted where
-it participates.
+the client API shown here; its per-stream policy parameter is noted
+where it participates.
 
 ---
 
@@ -106,7 +106,7 @@ Key contracts:
 - Close/destroy paths set every parked Event so waiters exit cleanly
   (`_handle_raw_event` close/destroy branches, `connection.py`).
 
-### TX backpressure ladder
+### TX backpressure layers
 
 Layered from coarsest to finest; whichever binds first governs.
 Latency contributed by a queue = its depth ÷ drain rate.
@@ -118,8 +118,9 @@ Latency contributed by a queue = its depth ÷ drain rate.
 | 3 | `sc->tx` ring full (4 MiB) | commit doesn't fit | `BufferError` → dual-event wait → retry | per stream, hard |
 | 4 | `tx_event_ring` pressure | > 90% → hard wait; > 50% → post-send `sleep(0)` | ring-drained event at ≤ 50% low-water | connection, command channel |
 
-Sender-side mirror of QUIC's receive-side model: #2 ↔
-MAX_STREAM_DATA, #1 ↔ MAX_DATA. Aggregate counters:
+Sender-side mirror of QUIC's receive-side model:
+`tx_max_inflight_bytes` ↔ MAX_STREAM_DATA, `tx_max_queued_bytes` ↔
+MAX_DATA. Aggregate counters:
 `tx_data_bytes_pushed/pulled/discarded` (`stream_ctx.h`);
 `discarded` credits bytes abandoned at stream teardown so the gate
 cannot drift.
@@ -215,12 +216,13 @@ Counter signature: `*_arms = 0`, `rx_event_drops = 0`,
 
 **At saturation**, the binding constraint by direction:
 
-- **TX, unpaced producer**: ladder #1 parks producers at stream
-  rollover; standing queue oscillates in the [cap/2, cap] band, so
+- **TX, unpaced producer**: the aggregate gate
+  (`tx_max_queued_bytes`) parks producers at stream rollover;
+  standing queue oscillates in the [cap/2, cap] band, so
   steady-state e2e latency ≈ `0.75 × cap ÷ drain rate` (4 MiB ≈ 8 ms
-  at ~3 Gbps). The floor below the aggregate knob is the rollover
+  at ~3 Gbps). The floor below the aggregate cap is the rollover
   overshoot `P × min(per-stream cap, bytes-per-stream)`; the
-  per-stream knob (#2) governs below that floor.
+  per-stream cap (`tx_max_inflight_bytes`) governs below that floor.
 - **RX, slow consumer**: per-stream FC stalls the peer at the
   unreplenished window; bytes bounded at `ring × live streams`,
   events at one per stream.
@@ -232,21 +234,21 @@ Counter signature: `*_arms = 0`, `rx_event_drops = 0`,
 
 ---
 
-## 5. Knobs
+## 5. Configuration parameters
 
-| Knob | Default | Bounds | Applies to |
-|---|---|---|---|
-| `QuicConfiguration.max_data` | 16 MiB | cnx-level inbound FC (initial; picoquic auto-extends) | both transports |
-| `QuicConfiguration.max_stream_data` | 16 MiB | per-stream inbound window AND `sc->rx` size | both |
-| `QuicConfiguration.stream_ring_cap` | 4 MiB | per-stream `sc->tx` hard cap | both |
-| `QuicConfiguration.tx_max_queued_bytes` | 4 MiB (0/None off) | aggregate outbound queue (ladder #1) | both |
-| `QuicConfiguration.max_streams_uni/bidi` | 512 | initial MAX_STREAMS credit | both |
-| `QuicConfiguration.event_ring_capacity` | None → 2048/16384 | both event rings | both |
-| `QuicConfiguration.idle_timeout` | 10 s | QUIC idle timeout | both |
-| `QuicConfiguration.congestion_control_algorithm` | "bbr1" | CC algorithm | both |
-| aiomoqt `tx_max_inflight_bytes` | 1 MiB (None off) | one stream's outbound queue (ladder #2) | both, via `stream_write_drain` |
-| CLI `--max-queued-bytes` | (cfg default) | ladder #1 | pub_server, pub_bench, loopback_bench |
-| CLI `--max-inflight-bytes` | (aiomoqt default) | ladder #2 | pub_server, loopback_bench |
+| Parameter | Default | Bounds |
+|---|---|---|
+| `QuicConfiguration.max_data` | 16 MiB | cnx-level inbound FC (initial; picoquic auto-extends) |
+| `QuicConfiguration.max_stream_data` | 16 MiB | per-stream inbound window AND `sc->rx` size |
+| `QuicConfiguration.stream_ring_cap` | 4 MiB | per-stream `sc->tx` hard cap |
+| `QuicConfiguration.tx_max_queued_bytes` | 4 MiB (0/None off) | aggregate outbound queue, all streams |
+| `QuicConfiguration.max_streams_uni/bidi` | 512 | initial MAX_STREAMS credit |
+| `QuicConfiguration.event_ring_capacity` | None → 2048/16384 | both event rings |
+| `QuicConfiguration.idle_timeout` | 10 s | QUIC idle timeout |
+| `QuicConfiguration.congestion_control_algorithm` | "bbr1" | CC algorithm |
+| aiomoqt `tx_max_inflight_bytes` | 1 MiB (None off) | one stream's outbound queue |
+| CLI `--max-queued-bytes` | (cfg default) | sets `tx_max_queued_bytes` |
+| CLI `--max-inflight-bytes` | (aiomoqt default) | sets `tx_max_inflight_bytes` |
 
 
 ---
