@@ -154,6 +154,13 @@ class QuicConnection:
     def configuration(self) -> QuicConfiguration:
         return self._configuration
 
+    @property
+    def closed(self) -> bool:
+        """True once this connection has seen close/app-close. The
+        worker no longer drains TX rings; sends become no-ops, so
+        callers in produce loops should stop writing."""
+        return self._closed
+
     def _start_transport(self, port: int = 0) -> None:
         """Create and start the TransportContext."""
         if self._transport is not None:
@@ -669,6 +676,11 @@ class QuicConnection:
                 while not self._closed and tx_data_bytes_queued() > low:
                     await asyncio.sleep(0.002)
             if self._closed:
+                # Yield before the no-op return: an await that never
+                # suspends starves the event loop — a produce loop
+                # calling this on a closed cnx would otherwise spin
+                # at 100% with cancellation undeliverable.
+                await asyncio.sleep(0)
                 return
             # Cooperative yield at the stream-creation boundary — the
             # raw-QUIC mirror of WT create_stream's worker round-trip
@@ -691,7 +703,12 @@ class QuicConnection:
             # on a closed cnx, and propagate that failure into the
             # caller. Return cleanly instead. STREAM_DESTROY also sets
             # the per-stream event before popping it (see handler).
+            # The sleep(0) guarantees this coroutine suspends at least
+            # once even on a dead cnx — without it an unpaced produce
+            # loop never yields, the event loop never runs again, and
+            # task cancellation can never be delivered (100% spin).
             if self._closed:
+                await asyncio.sleep(0)
                 return
             # Connection-global ring pressure: tx_pressure reads the
             # SPSC TX event ring. Wait on the connection-global ring
