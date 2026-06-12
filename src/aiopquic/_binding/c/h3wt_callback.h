@@ -249,7 +249,7 @@ static inline aiopquic_wt_stream_link_t* aiopquic_wt_ensure_link(
 }
 
 /*
- * Phase B WT push: notification event carrying a BORROWED pointer to
+ * WT push: notification event carrying a BORROWED pointer to
  * the per-stream aiopquic_stream_ctx_t. No inline byte copy — bytes
  * live in sc->rx and the consumer (asyncio drain_rx) pops them
  * directly. entry.data_length=0 signals "borrowed" to spsc_ring_pop

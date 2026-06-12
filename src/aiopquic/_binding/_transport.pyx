@@ -1558,18 +1558,17 @@ cdef class TransportContext:
         the picoquic worker re-evaluates peer's MAX_STREAM_DATA for
         this stream.
 
-        Hysteresis gate: skip the push if the stream's rx_consumed has
-        not advanced by AIOPQUIC_RX_FC_HYSTERESIS_BYTES since the last
-        push (default = sc->rx ring capacity / 4). Prevents the
-        per-chunk FC storm — at 2 Gbps × 64KB objects we were emitting
-        ~280K OPEN_FLOW_CONTROL events/sec, saturating the asyncio
-        thread which then could not drain the rx_event_ring, causing
-        STREAM_DATA event drops (the cliff).
+        Hysteresis gate: skip the push unless the stream's rx_consumed
+        has advanced by at least ring capacity >> 4 since the last
+        push. Prevents a per-chunk FC storm — unthrottled, a multi-Gbps
+        flow emits hundreds of thousands of OPEN_FLOW_CONTROL events
+        per second, saturating the asyncio thread until it cannot
+        drain the rx_event_ring and STREAM_DATA events drop.
 
-        Hysteresis cost: peer's MAX_STREAM_DATA advances in chunks of
-        HYSTERESIS_BYTES instead of continuously. Peer has full
-        ring_cap of headroom at all times; advancing every quarter-ring
-        means peer never actually waits at our typical rates.
+        Hysteresis cost: peer's MAX_STREAM_DATA advances in
+        ring_cap/16 steps instead of continuously. Peer has up to a
+        full ring_cap of headroom at all times, so it never actually
+        waits at typical rates.
 
         The worker (in the SPSC handler) computes effective_free
         = sc->rx_buf_free - sc->bytes_pending_release and calls
@@ -2028,8 +2027,7 @@ cdef class TransportContext:
     def worker_rx_byte_ring_overflow(self):
         """Worker thread: count of per-stream RX byte-ring overflow
         events. Indicates the peer sent more bytes than its
-        flow-control window allowed (spec violation). Previously
-        printed to stderr per occurrence; now silent unless
+        flow-control window allowed (spec violation). Silent unless
         AIOPQUIC_RX_LOG=1 is set in the env."""
         return self._ctx.worker_rx_byte_ring_overflow
 

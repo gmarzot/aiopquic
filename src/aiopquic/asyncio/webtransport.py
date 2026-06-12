@@ -10,7 +10,7 @@ Three classes:
   WebTransportClient(...)  — initiator subclass; adds open(). Used by
                               connect_webtransport(host, port, path).
 
-  WebTransportServerSession(...) — acceptor subclass (Phase C.4 step 2/3);
+  WebTransportServerSession(...) — acceptor subclass;
                               constructed from an incoming H3 CONNECT.
 
 The cdef class WebTransportSessionState (in _binding._transport) is the
@@ -549,8 +549,7 @@ class WebTransportSession:
             self._event_queue.put_nowait(err)
         elif evt_type == _EVT_WT_SESSION_CLOSED:
             reason = data if data is not None else memoryview(b"")
-            ev = WebTransportSessionClosed(error_code=error_code,
-                                              reason=reason)
+            ev = WebTransportSessionClosed(error_code=error_code, reason=reason)
             self._session_close_event = ev
             self._session_closed.set()
             if (self._session_ready
@@ -769,8 +768,8 @@ class WebTransportClient(WebTransportSession):
 
 
 # =====================================================================
-# Acceptor-side: subclass added in Phase C.4 step 3 (server-side
-# bridge in C must surface WT_NEW_SESSION events first).
+# Acceptor-side subclass: the C bridge surfaces WT_NEW_SESSION
+# events that construct these.
 # =====================================================================
 
 class WebTransportServerSession(WebTransportSession):
@@ -966,6 +965,7 @@ async def connect_webtransport(
                 idle_timeout_ms=int(configuration.idle_timeout * 1000),
                 congestion_control_algorithm=(
                     configuration.congestion_control_algorithm),
+                qlog_dir=configuration.qlog_dir,
             )
         transport.start(**start_kwargs)
 
@@ -1070,6 +1070,7 @@ async def serve_webtransport(
                 idle_timeout_ms=int(configuration.idle_timeout * 1000),
                 congestion_control_algorithm=(
                     configuration.congestion_control_algorithm),
+                qlog_dir=configuration.qlog_dir,
             )
         transport.start(**start_kwargs)
 

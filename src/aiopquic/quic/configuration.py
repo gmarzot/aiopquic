@@ -44,6 +44,11 @@ class QuicConfiguration:
     # writes TLS secrets per connection so packet captures can be
     # decrypted offline. Honors the SSLKEYLOGFILE env var as a default.
     secrets_log_file: str | None = None
+    # Directory for picoquic qlog traces (one JSON file per connection,
+    # named by initial CID: CC state, RTT, FC frames). Directory must
+    # already exist. The AIOPQUIC_QLOG_DIR env var serves as a
+    # shell-level fallback when this is None.
+    qlog_dir: str | None = None
     # Congestion-control algorithm for picoquic to use on this transport.
     # Default "bbr1": loss-tolerant (loss-based CCs collapse on the
     # GIL-induced loss blips common on loopback and loaded hosts) and

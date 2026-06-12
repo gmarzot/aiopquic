@@ -182,6 +182,17 @@ AIOPQUIC_GSO=0                  # force off (diagnostic only)
 AIOPQUIC_SEND_LENGTH_MAX=8192   # cap kernel-coalesced buffer (Linux GSO on)
 ```
 
+### qlog / textlog tracing
+
+Off by default — at multi-Gbps rates, writing qlog roughly halves
+throughput, so don't measure with it on. Enable via
+`QuicConfiguration.qlog_dir` (or the `AIOPQUIC_QLOG_DIR` env
+fallback); picoquic writes one `.qlog` file per connection into that
+directory (it must already exist). `AIOPQUIC_TEXTLOG_FILE` enables the
+much lighter human-readable per-packet text log. For
+production-compatible visibility, prefer the counters
+(`TransportContext.counters`, SIGUSR2 dump).
+
 ### TX wake threshold
 
 The TX SPSC event ring's drain-wake threshold defaults to 50% —

@@ -94,7 +94,7 @@
  * deref into a freed cnx is a UAF, surfacing as a NULL-page fault
  * inside picoquic when a struct field is loaded.
  *
- * TODO(0.3.5+): replace with a generation-counter lookup if aiomoqt
+ * TODO: replace with a generation-counter lookup if aiomoqt
  * grows into a relay role with many concurrent cnxs. For the
  * current publisher/client shape (1–2 cnxs) the walk is one or two
  * pointer compares per event — effectively free. Cost scales O(N)
