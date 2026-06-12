@@ -19,9 +19,9 @@ eventfd:
 
 | Ring | Direction | Carries | Size (default) |
 |---|---|---|---|
-| `tx_event_ring` | asyncio → worker | commands: MARK_ACTIVE, FC credit, WT control. Fixed ~64 B entries, no stream payload (pull model) | 2048 entries (`AIOPQUIC_TX_RING_CAP_DEFAULT`, `callback.h`) |
-| `rx_event_ring` | worker → asyncio | notifications: data-ready, FIN, RESET, DESTROY, drain wakes. Payload-less for stream data | 16384 entries (`AIOPQUIC_RX_RING_CAP_DEFAULT`, `callback.h`) |
-| `sc->tx` | asyncio → worker | one per stream: outbound payload bytes | 4 MiB (`AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT`, `callback.h`); raw QUIC overridable via `stream_ring_cap` |
+| `tx_event_ring` | asyncio → worker | commands: MARK_ACTIVE, FC credit, WT control. Fixed ~64 B entries, no stream payload (pull model) | 2048 entries (`AIOPQUIC_TX_EVENT_RING_CAP_DEFAULT`, `callback.h`) |
+| `rx_event_ring` | worker → asyncio | notifications: data-ready, FIN, RESET, DESTROY, drain wakes. Payload-less for stream data | 16384 entries (`AIOPQUIC_RX_EVENT_RING_CAP_DEFAULT`, `callback.h`) |
+| `sc->tx` | asyncio → worker | one per stream: outbound payload bytes | 4 MiB (`AIOPQUIC_TX_DATA_RING_CAP_DEFAULT`, `callback.h`); raw QUIC overridable via `stream_ring_cap` |
 | `sc->rx` | worker → asyncio | one per stream: inbound payload bytes | sized to the advertised per-stream FC window (= `max_stream_data`, pow2-rounded) |
 
 Worker→asyncio wakeups go through one eventfd

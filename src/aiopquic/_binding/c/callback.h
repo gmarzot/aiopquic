@@ -35,15 +35,15 @@
 
 /* Per-stream RX byte ring fallback. 4 MB covers 1 Gbps × 32 ms or
  * 2.5 Gbps × 13 ms cleanly. For 2.5 Gbps × 100 ms WAN set ~32 MB via
- * QuicConfiguration.rx_ring_cap; for 10 Gbps × 100 ms set ~128 MB.
+ * QuicConfiguration.rx_data_ring_cap; for 10 Gbps × 100 ms set ~128 MB.
  * Memory cost scales with concurrent stream count. Power of two. */
-#define AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT (1u << 22)
+#define AIOPQUIC_RX_DATA_RING_CAP_DEFAULT (1u << 22)
 
 /* Per-stream TX byte ring fallback. Holds bytes between Python's
  * send_stream_data and picoquic's worker drain. Doesn't need to
  * be BDP-sized (picoquic drains continuously); 4 MB matches RX
  * for symmetry and gives ample staging headroom. */
-#define AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT (1u << 22)
+#define AIOPQUIC_TX_DATA_RING_CAP_DEFAULT (1u << 22)
 
 /* Legacy shared SPSC ring default — preserved for backward-compat
  * callers (Python QuicConfiguration.event_ring_capacity fallback).
@@ -59,7 +59,7 @@
  * large enough to absorb command bursts without starving the data
  * path. Drainage threshold controlled by AIOPQUIC_TX_RING_WAKE_PCT.
  * Power of two. */
-#define AIOPQUIC_TX_RING_CAP_DEFAULT 2048
+#define AIOPQUIC_TX_EVENT_RING_CAP_DEFAULT 2048
 
 /* RX SPSC event ring default. Carries worker→asyncio notifications:
  * stream_data / stream_fin / stream_open / connection events + the
@@ -70,7 +70,7 @@
  * 16384 entries chosen as the floor at which sustained MoQT
  * subgroup churn at multi-Gbps stops triggering drops in lab.
  * Power of two. */
-#define AIOPQUIC_RX_RING_CAP_DEFAULT 16384
+#define AIOPQUIC_RX_EVENT_RING_CAP_DEFAULT 16384
 
 /* TX SPSC ring drain-wake low-water mark, as percent of ring
  * capacity. Worker fires SPSC_EVT_TX_EVENT_RING_DRAINED when count
@@ -197,7 +197,7 @@ typedef struct {
      * never sends more before MAX_STREAM_DATA is extended). Rounded
      * up to a power of two by the Cython binding before being stored
      * here. */
-    uint32_t        rx_ring_cap;
+    uint32_t        rx_data_ring_cap;
     /* Forensic counters — incremented from the picoquic worker thread
      * as it processes TX events. The asyncio thread reads them via
      * Cython properties to verify per-event accounting. Plain ints,
@@ -302,14 +302,14 @@ typedef struct {
 /* Create a TransportContext with independent TX and RX SPSC ring
  * sizes and an explicit drain-wake low-water percent. Pass 0 for
  * any of the three to take the compile-time default
- * (AIOPQUIC_TX_RING_CAP_DEFAULT / AIOPQUIC_RX_RING_CAP_DEFAULT /
+ * (AIOPQUIC_TX_EVENT_RING_CAP_DEFAULT / AIOPQUIC_RX_EVENT_RING_CAP_DEFAULT /
  * AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT). Ring caps must be powers of
  * two — the caller (Cython binding) is responsible for rounding. */
 static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
                                                    uint32_t rx_cap,
                                                    uint32_t low_water_pct) {
-    if (tx_cap == 0) tx_cap = AIOPQUIC_TX_RING_CAP_DEFAULT;
-    if (rx_cap == 0) rx_cap = AIOPQUIC_RX_RING_CAP_DEFAULT;
+    if (tx_cap == 0) tx_cap = AIOPQUIC_TX_EVENT_RING_CAP_DEFAULT;
+    if (rx_cap == 0) rx_cap = AIOPQUIC_RX_EVENT_RING_CAP_DEFAULT;
     if (low_water_pct == 0 || low_water_pct >= 100) {
         low_water_pct = AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT;
     }
@@ -805,9 +805,9 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
          * memory traffic + cache footprint per stream. RX ring
          * overflow remains a hard error: a peer that overruns is a
          * spec-correct FLOW_CONTROL_ERROR connection close. */
-        uint32_t advertise_cap = ctx->rx_ring_cap > 0
-            ? ctx->rx_ring_cap
-            : AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT;
+        uint32_t advertise_cap = ctx->rx_data_ring_cap > 0
+            ? ctx->rx_data_ring_cap
+            : AIOPQUIC_RX_DATA_RING_CAP_DEFAULT;
         uint32_t physical_cap = advertise_cap;
         aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)stream_ctx;
         int rx_first_touch = 0;

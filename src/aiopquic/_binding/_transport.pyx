@@ -228,11 +228,11 @@ cdef extern from "picoquic_packet_loop.h":
 cdef extern from "c/callback.h":
     # Resource defaults — single source of truth in callback.h.
     enum:
-        AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT
-        AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT
+        AIOPQUIC_RX_DATA_RING_CAP_DEFAULT
+        AIOPQUIC_TX_DATA_RING_CAP_DEFAULT
         AIOPQUIC_SPSC_RING_CAPACITY_DEFAULT
-        AIOPQUIC_TX_RING_CAP_DEFAULT
-        AIOPQUIC_RX_RING_CAP_DEFAULT
+        AIOPQUIC_TX_EVENT_RING_CAP_DEFAULT
+        AIOPQUIC_RX_EVENT_RING_CAP_DEFAULT
         AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT
 
     ctypedef struct aiopquic_ctx_t:
@@ -241,7 +241,7 @@ cdef extern from "c/callback.h":
         int eventfd
         picoquic_quic_t* quic
         picoquic_network_thread_ctx_t* thread_ctx
-        uint32_t rx_ring_cap
+        uint32_t rx_data_ring_cap
         uint64_t worker_mark_active_processed
         uint64_t worker_prepare_to_send_calls
         uint64_t worker_prepare_to_send_pulled_bytes
@@ -873,16 +873,16 @@ cdef class TransportContext:
     def __cinit__(self,
                   uint32_t ring_capacity=0,
                   uint32_t tx_ring_cap=0,
-                  uint32_t rx_ring_cap=0,
+                  uint32_t rx_data_ring_cap=0,
                   uint32_t tx_event_ring_low_water_pct=0):
         # Resolution order for each SPSC cap:
-        #   1. Explicit per-direction kwarg (tx_ring_cap / rx_ring_cap)
+        #   1. Explicit per-direction kwarg (tx_ring_cap / rx_data_ring_cap)
         #   2. Legacy shared ring_capacity (positional or kwarg)
         #   3. 0 → C-side picks AIOPQUIC_{TX,RX}_RING_CAP_DEFAULT
         # ring_capacity preserves the pre-0.3.5 positional signature
         # (TransportContext(262144) still works).
         cdef uint32_t tx_cap = tx_ring_cap if tx_ring_cap > 0 else ring_capacity
-        cdef uint32_t rx_cap = rx_ring_cap if rx_ring_cap > 0 else ring_capacity
+        cdef uint32_t rx_cap = rx_data_ring_cap if rx_data_ring_cap > 0 else ring_capacity
         if tx_cap > 0:
             tx_cap = aiopquic_ceil_pow2_u32(tx_cap)
         if rx_cap > 0:
@@ -1587,7 +1587,7 @@ cdef class TransportContext:
         # targets). Still ~256× lower event rate than per-chunk push.
         cdef uint64_t consumed = aiopquic_stream_ctx_rx_consumed_load(sc)
         cdef uint64_t last_push = aiopquic_stream_ctx_last_fc_push_consumed_load(sc)
-        cdef uint64_t hysteresis = self._ctx.rx_ring_cap
+        cdef uint64_t hysteresis = self._ctx.rx_data_ring_cap
         if hysteresis > 0:
             hysteresis >>= 4  # 1/16 of advertise_cap (~256KB default)
         else:
@@ -1911,7 +1911,7 @@ cdef class TransportContext:
 
     def tx_send_stream(self, uintptr_t cnx_ptr, uint64_t stream_id,
                         bytes data, bint end_stream=False,
-                        uint32_t stream_ring_cap=AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT):
+                        uint32_t stream_ring_cap=AIOPQUIC_TX_DATA_RING_CAP_DEFAULT):
         """Test-friendly low-level pull-model send primitive.
 
         Wraps tx_send_atomic with per-(cnx, sid) stream-context lifecycle
@@ -2035,7 +2035,7 @@ cdef class TransportContext:
               alpn=None, bint is_client=True, uint64_t idle_timeout_ms=30000,
               uint32_t max_datagram_frame_size=0,
               wt_path=None, debug_log=None, keylog_filename=None,
-              uint32_t rx_ring_cap=0, congestion_control_algorithm=None,
+              uint32_t rx_data_ring_cap=0, congestion_control_algorithm=None,
               uint64_t initial_max_data=0,
               uint64_t initial_max_streams_uni=0,
               uint64_t initial_max_streams_bidi=0,
@@ -2068,8 +2068,8 @@ cdef class TransportContext:
         # configured max_stream_data window. The C-side ring allocator
         # handles power-of-two rounding internally; we just pass the
         # configured window verbatim. 0 leaves the C default in place.
-        if rx_ring_cap > 0:
-            self._ctx.rx_ring_cap = aiopquic_ceil_pow2_u32(rx_ring_cap)
+        if rx_data_ring_cap > 0:
+            self._ctx.rx_data_ring_cap = aiopquic_ceil_pow2_u32(rx_data_ring_cap)
 
         cdef const char* c_cert = NULL
         cdef const char* c_key = NULL
@@ -2205,13 +2205,13 @@ cdef class TransportContext:
         # Default transport-parameter overrides. Both the per-stream
         # initial_max_stream_data window AND optional max_datagram_frame
         # are merged into the existing TP defaults. Setting the per-
-        # stream window to match rx_ring_cap ensures the peer is told
+        # stream window to match rx_data_ring_cap ensures the peer is told
         # at handshake time exactly how many bytes it may keep
         # unconsumed before MAX_STREAM_DATA must be extended — keeping
         # peer-allowed in-flight ≤ our RX ring capacity.
         cdef picoquic_tp_t tp
         cdef const picoquic_tp_t* cur_tp
-        if (max_datagram_frame_size > 0 or rx_ring_cap > 0
+        if (max_datagram_frame_size > 0 or rx_data_ring_cap > 0
                 or initial_max_data > 0
                 or initial_max_streams_uni > 0
                 or initial_max_streams_bidi > 0):
@@ -2220,10 +2220,10 @@ cdef class TransportContext:
                 tp = cur_tp[0]
                 if max_datagram_frame_size > 0:
                     tp.max_datagram_frame_size = max_datagram_frame_size
-                if rx_ring_cap > 0:
-                    tp.initial_max_stream_data_bidi_local = rx_ring_cap
-                    tp.initial_max_stream_data_bidi_remote = rx_ring_cap
-                    tp.initial_max_stream_data_uni = rx_ring_cap
+                if rx_data_ring_cap > 0:
+                    tp.initial_max_stream_data_bidi_local = rx_data_ring_cap
+                    tp.initial_max_stream_data_bidi_remote = rx_data_ring_cap
+                    tp.initial_max_stream_data_uni = rx_data_ring_cap
                 if initial_max_data > 0:
                     # Connection-level flow control. picoquic's default
                     # is 1 MiB which falls over hard on MP-loopback at
@@ -2609,7 +2609,7 @@ cdef class WebTransportSessionState:
     def push_stream_data(self, uint64_t stream_id, uintptr_t sc_ptr,
                           bytes data,
                           bint end_stream=False,
-                          uint32_t stream_ring_cap=AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT):
+                          uint32_t stream_ring_cap=AIOPQUIC_TX_DATA_RING_CAP_DEFAULT):
         """Send bytes on a WT data stream — pull model.
 
         sc_ptr is the per-stream aiopquic_stream_ctx_t pointer the

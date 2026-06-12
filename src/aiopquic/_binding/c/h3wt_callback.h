@@ -544,9 +544,9 @@ static int aiopquic_wt_path_callback(
             aiopquic_stream_ctx_t* sc = link->sc;
 
             uint32_t advertise_cap =
-                s->bridge->rx_ring_cap > 0
-                    ? s->bridge->rx_ring_cap
-                    : AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT;
+                s->bridge->rx_data_ring_cap > 0
+                    ? s->bridge->rx_data_ring_cap
+                    : AIOPQUIC_RX_DATA_RING_CAP_DEFAULT;
             int rx_first = (sc->rx == NULL);
             if (rx_first) {
                 /* Switch picoquic to app-controlled FC on this stream.
@@ -616,9 +616,9 @@ static int aiopquic_wt_path_callback(
             aiopquic_stream_ctx_t* sc = link->sc;
 
             uint32_t advertise_cap =
-                s->bridge->rx_ring_cap > 0
-                    ? s->bridge->rx_ring_cap
-                    : AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT;
+                s->bridge->rx_data_ring_cap > 0
+                    ? s->bridge->rx_data_ring_cap
+                    : AIOPQUIC_RX_DATA_RING_CAP_DEFAULT;
             int rx_first = (sc->rx == NULL);
             if (rx_first) {
                 (void)picoquic_set_app_flow_control(cnx, sid, 1);

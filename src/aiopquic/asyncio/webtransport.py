@@ -958,7 +958,7 @@ async def connect_webtransport(
             # advertises picoquic defaults and the connection runs the
             # compile-time CC regardless of configuration.
             start_kwargs.update(
-                rx_ring_cap=configuration.max_stream_data,
+                rx_data_ring_cap=configuration.max_stream_data,
                 initial_max_data=configuration.max_data,
                 initial_max_streams_uni=configuration.max_streams_uni,
                 initial_max_streams_bidi=configuration.max_streams_bidi,
@@ -1063,7 +1063,7 @@ async def serve_webtransport(
             # advertises picoquic defaults and the connection runs the
             # compile-time CC regardless of configuration.
             start_kwargs.update(
-                rx_ring_cap=configuration.max_stream_data,
+                rx_data_ring_cap=configuration.max_stream_data,
                 initial_max_data=configuration.max_data,
                 initial_max_streams_uni=configuration.max_streams_uni,
                 initial_max_streams_bidi=configuration.max_streams_bidi,
