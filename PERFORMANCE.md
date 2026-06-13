@@ -162,13 +162,24 @@ sockets, and memory:
 
 - A scheduling gap stalls a process's asyncio drain → flow control
   back-pressures its sender to silence → the now-idle connection drops
-  on the idle timeout. Mitigate with `keep_alive_interval` (below) and
-  a larger kernel UDP receive buffer to absorb the burst across the
-  gap.
-- aiopquic does not set `SO_RCVBUF` yet, so each socket gets the host
-  default (often ~200 KB) — too small to ride out a fan-out burst
-  during a scheduling gap. Until it's a config option, raise it
-  host-wide via the kernel prereqs below.
+  on the idle timeout. Mitigate with `keep_alive_interval` (below).
+- **Socket buffers are already large.** aiopquic requests a 64 MiB UDP
+  send+receive buffer via picoquic (`socket_buffer_size`); it is *not*
+  the kernel default. But Linux **clamps** the request to
+  `net.core.rmem_max` / `wmem_max` (and doubles internally), so the
+  *effective* buffer is `min(64 MiB, rmem_max)`. On a stock box
+  (`rmem_max` ~200 KB) that clamp is the real receive buffer — so the
+  lever is the **host sysctl**, not an aiopquic setting. Raise
+  `rmem_max`/`wmem_max` (kernel prereqs below) to actually get a large
+  buffer. Per-socket memory then is the clamped value × N processes —
+  size `rmem_max` with that product in mind for high process counts.
+- The socket is owned by picoquic's network thread with its own
+  recv loop — aiopquic does not use asyncio's datagram transport, so
+  the "one recvfrom per loop wakeup" pitfall does not apply.
+- GSO (send-side segmentation offload) is on by default on Linux
+  (`AIOPQUIC_GSO`, `AIOPQUIC_SEND_LENGTH_MAX`). Receive-side GRO
+  coalescing is *not* enabled in picoquic today — a potential
+  recv-path improvement tracked upstream.
 - Diagnose with `ss -uanm` (per-socket `rb`=rcvbuf, `d`=drops) and
   `netstat -su | grep -A1 Udp:` (`RcvbufErrors` / `InErrors`).
 
