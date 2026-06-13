@@ -148,6 +148,61 @@ any binary. Transport-level configuration (TX budgets, ring
 capacities, congestion control, flow-control windows) is covered in
 [DATAFLOW.md](DATAFLOW.md) §Configuration parameters.
 
+### Subscriber / fan-out tuning
+
+A MoQT subscriber receives each subgroup on its own unidirectional
+stream, so a high object rate or high group-churn track opens and
+retires uni streams fast. The receiver advertises the concurrency
+limit, and **three independent limits each gate delivery — a small one
+anywhere stalls the track, often at idle CPU** (a credit/window wall,
+not a busy loop):
+
+- **`max_streams_uni`** (`QuicConfiguration`, default 512) — the
+  MAX_STREAMS credit the subscriber grants the peer. If the relay
+  opens subgroup streams faster than completed streams replenish this
+  credit, it blocks on MAX_STREAMS and delivery stalls until the
+  subscriber tears the track down. Symptom: subscriber drops under
+  load well below the relay's bandwidth ceiling, CPU idle. Relays
+  commonly advertise far more (e.g. moxygen/mvfst: 8192). Raise it for
+  high-fan-out/high-churn subscribers — **but bound the memory:**
+  worst-case RX memory ≈ `max_streams_uni × max_stream_data`
+  (512 × 16 MiB = 8 GiB; 8192 × 16 MiB = 128 GiB). Raise concurrency
+  and lower `max_stream_data` together so the product stays sane.
+- **`max_data` / `max_stream_data`** — QUIC flow-control credit (max
+  unacked bytes the peer may send, per-connection / per-stream). Must
+  cover BDP × concurrency.
+- **kernel UDP receive buffer (`SO_RCVBUF`)** — raw datagrams waiting
+  to be read. aiopquic does not set it yet, so each socket gets the
+  host default (often ~200 KB); under a fan-out burst during a
+  per-process scheduling gap that overflows and drops packets. Until
+  it's a config option, raise it host-wide (see kernel prereqs below).
+
+Diagnose with `ss -uanm` (per-socket `rb`=rcvbuf, `d`=drops) and
+`netstat -su | grep -A1 Udp:` (`RcvbufErrors` / `InErrors`).
+
+### Quiet-connection liveness (keep-alive)
+
+A flow-controlled receiver whose consumer stalls back-pressures the
+sender to silence; the now-idle connection then hits the idle timeout
+(default 30 s) and drops. Set `QuicConfiguration.keep_alive_interval`
+(seconds, e.g. `idle_timeout/3`) so PING frames hold it open through
+the stall. Off by default — opt in on subscribers/control connections
+that must survive long quiet periods. See DATAFLOW.md.
+
+### Host kernel prerequisites (deployment, not aiopquic's job)
+
+Socket-buffer tuning rides on these ceilings — set them where
+high-pps fan-out runs (persist via `/etc/sysctl.d/`; WSL/containers
+reset on restart):
+
+```bash
+net.core.rmem_max    # >= 2x your SO_RCVBUF target (Linux doubles + clamps)
+net.core.wmem_max    # >= 2x SO_SNDBUF target
+net.core.netdev_max_backlog = 10000   # 1000 default is low for fan-out
+# net.ipv4.udp_mem — global cap across all UDP sockets; bites only when
+# many sockets back up at once
+```
+
 ### jemalloc for tail-latency reduction
 
 The default `glibc` allocator's per-thread arenas + occasional
