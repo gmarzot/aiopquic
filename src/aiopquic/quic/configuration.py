@@ -32,6 +32,13 @@ class QuicConfiguration:
     # otherwise idle-time-out and drop). Pick well under idle_timeout
     # (e.g. idle_timeout/3). App opts in; nothing is sent when None.
     keep_alive_interval: float | None = None
+    # UDP socket SO_RCVBUF/SO_SNDBUF request in bytes. None = aiopquic's
+    # 64 MiB default. The kernel clamps the effective value to
+    # net.core.rmem_max / wmem_max (Linux also doubles internally), so
+    # the real ceiling is the host sysctl. Lower this to cap per-socket
+    # memory when running many sockets (e.g. high subscriber-process
+    # fan-out, where N × clamped-buffer adds up).
+    socket_buffer_size: int | None = None
     is_client: bool = True
     # Initial flow-control windows advertised to the peer at handshake.
     # The peer is bound by spec to never send more than max_stream_data

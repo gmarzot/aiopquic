@@ -2041,6 +2041,7 @@ cdef class TransportContext:
               uint64_t initial_max_streams_uni=0,
               uint64_t initial_max_streams_bidi=0,
               uint64_t keep_alive_interval_ms=0,
+              int socket_buffer_size=0,
               qlog_dir=None):
         """
         Create the picoquic context and start the network thread.
@@ -2259,13 +2260,18 @@ cdef class TransportContext:
         self._param.local_port = <unsigned short>port
         self._param.local_af = AF_INET
         self._param.dest_if = 0
-        # SO_RCVBUF/SO_SNDBUF size. Default 0 lets picoquic use kernel
-        # default (~200 KB on Linux). At line-rate UDP loopback (~3 Gbps
-        # at QUIC MTU), 200 KB drains in 0.5 ms — bursty publishers
-        # overrun the receive buffer, kernel drops packets, entire
-        # streams disappear. 16 MiB matches the typical TCP autotune
-        # ceiling and is plenty for sustained loopback.
-        self._param.socket_buffer_size = 64 * 1024 * 1024
+        # SO_RCVBUF/SO_SNDBUF request passed to picoquic. picoquic's own
+        # default is 0 (kernel default, ~200 KB on Linux) — far too
+        # small: at line-rate UDP loopback (~3 Gbps at QUIC MTU) 200 KB
+        # drains in 0.5 ms, so bursty senders overrun the receive
+        # buffer, the kernel drops packets, and whole streams disappear.
+        # We default to 64 MiB; the kernel clamps the effective value to
+        # net.core.rmem_max / wmem_max. Caller-overridable (0 = use the
+        # 64 MiB default) — lower it to cap per-socket memory when
+        # running many sockets, e.g. high subscriber-process fan-out.
+        self._param.socket_buffer_size = (
+            socket_buffer_size if socket_buffer_size > 0
+            else 64 * 1024 * 1024)
         self._param.extra_socket_required = 0
         self._param.prefer_extra_socket = 0
         # GSO + max-send-length defaults are platform-specific. The

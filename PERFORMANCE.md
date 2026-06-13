@@ -173,6 +173,9 @@ sockets, and memory:
   `rmem_max`/`wmem_max` (kernel prereqs below) to actually get a large
   buffer. Per-socket memory then is the clamped value × N processes —
   size `rmem_max` with that product in mind for high process counts.
+  To *lower* the per-socket request (cap memory under heavy
+  process fan-out), set `QuicConfiguration.socket_buffer_size` (bytes;
+  default 64 MiB).
 - The socket is owned by picoquic's network thread with its own
   recv loop — aiopquic does not use asyncio's datagram transport, so
   the "one recvfrom per loop wakeup" pitfall does not apply.

@@ -201,6 +201,7 @@ class QuicConnection:
             initial_max_streams_bidi=getattr(cfg, 'max_streams_bidi', 0) or 0,
             keep_alive_interval_ms=int((cfg.keep_alive_interval or 0)
                                         * 1000),
+            socket_buffer_size=(cfg.socket_buffer_size or 0),
             qlog_dir=cfg.qlog_dir,
         )
 
@@ -889,6 +890,7 @@ class QuicEngine:
             initial_max_streams_bidi=getattr(cfg, 'max_streams_bidi', 0) or 0,
             keep_alive_interval_ms=int((cfg.keep_alive_interval or 0)
                                         * 1000),
+            socket_buffer_size=(cfg.socket_buffer_size or 0),
             qlog_dir=cfg.qlog_dir,
         )
 
