@@ -150,35 +150,44 @@ capacities, congestion control, flow-control windows) is covered in
 
 ### Subscriber / fan-out tuning
 
-A MoQT subscriber receives each subgroup on its own unidirectional
-stream, so a high object rate or high group-churn track opens and
-retires uni streams fast. The receiver advertises the concurrency
-limit, and **three independent limits each gate delivery — a small one
-anywhere stalls the track, often at idle CPU** (a credit/window wall,
-not a busy loop):
+Two different "fan-out" shapes with different walls — don't confuse
+them:
+
+**Per-process fan-out (N separate subscriber processes on one host)**
+is the common shape, and the wall is **host resources, not
+per-connection transport limits.** Each subscriber to a single track
+holds only a couple of uni streams at a time, so the transport limits
+below are ample; what bites first is N processes contending for CPU,
+sockets, and memory:
+
+- A scheduling gap stalls a process's asyncio drain → flow control
+  back-pressures its sender to silence → the now-idle connection drops
+  on the idle timeout. Mitigate with `keep_alive_interval` (below) and
+  a larger kernel UDP receive buffer to absorb the burst across the
+  gap.
+- aiopquic does not set `SO_RCVBUF` yet, so each socket gets the host
+  default (often ~200 KB) — too small to ride out a fan-out burst
+  during a scheduling gap. Until it's a config option, raise it
+  host-wide via the kernel prereqs below.
+- Diagnose with `ss -uanm` (per-socket `rb`=rcvbuf, `d`=drops) and
+  `netstat -su | grep -A1 Udp:` (`RcvbufErrors` / `InErrors`).
+
+**Per-connection fan-out (one subscriber, a high-subgroup-count or
+many-track session)** is where the transport limits matter — each
+subgroup is its own uni stream:
 
 - **`max_streams_uni`** (`QuicConfiguration`, default 512) — the
-  MAX_STREAMS credit the subscriber grants the peer. If the relay
-  opens subgroup streams faster than completed streams replenish this
-  credit, it blocks on MAX_STREAMS and delivery stalls until the
-  subscriber tears the track down. Symptom: subscriber drops under
-  load well below the relay's bandwidth ceiling, CPU idle. Relays
-  commonly advertise far more (e.g. moxygen/mvfst: 8192). Raise it for
-  high-fan-out/high-churn subscribers — **but bound the memory:**
-  worst-case RX memory ≈ `max_streams_uni × max_stream_data`
-  (512 × 16 MiB = 8 GiB; 8192 × 16 MiB = 128 GiB). Raise concurrency
-  and lower `max_stream_data` together so the product stays sane.
+  MAX_STREAMS credit granted to the peer. picoquic auto-replenishes it
+  as streams complete, so a typical few-subgroup track never
+  approaches 512. It only bites if the cumulative open rate outruns
+  replenishment (very high subgroup count, or streams that open but
+  never close — a leak). If raised, bound the memory: worst-case RX ≈
+  `max_streams_uni × max_stream_data` (512 × 16 MiB = 8 GiB;
+  8192 × 16 MiB = 128 GiB) — raise concurrency and lower
+  `max_stream_data` together.
 - **`max_data` / `max_stream_data`** — QUIC flow-control credit (max
-  unacked bytes the peer may send, per-connection / per-stream). Must
-  cover BDP × concurrency.
-- **kernel UDP receive buffer (`SO_RCVBUF`)** — raw datagrams waiting
-  to be read. aiopquic does not set it yet, so each socket gets the
-  host default (often ~200 KB); under a fan-out burst during a
-  per-process scheduling gap that overflows and drops packets. Until
-  it's a config option, raise it host-wide (see kernel prereqs below).
-
-Diagnose with `ss -uanm` (per-socket `rb`=rcvbuf, `d`=drops) and
-`netstat -su | grep -A1 Udp:` (`RcvbufErrors` / `InErrors`).
+  unacked bytes the peer may send, per-connection / per-stream). Size
+  for BDP × concurrency.
 
 ### Quiet-connection liveness (keep-alive)
 
