@@ -242,6 +242,7 @@ cdef extern from "c/callback.h":
         picoquic_quic_t* quic
         picoquic_network_thread_ctx_t* thread_ctx
         uint32_t rx_data_ring_cap
+        uint64_t keep_alive_us
         uint64_t worker_mark_active_processed
         uint64_t worker_prepare_to_send_calls
         uint64_t worker_prepare_to_send_pulled_bytes
@@ -2039,6 +2040,7 @@ cdef class TransportContext:
               uint64_t initial_max_data=0,
               uint64_t initial_max_streams_uni=0,
               uint64_t initial_max_streams_bidi=0,
+              uint64_t keep_alive_interval_ms=0,
               qlog_dir=None):
         """
         Create the picoquic context and start the network thread.
@@ -2201,6 +2203,13 @@ cdef class TransportContext:
 
         if idle_timeout_ms > 0:
             picoquic_set_default_idle_timeout(self._quic, idle_timeout_ms)
+
+        # Keep-alive: stored on the ctx; the worker thread enables it
+        # per-cnx at the ready callback (raw QUIC in callback.h, WT in
+        # h3wt_callback.h). PING frames hold a quiet connection open
+        # past the idle timeout — e.g. a flow-controlled subscriber
+        # whose consumer stalled and back-pressured the sender silent.
+        self._ctx.keep_alive_us = keep_alive_interval_ms * 1000
 
         # Default transport-parameter overrides. Both the per-stream
         # initial_max_stream_data window AND optional max_datagram_frame

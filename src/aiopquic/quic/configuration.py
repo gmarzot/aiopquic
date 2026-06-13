@@ -17,7 +17,21 @@ class QuicConfiguration:
     # keep the asyncio loop responsive even under unpaced producers —
     # setup-phase exchanges can no longer be starved long enough to
     # trip it. Raise for long-quiescent control-plane sessions.
-    idle_timeout: float = 10.0
+    # QUIC idle timeout in seconds: the connection closes if no packet
+    # is exchanged for this long. 30 s matches picoquic's default and
+    # leaves headroom for a flow-controlled receiver whose consumer
+    # briefly stalls (a lower value drops such connections — enable
+    # keep_alive_interval below for active liveness instead of relying
+    # on a short idle timeout).
+    idle_timeout: float = 30.0
+    # QUIC keep-alive interval in seconds. None/0 = disabled (default).
+    # When set, the peer sends PING frames at this interval to hold an
+    # otherwise-quiet connection open past idle_timeout — important for
+    # a flow-controlled receiver whose consumer stalls and
+    # back-pressures the sender to silence (the connection would
+    # otherwise idle-time-out and drop). Pick well under idle_timeout
+    # (e.g. idle_timeout/3). App opts in; nothing is sent when None.
+    keep_alive_interval: float | None = None
     is_client: bool = True
     # Initial flow-control windows advertised to the peer at handshake.
     # The peer is bound by spec to never send more than max_stream_data

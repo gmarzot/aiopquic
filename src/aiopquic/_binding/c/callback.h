@@ -295,6 +295,13 @@ typedef struct {
     uint64_t        cnt_sc_destroy_wt_link_close_walker;  /* via session-close walker sweep */
     uint64_t        cnt_sc_destroy_fc_credit_pushfail; /* callback.h ~464 push-fail unref */
     uint64_t        cnt_sc_destroy_fc_credit_worker;   /* callback.h ~1114 worker unref */
+    /* QUIC keep-alive interval (microseconds). 0 = disabled. Applied
+     * per-cnx by the worker thread at the ready callback via
+     * picoquic_enable_keep_alive — PING frames hold an otherwise-quiet
+     * connection open past the idle timeout (e.g. a consumer-stalled
+     * subscriber whose flow control has back-pressured the sender to
+     * silence). Set once at start(); read by the worker. */
+    uint64_t        keep_alive_us;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -749,6 +756,15 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             }
         }
         return 0;
+    }
+
+    if (fin_or_event == picoquic_callback_ready
+            && ctx->keep_alive_us > 0) {
+        /* Enable keep-alive once the cnx is ready (worker thread owns
+         * the cnx here). PING frames keep a quiet connection alive past
+         * the idle timeout — important for a flow-controlled subscriber
+         * whose consumer stalled and back-pressured the sender silent. */
+        picoquic_enable_keep_alive(cnx, ctx->keep_alive_us);
     }
 
     int evt = aiopquic_map_event(fin_or_event);

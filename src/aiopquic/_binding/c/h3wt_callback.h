@@ -505,6 +505,12 @@ static int aiopquic_wt_path_callback(
 
     case picohttp_callback_connect_accepted:
         s->session_ready = 1;
+        if (s->bridge != NULL && s->bridge->keep_alive_us > 0) {
+            /* PING keep-alive on the WT cnx — same rationale as the
+             * raw-QUIC path: hold a quiet (e.g. FC-stalled) connection
+             * open past the idle timeout. Worker thread owns cnx here. */
+            picoquic_enable_keep_alive(cnx, s->bridge->keep_alive_us);
+        }
         aiopquic_wt_log_cnxid("client-cnx-ready", cnx, UINT64_MAX);
         aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_READY,
                                 s->control_stream_id, 0, NULL, 0);
@@ -902,6 +908,10 @@ static int aiopquic_wt_server_path_callback(
     s->control_stream = stream_ctx;
     s->control_stream_id = stream_ctx->stream_id;
     s->session_ready = 1;
+    if (bridge != NULL && bridge->keep_alive_us > 0) {
+        /* PING keep-alive on the accepted WT cnx (worker thread). */
+        picoquic_enable_keep_alive(cnx, bridge->keep_alive_us);
+    }
     aiopquic_wt_log_cnxid("server-cnx-accept", cnx, stream_ctx->stream_id);
 
     stream_ctx->path_callback = aiopquic_wt_path_callback;
