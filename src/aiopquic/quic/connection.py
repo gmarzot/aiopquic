@@ -6,9 +6,12 @@ events into QuicEvent objects that match qh3's event interface.
 
 import asyncio
 import contextlib
+import logging
 import os
 from collections import deque
 from enum import IntEnum
+
+logger = logging.getLogger(__name__)
 
 from .configuration import QuicConfiguration
 from .events import (
@@ -272,6 +275,11 @@ class QuicConnection:
                 end_stream=(evt_type == _EVT_STREAM_FIN),
             ))
         elif evt_type == _EVT_STREAM_RESET:
+            # Abnormal stream end (peer RESET_STREAM) — surface the code
+            # so drop-under-load investigations see the actual reason
+            # rather than inferring it from the relay's logs.
+            logger.warning("stream %d reset by peer: error=%d",
+                           stream_id, error_code)
             self._events.append(StreamReset(
                 stream_id=stream_id,
                 error_code=error_code,
@@ -283,6 +291,17 @@ class QuicConnection:
             ))
         elif evt_type == _EVT_CLOSE or evt_type == _EVT_APP_CLOSE:
             self._closed = True
+            # Log the close so drop-under-load investigations can read
+            # the actual cause: transport vs application close + the
+            # error code. error_code 0 is a clean close (debug);
+            # anything else is abnormal (warning).
+            _kind = ("app" if evt_type == _EVT_APP_CLOSE
+                     else "transport")
+            if error_code:
+                logger.warning("connection closed (%s): error=%d",
+                               _kind, error_code)
+            else:
+                logger.debug("connection closed (%s, clean)", _kind)
             self._events.append(ConnectionTerminated(
                 error_code=error_code,
             ))
