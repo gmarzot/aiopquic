@@ -1,6 +1,31 @@
 # Changelog
 
-## v0.3.6 (unreleased)
+## v0.3.7 (unreleased)
+
+Pairs with aiomoqt 0.9.7.
+
+### Saturation / stream-churn under load
+
+- Aggregate TX gate: `tx_max_queued_bytes` (default 4 MiB) bounds total un-transmitted bytes across all streams, alongside the per-stream `stream_ring_cap` (4 MiB). With aiomoqt's per-stream `tx_max_inflight_bytes` (1 MiB) this is the two-budget producer model — bounded RSS and latency under high group/stream churn.
+- Cooperative yield at the raw-QUIC stream-creation boundary + bounded `next_event` ingest (deque) keep the asyncio loop responsive when producers run ahead.
+
+### Teardown livelock fix
+
+- Sends on a closed connection now suspend (`sleep(0)`) before their no-op return, and a public `closed` property is exposed. Without the suspend a producer spinning on a dead connection could never receive cancellation (100% CPU at exit).
+
+### Liveness / config
+
+- QUIC keep-alive, opt-in via `keep_alive_interval` (raw QUIC **and** WebTransport); `idle_timeout` reverted 10s → 30s.
+- New `QuicConfiguration` parameters: `socket_buffer_size`, `qlog_dir`.
+- `congestion_control_algorithm` default `"bbr1"` — loss-tolerant and free of the picoquic bbr-v3 sub-128µs-RTT cwnd freeze (upstream #2118).
+
+### Clarity / diagnostics
+
+- Data-ring vs event-ring API rename pass: per-stream byte rings (`sc->tx` / `sc->rx`) now say `data_ring` explicitly, SPSC rings say `event_ring`; adds `rx_data_ring_cap` and ring-cap macro disambiguation.
+- Abnormal connection-close + stream-reset logging (interop / drop diagnosis).
+- WT `_on_event` dispatch reordered hot-branches-first; picotls bumped to bfa6787.
+
+## v0.3.6
 
 ### WT pull-model migration (parity with raw-QUIC)
 
