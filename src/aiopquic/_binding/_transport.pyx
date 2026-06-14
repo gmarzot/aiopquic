@@ -163,6 +163,7 @@ cdef extern from *:
     int picoquic_start_client_cnx(picoquic_cnx_t* cnx)
     int picoquic_close(picoquic_cnx_t* cnx, uint64_t reason)
     int picoquic_get_cnx_state(picoquic_cnx_t* cnx)
+    const char* picoquic_tls_get_negotiated_alpn(picoquic_cnx_t* cnx)
     uint64_t picoquic_get_data_sent(picoquic_cnx_t* cnx)
     uint64_t picoquic_get_data_received(picoquic_cnx_t* cnx)
 
@@ -1234,6 +1235,22 @@ cdef class TransportContext:
             return
         cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*><void*>sc_ptr
         aiopquic_clear_tx_data_drain_pending(sc)
+
+    def get_negotiated_alpn(self, uintptr_t cnx_ptr):
+        """The ALPN protocol TLS actually negotiated for this cnx.
+
+        picoquic settles the real ALPN at handshake; this returns it so
+        callers don't have to assume their first offered protocol was
+        selected (it isn't, when offering multiple). Returns None on a
+        NULL cnx or before negotiation completes.
+        """
+        if cnx_ptr == 0:
+            return None
+        cdef picoquic_cnx_t* cnx = <picoquic_cnx_t*><void*>cnx_ptr
+        cdef const char* alpn = picoquic_tls_get_negotiated_alpn(cnx)
+        if alpn == NULL:
+            return None
+        return (<bytes>alpn).decode('ascii', 'replace')
 
     def path_quality(self, uintptr_t cnx_ptr):
         """Snapshot of picoquic's path-quality metrics for the cnx.

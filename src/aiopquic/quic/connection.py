@@ -253,6 +253,26 @@ class QuicConnection:
             return
         self._transport.drain_rx_callback(self._handle_raw_event)
 
+    def _negotiated_alpn(self, cnx_ptr):
+        """The ALPN TLS actually negotiated for this cnx, falling back
+        to the first configured ALPN if picoquic can't report it.
+
+        Reporting the configured `alpn_protocols[0]` was correct only
+        while exactly one ALPN was offered; with a multi-version offer
+        the first-offered protocol is not necessarily the one the peer
+        selected, so the version derived from it would be wrong.
+        """
+        ptr = cnx_ptr or self._cnx_ptr
+        if ptr and self._transport is not None:
+            try:
+                alpn = self._transport.get_negotiated_alpn(ptr)
+                if alpn:
+                    return alpn
+            except Exception:
+                pass
+        cfg = self._configuration
+        return cfg.alpn_protocols[0] if cfg.alpn_protocols else None
+
     def _handle_raw_event(self, evt_type, stream_id, data, is_fin,
                           error_code, cnx_ptr, _stream_ctx_ptr,
                           _sc_ptr) -> None:
@@ -331,8 +351,7 @@ class QuicConnection:
             if cnx_ptr != 0:
                 self._cnx_ptr = cnx_ptr
                 self._connected = True
-                alpn = (self._configuration.alpn_protocols[0]
-                        if self._configuration.alpn_protocols else None)
+                alpn = self._negotiated_alpn(cnx_ptr)
                 self._events.append(HandshakeCompleted(
                     alpn_protocol=alpn,
                 ))
@@ -543,8 +562,7 @@ class QuicConnection:
             # short-circuit cleanly rather than UAF on the freed cnx.
             self._cnx_ptr = 0
         elif evt_type == _EVT_READY:
-            alpn = (self._configuration.alpn_protocols[0]
-                    if self._configuration.alpn_protocols else None)
+            alpn = self._negotiated_alpn(0)
             self._events.append(HandshakeCompleted(alpn_protocol=alpn))
             self._events.append(ProtocolNegotiated(alpn_protocol=alpn))
         elif evt_type == _EVT_DATAGRAM:

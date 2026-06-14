@@ -1,6 +1,12 @@
 # Changelog
 
-## v0.3.7 (unreleased)
+## v0.3.8 (unreleased)
+
+### Report the real negotiated ALPN
+
+- `ProtocolNegotiated` / `HandshakeCompleted` now carry the ALPN that TLS actually negotiated (read from picoquic via `picoquic_tls_get_negotiated_alpn`), not `alpn_protocols[0]`. Reporting the first *configured* protocol was correct only while exactly one ALPN was offered; a client offering multiple versions (e.g. `["moqt-16", "moq-00"]`) would otherwise believe it was speaking its first preference regardless of what the peer selected, and derive the wrong protocol version. Enables correct multi-version negotiation in higher layers (aiomoqt 0.9.8). New `TransportContext.get_negotiated_alpn(cnx_ptr)` exposes it; falls back to the configured first ALPN when picoquic can't report one.
+
+## v0.3.7
 
 Pairs with aiomoqt 0.9.7.
 
