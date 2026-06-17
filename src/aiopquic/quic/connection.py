@@ -192,7 +192,17 @@ class QuicConnection:
             port=port,
             cert_file=cfg.certificate_file,
             key_file=cfg.private_key_file,
-            alpn=(cfg.alpn_protocols[0] if cfg.alpn_protocols else None),
+            # Single configured ALPN keeps the simple default_alpn path
+            # (byte-identical to before). Multiple ALPNs switch to the
+            # negotiation path: client offers the list (request_alpn_list),
+            # server selects (alpn_select_fn) — both require default_alpn
+            # NULL, which start() sets when alpn_list is given.
+            alpn=(cfg.alpn_protocols[0]
+                  if cfg.alpn_protocols and len(cfg.alpn_protocols) == 1
+                  else None),
+            alpn_list=(list(cfg.alpn_protocols)
+                       if cfg.alpn_protocols and len(cfg.alpn_protocols) > 1
+                       else None),
             is_client=cfg.is_client,
             idle_timeout_ms=int(cfg.idle_timeout * 1000),
             max_datagram_frame_size=(cfg.max_datagram_frame_size or 0),
@@ -217,7 +227,12 @@ class QuicConnection:
         self._transport.create_client_connection(
             host, port,
             sni=cfg.server_name or host,
-            alpn=(cfg.alpn_protocols[0] if cfg.alpn_protocols else None),
+            # Single ALPN: set it on the cnx (simple path). Multiple:
+            # leave NULL so picoquic asks our request_alpn_list callback,
+            # which offers the full list start() stashed on the bridge.
+            alpn=(cfg.alpn_protocols[0]
+                  if cfg.alpn_protocols and len(cfg.alpn_protocols) == 1
+                  else None),
         )
 
     @property
@@ -270,8 +285,14 @@ class QuicConnection:
                     return alpn
             except Exception:
                 pass
+        # Fall back to the configured ALPN only when exactly one was
+        # offered (then it is unambiguously the negotiated one). With a
+        # multi-version offer, guessing alpn_protocols[0] could report the
+        # wrong draft, so return None and let the caller decide.
         cfg = self._configuration
-        return cfg.alpn_protocols[0] if cfg.alpn_protocols else None
+        if cfg.alpn_protocols and len(cfg.alpn_protocols) == 1:
+            return cfg.alpn_protocols[0]
+        return None
 
     def _handle_raw_event(self, evt_type, stream_id, data, is_fin,
                           error_code, cnx_ptr, _stream_ctx_ptr,
@@ -915,7 +936,17 @@ class QuicEngine:
             port=port,
             cert_file=cfg.certificate_file,
             key_file=cfg.private_key_file,
-            alpn=(cfg.alpn_protocols[0] if cfg.alpn_protocols else None),
+            # Single configured ALPN keeps the simple default_alpn path
+            # (byte-identical to before). Multiple ALPNs switch to the
+            # negotiation path: client offers the list (request_alpn_list),
+            # server selects (alpn_select_fn) — both require default_alpn
+            # NULL, which start() sets when alpn_list is given.
+            alpn=(cfg.alpn_protocols[0]
+                  if cfg.alpn_protocols and len(cfg.alpn_protocols) == 1
+                  else None),
+            alpn_list=(list(cfg.alpn_protocols)
+                       if cfg.alpn_protocols and len(cfg.alpn_protocols) > 1
+                       else None),
             is_client=cfg.is_client,
             idle_timeout_ms=int(cfg.idle_timeout * 1000),
             max_datagram_frame_size=(cfg.max_datagram_frame_size or 0),

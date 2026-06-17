@@ -302,6 +302,23 @@ typedef struct {
      * subscriber whose flow control has back-pressured the sender to
      * silence). Set once at start(); read by the worker. */
     uint64_t        keep_alive_us;
+    /* Server-mode WebTransport subprotocol allowlist: a comma-separated
+     * CSV (e.g. "moqt-18, moqt-16") the server offers when selecting a
+     * WT-Protocol against the client's WT-Available-Protocols. Borrowed
+     * pointer owned by the Cython TransportContext (kept alive there);
+     * NULL = no subprotocol negotiation. Read by the worker thread in
+     * the WT server path callback. */
+    char*           wt_supported_protocols;
+    /* Raw-QUIC ALPN offer/allowlist as an owned array of NUL-terminated
+     * strings in preference order (newest first). On a client these are
+     * offered in the ClientHello via picoquic_callback_request_alpn_list;
+     * picoquic_add_proposed_alpn STORES the pointers (does not copy), so
+     * they must outlive the handshake — hence owned copies, not a
+     * borrowed CSV. On a server the alpn_select_fn picks the highest
+     * mutual. Built by aiopquic_ctx_set_alpn_list, freed in
+     * aiopquic_ctx_destroy. NULL/0 = single-ALPN path (default_alpn). */
+    char**          alpn_list;
+    size_t          alpn_list_count;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -387,6 +404,11 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
         }
         spsc_ring_destroy(ctx->rx_event_ring);
         spsc_ring_destroy(ctx->tx_event_ring);
+        if (ctx->alpn_list) {
+            for (size_t i = 0; i < ctx->alpn_list_count; i++)
+                free(ctx->alpn_list[i]);
+            free(ctx->alpn_list);
+        }
         free(ctx);
     }
 }
@@ -622,6 +644,88 @@ static inline int aiopquic_map_event(picoquic_call_back_event_t ev) {
     }
 }
 
+/* Parse the next comma/space-delimited token from a CSV cursor. Advances
+ * *cursor past the token. Copies the token (NUL-terminated, surrounding
+ * quotes stripped) into out[0..outsz). Returns the token length, or 0 at
+ * end of string. */
+static inline size_t aiopquic_alpn_next_token(const char** cursor,
+                                              char* out, size_t outsz) {
+    const char* p = *cursor;
+    size_t n = 0;
+    while (*p == ' ' || *p == '\t' || *p == ',') p++;
+    while (*p != '\0' && *p != ',' && *p != ' ' && *p != '\t') {
+        if (*p != '"' && n + 1 < outsz) out[n++] = *p;
+        p++;
+    }
+    if (outsz > 0) out[n] = '\0';
+    *cursor = p;
+    return n;
+}
+
+/* Parse a CSV (e.g. "moqt-18,moqt-16") into an owned array of
+ * NUL-terminated strings on the bridge, in input/preference order,
+ * replacing any previous list. Tokens are copied because
+ * picoquic_add_proposed_alpn stores the pointers for the handshake's
+ * lifetime. NULL/empty clears the list. */
+static inline void aiopquic_ctx_set_alpn_list(aiopquic_ctx_t* ctx,
+                                              const char* csv) {
+    if (ctx == NULL) return;
+    if (ctx->alpn_list != NULL) {
+        for (size_t i = 0; i < ctx->alpn_list_count; i++)
+            free(ctx->alpn_list[i]);
+        free(ctx->alpn_list);
+        ctx->alpn_list = NULL;
+    }
+    ctx->alpn_list_count = 0;
+    if (csv == NULL || *csv == '\0') return;
+    size_t cap = strlen(csv) + 1;  /* upper bound on token count */
+    char** arr = (char**)malloc(cap * sizeof(char*));
+    if (arr == NULL) return;
+    char tok[256];
+    const char* cursor = csv;
+    size_t n = 0, tlen;
+    while (n < cap &&
+           (tlen = aiopquic_alpn_next_token(&cursor, tok, sizeof(tok))) > 0) {
+        char* s = (char*)malloc(tlen + 1);
+        if (s == NULL) {  /* OOM: free what we built and leave the list empty */
+            for (size_t j = 0; j < n; j++) free(arr[j]);
+            free(arr);
+            return;
+        }
+        memcpy(s, tok, tlen + 1);  /* tok is NUL-terminated at tlen */
+        arr[n++] = s;
+    }
+    if (n == 0) { free(arr); return; }
+    ctx->alpn_list = arr;
+    ctx->alpn_list_count = n;
+}
+
+/* Server-side ALPN selector (picoquic_alpn_select_fn_v2). Picks the
+ * highest-preference protocol in the server's configured allowlist
+ * (bridge->alpn_list) that the client also offered and returns its index
+ * into the client's list. Honors SERVER preference order (RFC 7301: the
+ * server selects); since aiomoqt lists drafts newest-first on both ends,
+ * this resolves to the newest mutually-supported draft. Returns count
+ * (reject → TLS no_application_protocol / PICOQUIC_TLS_ALERT_WRONG_ALPN)
+ * when there is no overlap or no allowlist is set. Reached only when
+ * default_alpn is NULL, i.e. a multi-ALPN server. */
+static size_t aiopquic_alpn_select_cb(picoquic_quic_t* quic,
+                                      picoquic_iovec_t* list, size_t count) {
+    aiopquic_ctx_t* bridge =
+        (aiopquic_ctx_t*)picoquic_get_default_callback_context(quic);
+    if (bridge == NULL || bridge->alpn_list == NULL) return count;
+    for (size_t a = 0; a < bridge->alpn_list_count; a++) {
+        size_t alen = strlen(bridge->alpn_list[a]);
+        for (size_t i = 0; i < count; i++) {
+            if (list[i].len == alen &&
+                memcmp(list[i].base, bridge->alpn_list[a], alen) == 0) {
+                return i;
+            }
+        }
+    }
+    return count;  /* no mutual ALPN — reject the handshake */
+}
+
 /*
  * Picoquic stream/connection callback. Runs in the picoquic network thread.
  * Mandatory copy-out happens here: picoquic's stream-callback bytes have
@@ -637,6 +741,21 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                                void* stream_ctx) {
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)callback_ctx;
     if (!ctx) return -1;
+
+    /* Client-side ALPN offer: picoquic asks the app for the ALPN list to
+     * advertise in the ClientHello when the cnx was created with a NULL
+     * alpn. 'bytes' is the opaque TLS context handed to
+     * picoquic_add_proposed_alpn. Offer each configured ALPN in
+     * preference order (newest first). */
+    if (fin_or_event == picoquic_callback_request_alpn_list) {
+        /* Offer each configured ALPN (preference order). The bridge owns
+         * these strings; picoquic_add_proposed_alpn stores the pointers,
+         * which stay valid until the handshake completes. */
+        for (size_t i = 0; i < ctx->alpn_list_count; i++) {
+            (void)picoquic_add_proposed_alpn((void*)bytes, ctx->alpn_list[i]);
+        }
+        return 0;
+    }
 
     /* TX-side callback. PULL model only: stream_ctx is an
      * aiopquic_stream_ctx_t* set by picoquic_mark_active_stream

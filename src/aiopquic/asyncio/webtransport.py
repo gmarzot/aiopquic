@@ -143,6 +143,15 @@ class WebTransportSession:
         return self._role == "client"
 
     @property
+    def negotiated_protocol(self) -> str | None:
+        """The WebTransport subprotocol (WT-Protocol) negotiated for this
+        session, or None if none was negotiated. On the client this is the
+        server's selection from the offered WT-Available-Protocols; on the
+        server it is what this server chose from its allowlist. Valid once
+        the session is established (after open() returns / acceptance)."""
+        return self._state.negotiated_wt_protocol
+
+    @property
     def is_server(self) -> bool:
         return self._role == "server"
 
@@ -1033,6 +1042,7 @@ async def serve_webtransport(
         transport: TransportContext | None = None,
         session_factory=None,
         configuration: QuicConfiguration | None = None,
+        wt_supported_protocols: list[str] | None = None,
 ) -> WebTransportServer:
     """Start a WebTransport server listening on (host, port) at path.
 
@@ -1082,6 +1092,12 @@ async def serve_webtransport(
                     configuration.socket_buffer_size or 0),
                 qlog_dir=configuration.qlog_dir,
             )
+        if wt_supported_protocols:
+            # Server subprotocol allowlist for WT-Protocol selection,
+            # newest-preferred. picowt matches the client's offered
+            # WT-Available-Protocols against this unquoted CSV.
+            start_kwargs["wt_supported_protocols"] = ", ".join(
+                wt_supported_protocols)
         transport.start(**start_kwargs)
 
     loop = asyncio.get_event_loop()

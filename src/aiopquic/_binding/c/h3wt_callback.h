@@ -106,6 +106,7 @@ struct st_aiopquic_wt_session_t {
     picowt_capsule_t              capsule;         /* incremental capsule accumulator */
     int                           session_ready;   /* CONNECT accepted */
     int                           session_closing; /* close/drain seen or initiated */
+    char*                         wt_protocol;     /* negotiated WT subprotocol (owned copy), NULL if none */
 };
 
 /*
@@ -138,6 +139,18 @@ static inline void aiopquic_wt_log_cnxid(const char* tag,
     fflush(stderr);
 }
 
+/* Copy a NUL-terminated string into a freshly malloc'd buffer
+ * (self-contained; avoids depending on POSIX strdup feature macros).
+ * Used to capture the negotiated WT subprotocol off picoquic-owned
+ * memory so the session owns a copy independent of stream lifetime. */
+static inline char* aiopquic_wt_strdup(const char* src) {
+    if (src == NULL) return NULL;
+    size_t n = strlen(src);
+    char* d = (char*)malloc(n + 1);
+    if (d != NULL) memcpy(d, src, n + 1);
+    return d;
+}
+
 static inline aiopquic_wt_session_t* aiopquic_wt_session_create(
         aiopquic_ctx_t* bridge) {
     aiopquic_wt_session_t* s =
@@ -151,6 +164,7 @@ static inline aiopquic_wt_session_t* aiopquic_wt_session_create(
 static inline void aiopquic_wt_session_destroy(aiopquic_wt_session_t* s) {
     if (!s) return;
     picowt_release_capsule(&s->capsule);
+    free(s->wt_protocol);  /* free(NULL) is a no-op when unnegotiated */
     s->kind = 0;  /* clear canary so post-free dispatch fails fast */
     free(s);
 }
@@ -505,6 +519,16 @@ static int aiopquic_wt_path_callback(
 
     case picohttp_callback_connect_accepted:
         s->session_ready = 1;
+        /* Capture the server's selected WT-Protocol from the parsed
+         * CONNECT response header. h3zero populates header.wt_protocol
+         * (NUL-terminated) before firing this event; the buffer is
+         * h3zero-owned and lives until stream cleanup, so we copy it
+         * onto the session now. NULL when the server sent no WT-Protocol. */
+        if (stream_ctx != NULL &&
+            stream_ctx->ps.stream_state.header.wt_protocol != NULL) {
+            s->wt_protocol = aiopquic_wt_strdup(
+                (const char*)stream_ctx->ps.stream_state.header.wt_protocol);
+        }
         if (s->bridge != NULL && s->bridge->keep_alive_us > 0) {
             /* PING keep-alive on the WT cnx — same rationale as the
              * raw-QUIC path: hold a quiet (e.g. FC-stalled) connection
@@ -913,6 +937,28 @@ static int aiopquic_wt_server_path_callback(
         picoquic_enable_keep_alive(cnx, bridge->keep_alive_us);
     }
     aiopquic_wt_log_cnxid("server-cnx-accept", cnx, stream_ctx->stream_id);
+
+    /* WT subprotocol selection: pick the highest mutual from the
+     * client's WT-Available-Protocols against our configured allowlist.
+     * picowt_select_wt_protocol reads the client offer off stream_ctx
+     * and, on a match, sets stream_state.wt_protocol — which h3zero then
+     * emits as the WT-Protocol response header. We copy it onto the
+     * session so Python can read the negotiated value. No allowlist or
+     * no match → no WT-Protocol header sent (s->wt_protocol stays NULL).
+     *
+     * Deliberately PERMISSIVE: unlike raw-QUIC ALPN (mandatory in TLS, a
+     * mismatch hard-fails the handshake), WT-Protocol is OPTIONAL, so the
+     * CONNECT still succeeds with no subprotocol when there is no overlap
+     * (or the client offered none — picowt can't tell those apart). The
+     * version-mismatch policy belongs to the application layer (aiomoqt),
+     * which sees negotiated_protocol == None and decides whether to close. */
+    if (bridge->wt_supported_protocols != NULL &&
+        picowt_select_wt_protocol(
+            stream_ctx, bridge->wt_supported_protocols) == 0 &&
+        stream_ctx->ps.stream_state.wt_protocol != NULL) {
+        s->wt_protocol =
+            aiopquic_wt_strdup(stream_ctx->ps.stream_state.wt_protocol);
+    }
 
     stream_ctx->path_callback = aiopquic_wt_path_callback;
     stream_ctx->path_callback_ctx = s;

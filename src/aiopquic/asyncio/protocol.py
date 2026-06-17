@@ -28,6 +28,11 @@ class QuicConnectionProtocol:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._closed = asyncio.Event()
         self._connected_waiter: asyncio.Future | None = None
+        # Set when the connection terminates BEFORE the handshake
+        # completes (e.g. no mutual ALPN → WRONG_ALPN). Surfaced to
+        # wait_connected() so connect() fails promptly instead of
+        # hanging until the idle timeout.
+        self._handshake_error: Exception | None = None
 
     @property
     def _transport(self):
@@ -65,6 +70,18 @@ class QuicConnectionProtocol:
 
             if isinstance(event, ConnectionTerminated):
                 self._closed.set()
+                # A termination before the handshake completes (e.g. no
+                # mutual ALPN) must fail wait_connected() now, not after
+                # the idle timeout. A post-handshake close is a normal
+                # teardown and must not raise here.
+                if not self._quic._connected:
+                    exc = ConnectionError(
+                        "connection terminated during handshake "
+                        f"(error_code={event.error_code})")
+                    self._handshake_error = exc
+                    if (self._connected_waiter is not None
+                            and not self._connected_waiter.done()):
+                        self._connected_waiter.set_exception(exc)
 
             self.quic_event_received(event)
             event = self._quic.next_event()
@@ -75,6 +92,9 @@ class QuicConnectionProtocol:
 
     def connect(self, addr: tuple[str, int]) -> None:
         """Initiate TLS handshake (client only)."""
+        # Clear any handshake error cached from a prior attempt so a fresh
+        # connect() isn't shadowed by a stale failure.
+        self._handshake_error = None
         self._quic.connect(addr)
 
     def close(self) -> None:
@@ -92,9 +112,16 @@ class QuicConnectionProtocol:
         return None
 
     async def wait_connected(self) -> None:
-        """Wait for TLS handshake to complete."""
+        """Wait for TLS handshake to complete.
+
+        Raises ConnectionError if the connection terminated during the
+        handshake (e.g. no mutual ALPN), rather than hanging until the
+        idle timeout.
+        """
         if self._quic._connected:
             return
+        if self._handshake_error is not None:
+            raise self._handshake_error
         if self._connected_waiter is None:
             self._connected_waiter = self._loop.create_future()
         await self._connected_waiter

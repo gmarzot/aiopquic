@@ -164,6 +164,19 @@ cdef extern from *:
     int picoquic_close(picoquic_cnx_t* cnx, uint64_t reason)
     int picoquic_get_cnx_state(picoquic_cnx_t* cnx)
     const char* picoquic_tls_get_negotiated_alpn(picoquic_cnx_t* cnx)
+    # Multi-ALPN negotiation. The select fn fires server-side only when
+    # default_alpn is NULL; get_default_callback_context lets it reach the
+    # bridge from just the quic ctx. add_proposed_alpn is called from the
+    # client request_alpn_list callback to build the ClientHello offer.
+    ctypedef struct picoquic_iovec_t:
+        uint8_t* base
+        size_t len
+    ctypedef size_t (*picoquic_alpn_select_fn_v2)(
+        picoquic_quic_t* quic, picoquic_iovec_t* list, size_t count)
+    void picoquic_set_alpn_select_fn_v2(
+        picoquic_quic_t* quic, picoquic_alpn_select_fn_v2 fn)
+    void* picoquic_get_default_callback_context(picoquic_quic_t* quic)
+    int picoquic_add_proposed_alpn(void* tls_context, const char* alpn)
     uint64_t picoquic_get_data_sent(picoquic_cnx_t* cnx)
     uint64_t picoquic_get_data_received(picoquic_cnx_t* cnx)
 
@@ -244,6 +257,7 @@ cdef extern from "c/callback.h":
         picoquic_network_thread_ctx_t* thread_ctx
         uint32_t rx_data_ring_cap
         uint64_t keep_alive_us
+        char* wt_supported_protocols
         uint64_t worker_mark_active_processed
         uint64_t worker_prepare_to_send_calls
         uint64_t worker_prepare_to_send_pulled_bytes
@@ -297,6 +311,9 @@ cdef extern from "c/callback.h":
                             void* callback_ctx, void* stream_ctx)
     int aiopquic_loop_cb(picoquic_quic_t* quic, int cb_mode,
                           void* callback_ctx, void* callback_argv)
+    size_t aiopquic_alpn_select_cb(picoquic_quic_t* quic,
+                                    picoquic_iovec_t* list, size_t count)
+    void aiopquic_ctx_set_alpn_list(aiopquic_ctx_t* ctx, const char* csv)
 
     # picoquic-side audit loaders (defined in third_party/picoquic/
     # picoquic/frames.c). Forward-declared in callback.h above.
@@ -493,6 +510,7 @@ cdef extern from "c/h3wt_callback.h":
         uint64_t control_stream_id
         int session_ready
         int session_closing
+        char* wt_protocol
 
     aiopquic_wt_session_t* aiopquic_wt_session_create(aiopquic_ctx_t* bridge)
     void aiopquic_wt_session_destroy(aiopquic_wt_session_t* s)
@@ -853,6 +871,14 @@ cdef class TransportContext:
     cdef bint _started
     # WT server-mode storage; must persist for picoquic's lifetime.
     cdef bytes _wt_path_bytes
+    # Server WT subprotocol allowlist (CSV). Held here so the borrowed
+    # pointer handed to the bridge (ctx->wt_supported_protocols) stays
+    # valid for picoquic's lifetime.
+    cdef bytes _wt_supported_csv
+    # Raw-QUIC ALPN list (CSV), input to aiopquic_ctx_set_alpn_list which
+    # parses it into a bridge-owned array of copies (client offer + server
+    # allowlist). Retained only to keep the buffer alive across that call.
+    cdef bytes _alpn_list_csv
     cdef picohttp_server_path_item_t _wt_path_item
     cdef picohttp_server_parameters_t _wt_params
     # Forensic counters for the atomic send_stream_data path.
@@ -2059,7 +2085,9 @@ cdef class TransportContext:
               uint64_t initial_max_streams_bidi=0,
               uint64_t keep_alive_interval_ms=0,
               int socket_buffer_size=0,
-              qlog_dir=None):
+              qlog_dir=None,
+              wt_supported_protocols=None,
+              alpn_list=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -2094,7 +2122,7 @@ cdef class TransportContext:
         cdef const char* c_cert = NULL
         cdef const char* c_key = NULL
         cdef const char* c_alpn = NULL
-        cdef bytes b_cert, b_key, b_alpn
+        cdef bytes b_cert, b_key, b_alpn, b_alpn_csv
 
         if cert_file is not None:
             b_cert = cert_file.encode() if isinstance(cert_file, str) else cert_file
@@ -2105,6 +2133,16 @@ cdef class TransportContext:
         if alpn is not None:
             b_alpn = alpn.encode() if isinstance(alpn, str) else alpn
             c_alpn = b_alpn
+        # Multi-ALPN raw-QUIC: offer/allow a preference-ordered list
+        # (newest first). default_alpn MUST be NULL so picoquic asks the
+        # client callback for the ClientHello offer (request_alpn_list)
+        # and lets the server's alpn_select_fn choose. Overrides any single
+        # 'alpn' above. The select_fn is installed after picoquic_create.
+        if alpn_list:
+            b_alpn_csv = ",".join(alpn_list).encode()
+            self._alpn_list_csv = b_alpn_csv
+            aiopquic_ctx_set_alpn_list(self._ctx, <char*>self._alpn_list_csv)
+            c_alpn = NULL
 
         cdef picoquic_stream_data_cb_fn default_cb_fn = aiopquic_stream_cb
         cdef void* default_cb_ctx = <void*>self._ctx
@@ -2124,6 +2162,15 @@ cdef class TransportContext:
             self._wt_params.path_table_nb = 1
             default_cb_fn = h3zero_callback
             default_cb_ctx = <void*>&self._wt_params
+            # Server WT subprotocol allowlist (CSV, e.g. "moqt-18, moqt-16").
+            # Held as bytes on self so the borrowed pointer the bridge reads
+            # in the WT path callback stays valid for picoquic's lifetime.
+            if wt_supported_protocols:
+                self._wt_supported_csv = (
+                    wt_supported_protocols.encode()
+                    if isinstance(wt_supported_protocols, str)
+                    else wt_supported_protocols)
+                self._ctx.wt_supported_protocols = <char*>self._wt_supported_csv
 
         # Register picoquic's full CC algorithm catalog. Without this,
         # picoquic_get_congestion_algorithm() returns NULL for ANY name
@@ -2156,6 +2203,13 @@ cdef class TransportContext:
             raise RuntimeError("Failed to create picoquic context")
 
         self._ctx.quic = self._quic
+
+        # Multi-ALPN server: install the selector so picoquic picks the
+        # highest mutual ALPN from the client's offer (default_alpn is
+        # NULL → the selector is consulted). Clients drive their offer via
+        # the request_alpn_list callback instead, so they need no install.
+        if alpn_list and not is_client:
+            picoquic_set_alpn_select_fn_v2(self._quic, aiopquic_alpn_select_cb)
 
         # Optional congestion-control selection. None defers to picoquic's
         # compile-time default (newreno). Unknown names fall back the
@@ -2536,6 +2590,19 @@ cdef class WebTransportSessionState:
         if self._wt is NULL:
             return 0
         return self._wt.control_stream_id
+
+    @property
+    def negotiated_wt_protocol(self):
+        """The WebTransport subprotocol negotiated for this session, or
+        None. Server side: what picowt_select_wt_protocol chose from the
+        client's WT-Available-Protocols against the configured allowlist.
+        Client side: the WT-Protocol the server selected, read from the
+        CONNECT response. Both are captured (copied) on the picoquic
+        thread when the session is established, so this is safe to read
+        after SESSION_READY (client) / NEW_SESSION (server)."""
+        if self._wt is NULL or self._wt.wt_protocol is NULL:
+            return None
+        return (<bytes>self._wt.wt_protocol).decode('ascii', 'replace')
 
     def push_open(self, str host, int port, str path, str sni,
                   str wt_protocols=""):
