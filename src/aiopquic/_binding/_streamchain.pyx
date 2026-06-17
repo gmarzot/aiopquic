@@ -318,6 +318,31 @@ cdef class StreamChain:
             acc = (acc << 8) | (<uint8_t>raw[i])
         return acc
 
+    cpdef object pull_uint_vi64(self):
+        """draft-18 vi64 varint (§1.4.1): leading-1-bits of the first byte
+        give the length (1-9 bytes); bits after the first 0 plus subsequent
+        bytes are the value, big-endian. Non-minimal encodings accepted."""
+        cdef Py_ssize_t avail = self._total - self._pos
+        if avail < 1:
+            from aiopquic.exceptions import StreamUnderflow
+            raise StreamUnderflow(self._pos, self._pos + 1)
+        cdef _Chunk c = self._chunk_at(self._chunk_idx)
+        cdef uint8_t first = (<uint8_t*>c.buf.buf)[self._chunk_off]
+        cdef int k = 0
+        while k < 8 and (first & (0x80 >> k)):
+            k += 1
+        cdef Py_ssize_t nbytes = k + 1
+        if nbytes > avail:
+            from aiopquic.exceptions import StreamUnderflow
+            raise StreamUnderflow(self._pos, self._pos + nbytes)
+        # pull_bytes consumes nbytes (incl. the peeked first) across chunks.
+        cdef bytes raw = self.pull_bytes(nbytes)
+        cdef uint64_t v = (<uint8_t>raw[0]) & <uint8_t>(0xFF >> (k + 1))
+        cdef Py_ssize_t i
+        for i in range(1, nbytes):
+            v = (v << 8) | (<uint8_t>raw[i])
+        return v
+
     # --- save / rollback / commit ---------------------------------
 
     def save(self):

@@ -13,6 +13,10 @@
 - **WebTransport WT-Protocol.** The server selects a subprotocol from a configured allowlist (`serve_webtransport(wt_supported_protocols=[...])` → `picowt_select_wt_protocol`; h3zero emits the `WT-Protocol` response header automatically); the client captures the selected value at CONNECT acceptance. Both sides read it back via `WebTransportSession.negotiated_protocol`. WT-Protocol is optional, so no overlap still establishes the session with `negotiated_protocol == None` (version policy belongs to the application).
 - `TransportContext.start(alpn_list=[...])` is the low-level knob underneath both the client offer and the server allowlist.
 
+### draft-18 groundwork — vi64 varint codec
+
+- `Buffer.push_uint_vi64` / `pull_uint_vi64` (`_buffer.pyx`) and `StreamChain.pull_uint_vi64` (`_streamchain.pyx`): the draft-18 §1.4.1 variable-length integer (leading-1-bits length prefix, 1–9 bytes, full uint64; non-minimal encodings accepted on decode, minimal on encode). Distinct from the RFC 9000 2-bit-prefix varint, which is untouched — these are additive, inert until d18 wiring consumes them (zero behavioral risk for d14/d16). Validated against draft-18 Table 2.
+
 ## v0.3.7
 
 Pairs with aiomoqt 0.9.7.
