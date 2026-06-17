@@ -9,7 +9,9 @@ minimal length. Test vectors are draft-18 Table 2.
 import pytest
 
 from aiopquic.buffer import Buffer, BufferReadError
-from aiopquic._binding._streamchain import StreamChain
+from aiopquic._binding._streamchain import (
+    StreamChain, encode_object_subgroup_vi64,
+)
 
 
 def _enc(v):
@@ -132,3 +134,40 @@ def test_streamchain_cross_chunk_boundary():
     sc.extend(raw[:3])
     sc.extend(raw[3:])
     assert sc.pull_uint_vi64() == 70423237261249041
+
+
+# --- object-subgroup body twins (parse/encode_object_subgroup_vi64) ---
+
+def _roundtrip_obj(delta, exts, status, payload, ext_present):
+    raw = encode_object_subgroup_vi64(delta, exts, status, payload, ext_present)
+    sc = StreamChain()
+    sc.extend(raw)
+    return sc.parse_object_subgroup_vi64(ext_present, 1 << 20)
+
+
+def test_obj_vi64_normal_no_ext():
+    assert _roundtrip_obj(5, None, 0, b"hello", False) == (5, None, 0, b"hello")
+
+
+def test_obj_vi64_with_extensions():
+    # ext_id even -> varint value; odd -> length-prefixed bytes.
+    d, e, s, p = _roundtrip_obj(7, {2: 42, 3: b"abc"}, 0, b"data", True)
+    assert (d, s, p) == (7, 0, b"data")
+    assert e == {2: 42, 3: b"abc"}
+
+
+def test_obj_vi64_non_normal_status_empty_payload():
+    # status != 0 -> empty ext block + payload_len 0 + status.
+    assert _roundtrip_obj(1, None, 3, b"", True) == (1, None, 3, b"")
+
+
+def test_obj_vi64_large_delta_multibyte():
+    d, e, s, p = _roundtrip_obj(1 << 40, None, 0, b"x", False)
+    assert (d, e, s, p) == (1 << 40, None, 0, b"x")
+
+
+def test_obj_vi64_large_extension_value():
+    # vi64-encoded even-ext value spanning multiple bytes.
+    d, e, s, p = _roundtrip_obj(0, {4: 2 ** 50}, 0, b"p", True)
+    assert e == {4: 2 ** 50}
+    assert (d, s, p) == (0, 0, b"p")

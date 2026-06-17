@@ -16,6 +16,7 @@
 ### draft-18 groundwork — vi64 varint codec
 
 - `Buffer.push_uint_vi64` / `pull_uint_vi64` (`_buffer.pyx`) and `StreamChain.pull_uint_vi64` (`_streamchain.pyx`): the draft-18 §1.4.1 variable-length integer (leading-1-bits length prefix, 1–9 bytes, full uint64; non-minimal encodings accepted on decode, minimal on encode). Distinct from the RFC 9000 2-bit-prefix varint, which is untouched — these are additive, inert until d18 wiring consumes them (zero behavioral risk for d14/d16). Validated against draft-18 Table 2.
+- `StreamChain.parse_object_subgroup_vi64` and `encode_object_subgroup_vi64` (`_streamchain.pyx`): draft-18 twins of the subgroup-stream object-body codec — identical body shape, vi64 instead of the RFC 9000 varint — so the d18 data hot path stays in C while the d14/d16 functions are left byte-for-byte unchanged.
 
 ## v0.3.7
 
