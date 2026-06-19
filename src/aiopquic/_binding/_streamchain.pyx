@@ -82,8 +82,9 @@ cdef class StreamChain:
     cdef Py_ssize_t _save_chunk_idx
     cdef Py_ssize_t _save_chunk_off
     cdef Py_ssize_t _save_pos
+    cdef bint _vi64
 
-    def __cinit__(self):
+    def __cinit__(self, vi64=False):
         self._chunks = deque()
         self._chunk_idx = 0
         self._chunk_off = 0
@@ -92,6 +93,7 @@ cdef class StreamChain:
         self._save_chunk_idx = 0
         self._save_chunk_off = 0
         self._save_pos = 0
+        self._vi64 = bool(vi64)
 
     # --- ingest --------------------------------------------------
 
@@ -115,6 +117,17 @@ cdef class StreamChain:
     @property
     def capacity(self):
         return self._total
+
+    @property
+    def vi64(self) -> bool:
+        """Variable-length-integer flavor for pull_vint: True = draft-18
+        vi64, False = RFC9000 varint. Settable so a freshly-created chain
+        can be tagged for the session's draft before the first read."""
+        return self._vi64
+
+    @vi64.setter
+    def vi64(self, bint value):
+        self._vi64 = value
 
     def __len__(self):
         return self._total - self._pos
@@ -342,6 +355,14 @@ cdef class StreamChain:
         for i in range(1, nbytes):
             v = (v << 8) | (<uint8_t>raw[i])
         return v
+
+    cpdef object pull_vint(self):
+        """Pull a variable-length integer in this chain's flavor (vi64 if
+        self._vi64 else RFC9000 varint). One C branch — no codec lookup
+        above."""
+        if self._vi64:
+            return self.pull_uint_vi64()
+        return self.pull_uint_var()
 
     # --- save / rollback / commit ---------------------------------
 

@@ -38,8 +38,9 @@ cdef class Buffer:
     cdef Py_ssize_t _pos
     cdef bint _growable
     cdef bint _own_buf
+    cdef bint _vi64
 
-    def __cinit__(self, capacity=None, data=None):
+    def __cinit__(self, capacity=None, data=None, vi64=False):
         cdef const uint8_t* src
         cdef Py_ssize_t n
         cdef bytes b
@@ -47,6 +48,7 @@ cdef class Buffer:
         self._pos = 0
         self._growable = False
         self._own_buf = False
+        self._vi64 = bool(vi64)
         if data is not None:
             b = bytes(data)
             n = len(b)
@@ -79,6 +81,17 @@ cdef class Buffer:
     @property
     def capacity(self) -> int:
         return self._capacity
+
+    @property
+    def vi64(self) -> bool:
+        """Variable-length-integer flavor for push_vint/pull_vint:
+        True = draft-18 vi64, False = RFC9000 varint. Settable so a
+        buffer wrapping received bytes can be tagged after construction."""
+        return self._vi64
+
+    @vi64.setter
+    def vi64(self, bint value):
+        self._vi64 = value
 
     @property
     def data(self):
@@ -220,6 +233,14 @@ cdef class Buffer:
             v = (v << 8) | p[i]
         return v
 
+    cpdef object pull_vint(self):
+        """Pull a variable-length integer in this buffer's flavor
+        (vi64 if self._vi64 else RFC9000 varint). Dispatch is one C
+        branch — no per-call codec lookup above."""
+        if self._vi64:
+            return self.pull_uint_vi64()
+        return self.pull_uint_var()
+
     def pull_bytes(self, Py_ssize_t n):
         if n < 0:
             raise BufferReadError("negative read length")
@@ -351,6 +372,14 @@ cdef class Buffer:
                 p[i] = <uint8_t>((v >> (8 * (n - 1 - i))) & 0xFF)
         self._pos += n
         return 0
+
+    cpdef int push_vint(self, object v_obj) except -1:
+        """Push a variable-length integer in this buffer's flavor
+        (vi64 if self._vi64 else RFC9000 varint). Dispatch is one C
+        branch — no per-call codec lookup above."""
+        if self._vi64:
+            return self.push_uint_vi64(v_obj)
+        return self.push_uint_var(v_obj)
 
     cpdef int push_bytes(self, object data) except -1:
         cdef Py_ssize_t n
