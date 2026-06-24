@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# Advance vendored submodule pins (picoquic / picotls / liburing) to the
+# latest commit that still builds and passes the aiopquic test suite.
+#
+# The "pin" is the submodule SHA recorded in this superproject. picoquic
+# and picotls do not cut release tags we track, so "latest release" means
+# "newest commit on the upstream tracking branch". liburing is pinned to a
+# release tag, so its candidates are version tags.
+#
+# Modes:
+#   (default)        Dry-run: fetch upstream and report drift only. No
+#                    checkout, no build, no changes.
+#   --advance        For each selected submodule, walk candidate commits
+#                    newest -> oldest; for each, check it out, rebuild, and
+#                    run the gate. Stop at the first that passes ("latest
+#                    passing") and leave the submodule staged at that SHA.
+#                    On total failure, restore the original pin.
+#
+# Options:
+#   --only NAME      Restrict to one submodule (picoquic|picotls|liburing).
+#                    Repeatable.
+#   --to REF         Only meaningful with --only: try exactly this ref
+#                    (commit/tag/branch), not the newest-to-oldest walk.
+#   --no-build       Skip rebuild + gate; just move the pin (with --advance).
+#   --commit         After a successful --advance, commit the staged pin
+#                    update(s) with a generated message.
+#
+# Env:
+#   AIOPQUIC_SKIP_PATCHES   honored by build_picoquic.sh during the gate.
+#   PYTEST_ARGS             extra args appended to the pytest gate.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "${SCRIPT_DIR}"
+
+COLOR_GREEN="\033[0;32m"
+COLOR_RED="\033[0;31m"
+COLOR_YELLOW="\033[0;33m"
+COLOR_BOLD="\033[1m"
+COLOR_OFF="\033[0m"
+
+say()  { echo -e "${COLOR_GREEN}$*${COLOR_OFF}"; }
+warn() { echo -e "${COLOR_YELLOW}$*${COLOR_OFF}" >&2; }
+die()  { echo -e "${COLOR_RED}$*${COLOR_OFF}" >&2; exit 1; }
+
+# --- Submodule registry: name | path | tracking branch | tag-mode (0/1) ---
+# tag-mode submodules pick the newest version tag instead of branch HEAD.
+declare -A SUB_PATH=(
+    [picoquic]="third_party/picoquic"
+    [picotls]="third_party/picotls"
+    [liburing]="third_party/liburing"
+)
+declare -A SUB_BRANCH=(
+    [picoquic]="master"
+    [picotls]="master"
+    [liburing]="master"
+)
+declare -A SUB_TAGMODE=(
+    [picoquic]=0
+    [picotls]=0
+    [liburing]=1
+)
+ALL_SUBS=(picoquic picotls liburing)
+
+# --- Parse args ---
+MODE="dryrun"
+NO_BUILD=0
+DO_COMMIT=0
+TO_REF=""
+SELECTED=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --advance)  MODE="advance" ;;
+        --dry-run)  MODE="dryrun" ;;
+        --no-build) NO_BUILD=1 ;;
+        --commit)   DO_COMMIT=1 ;;
+        --only)     shift; [ $# -gt 0 ] || die "--only needs a submodule name"; SELECTED+=("$1") ;;
+        --to)       shift; [ $# -gt 0 ] || die "--to needs a ref"; TO_REF="$1" ;;
+        -h|--help)  sed -n '2,40p' "$0"; exit 0 ;;
+        *)          die "unknown option: $1" ;;
+    esac
+    shift
+done
+
+if [ ${#SELECTED[@]} -eq 0 ]; then
+    SELECTED=("${ALL_SUBS[@]}")
+fi
+for name in "${SELECTED[@]}"; do
+    [ -n "${SUB_PATH[$name]:-}" ] || die "unknown submodule: ${name}"
+done
+if [ -n "${TO_REF}" ] && [ ${#SELECTED[@]} -ne 1 ]; then
+    die "--to requires exactly one --only <submodule>"
+fi
+
+# --- Helpers ------------------------------------------------------------
+
+short() { git -C "$1" rev-parse --short "$2" 2>/dev/null || echo "?"; }
+
+# Version string for a submodule at a given ref (best-effort, human info).
+version_at() {
+    local name="$1" path="$2" ref="$3"
+    case "${name}" in
+        picoquic)
+            git -C "${path}" show "${ref}:picoquic/picoquic.h" 2>/dev/null \
+                | sed -n 's/.*PICOQUIC_VERSION "\([^"]*\)".*/\1/p' | head -1 ;;
+        liburing)
+            git -C "${path}" describe --tags "${ref}" 2>/dev/null ;;
+        *)
+            git -C "${path}" show -s --format=%cs "${ref}" 2>/dev/null ;;  # commit date
+    esac
+}
+
+# Echo candidate refs newest -> oldest for a submodule (one SHA per line).
+candidates() {
+    local name="$1" path="$2"
+    local pin; pin="$(git -C "${path}" rev-parse HEAD)"
+    if [ -n "${TO_REF}" ]; then
+        git -C "${path}" rev-parse "${TO_REF}^{commit}"
+        return
+    fi
+    if [ "${SUB_TAGMODE[$name]}" = "1" ]; then
+        # newest version tags above the current pin, newest first
+        local cur_tag; cur_tag="$(git -C "${path}" describe --tags --abbrev=0 HEAD 2>/dev/null || true)"
+        git -C "${path}" tag --sort=-version:refname \
+            | grep -E '^(v)?[0-9]+\.[0-9]' \
+            | grep -viE 'rc|alpha|beta|pre|dev' \
+            | while read -r t; do
+                  local sha; sha="$(git -C "${path}" rev-parse "${t}^{commit}")"
+                  [ "${sha}" = "${pin}" ] && break
+                  echo "${sha}"
+              done
+    else
+        local branch="${SUB_BRANCH[$name]}"
+        # commits on the tracking branch ahead of the pin, newest first
+        git -C "${path}" rev-list --first-parent "${pin}..origin/${branch}"
+    fi
+}
+
+# Run the build + test gate against the currently checked-out submodules.
+# Returns 0 on pass, 1 on build failure, 2 on test failure.
+run_gate() {
+    if [ "${NO_BUILD}" = "1" ]; then
+        warn "  --no-build: skipping rebuild + gate"
+        return 0
+    fi
+    say "  building (build_picoquic.sh)..."
+    if ! ./build_picoquic.sh; then
+        return 1
+    fi
+    say "  relinking extension (pip install -e .)..."
+    if ! pip install -e . >/dev/null; then
+        return 1
+    fi
+    say "  testing (pytest -m 'not interop')..."
+    if ! pytest -m "not interop" -n auto ${PYTEST_ARGS:-}; then
+        return 2
+    fi
+    return 0
+}
+
+# --- Dry-run report -----------------------------------------------------
+
+dry_report() {
+    echo -e "${COLOR_BOLD}pin drift report${COLOR_OFF}"
+    printf '%-10s  %-12s  %-12s  %-7s  %s\n' "submodule" "pin" "upstream" "behind" "version (pin -> upstream)"
+    for name in "${SELECTED[@]}"; do
+        local path="${SUB_PATH[$name]}"
+        [ -d "${path}/.git" ] || [ -f "${path}/.git" ] || { warn "${name}: submodule not initialized"; continue; }
+        git -C "${path}" fetch --tags -q origin 2>/dev/null || warn "${name}: fetch failed"
+        local pin upstream behind
+        pin="$(git -C "${path}" rev-parse HEAD)"
+        if [ "${SUB_TAGMODE[$name]}" = "1" ]; then
+            local newest_tag
+            newest_tag="$(git -C "${path}" tag --sort=-version:refname \
+                | grep -E '^(v)?[0-9]+\.[0-9]' | grep -viE 'rc|alpha|beta|pre|dev' | head -1)"
+            upstream="$(git -C "${path}" rev-parse "${newest_tag:-HEAD}^{commit}" 2>/dev/null || echo "${pin}")"
+        else
+            upstream="$(git -C "${path}" rev-parse "origin/${SUB_BRANCH[$name]}")"
+        fi
+        behind="$(git -C "${path}" rev-list --count "${pin}..${upstream}" 2>/dev/null || echo "?")"
+        local vp vu
+        vp="$(version_at "${name}" "${path}" "${pin}")"
+        vu="$(version_at "${name}" "${path}" "${upstream}")"
+        printf '%-10s  %-12s  %-12s  %-7s  %s -> %s\n' \
+            "${name}" "$(short "${path}" "${pin}")" "$(short "${path}" "${upstream}")" \
+            "${behind}" "${vp:-?}" "${vu:-?}"
+    done
+    echo
+    say "dry-run only. re-run with --advance to advance pins (gated by build+pytest)."
+}
+
+# --- Advance ---------------------------------------------------------------
+
+advance_one() {
+    local name="$1" path="$2"
+    local orig; orig="$(git -C "${path}" rev-parse HEAD)"
+    say "${COLOR_BOLD}${name}${COLOR_OFF}: pin $(short "${path}" "${orig}") ($(version_at "${name}" "${path}" "${orig}"))"
+
+    git -C "${path}" fetch --tags -q origin 2>/dev/null || warn "  fetch failed"
+
+    local cands; cands="$(candidates "${name}" "${path}")"
+    if [ -z "${cands}" ]; then
+        say "  already at latest. nothing to do."
+        return 0
+    fi
+    local n; n="$(echo "${cands}" | wc -l | tr -d ' ')"
+    say "  ${n} candidate(s) to try, newest first"
+
+    local cand
+    while read -r cand; do
+        [ -n "${cand}" ] || continue
+        say "  trying $(short "${path}" "${cand}") ($(version_at "${name}" "${path}" "${cand}"))"
+        git -C "${path}" checkout -q "${cand}"
+        local rc=0
+        run_gate || rc=$?
+        if [ "${rc}" = "0" ]; then
+            git add "${path}"
+            say "  PASS -> staged ${name} at $(short "${path}" "${cand}")"
+            ADVANCED+=("${name} $(short "${path}" "${orig}") -> $(short "${path}" "${cand}")")
+            return 0
+        elif [ "${rc}" = "1" ]; then
+            warn "  build FAILED at $(short "${path}" "${cand}") — stepping back"
+        else
+            warn "  tests FAILED at $(short "${path}" "${cand}") — stepping back"
+        fi
+    done <<< "${cands}"
+
+    warn "  no candidate passed; restoring pin $(short "${path}" "${orig}")"
+    git -C "${path}" checkout -q "${orig}"
+    [ "${NO_BUILD}" = "1" ] || { ./build_picoquic.sh >/dev/null 2>&1 || true; pip install -e . >/dev/null 2>&1 || true; }
+    return 1
+}
+
+# --- Main ---------------------------------------------------------------
+
+if [ "${MODE}" = "dryrun" ]; then
+    dry_report
+    exit 0
+fi
+
+ADVANCED=()
+fail=0
+for name in "${SELECTED[@]}"; do
+    advance_one "${name}" "${SUB_PATH[$name]}" || fail=1
+    echo
+done
+
+if [ ${#ADVANCED[@]} -eq 0 ]; then
+    say "no pins advanced."
+    exit "${fail}"
+fi
+
+echo -e "${COLOR_BOLD}advanced pins:${COLOR_OFF}"
+for b in "${ADVANCED[@]}"; do echo "  ${b}"; done
+
+if [ "${DO_COMMIT}" = "1" ]; then
+    msg="build: advance vendored pins"$'\n'
+    for b in "${ADVANCED[@]}"; do msg+=$'\n'"  ${b}"; done
+    git commit -m "${msg}"
+    say "committed."
+else
+    echo
+    say "staged but not committed. review with 'git diff --cached', then commit (or re-run with --commit)."
+fi
+
+exit "${fail}"
