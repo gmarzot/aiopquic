@@ -26,6 +26,10 @@
 #                    ("latest passing"). OFF by default — each step is a
 #                    full rebuild + test, so an API break grinds for a long
 #                    time. Use only when a single commit is expected to fail.
+#   --force          When a submodule is already at its target, re-run the
+#                    build+test gate at the current pin anyway (verify it
+#                    still builds/passes). Without it, an already-current pin
+#                    is a no-op (no recompile).
 #   --no-build       Skip rebuild + gate; just move the pin (with --advance).
 #   --commit         After a successful --advance, commit the staged pin
 #                    update(s) with a generated message.
@@ -53,8 +57,15 @@ say()  { echo -e "${COLOR_GREEN}$*${COLOR_OFF}"; }
 warn() { echo -e "${COLOR_YELLOW}$*${COLOR_OFF}" >&2; }
 die()  { echo -e "${COLOR_RED}$*${COLOR_OFF}" >&2; exit 1; }
 
-# --- Submodule registry: name | path | tracking branch | tag-mode (0/1) ---
-# tag-mode submodules pick the newest version tag instead of branch HEAD.
+# --- Submodule registry --------------------------------------------------
+# Pin model per submodule:
+#   picoquic  driver  — tracks upstream master HEAD (newest commit).
+#   picotls   derived — NOT its own master. Target = the commit picoquic
+#                       blesses (PICOQUIC_FETCH_PTLS_DEFAULT_TAG in picoquic's
+#                       CMakeLists, non-AEGIS branch; cross-checked against
+#                       ci/build_picotls.sh). Follows picoquic.
+#   liburing  tag      — newest stable upstream version tag (independent;
+#                       picoquic does not bless it).
 declare -A SUB_PATH=(
     [picoquic]="third_party/picoquic"
     [picotls]="third_party/picotls"
@@ -70,6 +81,12 @@ declare -A SUB_TAGMODE=(
     [picotls]=0
     [liburing]=1
 )
+# Derived pins take their target from another component, not upstream.
+declare -A SUB_DERIVED=(
+    [picoquic]=0
+    [picotls]=1
+    [liburing]=0
+)
 ALL_SUBS=(picoquic picotls liburing)
 
 # --- Parse args ---
@@ -77,6 +94,7 @@ MODE="dryrun"
 NO_BUILD=0
 DO_COMMIT=0
 WALK=0
+FORCE=0
 TO_REF=""
 SELECTED=()
 
@@ -85,6 +103,7 @@ while [ $# -gt 0 ]; do
         --advance)  MODE="advance" ;;
         --dry-run)  MODE="dryrun" ;;
         --walk)     WALK=1 ;;
+        --force)    FORCE=1 ;;
         --no-build) NO_BUILD=1 ;;
         --commit)   DO_COMMIT=1 ;;
         --only)     shift; [ $# -gt 0 ] || die "--only needs a submodule name"; SELECTED+=("$1") ;;
@@ -123,12 +142,42 @@ version_at() {
     esac
 }
 
+# The picotls commit picoquic (at its currently checked-out tree) blesses.
+# Primary source: PICOQUIC_FETCH_PTLS_DEFAULT_TAG in picoquic's CMakeLists,
+# else-branch (WITH_AEGIS OFF — our build). Cross-checked against the CI
+# helper ci/build_picotls.sh; warns if the two disagree. Echoes the 40-hex.
+picoquic_blessed_picotls() {
+    local pq="${SUB_PATH[picoquic]}"
+    local cmake_tag ci_tag
+    cmake_tag="$(awk '
+        /if *\(WITH_AEGIS\)/      {blk=1; branch="if"; next}
+        blk && /else *\( *\)/     {branch="else"; next}
+        blk && /endif *\( *\)/    {blk=0; next}
+        blk && branch=="else" && /PICOQUIC_FETCH_PTLS_DEFAULT_TAG/ {
+            if (match($0, /[0-9a-f]{40}/)) { print substr($0, RSTART, RLENGTH); exit }
+        }' "${pq}/CMakeLists.txt" 2>/dev/null)"
+    ci_tag="$(grep -oE 'COMMIT_ID=[0-9a-f]{40}' "${pq}/ci/build_picotls.sh" 2>/dev/null | cut -d= -f2 | head -1)"
+    if [ -n "${cmake_tag}" ] && [ -n "${ci_tag}" ] && [ "${cmake_tag}" != "${ci_tag}" ]; then
+        warn "  picoquic picotls sources DISAGREE: CMake=${cmake_tag:0:12} ci=${ci_tag:0:12} — using CMake"
+    fi
+    echo "${cmake_tag:-${ci_tag}}"
+}
+
 # Echo candidate refs newest -> oldest for a submodule (one SHA per line).
 candidates() {
     local name="$1" path="$2"
     local pin; pin="$(git -C "${path}" rev-parse HEAD)"
     if [ -n "${TO_REF}" ]; then
         git -C "${path}" rev-parse "${TO_REF}^{commit}"
+        return
+    fi
+    if [ "${SUB_DERIVED[$name]:-0}" = "1" ]; then
+        # single target: whatever the current picoquic blesses
+        local blessed; blessed="$(picoquic_blessed_picotls)"
+        [ -n "${blessed}" ] || { warn "  could not derive blessed ${name} from picoquic"; return; }
+        local bsha; bsha="$(git -C "${path}" rev-parse "${blessed}^{commit}" 2>/dev/null)" \
+            || { warn "  blessed ${name} ${blessed:0:12} not in local objects (fetch needed)"; return; }
+        [ "${bsha}" = "${pin}" ] || echo "${bsha}"   # empty => already in lockstep
         return
     fi
     if [ "${SUB_TAGMODE[$name]}" = "1" ]; then
@@ -184,7 +233,10 @@ dry_report() {
         git -C "${path}" fetch --tags -q origin 2>/dev/null || warn "${name}: fetch failed"
         local pin upstream behind
         pin="$(git -C "${path}" rev-parse HEAD)"
-        if [ "${SUB_TAGMODE[$name]}" = "1" ]; then
+        if [ "${SUB_DERIVED[$name]:-0}" = "1" ]; then
+            local blessed; blessed="$(picoquic_blessed_picotls)"
+            upstream="$(git -C "${path}" rev-parse "${blessed}^{commit}" 2>/dev/null || echo "${pin}")"
+        elif [ "${SUB_TAGMODE[$name]}" = "1" ]; then
             local newest_tag
             newest_tag="$(git -C "${path}" tag --sort=-version:refname \
                 | grep -E '^(v)?[0-9]+\.[0-9]' | grep -viE 'rc|alpha|beta|pre|dev' | head -1)"
@@ -192,7 +244,11 @@ dry_report() {
         else
             upstream="$(git -C "${path}" rev-parse "origin/${SUB_BRANCH[$name]}")"
         fi
-        behind="$(git -C "${path}" rev-list --count "${pin}..${upstream}" 2>/dev/null || echo "?")"
+        if [ "${SUB_DERIVED[$name]:-0}" = "1" ]; then
+            [ "${pin}" = "${upstream}" ] && behind="lockstep" || behind="DRIFT"
+        else
+            behind="$(git -C "${path}" rev-list --count "${pin}..${upstream}" 2>/dev/null || echo "?")"
+        fi
         local vp vu
         vp="$(version_at "${name}" "${path}" "${pin}")"
         vu="$(version_at "${name}" "${path}" "${upstream}")"
@@ -215,7 +271,13 @@ advance_one() {
 
     local cands; cands="$(candidates "${name}" "${path}")"
     if [ -z "${cands}" ]; then
-        say "  already at latest. nothing to do."
+        if [ "${FORCE}" = "1" ]; then
+            say "  already at target — --force: re-running gate at current pin $(short "${path}" "${orig}")"
+            local rc=0; run_gate || rc=$?
+            [ "${rc}" = "0" ] && say "  gate PASS at current pin" || warn "  gate FAILED (rc=${rc}) at current pin"
+            return "${rc}"
+        fi
+        say "  already at target. nothing to do (use --force to re-run the gate at the current pin)."
         return 0
     fi
     # Fail-fast default: try only the newest candidate. --walk steps back
