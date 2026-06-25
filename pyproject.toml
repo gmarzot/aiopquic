@@ -60,7 +60,7 @@ markers = [
 # Wheel build matrix (cibuildwheel)
 # ---------------------------------------------------------------------------
 # Targets: Linux x86_64 (manylinux_2_28), macOS x86_64 (10.15+), macOS arm64.
-# Python: cp314 only — aiopquic requires Python 3.14+.
+# Python: cp312 / cp313 / cp314 — aiopquic requires Python 3.12+.
 #
 # Each wheel build first compiles picoquic+picotls from the vendored
 # submodules via build_picoquic.sh inside the cibuildwheel container.
