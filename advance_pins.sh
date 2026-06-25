@@ -10,17 +10,22 @@
 # Modes:
 #   (default)        Dry-run: fetch upstream and report drift only. No
 #                    checkout, no build, no changes.
-#   --advance        For each selected submodule, walk candidate commits
-#                    newest -> oldest; for each, check it out, rebuild, and
-#                    run the gate. Stop at the first that passes ("latest
-#                    passing") and leave the submodule staged at that SHA.
-#                    On total failure, restore the original pin.
+#   --advance        For each selected submodule, try the newest upstream
+#                    commit (or --to REF): check it out, rebuild, run the
+#                    gate. On pass, stage that pin. On FAILURE, restore the
+#                    original pin and stop (fail-fast) — the gate output and
+#                    the captured pip-install log show why.
 #
 # Options:
 #   --only NAME      Restrict to one submodule (picoquic|picotls|liburing).
 #                    Repeatable.
 #   --to REF         Only meaningful with --only: try exactly this ref
-#                    (commit/tag/branch), not the newest-to-oldest walk.
+#                    (commit/tag/branch) instead of upstream newest.
+#   --walk           If the newest commit fails the gate, step back through
+#                    older commits (newest -> oldest) until one passes
+#                    ("latest passing"). OFF by default — each step is a
+#                    full rebuild + test, so an API break grinds for a long
+#                    time. Use only when a single commit is expected to fail.
 #   --no-build       Skip rebuild + gate; just move the pin (with --advance).
 #   --commit         After a successful --advance, commit the staged pin
 #                    update(s) with a generated message.
@@ -33,6 +38,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "${SCRIPT_DIR}"
+
+# pip-install (extension relink) output is captured here so a link/ABI
+# failure is shown instead of silently swallowed.
+GATE_LOG="${SCRIPT_DIR}/.advance_pins_gate.log"
 
 COLOR_GREEN="\033[0;32m"
 COLOR_RED="\033[0;31m"
@@ -67,6 +76,7 @@ ALL_SUBS=(picoquic picotls liburing)
 MODE="dryrun"
 NO_BUILD=0
 DO_COMMIT=0
+WALK=0
 TO_REF=""
 SELECTED=()
 
@@ -74,11 +84,12 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --advance)  MODE="advance" ;;
         --dry-run)  MODE="dryrun" ;;
+        --walk)     WALK=1 ;;
         --no-build) NO_BUILD=1 ;;
         --commit)   DO_COMMIT=1 ;;
         --only)     shift; [ $# -gt 0 ] || die "--only needs a submodule name"; SELECTED+=("$1") ;;
         --to)       shift; [ $# -gt 0 ] || die "--to needs a ref"; TO_REF="$1" ;;
-        -h|--help)  sed -n '2,40p' "$0"; exit 0 ;;
+        -h|--help)  sed -n '2,48p' "$0"; exit 0 ;;
         *)          die "unknown option: $1" ;;
     esac
     shift
@@ -150,7 +161,9 @@ run_gate() {
         return 1
     fi
     say "  relinking extension (pip install -e .)..."
-    if ! pip install -e . >/dev/null; then
+    if ! pip install -e . >"${GATE_LOG}" 2>&1; then
+        warn "  pip install FAILED (likely a picotls/picoquic API change) — tail of ${GATE_LOG}:"
+        tail -20 "${GATE_LOG}" >&2
         return 1
     fi
     say "  testing (pytest -m 'not interop')..."
@@ -205,8 +218,14 @@ advance_one() {
         say "  already at latest. nothing to do."
         return 0
     fi
-    local n; n="$(echo "${cands}" | wc -l | tr -d ' ')"
-    say "  ${n} candidate(s) to try, newest first"
+    # Fail-fast default: try only the newest candidate. --walk steps back
+    # through older commits (each a full rebuild + test) until one passes.
+    if [ "${WALK}" != "1" ]; then
+        cands="$(echo "${cands}" | head -1)"
+    else
+        local n; n="$(echo "${cands}" | wc -l | tr -d ' ')"
+        say "  --walk: up to ${n} candidate(s), newest first"
+    fi
 
     local cand
     while read -r cand; do
@@ -220,16 +239,21 @@ advance_one() {
             say "  PASS -> staged ${name} at $(short "${path}" "${cand}")"
             ADVANCED+=("${name} $(short "${path}" "${orig}") -> $(short "${path}" "${cand}")")
             return 0
-        elif [ "${rc}" = "1" ]; then
-            warn "  build FAILED at $(short "${path}" "${cand}") — stepping back"
-        else
-            warn "  tests FAILED at $(short "${path}" "${cand}") — stepping back"
         fi
+        local step; [ "${WALK}" = "1" ] && step=" — stepping back" || step=""
+        [ "${rc}" = "1" ] \
+            && warn "  build/link FAILED at $(short "${path}" "${cand}")${step}" \
+            || warn "  tests FAILED at $(short "${path}" "${cand}")${step}"
     done <<< "${cands}"
 
-    warn "  no candidate passed; restoring pin $(short "${path}" "${orig}")"
+    warn "  gate failed; reverting ${name} to pin $(short "${path}" "${orig}")"
     git -C "${path}" checkout -q "${orig}"
-    [ "${NO_BUILD}" = "1" ] || { ./build_picoquic.sh >/dev/null 2>&1 || true; pip install -e . >/dev/null 2>&1 || true; }
+    if [ "${NO_BUILD}" != "1" ]; then
+        say "  rebuilding at original pin..."
+        ./build_picoquic.sh >/dev/null 2>&1 || true
+        pip install -e . >/dev/null 2>&1 || true
+    fi
+    [ "${WALK}" = "1" ] || warn "  newest commit failed; re-run with --walk to search older commits for one that passes"
     return 1
 }
 
