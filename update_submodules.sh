@@ -64,8 +64,13 @@ die()  { echo -e "${COLOR_RED}$*${COLOR_OFF}" >&2; exit 1; }
 #                       blesses (PICOQUIC_FETCH_PTLS_DEFAULT_TAG in picoquic's
 #                       CMakeLists, non-AEGIS branch; cross-checked against
 #                       ci/build_picotls.sh). Follows picoquic.
-#   liburing  tag      — newest stable upstream version tag (independent;
-#                       picoquic does not bless it).
+#   liburing  tag/held — aiopquic's own io_uring dep. picoquic only
+#                       find_library()s it, blessing no version, so there is
+#                       nothing to derive from. Pinned to a known-good and
+#                       HELD: never auto-advanced (a newer tag may build but
+#                       break the io_uring runtime). Advance only deliberately
+#                       via --only liburing; tag-mode picks the newest stable
+#                       tag as the candidate when you do.
 declare -A SUB_PATH=(
     [picoquic]="third_party/picoquic"
     [picotls]="third_party/picotls"
@@ -87,6 +92,13 @@ declare -A SUB_DERIVED=(
     [picotls]=1
     [liburing]=0
 )
+# Held pins are pinned to a known-good and skipped by the default --advance
+# sweep; advance them only when named explicitly via --only.
+declare -A SUB_HELD=(
+    [picoquic]=0
+    [picotls]=0
+    [liburing]=1
+)
 ALL_SUBS=(picoquic picotls liburing)
 
 # --- Parse args ---
@@ -95,6 +107,7 @@ NO_BUILD=0
 DO_COMMIT=0
 WALK=0
 FORCE=0
+EXPLICIT_SELECT=0
 TO_REF=""
 SELECTED=()
 
@@ -106,7 +119,7 @@ while [ $# -gt 0 ]; do
         --force)    FORCE=1 ;;
         --no-build) NO_BUILD=1 ;;
         --commit)   DO_COMMIT=1 ;;
-        --only)     shift; [ $# -gt 0 ] || die "--only needs a submodule name"; SELECTED+=("$1") ;;
+        --only)     shift; [ $# -gt 0 ] || die "--only needs a submodule name"; SELECTED+=("$1"); EXPLICIT_SELECT=1 ;;
         --to)       shift; [ $# -gt 0 ] || die "--to needs a ref"; TO_REF="$1" ;;
         -h|--help)  sed -n '2,48p' "$0"; exit 0 ;;
         *)          die "unknown option: $1" ;;
@@ -230,8 +243,8 @@ run_gate() {
         tail -20 "${GATE_LOG}" >&2
         return 1
     fi
-    say "  testing (pytest -m 'not interop')..."
-    if ! pytest -m "not interop" -n auto ${PYTEST_ARGS:-}; then
+    say "  testing (pytest -m 'not interop' -x — fail-fast)..."
+    if ! pytest -m "not interop" -x -n auto ${PYTEST_ARGS:-}; then
         return 2
     fi
     return 0
@@ -243,7 +256,7 @@ run_gate() {
 # dry-run report and the --advance overview.
 status_table() {
     echo -e "${COLOR_BOLD}submodule version status${COLOR_OFF}"
-    printf '%-10s  %-12s  %-12s  %-18s  %s\n' "submodule" "pin" "upstream" "status" "version (pin -> upstream)"
+    printf '%-10s  %-12s  %-12s  %-22s  %s\n' "submodule" "pin" "upstream" "status" "version (pin -> upstream)"
     for name in "${SELECTED[@]}"; do
         local path="${SUB_PATH[$name]}"
         [ -d "${path}/.git" ] || [ -f "${path}/.git" ] || { warn "${name}: submodule not initialized"; continue; }
@@ -262,10 +275,11 @@ status_table() {
             upstream="$(git -C "${path}" rev-parse "origin/${SUB_BRANCH[$name]}")"
         fi
         status="$(sync_status "${path}" "${pin}" "${upstream}")"
+        [ "${SUB_HELD[$name]:-0}" = "1" ] && status="${status} (held)"
         local vp vu
         vp="$(version_at "${name}" "${path}" "${pin}")"
         vu="$(version_at "${name}" "${path}" "${upstream}")"
-        printf '%-10s  %-12s  %-12s  %-18s  %s -> %s\n' \
+        printf '%-10s  %-12s  %-12s  %-22s  %s -> %s\n' \
             "${name}" "$(short "${path}" "${pin}")" "$(short "${path}" "${upstream}")" \
             "${status}" "${vp:-?}" "${vu:-?}"
     done
@@ -353,6 +367,10 @@ echo
 ADVANCED=()
 fail=0
 for name in "${SELECTED[@]}"; do
+    if [ "${SUB_HELD[$name]:-0}" = "1" ] && [ "${EXPLICIT_SELECT}" != "1" ]; then
+        warn "${name}: held pin — not auto-advanced (use --only ${name} to advance deliberately)"
+        continue
+    fi
     advance_one "${name}" "${SUB_PATH[$name]}" || fail=1
 done
 
