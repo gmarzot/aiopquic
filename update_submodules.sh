@@ -256,7 +256,7 @@ run_gate() {
 # dry-run report and the --advance overview.
 status_table() {
     echo -e "${COLOR_BOLD}submodule version status${COLOR_OFF}"
-    printf '%-10s  %-12s  %-12s  %-22s  %s\n' "submodule" "pin" "upstream" "status" "version (pin -> upstream)"
+    printf '%-10s  %-12s  %-12s  %-18s  %s\n' "submodule" "pin" "upstream" "status" "version (pin -> upstream)"
     for name in "${SELECTED[@]}"; do
         local path="${SUB_PATH[$name]}"
         [ -d "${path}/.git" ] || [ -f "${path}/.git" ] || { warn "${name}: submodule not initialized"; continue; }
@@ -275,13 +275,17 @@ status_table() {
             upstream="$(git -C "${path}" rev-parse "origin/${SUB_BRANCH[$name]}")"
         fi
         status="$(sync_status "${path}" "${pin}" "${upstream}")"
-        [ "${SUB_HELD[$name]:-0}" = "1" ] && status="${status} (held)"
         local vp vu
         vp="$(version_at "${name}" "${path}" "${pin}")"
         vu="$(version_at "${name}" "${path}" "${upstream}")"
-        printf '%-10s  %-12s  %-12s  %-22s  %s -> %s\n' \
+        printf '%-10s  %-12s  %-12s  %-18s  %s -> %s\n' \
             "${name}" "$(short "${path}" "${pin}")" "$(short "${path}" "${upstream}")" \
             "${status}" "${vp:-?}" "${vu:-?}"
+    done
+    # Footnotes: held pins are pinned locally and skipped by default.
+    for name in "${SELECTED[@]}"; do
+        [ "${SUB_HELD[$name]:-0}" = "1" ] \
+            && warn "${name}: pinned locally (use --only ${name} to attempt update)"
     done
 }
 
@@ -367,8 +371,9 @@ echo
 ADVANCED=()
 fail=0
 for name in "${SELECTED[@]}"; do
+    # held pins are skipped by the default sweep (the status footnote already
+    # said so); advance them only when named explicitly via --only.
     if [ "${SUB_HELD[$name]:-0}" = "1" ] && [ "${EXPLICIT_SELECT}" != "1" ]; then
-        warn "${name}: held pin — not auto-advanced (use --only ${name} to advance deliberately)"
         continue
     fi
     advance_one "${name}" "${SUB_PATH[$name]}" || fail=1
