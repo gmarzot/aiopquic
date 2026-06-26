@@ -1,10 +1,6 @@
 # Changelog
 
-## v0.3.8 (unreleased)
-
-### Report the real negotiated ALPN
-
-- `ProtocolNegotiated` / `HandshakeCompleted` now carry the ALPN that TLS actually negotiated (read from picoquic via `picoquic_tls_get_negotiated_alpn`), not `alpn_protocols[0]`. Reporting the first *configured* protocol was correct only while exactly one ALPN was offered; a client offering multiple versions (e.g. `["moqt-16", "moq-00"]`) would otherwise believe it was speaking its first preference regardless of what the peer selected, and derive the wrong protocol version. Enables correct multi-version negotiation in higher layers (aiomoqt 0.9.8). New `TransportContext.get_negotiated_alpn(cnx_ptr)` exposes it; falls back to the configured first ALPN only when exactly one was configured (else `None` — a multi-version offer can't be guessed).
+## v0.3.9 (2026-06-20)
 
 ### Multi-version negotiation (raw-QUIC ALPN list + WebTransport WT-Protocol)
 
@@ -18,7 +14,13 @@
 - `Buffer.push_uint_vi64` / `pull_uint_vi64` (`_buffer.pyx`) and `StreamChain.pull_uint_vi64` (`_streamchain.pyx`): the draft-18 §1.4.1 variable-length integer (leading-1-bits length prefix, 1–9 bytes, full uint64; non-minimal encodings accepted on decode, minimal on encode). Distinct from the RFC 9000 2-bit-prefix varint, which is untouched — these are additive, inert until d18 wiring consumes them (zero behavioral risk for d14/d16). Validated against draft-18 Table 2.
 - `StreamChain.parse_object_subgroup_vi64` and `encode_object_subgroup_vi64` (`_streamchain.pyx`): draft-18 twins of the subgroup-stream object-body codec — identical body shape, vi64 instead of the RFC 9000 varint — so the d18 data hot path stays in C while the d14/d16 functions are left byte-for-byte unchanged.
 
-## v0.3.7
+## v0.3.8 (2026-06-14)
+
+### Report the real negotiated ALPN
+
+- `ProtocolNegotiated` / `HandshakeCompleted` now carry the ALPN that TLS actually negotiated (read from picoquic via `picoquic_tls_get_negotiated_alpn`), not `alpn_protocols[0]`. Reporting the first *configured* protocol was correct only while exactly one ALPN was offered; a client offering multiple versions (e.g. `["moqt-16", "moq-00"]`) would otherwise believe it was speaking its first preference regardless of what the peer selected, and derive the wrong protocol version. Enables correct multi-version negotiation in higher layers (aiomoqt 0.9.8). New `TransportContext.get_negotiated_alpn(cnx_ptr)` exposes it; falls back to the configured first ALPN only when exactly one was configured (else `None` — a multi-version offer can't be guessed).
+
+## v0.3.7 (2026-06-14)
 
 Pairs with aiomoqt 0.9.7.
 
@@ -43,7 +45,7 @@ Pairs with aiomoqt 0.9.7.
 - Abnormal connection-close + stream-reset logging (interop / drop diagnosis).
 - WT `_on_event` dispatch reordered hot-branches-first; picotls bumped to bfa6787.
 
-## v0.3.6
+## v0.3.6 (2026-06-07)
 
 ### WT pull-model migration (parity with raw-QUIC)
 
