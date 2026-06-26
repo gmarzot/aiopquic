@@ -156,11 +156,18 @@ jobs:
           workspaces: s2n-quic -> s2n-quic/target
           shared-key: s2n-quic-qns
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # @beta, not @stable: s2n-quic has no committed Cargo.lock, so cargo
+        # resolves s2n-tls to its newest 0.3.x, whose MSRV can outrun the
+        # runner's current stable (s2n-tls 0.3.39 needs rustc 1.89 while
+        # stable was still 1.88). beta is always stable+1, covering that lag
+        # window; it folds back to matching stable once stable catches up.
+        uses: dtolnay/rust-toolchain@beta
       - name: Build s2n-quic-qns
         run: |
           if [ ! -x s2n-quic/target/release/s2n-quic-qns ]; then
-            git clone --depth 1 https://github.com/aws/s2n-quic
+            # Pin the s2n-quic-qns interop binary to a release tag for
+            # reproducibility (its deps still float — see the toolchain note).
+            git clone --depth 1 --branch v1.83.0 https://github.com/aws/s2n-quic
             (cd s2n-quic && cargo build --release --bin s2n-quic-qns)
           fi
       - name: Run native peer interop tests
