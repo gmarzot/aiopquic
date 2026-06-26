@@ -128,6 +128,21 @@ fi
 
 short() { git -C "$1" rev-parse --short "$2" 2>/dev/null || echo "?"; }
 
+# Relationship of a pin to its upstream/target ref, as a signed status:
+#   in-sync | behind: N | ahead: N | ahead: N behind: M (diverged).
+# "behind" = commits upstream has that we don't; "ahead" = vice-versa.
+sync_status() {
+    local path="$1" pin="$2" up="$3"
+    local lr ahead behind
+    lr="$(git -C "${path}" rev-list --left-right --count "${pin}...${up}" 2>/dev/null)" || { echo "?"; return; }
+    ahead="${lr%%[[:space:]]*}"; behind="${lr##*[[:space:]]}"
+    if   [ "${ahead}" = "0" ] && [ "${behind}" = "0" ]; then echo "in-sync"
+    elif [ "${ahead}" = "0" ]; then echo "behind: ${behind}"
+    elif [ "${behind}" = "0" ]; then echo "ahead: ${ahead}"
+    else echo "ahead: ${ahead} behind: ${behind}"
+    fi
+}
+
 # Version string for a submodule at a given ref (best-effort, human info).
 version_at() {
     local name="$1" path="$2" ref="$3"
@@ -226,12 +241,12 @@ run_gate() {
 
 dry_report() {
     echo -e "${COLOR_BOLD}pin drift report${COLOR_OFF}"
-    printf '%-10s  %-12s  %-12s  %-7s  %s\n' "submodule" "pin" "upstream" "behind" "version (pin -> upstream)"
+    printf '%-10s  %-12s  %-12s  %-18s  %s\n' "submodule" "pin" "upstream" "status" "version (pin -> upstream)"
     for name in "${SELECTED[@]}"; do
         local path="${SUB_PATH[$name]}"
         [ -d "${path}/.git" ] || [ -f "${path}/.git" ] || { warn "${name}: submodule not initialized"; continue; }
         git -C "${path}" fetch --tags -q origin 2>/dev/null || warn "${name}: fetch failed"
-        local pin upstream behind
+        local pin upstream status
         pin="$(git -C "${path}" rev-parse HEAD)"
         if [ "${SUB_DERIVED[$name]:-0}" = "1" ]; then
             local blessed; blessed="$(picoquic_blessed_picotls)"
@@ -244,17 +259,13 @@ dry_report() {
         else
             upstream="$(git -C "${path}" rev-parse "origin/${SUB_BRANCH[$name]}")"
         fi
-        if [ "${SUB_DERIVED[$name]:-0}" = "1" ]; then
-            [ "${pin}" = "${upstream}" ] && behind="lockstep" || behind="DRIFT"
-        else
-            behind="$(git -C "${path}" rev-list --count "${pin}..${upstream}" 2>/dev/null || echo "?")"
-        fi
+        status="$(sync_status "${path}" "${pin}" "${upstream}")"
         local vp vu
         vp="$(version_at "${name}" "${path}" "${pin}")"
         vu="$(version_at "${name}" "${path}" "${upstream}")"
-        printf '%-10s  %-12s  %-12s  %-7s  %s -> %s\n' \
+        printf '%-10s  %-12s  %-12s  %-18s  %s -> %s\n' \
             "${name}" "$(short "${path}" "${pin}")" "$(short "${path}" "${upstream}")" \
-            "${behind}" "${vp:-?}" "${vu:-?}"
+            "${status}" "${vp:-?}" "${vu:-?}"
     done
     echo
     say "dry-run only. re-run with --advance to advance pins (gated by build+pytest)."
