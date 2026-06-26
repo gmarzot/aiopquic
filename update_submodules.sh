@@ -255,7 +255,6 @@ run_gate() {
 # Print the submodule version-status table (no footer). Shared by the
 # dry-run report and the --advance overview.
 status_table() {
-    echo -e "${COLOR_BOLD}submodule version status${COLOR_OFF}"
     printf '%-10s  %-12s  %-12s  %-18s  %s\n' "submodule" "pin" "upstream" "status" "version (pin -> upstream)"
     for name in "${SELECTED[@]}"; do
         local path="${SUB_PATH[$name]}"
@@ -293,7 +292,6 @@ status_table() {
 
 dry_report() {
     status_table
-    echo
     say "dry-run only. re-run with --advance to update submodules (gated by build+pytest)."
 }
 
@@ -366,7 +364,6 @@ fi
 
 # advance mode: same status overview first, then act only on drifted ones.
 status_table
-echo
 
 ADVANCED=()
 fail=0
