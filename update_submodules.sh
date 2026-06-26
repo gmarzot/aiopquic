@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Advance vendored submodule pins (picoquic / picotls / liburing) to the
-# latest commit that still builds and passes the aiopquic test suite.
+# Update vendored submodules (picoquic / picotls / liburing) to the latest
+# commit that still builds and passes the aiopquic test suite.
 #
 # The "pin" is the submodule SHA recorded in this superproject. picoquic
 # and picotls do not cut release tags we track, so "latest release" means
@@ -45,7 +45,7 @@ cd "${SCRIPT_DIR}"
 
 # pip-install (extension relink) output is captured here so a link/ABI
 # failure is shown instead of silently swallowed.
-GATE_LOG="${SCRIPT_DIR}/.advance_pins_gate.log"
+GATE_LOG="${SCRIPT_DIR}/.update_submodules_gate.log"
 
 COLOR_GREEN="\033[0;32m"
 COLOR_RED="\033[0;31m"
@@ -198,14 +198,14 @@ candidates() {
     if [ "${SUB_TAGMODE[$name]}" = "1" ]; then
         # newest version tags above the current pin, newest first
         local cur_tag; cur_tag="$(git -C "${path}" describe --tags --abbrev=0 HEAD 2>/dev/null || true)"
-        git -C "${path}" tag --sort=-version:refname \
-            | grep -E '^(v)?[0-9]+\.[0-9]' \
+        { git -C "${path}" tag --sort=-version:refname \
+            | grep -E '[0-9]+\.[0-9]' \
             | grep -viE 'rc|alpha|beta|pre|dev' \
             | while read -r t; do
                   local sha; sha="$(git -C "${path}" rev-parse "${t}^{commit}")"
                   [ "${sha}" = "${pin}" ] && break
                   echo "${sha}"
-              done
+              done; } || true
     else
         local branch="${SUB_BRANCH[$name]}"
         # commits on the tracking branch ahead of the pin, newest first
@@ -237,10 +237,12 @@ run_gate() {
     return 0
 }
 
-# --- Dry-run report -----------------------------------------------------
+# --- Status table -------------------------------------------------------
 
-dry_report() {
-    echo -e "${COLOR_BOLD}pin drift report${COLOR_OFF}"
+# Print the submodule version-status table (no footer). Shared by the
+# dry-run report and the --advance overview.
+status_table() {
+    echo -e "${COLOR_BOLD}submodule version status${COLOR_OFF}"
     printf '%-10s  %-12s  %-12s  %-18s  %s\n' "submodule" "pin" "upstream" "status" "version (pin -> upstream)"
     for name in "${SELECTED[@]}"; do
         local path="${SUB_PATH[$name]}"
@@ -254,7 +256,7 @@ dry_report() {
         elif [ "${SUB_TAGMODE[$name]}" = "1" ]; then
             local newest_tag
             newest_tag="$(git -C "${path}" tag --sort=-version:refname \
-                | grep -E '^(v)?[0-9]+\.[0-9]' | grep -viE 'rc|alpha|beta|pre|dev' | head -1)"
+                | grep -E '[0-9]+\.[0-9]' | grep -viE 'rc|alpha|beta|pre|dev' | head -1 || true)"
             upstream="$(git -C "${path}" rev-parse "${newest_tag:-HEAD}^{commit}" 2>/dev/null || echo "${pin}")"
         else
             upstream="$(git -C "${path}" rev-parse "origin/${SUB_BRANCH[$name]}")"
@@ -267,8 +269,14 @@ dry_report() {
             "${name}" "$(short "${path}" "${pin}")" "$(short "${path}" "${upstream}")" \
             "${status}" "${vp:-?}" "${vu:-?}"
     done
+}
+
+# --- Dry-run report -----------------------------------------------------
+
+dry_report() {
+    status_table
     echo
-    say "dry-run only. re-run with --advance to advance pins (gated by build+pytest)."
+    say "dry-run only. re-run with --advance to update submodules (gated by build+pytest)."
 }
 
 # --- Advance ---------------------------------------------------------------
@@ -276,21 +284,22 @@ dry_report() {
 advance_one() {
     local name="$1" path="$2"
     local orig; orig="$(git -C "${path}" rev-parse HEAD)"
-    say "${COLOR_BOLD}${name}${COLOR_OFF}: pin $(short "${path}" "${orig}") ($(version_at "${name}" "${path}" "${orig}"))"
 
-    git -C "${path}" fetch --tags -q origin 2>/dev/null || warn "  fetch failed"
+    git -C "${path}" fetch --tags -q origin 2>/dev/null || warn "${name}: fetch failed"
 
     local cands; cands="$(candidates "${name}" "${path}")"
     if [ -z "${cands}" ]; then
+        # Already at target — the status table already showed "in-sync";
+        # stay silent unless --force asks to re-verify the gate.
         if [ "${FORCE}" = "1" ]; then
-            say "  already at target — --force: re-running gate at current pin $(short "${path}" "${orig}")"
+            say "${COLOR_BOLD}${name}${COLOR_OFF}: --force — re-running gate at current pin $(short "${path}" "${orig}")"
             local rc=0; run_gate || rc=$?
             [ "${rc}" = "0" ] && say "  gate PASS at current pin" || warn "  gate FAILED (rc=${rc}) at current pin"
             return "${rc}"
         fi
-        say "  already at target. nothing to do (use --force to re-run the gate at the current pin)."
         return 0
     fi
+    say "${COLOR_BOLD}${name}${COLOR_OFF}: pin $(short "${path}" "${orig}") ($(version_at "${name}" "${path}" "${orig}")) — updating"
     # Fail-fast default: try only the newest candidate. --walk steps back
     # through older commits (each a full rebuild + test) until one passes.
     if [ "${WALK}" != "1" ]; then
@@ -337,23 +346,26 @@ if [ "${MODE}" = "dryrun" ]; then
     exit 0
 fi
 
+# advance mode: same status overview first, then act only on drifted ones.
+status_table
+echo
+
 ADVANCED=()
 fail=0
 for name in "${SELECTED[@]}"; do
     advance_one "${name}" "${SUB_PATH[$name]}" || fail=1
-    echo
 done
 
 if [ ${#ADVANCED[@]} -eq 0 ]; then
-    say "no pins advanced."
+    say "all selected submodules in-sync — nothing to update (use --force to re-run the gate at current pins)."
     exit "${fail}"
 fi
 
-echo -e "${COLOR_BOLD}advanced pins:${COLOR_OFF}"
+echo -e "${COLOR_BOLD}updated submodules:${COLOR_OFF}"
 for b in "${ADVANCED[@]}"; do echo "  ${b}"; done
 
 if [ "${DO_COMMIT}" = "1" ]; then
-    msg="build: advance vendored pins"$'\n'
+    msg="build: update vendored submodules"$'\n'
     for b in "${ADVANCED[@]}"; do msg+=$'\n'"  ${b}"; done
     git commit -m "${msg}"
     say "committed."
