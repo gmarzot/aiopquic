@@ -337,7 +337,7 @@ advance_one() {
         if [ "${rc}" = "0" ]; then
             git add "${path}"
             say "  PASS -> staged ${name} at $(short "${path}" "${cand}")"
-            ADVANCED+=("${name} $(short "${path}" "${orig}") -> $(short "${path}" "${cand}")")
+            ADVANCED+=("${name} updated -> $(short "${path}" "${cand}")")
             return 0
         fi
         local step; [ "${WALK}" = "1" ] && step=" — stepping back" || step=""
@@ -380,12 +380,12 @@ for name in "${SELECTED[@]}"; do
 done
 
 if [ ${#ADVANCED[@]} -eq 0 ]; then
-    say "all selected submodules in-sync — nothing to update (use --force to re-run the gate at current pins)."
+    say "no submodule updates (use --force to force recompile on current versions)."
     exit "${fail}"
 fi
 
-echo -e "${COLOR_BOLD}updated submodules:${COLOR_OFF}"
-for b in "${ADVANCED[@]}"; do echo "  ${b}"; done
+joined="$(printf '%s, ' "${ADVANCED[@]}")"
+say "${joined%, }"
 
 if [ "${DO_COMMIT}" = "1" ]; then
     msg="build: update vendored submodules"$'\n'
