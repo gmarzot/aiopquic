@@ -11,12 +11,6 @@ class QuicConfiguration:
     individual fields where a different policy is needed.
     """
     alpn_protocols: list[str] | None = None
-    # QUIC idle timeout (seconds). 10s balances prompt dead-peer
-    # detection against scheduling jitter. Safe at this value because
-    # the aggregate TX gate and the per-new-stream cooperative yield
-    # keep the asyncio loop responsive even under unpaced producers —
-    # setup-phase exchanges can no longer be starved long enough to
-    # trip it. Raise for long-quiescent control-plane sessions.
     # QUIC idle timeout in seconds: the connection closes if no packet
     # is exchanged for this long. 30 s matches picoquic's default and
     # leaves headroom for a flow-controlled receiver whose consumer
