@@ -173,9 +173,13 @@ jobs:
         # window; it folds back to matching stable once stable catches up.
         uses: dtolnay/rust-toolchain@beta
       - name: Build s2n-quic-qns
+        # `cargo +beta`: s2n-quic ships a rust-toolchain.toml that pins the
+        # channel, overriding the installed default — so the build must select
+        # beta explicitly, else it falls back to the workspace-pinned stable
+        # and trips the s2n-tls MSRV above.
         run: |
           if [ ! -x s2n-quic/target/release/s2n-quic-qns ]; then
-            (cd s2n-quic && cargo build --release --bin s2n-quic-qns)
+            (cd s2n-quic && cargo +beta build --release --bin s2n-quic-qns)
           fi
       - name: Run native peer interop tests
         timeout-minutes: 12
