@@ -11,7 +11,7 @@ Pairs with aiomoqt 0.10.5. No public API changes — tooling, CI, and docs.
 
 ### CI
 
-- **s2n-quic interop peer build hardened.** The native `s2n-quic-qns` interop peer is pinned to release tag `v1.83.0` for reproducibility and built with the `@beta` Rust toolchain instead of `@stable`: s2n-quic ships no `Cargo.lock`, so cargo floats `s2n-tls` to its newest 0.3.x, whose MSRV can outrun the runner's current stable (e.g. s2n-tls 0.3.39 needs rustc 1.89 while stable was 1.88). `beta` is always stable+1 and folds back once stable catches up.
+- **s2n-quic interop peer build hardened.** The native `s2n-quic-qns` interop peer is pinned to release tag `v1.83.0` for reproducibility and built with the `@beta` Rust toolchain instead of `@stable`: s2n-quic ships no `Cargo.lock`, so cargo floats `s2n-tls` to its newest 0.3.x, whose MSRV can outrun the runner's current stable (e.g. s2n-tls 0.3.39 needs rustc 1.89 while stable was 1.88). `beta` is always stable+1 and folds back once stable catches up. The clone now runs *before* the `rust-cache` step, which executes `cargo metadata` in the workspace to compute its key and otherwise errored ("cwd does not exist") on a cache miss.
 
 ### Docs
 
