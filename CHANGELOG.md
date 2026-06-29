@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.3.10 (2026-06-29)
+
+Pairs with aiomoqt 0.10.5. No public API changes — tooling, CI, and docs.
+
+### Tooling
+
+- **`update_submodules.sh` — gated submodule pin advancer / surveyor.** Surveys and (with `--advance`) advances the vendored `picoquic` / `picotls` / `liburing` pins to the newest upstream commit that still builds and passes the test suite. The default run is a zero-side-effect dry-run drift report (pin SHA vs upstream, commits behind, version delta). `--advance` checks out the candidate, rebuilds (`build_picoquic.sh`), runs `pytest -m "not interop"` as the gate, and stages the pin on pass; on failure it restores the original pin and stops (fail-fast), with `--walk` to step back to the latest passing commit. `picotls` is treated as a *derived* pin that follows picoquic's blessed PTLS tag rather than its own master; `liburing` is held (it is `find_library()`'d, blessing no version). Flags: `--only`, `--to`, `--walk`, `--force`, `--no-build`, `--commit`.
+- **`bench_vint_codec.py`** prints a SUMMARY block (vi64-vs-RFC9000 codec ratio + `push_vint`/`pull_vint` dispatch overhead with a one-line verdict); docstring run command corrected.
+
+### CI
+
+- **s2n-quic interop peer build hardened.** The native `s2n-quic-qns` interop peer is pinned to release tag `v1.83.0` for reproducibility and built with the `@beta` Rust toolchain instead of `@stable`: s2n-quic ships no `Cargo.lock`, so cargo floats `s2n-tls` to its newest 0.3.x, whose MSRV can outrun the runner's current stable (e.g. s2n-tls 0.3.39 needs rustc 1.89 while stable was 1.88). `beta` is always stable+1 and folds back once stable catches up.
+
+### Docs
+
+- `pyproject.toml` wheel-matrix comment corrected: builds target cp312 / cp313 / cp314 (Python 3.12+), not "cp314 only / 3.14+".
+- `DATAFLOW.md` config table: `idle_timeout` default is 30 s (matches picoquic), not 10 s; removed a stale 10s-rationale comment block left in `QuicConfiguration` directly above the correct 30 s block.
+
+### Vendored pins shipped
+
+- picoquic `d6c5653d` (1.1.49.2) · picotls `bfa6787` · liburing `5227d48b` (2.7) — reported at runtime by `python -m aiopquic.versions`.
+
 ## v0.3.9 (2026-06-20)
 
 ### Multi-version negotiation (raw-QUIC ALPN list + WebTransport WT-Protocol)
