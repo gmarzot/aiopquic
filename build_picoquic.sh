@@ -179,6 +179,7 @@ elif [ "${AIOPQUIC_PERF:-1}" = "1" ]; then
     if [ "${PERF_ARCH}" = "x86_64" ] || [ "${PERF_ARCH}" = "amd64" ]; then
         PICOQUIC_PERF_ARGS+=("-DPTLS_WITH_FUSION=ON")
         PICOTLS_PERF_ARGS+=("-DWITH_FUSION=ON")
+        WANT_FUSION=1
     fi
     if [ "$(uname -s)" = "Darwin" ] && [ "${PERF_ARCH}" = "arm64" ]; then
         _PERF_CC_FLAGS="-O3 -DNDEBUG -mcpu=native -flto"
@@ -217,6 +218,21 @@ for lib in "${PTLS_CORE_LIB}" "${PTLS_OPENSSL_LIB}" "${PTLS_MINICRYPTO_LIB}"; do
         exit 1
     fi
 done
+
+# Fusion lives in its own static lib (picotls ADD_LIBRARY(picotls-fusion)).
+# picoquic's FindPTLS only auto-locates it via find_library HINTS that don't
+# cover our out-of-tree picotls build dir, so hand it the explicit path;
+# otherwise picoquic compiles the fusion refs but links nothing that defines
+# ptls_fusion_* (undefined-reference link failure on hosts without a system
+# picotls-fusion).
+if [ "${WANT_FUSION:-0}" = "1" ]; then
+    PTLS_FUSION_LIB="${PTLS_BUILD_DIR}/libpicotls-fusion.a"
+    if [ ! -f "${PTLS_FUSION_LIB}" ]; then
+        echo -e "${COLOR_RED}ERROR: expected ${PTLS_FUSION_LIB} after picotls build (WITH_FUSION=ON)${COLOR_OFF}" >&2
+        exit 1
+    fi
+    PICOQUIC_PERF_ARGS+=("-DPTLS_FUSION_LIBRARY=${PTLS_FUSION_LIB}")
+fi
 
 # --- Step 2: Build picoquic against our picotls ---
 echo -e "${COLOR_GREEN}Building picoquic in ${BUILD_DIR}...${COLOR_OFF}"
