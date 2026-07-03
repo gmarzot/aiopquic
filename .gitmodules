@@ -1,9 +1,12 @@
 [submodule "third_party/picoquic"]
 	path = third_party/picoquic
 	url = https://github.com/private-octopus/picoquic.git
+	ignore = dirty
 [submodule "third_party/picotls"]
 	path = third_party/picotls
 	url = https://github.com/h2o/picotls.git
+	ignore = dirty
 [submodule "third_party/liburing"]
 	path = third_party/liburing
 	url = https://github.com/axboe/liburing.git
+	ignore = dirty
