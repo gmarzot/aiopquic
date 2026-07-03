@@ -91,8 +91,9 @@ compute_fingerprint() {
     flavor=$(build_flavor)
     arch=$(uname -m)
     cc=$(${CC:-cc} --version 2>/dev/null | head -1 || echo unknown)
-    printf '%s|%s|%s|%s|%s|%s|%s' \
-        "${pico}" "${ptls}" "${liburing}" "${patches}" "${flavor}" "${arch}" "${cc}" \
+    local openssl="${OPENSSL_ROOT_DIR:-system}"
+    printf '%s|%s|%s|%s|%s|%s|%s|%s' \
+        "${pico}" "${ptls}" "${liburing}" "${patches}" "${flavor}" "${arch}" "${cc}" "${openssl}" \
         | _sha256
 }
 
@@ -228,6 +229,27 @@ if expect_fusion:
             else:
                 print("  fusion     : FAIL - Fusion not linked (portable / PERF=0 build)")
                 ok = False
+# Report the runtime-linked OpenSSL — the real "am I on the fast path?"
+# signal (OpenSSL version dominates throughput; may differ from Python's
+# ssl module). Best-effort; never fails the verify.
+try:
+    from aiopquic._binding import _transport  # noqa: F401  (maps libcrypto)
+    import ctypes
+    ossl_path = None
+    try:
+        with open("/proc/self/maps") as fh:
+            for line in fh:
+                if "libcrypto" in line:
+                    ossl_path = line.split()[-1]
+                    break
+    except OSError:
+        pass
+    lib = ctypes.CDLL(ossl_path) if ossl_path else ctypes.CDLL("libcrypto.so.3")
+    lib.OpenSSL_version.restype = ctypes.c_char_p
+    ver = lib.OpenSSL_version(0).decode()
+    print("  openssl    : %s%s" % (ver, (" (%s)" % ossl_path) if ossl_path else ""))
+except Exception:
+    pass
 sys.exit(0 if ok else 4)
 PY
 }

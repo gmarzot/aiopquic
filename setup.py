@@ -186,6 +186,12 @@ extensions = [
         sources=[os.path.join("src", "aiopquic", "_binding", "_transport.pyx")],
         include_dirs=include_dirs,
         library_dirs=library_dirs,
+        # Bake an RPATH to the OpenSSL lib dir so a custom OPENSSL_ROOT_DIR
+        # libcrypto is found at runtime without LD_LIBRARY_PATH. Empty (no
+        # RPATH) when OPENSSL_ROOT_DIR is unset, so system builds are
+        # unchanged. Nothing in the core import path loads libcrypto before
+        # this extension, so the RPATH wins the soname resolution.
+        runtime_library_dirs=library_dirs,
         extra_objects=extra_objects_for_ext,
         extra_link_args=extra_link_args,
         libraries=libraries,
