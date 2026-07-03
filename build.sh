@@ -534,16 +534,18 @@ do_full() {
         say "native libs stale or missing — compiling..."
         build_native
         write_stamp
-        install_extension
     else
         say "native libs up to date (fingerprint match) — skipping compile"
     fi
-    # Guarantee imported == source even when native was already fresh —
-    # this is what catches a wheel that clobbered the editable install.
+    # Always relink the editable extension: the native fingerprint does
+    # not cover the Cython binding sources (src/aiopquic/_binding/**), so
+    # a branch switch that changes only binding/Python code must still be
+    # picked up here. The relink is incremental (Cython recompiles only
+    # changed files) and also restores an editable install that a
+    # portable wheel may have clobbered.
+    install_extension
     if ! verify_imported; then
-        warn "imported aiopquic does not reflect this source tree — relinking..."
-        install_extension
-        verify_imported || die "verification still failing after relink"
+        die "verification failed after relink — imported aiopquic does not reflect this source tree"
     fi
     say "OK — installed + imported aiopquic reflects the current source"
 }
