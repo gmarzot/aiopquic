@@ -44,7 +44,7 @@ syscall-rate ceiling. It isolates picoquic protocol CPU cost from the
 loopback wall and is platform-independent. The 11.2 Gbps number above
 is what picoquic can do without any kernel involvement on this
 hardware. Build with `./tests/bench/sim_link/build.sh` after
-`./build_picoquic.sh`.
+`./build.sh`.
 
 With a full protocol stack on top (aiomoqt's MoQT layer, 8 parallel
 streams with per-group stream churn), the same hardware sustains
@@ -96,7 +96,7 @@ optimizations for local benching — not enabled in PyPI wheels:
 ```bash
 # Host-tuned: Fusion AES-GCM (x86_64), DISABLE_DEBUG_PRINTF,
 # -O3 -march=native -flto. Binary becomes machine-specific.
-AIOPQUIC_PERF=1 ./build_picoquic.sh
+AIOPQUIC_PERF=1 ./build.sh   # PERF=1 is the default; shown for clarity
 ```
 
 Per-platform behavior:
@@ -116,7 +116,7 @@ picoquic patch, setup.py linkage). Enabling it builds
 links `liburing.a` into the Cython extension:
 
 ```bash
-AIOPQUIC_IO_URING=1 ./build_picoquic.sh   # auto-fetches + builds liburing-2.7
+AIOPQUIC_IO_URING=1 ./build.sh   # auto-fetches + builds liburing-2.7
 uv pip install -e '.[dev]'                 # re-cythonize with PICOQUIC_WITH_IO_URING define
 ```
 

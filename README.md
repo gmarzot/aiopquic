@@ -47,12 +47,13 @@ For older Linux (glibc 2.28–2.33) install via sdist; build toolchain required.
 ```bash
 git clone https://github.com/gmarzot/aiopquic.git
 cd aiopquic
-git submodule update --init --recursive
 ./bootstrap_python.sh    # creates .venv with uv-managed Python 3.14 (GIL build) and pins cython 3.2+
 source .venv/bin/activate
-./build_picoquic.sh      # builds picotls, picoquic, native test drivers
-uv pip install -e '.[dev]'    # or: pip install -e '.[dev]'
+./build.sh               # reconcile submodules, build picotls/picoquic + drivers, relink + verify
+uv pip install -e '.[dev]'    # add dev/test extras — or: pip install -e '.[dev]'
 ```
+
+Re-run `./build.sh` after any `git checkout` or submodule bump — it is idempotent (a matching fingerprint skips the compile) and guarantees the *imported* aiopquic reflects the current source, host-tuned. `./build.sh --check` is a read-only doctor that reports submodule drift, a stale native build, or a portable wheel shadowing the editable install, and exits nonzero — handy as a pre-benchmark or CI gate.
 
 On macOS, set `OPENSSL_ROOT_DIR` if Homebrew OpenSSL is not auto-detected (the build script tries `openssl@3` then `openssl@1.1`).
 
