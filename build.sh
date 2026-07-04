@@ -578,7 +578,9 @@ MODE=full
 FORCE=0
 
 usage() {
-    sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+    # Print the header comment block (line 2 through the first blank
+    # line), stripping the leading "# ".
+    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
