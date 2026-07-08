@@ -28,6 +28,17 @@ import zlib
 from typing import Optional
 
 from qh3.asyncio import serve, connect
+
+from qh3.asyncio.protocol import (
+    QuicConnectionProtocol as _QCP, QuicStreamAdapter as _QSA)
+def _create_stream_drain_fix(self, stream_id):
+    adapter = _QSA(self, stream_id)
+    reader = asyncio.StreamReader()
+    protocol = asyncio.streams.StreamReaderProtocol(reader)
+    writer = asyncio.StreamWriter(adapter, protocol, reader, self._loop)
+    self._stream_readers[stream_id] = reader
+    return reader, writer
+_QCP._create_stream = _create_stream_drain_fix
 from qh3.asyncio.protocol import QuicConnectionProtocol
 from qh3.quic.configuration import QuicConfiguration
 from qh3.quic.events import StreamDataReceived, ConnectionTerminated

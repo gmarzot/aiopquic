@@ -18,6 +18,16 @@ Pairs with aiomoqt 0.10.6.
   undefined-reference link failures when building with Fusion AES-GCM
   (host-tuned x86_64) by handing picoquic's `FindPTLS` the explicit
   `libpicotls-fusion.a` path.
+- **Server NULL-deref when the negotiated ALPN is queried after picoquic
+  trims the TLS context.** picoquic frees (`trim`s) the `ptls` context after
+  the handshake, but its public `picoquic_tls_get_negotiated_alpn` still
+  dereferenced it. A peer whose handshake timing lands aiopquic's ALPN query
+  after the trim (surfaced by a qh3 client in the interop suite) segfaulted
+  the server. Carried as a local picoquic patch
+  (`patches/picoquic-alpn-null-guard.patch`, applied to the vendored picoquic
+  at build time) that guards the trimmed context and falls back to
+  `cnx->alpn` — which picoquic keeps across the trim — so the query returns
+  the real negotiated protocol instead of crashing. To be filed upstream.
 
 ### Build tooling
 
@@ -45,6 +55,22 @@ Pairs with aiomoqt 0.10.6.
 - **Vendored submodules marked `ignore = dirty`** in `.gitmodules`, so
   patch / build churn under `third_party/*` no longer appears in
   `git status`.
+
+### Testing
+
+- **Cross-stack QUIC interop, both directions, now validated.** The
+  `tests/interop/{test_qh3,test_aioquic}.py` suites now exercise
+  byte-faithful transfers (CRC-checked, up to 100 MB) with the pure-Python
+  **qh3** and **aioquic** stacks as *both* client and server. The
+  foreign-client → aiopquic-server cases were previously skipped on a
+  mis-diagnosis (blamed on a "Python 3.14 stack interaction"); the real
+  cause was the test harness draining a WebTransport-only `_event_queue` on
+  a raw-QUIC server — corrected to the raw-QUIC `quic_event_received` path.
+  aiopquic's raw-QUIC server RX is byte-faithful against both foreign
+  stacks. qh3-as-client also needs a small peer-side workaround for a qh3
+  bug (it builds `asyncio.StreamWriter` with `protocol=None`, which crashes
+  `drain()` on every Python). Peers are pip-installable
+  (`pip install qh3 aioquic`) — no native build required.
 
 ## v0.3.10 (2026-06-29)
 
