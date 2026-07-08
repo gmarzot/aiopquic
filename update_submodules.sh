@@ -35,7 +35,7 @@
 #                    update(s) with a generated message.
 #
 # Env:
-#   AIOPQUIC_SKIP_PATCHES   honored by build_picoquic.sh during the gate.
+#   AIOPQUIC_SKIP_PATCHES   honored by build.sh during the gate.
 #   PYTEST_ARGS             extra args appended to the pytest gate.
 
 set -euo pipefail
@@ -233,8 +233,8 @@ run_gate() {
         warn "  --no-build: skipping rebuild + gate"
         return 0
     fi
-    say "  building (build_picoquic.sh)..."
-    if ! ./build_picoquic.sh; then
+    say "  building (build.sh --native)..."
+    if ! ./build.sh --native; then
         return 1
     fi
     say "  relinking extension (pip install -e .)..."
@@ -348,7 +348,7 @@ advance_one() {
     git -C "${path}" checkout -q "${orig}"
     if [ "${NO_BUILD}" != "1" ]; then
         say "  rebuilding at original pin..."
-        ./build_picoquic.sh >/dev/null 2>&1 || true
+        ./build.sh --native >/dev/null 2>&1 || true
         pip install -e . >/dev/null 2>&1 || true
     fi
     [ "${WALK}" = "1" ] || warn "  newest commit failed; re-run with --walk to search older commits for one that passes"

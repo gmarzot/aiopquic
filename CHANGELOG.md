@@ -30,8 +30,9 @@ Pairs with aiomoqt 0.10.6.
   idempotent), `--check` (read-only doctor — reports submodule drift, a stale
   native build, or a portable wheel shadowing the editable install, and exits
   nonzero; a pre-benchmark / CI gate), `--force`, `--native`, `--install`,
-  `--verify`. `build_picoquic.sh` is now a thin shim (`build.sh --native`), so
-  CI, cibuildwheel, `update_submodules.sh`, and `sim_link` are unchanged.
+  `--verify`. `build_picoquic.sh` is **removed**; its callers (CI,
+  cibuildwheel, `update_submodules.sh`, sim_link) now invoke
+  `build.sh --native` directly.
 - **Custom OpenSSL with baked RPATH.** `OPENSSL_ROOT_DIR=/path ./build.sh`
   builds against a specific OpenSSL and bakes its RPATH into the extension, so
   it loads at runtime with **no `LD_LIBRARY_PATH`** (system builds unchanged —

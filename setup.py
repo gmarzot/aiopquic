@@ -31,7 +31,7 @@ PTLS_LIB_DIRS = [PICOTLS_BUILD]
 # Skip the picoquic-built check for commands that don't actually compile
 # the extension. sdist + egg_info + dist_info just package source files
 # and don't need the static libraries; failing them would block source
-# distribution from a fresh checkout that hasn't run build_picoquic.sh.
+# distribution from a fresh checkout that hasn't run build.sh.
 _NO_BUILD_CMDS = {
     "sdist", "egg_info", "dist_info", "check",
     "--help", "--help-commands", "--name", "--version",
@@ -41,7 +41,7 @@ _needs_libs = not _NO_BUILD_CMDS.intersection(sys.argv[1:])
 
 picoquic_lib = find_lib("libpicoquic-core.a", PICOQUIC_LIB_DIRS)
 if picoquic_lib is None and _needs_libs:
-    print("ERROR: picoquic not built. Run: ./build_picoquic.sh", file=sys.stderr)
+    print("ERROR: picoquic not built. Run: ./build.sh", file=sys.stderr)
     sys.exit(1)
 
 # picohttp-core: H3 + WebTransport + h3zero. Provides picowt_*,
@@ -93,7 +93,7 @@ if os.environ.get("AIOPQUIC_IO_URING", "0") == "1" and platform.system() == "Lin
 def _detect_brew_openssl():
     """On macOS, fall back to Homebrew's openssl@3 / openssl@1.1 prefix
     when OPENSSL_ROOT_DIR isn't set. Mirrors the equivalent detection
-    in build_picoquic.sh so the final-extension link line knows where
+    in build.sh so the final-extension link line knows where
     -lssl / -lcrypto live."""
     if platform.system() != "Darwin":
         return None

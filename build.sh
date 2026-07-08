@@ -15,8 +15,8 @@
 #                         pre-benchmark / CI gate.
 #   ./build.sh --force    rebuild native even if the fingerprint matches.
 #   ./build.sh --native   only compile native libs (picotls/picoquic +
-#                         test drivers); no reconcile, no relink. This is
-#                         the phase build_picoquic.sh delegates to.
+#                         test drivers); no reconcile, no relink. CI,
+#                         cibuildwheel, and update_submodules.sh use this.
 #   ./build.sh --install  only relink the extension + verify.
 #   ./build.sh --verify   only check imported == this source tree + Fusion.
 #
@@ -255,9 +255,8 @@ PY
 }
 
 # --- Native build (picotls + picoquic) ----------------------------------
-# This is the phase build_picoquic.sh delegates to. Logic is preserved
-# verbatim from the former build_picoquic.sh so CI / cibuildwheel behave
-# identically.
+# Compile picotls + picoquic (+ native test drivers) only. CI, cibuildwheel,
+# update_submodules.sh, and sim_link invoke this via `build.sh --native`.
 build_native() {
     # --- Sanity: submodules present ---
     if [ ! -f "${PICOQUIC_DIR}/CMakeLists.txt" ]; then

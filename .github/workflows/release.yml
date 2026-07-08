@@ -132,7 +132,7 @@ jobs:
         # manylinux container. SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOPQUIC
         # forces setuptools_scm to emit the requested version verbatim,
         # bypassing all git/tree state detection — required because
-        # cibuildwheel's before-all (build_picoquic.sh) dirties the
+        # cibuildwheel's before-all (build.sh --native) dirties the
         # working tree and the default scheme would emit .post1.devN.
         CIBW_ENVIRONMENT_PASS_LINUX: GITHUB_WORKSPACE SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOPQUIC
         SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AIOPQUIC: ${{ needs.tag.outputs.version }}

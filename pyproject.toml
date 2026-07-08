@@ -63,7 +63,7 @@ markers = [
 # Python: cp312 / cp313 / cp314 — aiopquic requires Python 3.12+.
 #
 # Each wheel build first compiles picoquic+picotls from the vendored
-# submodules via build_picoquic.sh inside the cibuildwheel container.
+# submodules via `build.sh --native` inside the cibuildwheel container.
 # auditwheel/delocate handle bundling libssl/libcrypto into the wheel so
 # end users don't need OpenSSL preinstalled.
 [tool.cibuildwheel]
@@ -95,7 +95,7 @@ manylinux-x86_64-image = "manylinux_2_34"
 manylinux-aarch64-image = "manylinux_2_34"
 before-all = """
 dnf install -y openssl-devel cmake
-bash build_picoquic.sh
+bash build.sh --native
 """
 
 [tool.cibuildwheel.linux.environment]
@@ -103,7 +103,7 @@ bash build_picoquic.sh
 # -flto inlines across translation units; DISABLE_DEBUG_PRINTF strips
 # debug branches in picoquic. Arch-specific tuning (x86-64-v3 baseline,
 # PTLS Fusion AES-GCM) is added per-arch via overrides below.
-# AIOPQUIC_WHEEL_BUILD=1 suppresses build_picoquic.sh's default
+# AIOPQUIC_WHEEL_BUILD=1 suppresses build.sh's default
 # host-tuned -march=native so wheels stay portable (caller-provided
 # PICOQUIC_C_FLAGS / CMAKE_ARGS below drive the build).
 AIOPQUIC_WHEEL_BUILD = "1"
@@ -130,10 +130,10 @@ environment = { AIOPQUIC_WHEEL_BUILD = "1", CFLAGS = "-O3 -fno-strict-overflow -
 # Older macOS users fall back to sdist (build from source).
 before-all = """
 brew install cmake openssl@3
-bash build_picoquic.sh
+bash build.sh --native
 """
 
 [tool.cibuildwheel.macos.environment]
-# Portable wheel build — suppress build_picoquic.sh's default
+# Portable wheel build — suppress build.sh's default
 # host-tuned -march=native (which would make the wheel non-portable).
 AIOPQUIC_WHEEL_BUILD = "1"
