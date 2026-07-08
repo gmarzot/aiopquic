@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.3.11
+
+Pairs with aiomoqt 0.10.6.
+
+### Fixes
+
+- **WebTransport TX use-after-free on session teardown.** When picoquic
+  retires the connection + h3zero context, both become invalid, but the
+  session struct outlives them. A late TX event drained afterward (e.g.
+  `TX_WT_RESET_STREAM`) passed its `!s->cnx` guard on a dangling pointer and
+  `h3zero_find_stream` walked a freed splay tree. The WT path now nulls the
+  cached picoquic-owned pointers (`s->cnx`, `s->h3_ctx`, `s->control_stream`)
+  when the connection is retired, and guards the reset path on a live
+  `s->h3_ctx`.
+- **picotls Fusion linked into picoquic.** Resolves `ptls_fusion_*`
+  undefined-reference link failures when building with Fusion AES-GCM
+  (host-tuned x86_64) by handing picoquic's `FindPTLS` the explicit
+  `libpicotls-fusion.a` path.
+
+### Build tooling
+
+- **`build.sh` — single front-door build.** Reconciles the vendored
+  submodules to the checked-out commit, builds picotls / picoquic only when a
+  fingerprint of {submodule SHAs, patches, flavor, arch, compiler, OpenSSL}
+  is stale, relinks the editable extension, and verifies the *imported*
+  binding resolves to this source tree (with Fusion linked on host-tuned
+  x86_64). Modes: default (reconcile → build-if-stale → relink → verify,
+  idempotent), `--check` (read-only doctor — reports submodule drift, a stale
+  native build, or a portable wheel shadowing the editable install, and exits
+  nonzero; a pre-benchmark / CI gate), `--force`, `--native`, `--install`,
+  `--verify`. `build_picoquic.sh` is now a thin shim (`build.sh --native`), so
+  CI, cibuildwheel, `update_submodules.sh`, and `sim_link` are unchanged.
+- **Custom OpenSSL with baked RPATH.** `OPENSSL_ROOT_DIR=/path ./build.sh`
+  builds against a specific OpenSSL and bakes its RPATH into the extension, so
+  it loads at runtime with **no `LD_LIBRARY_PATH`** (system builds unchanged —
+  the RPATH is empty when `OPENSSL_ROOT_DIR` is unset). `OPENSSL_ROOT_DIR` is
+  part of the build fingerprint, so switching OpenSSL forces a rebuild.
+- **`aiopquic.versions` / `build.sh --check` report the linked OpenSSL.** They
+  now print the actually-loaded `libcrypto` version + path — which dominates
+  AES-GCM throughput and can differ from Python's `ssl` module. The
+  at-a-glance "am I on the fast crypto?" signal.
+- **Vendored submodules marked `ignore = dirty`** in `.gitmodules`, so
+  patch / build churn under `third_party/*` no longer appears in
+  `git status`.
+
 ## v0.3.10 (2026-06-29)
 
 Pairs with aiomoqt 0.10.5. No public API changes — tooling, CI, and docs.
