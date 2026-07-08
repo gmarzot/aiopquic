@@ -1133,9 +1133,19 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
     }
 
     case SPSC_EVT_TX_WT_RESET_STREAM: {
-        if (!s || !s->cnx || !s->h3_ctx) return 1;
+        if (!s || !s->cnx) return 1;
+        /* Re-fetch the live h3 ctx from the cnx rather than trusting the
+         * cached s->h3_ctx: by the time this TX event is drained the
+         * h3zero ctx can already be freed (observed as a SIGSEGV in
+         * h3zero_find_stream -> picosplay_find walking a freed splay
+         * tree, triggered by an incoming SUBSCRIBE over WebTransport).
+         * picoquic_get_callback_context returns the current ctx for a
+         * live cnx, or NULL once it is gone. */
+        h3zero_callback_ctx_t* h3_ctx =
+            (h3zero_callback_ctx_t*)picoquic_get_callback_context(s->cnx);
+        if (!h3_ctx) return 1;
         h3zero_stream_ctx_t* st =
-            h3zero_find_stream(s->h3_ctx, entry->stream_id);
+            h3zero_find_stream(h3_ctx, entry->stream_id);
         if (st) {
             picowt_reset_stream(s->cnx, st, entry->error_code);
         }

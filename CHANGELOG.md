@@ -28,6 +28,14 @@ Pairs with aiomoqt 0.10.6.
   at build time) that guards the trimmed context and falls back to
   `cnx->alpn` — which picoquic keeps across the trim — so the query returns
   the real negotiated protocol instead of crashing. To be filed upstream.
+- **WebTransport reset-stream TX use-after-free (SIGSEGV).** The WT
+  reset-stream TX handler dereferenced a cached `s->h3_ctx` that can already
+  be freed by the time the event is drained — a crash in `h3zero_find_stream`
+  → `picosplay_find` walking a freed splay tree, triggered by an incoming
+  SUBSCRIBE over WebTransport. It now re-fetches the live h3 context from the
+  connection (`picoquic_get_callback_context`) each cycle and bails if the
+  connection is gone, rather than trusting the cached pointer. Distinct
+  trigger from the session-teardown WT use-after-free above.
 
 ### Build tooling
 
