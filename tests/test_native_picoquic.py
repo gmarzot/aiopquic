@@ -5,7 +5,7 @@ non-slow test compiled into the binaries (~552 tests total, ~48s).
 This catches regressions in picoquic itself when the submodule is
 bumped, independent of aiopquic's binding.
 
-Drivers are built as part of ./build_picoquic.sh so this runs in
+Drivers are built as part of ./build.sh so this runs in
 default `pytest` if the build succeeded.
 
 Slow categories are excluded via `-x`: stress/fuzz, cnx_stress,
@@ -86,7 +86,7 @@ class TestNativePicoquic:
 
     @pytest.mark.skipif(
         not PICOQUIC_CT.exists(),
-        reason="picoquic_ct not built; run ./build_picoquic.sh",
+        reason="picoquic_ct not built; run ./build.sh",
     )
     def test_picoquic_ct(self):
         result = _run(PICOQUIC_CT, PICOQUIC_SLOW)
@@ -99,7 +99,7 @@ class TestNativePicoquic:
 
     @pytest.mark.skipif(
         not PICOHTTP_CT.exists(),
-        reason="picohttp_ct not built; run ./build_picoquic.sh",
+        reason="picohttp_ct not built; run ./build.sh",
     )
     def test_picohttp_ct(self):
         result = _run(PICOHTTP_CT, PICOHTTP_SLOW)

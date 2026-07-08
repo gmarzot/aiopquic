@@ -168,17 +168,6 @@ async def test_aiopquic_client_aioquic_server_sink(cert_paths, payload_bytes):
 # aioquic-as-client → aiopquic-as-server (sink mode):
 #   verifies aiopquic's RX is byte-faithful from a different stack.
 # ---------------------------------------------------------------------------
-@pytest.mark.skip(
-    reason=(
-        "aioquic-as-client → aiopquic-as-server on Python 3.14 does not "
-        "complete the byte transfer within the test timeout (bytes don't "
-        "reach the aiopquic side). The reverse direction "
-        "(aiopquic-as-client → aioquic-as-server) passes, so aiopquic's RX "
-        "path itself is fine. Likely an aioquic 1.3.0 + Python 3.14 stack "
-        "interaction; tracking separately. Skip until the peer stack "
-        "works cleanly on 3.14."
-    )
-)
 @pytest.mark.parametrize("payload_bytes", [
     1 * 1024 * 1024,
     10 * 1024 * 1024,
@@ -190,34 +179,33 @@ async def test_aioquic_client_aiopquic_server_sink(cert_paths, payload_bytes):
     from aiopquic.quic.configuration import QuicConfiguration
     from aiopquic.quic.events import StreamDataReceived
 
+    from aiopquic.asyncio.protocol import QuicConnectionProtocol
+
     cfg = QuicConfiguration(
         is_client=False,
         alpn_protocols=[ALPN],
     )
     cfg.load_cert_chain(cert_paths["cert"], cert_paths["key"])
 
-    received = {"bytes": 0, "crc": 0, "fin": False}
+    received = {"bytes": 0, "crc": 0}
     fin_event = asyncio.Event()
 
-    async def handle_protocol(protocol):
-        # Drain stream events from the protocol's event queue.
-        while True:
-            evt = await protocol._event_queue.get()
-            if isinstance(evt, StreamDataReceived):
-                if evt.data:
-                    received["bytes"] += len(evt.data)
+    # Raw-QUIC servers surface stream data via quic_event_received (draining
+    # QuicConnection.next_event) — NOT the WebTransport-session _event_queue.
+    class ServerProtocol(QuicConnectionProtocol):
+        def quic_event_received(self, event):
+            if isinstance(event, StreamDataReceived):
+                if event.data:
+                    received["bytes"] += len(event.data)
                     received["crc"] = zlib.crc32(
-                        bytes(evt.data), received["crc"]
-                    ) & 0xFFFFFFFF
-                if evt.end_stream:
-                    received["fin"] = True
+                        bytes(event.data), received["crc"]) & 0xFFFFFFFF
+                if event.end_stream:
                     fin_event.set()
-                    return
 
     server = await serve(
         host="127.0.0.1", port=port,
         configuration=cfg,
-        stream_handler=handle_protocol,
+        create_protocol=lambda quic, **kw: ServerProtocol(quic, **kw),
     )
 
     try:

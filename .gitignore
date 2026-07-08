@@ -1,3 +1,6 @@
+# Build state stamp (build.sh fingerprint)
+.build_state
+
 # Python
 __pycache__/
 *.py[cod]

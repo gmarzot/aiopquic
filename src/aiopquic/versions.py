@@ -223,6 +223,47 @@ def _format_submodule(name: str, info: dict[str, str]) -> str:
     return f"{label}{rev}"
 
 
+def _openssl_info() -> tuple[str, str | None] | None:
+    """Runtime OpenSSL the binding links: (version, resolved libcrypto
+    path). Answers 'am I on the fast crypto?' — the actually-loaded
+    libcrypto, which dominates throughput, not Python's `ssl` module
+    (which can link a different OpenSSL than the extension). Best-effort;
+    returns None when it can't be determined."""
+    import ctypes
+    try:
+        from aiopquic._binding import _transport  # noqa: F401  (maps libcrypto)
+    except Exception:
+        pass
+    path = None
+    try:
+        with open("/proc/self/maps") as fh:
+            for line in fh:
+                if "libcrypto" in line:
+                    path = line.split()[-1]
+                    break
+    except OSError:
+        pass
+    try:
+        lib = ctypes.CDLL(path) if path else ctypes.CDLL("libcrypto.so.3")
+        lib.OpenSSL_version.restype = ctypes.c_char_p
+        lib.OpenSSL_version.argtypes = [ctypes.c_int]
+        ver = lib.OpenSSL_version(0).decode()  # OPENSSL_VERSION = 0
+    except Exception:
+        return None
+    return (ver, path)
+
+
+def _format_openssl(info: tuple[str, str | None]) -> str:
+    """`  - openssl:  OpenSSL X.Y.Z (path)` — version trimmed of the
+    trailing release date, path abbreviated with ~."""
+    ver, path = info
+    label = f"  - {'openssl:':<{_LABEL_W}}"
+    short = " ".join(ver.split()[:2]) if ver else ver
+    if path:
+        return f"{label}{short} ({_abbrev(path)})"
+    return f"{label}{short}"
+
+
 def print_versions(file=sys.stdout) -> None:
     import aiopquic
     dist = _dist("aiopquic")
@@ -230,6 +271,9 @@ def print_versions(file=sys.stdout) -> None:
     print(f"{'aiopquic:':<{_LABEL_W}}{_version(ver)}{_meta(aiopquic, 'aiopquic')}", file=file)
     print(_format_submodule("picoquic", _submodule_info("PICOQUIC")), file=file)
     print(_format_submodule("picotls",  _submodule_info("PICOTLS")),  file=file)
+    ossl = _openssl_info()
+    if ossl is not None:
+        print(_format_openssl(ossl), file=file)
 
 
 def main() -> int:

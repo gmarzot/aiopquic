@@ -1,0 +1,32 @@
+diff --git a/picoquic/tls_api.c b/picoquic/tls_api.c
+index 0305cfa9..2b07daae 100644
+--- a/picoquic/tls_api.c
++++ b/picoquic/tls_api.c
+@@ -2291,10 +2291,26 @@ void picoquic_tlscontext_trim_after_handshake(picoquic_cnx_t * cnx)
+ char const* picoquic_tls_get_negotiated_alpn(picoquic_cnx_t* cnx)
+ {
+     picoquic_tls_ctx_t* ctx;
++    if (cnx == NULL) {
++        return NULL;
++    }
+     PICOQUIC_THREAD_CHECK(cnx->quic);
+     ctx = (picoquic_tls_ctx_t*)cnx->tls_ctx;
+ 
+-    return ptls_get_negotiated_protocol(ctx->tls);
++    if (ctx != NULL && ctx->tls != NULL) {
++        char const* alpn = ptls_get_negotiated_protocol(ctx->tls);
++        if (alpn != NULL) {
++            return alpn;
++        }
++    }
++
++    /* The ptls context can be absent (tls_ctx NULL) or detached at points
++     * where the connection is otherwise usable — some peers' handshake
++     * timing reaches the "ready" callback in this state. Fall back to the
++     * ALPN picoquic recorded on the connection during the handshake so
++     * callers still get the real negotiated protocol instead of a NULL
++     * dereference. */
++    return cnx->alpn;
+ }
+ 
+ char const* picoquic_tls_get_sni(picoquic_cnx_t* cnx)

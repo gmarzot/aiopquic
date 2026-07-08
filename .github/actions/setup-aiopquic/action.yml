@@ -67,7 +67,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: third_party/picoquic/build
-        key: picoquic-build${{ inputs.with-native-tests == 'true' && '-native' || '' }}-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build_picoquic.sh', 'patches/*.patch', 'build_picoquic_tests.sh') }}
+        key: picoquic-build${{ inputs.with-native-tests == 'true' && '-native' || '' }}-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build.sh', 'patches/*.patch', 'build_picoquic_tests.sh') }}
     - name: Build picoquic
       if: steps.picoquic-cache.outputs.cache-hit != 'true'
       shell: bash
@@ -78,7 +78,7 @@ runs:
         # cache-safe across runner instances.
         AIOPQUIC_WHEEL_BUILD: "1"
       run: |
-        ./build_picoquic.sh
+        ./build.sh --native
         if [ "${{ inputs.with-native-tests }}" = "true" ]; then
           if [ -x ./build_picoquic_tests.sh ]; then
             ./build_picoquic_tests.sh

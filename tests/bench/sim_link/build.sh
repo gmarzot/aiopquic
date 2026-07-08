@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build sim_link_bench. Run after build_picoquic.sh.
+# Build sim_link_bench. Run after ./build.sh (or ./build.sh --native).
 #
 # Output: tests/bench/sim_link/sim_link_bench
 set -euo pipefail
@@ -9,12 +9,12 @@ PQ="${ROOT}/third_party/picoquic"
 PT="${ROOT}/third_party/picotls"
 
 if [ ! -f "${PQ}/build/libpicoquic-test.a" ]; then
-    echo "error: picoquic libs not built. Run ./build_picoquic.sh first." >&2
+    echo "error: picoquic libs not built. Run ./build.sh first." >&2
     exit 1
 fi
 
 # macOS Homebrew OpenSSL paths — Apple deprecated the system openssl,
-# so libssl/libcrypto live under brew. build_picoquic.sh assumes the
+# so libssl/libcrypto live under brew. build.sh assumes the
 # same; we mirror that here.
 EXTRA_CFLAGS=""
 EXTRA_LDFLAGS=""

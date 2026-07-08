@@ -13,7 +13,7 @@ kernel?"
 ## Build
 
 ```bash
-./build_picoquic.sh                # builds picoquic static libs
+./build.sh --native                # builds picoquic static libs
 ./tests/bench/sim_link/build.sh    # builds sim_link_bench
 ```
 

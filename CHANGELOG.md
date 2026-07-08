@@ -1,5 +1,85 @@
 # Changelog
 
+## v0.3.11
+
+Pairs with aiomoqt 0.10.6.
+
+### Fixes
+
+- **WebTransport TX use-after-free on session teardown.** When picoquic
+  retires the connection + h3zero context, both become invalid, but the
+  session struct outlives them. A late TX event drained afterward (e.g.
+  `TX_WT_RESET_STREAM`) passed its `!s->cnx` guard on a dangling pointer and
+  `h3zero_find_stream` walked a freed splay tree. The WT path now nulls the
+  cached picoquic-owned pointers (`s->cnx`, `s->h3_ctx`, `s->control_stream`)
+  when the connection is retired, and guards the reset path on a live
+  `s->h3_ctx`.
+- **picotls Fusion linked into picoquic.** Resolves `ptls_fusion_*`
+  undefined-reference link failures when building with Fusion AES-GCM
+  (host-tuned x86_64) by handing picoquic's `FindPTLS` the explicit
+  `libpicotls-fusion.a` path.
+- **Server NULL-deref when the negotiated ALPN is queried after picoquic
+  trims the TLS context.** picoquic frees (`trim`s) the `ptls` context after
+  the handshake, but its public `picoquic_tls_get_negotiated_alpn` still
+  dereferenced it. A peer whose handshake timing lands aiopquic's ALPN query
+  after the trim (surfaced by a qh3 client in the interop suite) segfaulted
+  the server. Carried as a local picoquic patch
+  (`patches/picoquic-alpn-null-guard.patch`, applied to the vendored picoquic
+  at build time) that guards the trimmed context and falls back to
+  `cnx->alpn` — which picoquic keeps across the trim — so the query returns
+  the real negotiated protocol instead of crashing. To be filed upstream.
+- **WebTransport reset-stream TX use-after-free (SIGSEGV).** The WT
+  reset-stream TX handler dereferenced a cached `s->h3_ctx` that can already
+  be freed by the time the event is drained — a crash in `h3zero_find_stream`
+  → `picosplay_find` walking a freed splay tree, triggered by an incoming
+  SUBSCRIBE over WebTransport. It now re-fetches the live h3 context from the
+  connection (`picoquic_get_callback_context`) each cycle and bails if the
+  connection is gone, rather than trusting the cached pointer. Distinct
+  trigger from the session-teardown WT use-after-free above.
+
+### Build tooling
+
+- **`build.sh` — single front-door build.** Reconciles the vendored
+  submodules to the checked-out commit, builds picotls / picoquic only when a
+  fingerprint of {submodule SHAs, patches, flavor, arch, compiler, OpenSSL}
+  is stale, relinks the editable extension, and verifies the *imported*
+  binding resolves to this source tree (with Fusion linked on host-tuned
+  x86_64). Modes: default (reconcile → build-if-stale → relink → verify,
+  idempotent), `--check` (read-only doctor — reports submodule drift, a stale
+  native build, or a portable wheel shadowing the editable install, and exits
+  nonzero; a pre-benchmark / CI gate), `--force`, `--native`, `--install`,
+  `--verify`. `build_picoquic.sh` is **removed**; its callers (CI,
+  cibuildwheel, `update_submodules.sh`, sim_link) now invoke
+  `build.sh --native` directly.
+- **Custom OpenSSL with baked RPATH.** `OPENSSL_ROOT_DIR=/path ./build.sh`
+  builds against a specific OpenSSL and bakes its RPATH into the extension, so
+  it loads at runtime with **no `LD_LIBRARY_PATH`** (system builds unchanged —
+  the RPATH is empty when `OPENSSL_ROOT_DIR` is unset). `OPENSSL_ROOT_DIR` is
+  part of the build fingerprint, so switching OpenSSL forces a rebuild.
+- **`aiopquic.versions` / `build.sh --check` report the linked OpenSSL.** They
+  now print the actually-loaded `libcrypto` version + path — which dominates
+  AES-GCM throughput and can differ from Python's `ssl` module. The
+  at-a-glance "am I on the fast crypto?" signal.
+- **Vendored submodules marked `ignore = dirty`** in `.gitmodules`, so
+  patch / build churn under `third_party/*` no longer appears in
+  `git status`.
+
+### Testing
+
+- **Cross-stack QUIC interop, both directions, now validated.** The
+  `tests/interop/{test_qh3,test_aioquic}.py` suites now exercise
+  byte-faithful transfers (CRC-checked, up to 100 MB) with the pure-Python
+  **qh3** and **aioquic** stacks as *both* client and server. The
+  foreign-client → aiopquic-server cases were previously skipped on a
+  mis-diagnosis (blamed on a "Python 3.14 stack interaction"); the real
+  cause was the test harness draining a WebTransport-only `_event_queue` on
+  a raw-QUIC server — corrected to the raw-QUIC `quic_event_received` path.
+  aiopquic's raw-QUIC server RX is byte-faithful against both foreign
+  stacks. qh3-as-client also needs a small peer-side workaround for a qh3
+  bug (it builds `asyncio.StreamWriter` with `protocol=None`, which crashes
+  `drain()` on every Python). Peers are pip-installable
+  (`pip install qh3 aioquic`) — no native build required.
+
 ## v0.3.10 (2026-06-29)
 
 Pairs with aiomoqt 0.10.5. No public API changes — tooling, CI, and docs.
