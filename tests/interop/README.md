@@ -1,19 +1,18 @@
 # aiopquic interop tests
 
-Cross-stack tests against three independent QUIC implementations.
+Cross-stack tests against independent QUIC implementations.
 
 ## What runs where
 
 | stack    | language | install                         | runs in CI? | role                                      |
 |----------|----------|---------------------------------|-------------|-------------------------------------------|
 | qh3      | Python   | `pip install qh3` (transitive)  | **yes**     | basic byte-conservation smoke (1MB/10MB) |
-| s2n-quic | Rust     | local build, env var pointer    | **no**      | independent Rust impl validation          |
-| ngtcp2   | C        | local build, env var pointer    | **no**      | high-throughput / multi-stream stress     |
+| aioquic  | Python   | `pip install aioquic`           | **yes**     | reference asyncio QUIC cross-check        |
+| ngtcp2   | C        | local build, env var pointer    | **no**      | high-throughput / multi-stream stress (optional) |
 
-CI runs **only** the qh3 tests by default — they're pure-Python and need no
-extra binaries. The s2n-quic and ngtcp2 tests skip silently unless their
-env vars point to built binaries; they're a developer-machine harness, not
-a release gate.
+CI runs the pure-Python qh3 and aioquic tests by default — they need no extra
+binaries. The ngtcp2 tests skip silently unless their env vars point to built
+binaries; they're an optional developer-machine harness, not a release gate.
 
 The package wheel does not ship any of these test peers. They live entirely
 under `tests/interop/` and exist to validate aiopquic's transport against
@@ -25,10 +24,9 @@ genuinely independent QUIC stacks during dev and pre-release.
 # Default (CI shape) — runs qh3 only:
 pytest tests/interop/ -v
 
-# Full local stress (after building the binaries below):
+# Full local stress (after building the ngtcp2 binaries below):
 NGTCP2_CLIENT=$HOME/src/ngtcp2/examples/h09client \
 NGTCP2_SERVER=$HOME/src/ngtcp2/examples/h09server \
-S2N_QUIC_QNS=$HOME/src/s2n-quic/target/release/s2n-quic-qns \
 pytest tests/interop/ -v
 ```
 
@@ -37,15 +35,6 @@ pytest tests/interop/ -v
 Already a dev dependency (transitive via aiomoqt v0.8.x). Tests run
 automatically. If `import qh3` fails, the test file is skipped with a
 clear reason.
-
-## s2n-quic (local-only)
-
-```
-git clone https://github.com/aws/s2n-quic ~/src/s2n-quic
-cd ~/src/s2n-quic
-cargo build --release --bin s2n-quic-qns
-export S2N_QUIC_QNS=$(pwd)/target/release/s2n-quic-qns
-```
 
 ## ngtcp2 (local-only)
 
@@ -85,7 +74,6 @@ shortest on stock Ubuntu.)
 | ngtcp2  | 16 streams × 1MB concurrent         | multi-stream scheduler          |
 | ngtcp2  | 64 streams × 256KB concurrent       | high stream count               |
 | ngtcp2  | 1000 streams × 4KB                  | high object rate / open+close   |
-| s2n-quic | parity smoke vs ngtcp2             | Rust impl independence          |
 
 ## Pass criteria
 
