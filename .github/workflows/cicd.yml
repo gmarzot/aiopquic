@@ -3,15 +3,12 @@ name: CI
 # PR + main test gate. Releases (TestPyPI -> PyPI -> GitHub Release) live
 # in release.yml, triggered manually via workflow_dispatch.
 #
-# Tiers (post-enhancement):
+# Tiers:
 #   - core: unit + loopback. Required on (linux, macos) x (3.12, 3.13, 3.14).
-#   - native: picoquic_ct + picohttp_ct subprocess smoke. continue-on-error
-#     initially while runner flakiness is characterized.
-#   - perf-gate: bench_baselines_lowlevel short window, very conservative
-#     floor. continue-on-error initially.
-#
-# Once the new tiers are stable across a few PRs the continue-on-error
-# flags are removed and they become required.
+#   - native: picoquic_ct + picohttp_ct subprocess smoke. Required.
+#   - peer interop: qh3 + aioquic cross-stack transfers. Required.
+#   - benchmark: perf floor on shared runners — advisory only
+#     (continue-on-error); perf noise is not a correctness signal.
 
 on:
   pull_request:
@@ -53,7 +50,6 @@ jobs:
   native:
     name: picoquic / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -68,7 +64,7 @@ jobs:
           with-native-tests: 'true'
       - name: Run native tier
         timeout-minutes: 20
-        run: python -m pytest tests/ -v -m native || true
+        run: python -m pytest tests/ -v -m native
 
   peer-interop:
     # aioquic + qh3 are pip-installable Python QUIC implementations.
@@ -79,7 +75,6 @@ jobs:
     # installs them and runs those test files specifically.
     name: peer interop
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -96,102 +91,11 @@ jobs:
             tests/interop/test_qh3.py \
             -v --tb=short
 
-  peer-interop-native:
-    # Native (C / Rust) QUIC peers — independent stacks built from source.
-    # Skipped silently in dev (env vars unset); this job sets them.
-    # Build instructions match tests/interop/README.md.
-    #
-    #   - ngtcp2: HTTP/0.9-over-QUIC examples (h09client, h09server)
-    #     speak the canonical IETF interop reference protocol. Built
-    #     with gnutls (shortest path on Ubuntu — no custom OpenSSL).
-    #     Needs nghttp3 built first.
-    #   - s2n-quic: AWS Rust QUIC stack. s2n-quic-qns is the interop
-    #     runner binary; test file accepts S2N_QUIC_QNS or
-    #     S2N_QUIC_PERF env var.
-    name: peer interop (native)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
-      - uses: ./.github/actions/setup-aiopquic
-      - name: Install extra system dependencies for ngtcp2 build
-        run: |
-          sudo apt-get install -y \
-            libgnutls28-dev libev-dev pkg-config autoconf automake libtool
-      - name: Resolve ngtcp2 + nghttp3 HEAD SHAs
-        id: native-shas
-        run: |
-          ng3=$(git ls-remote https://github.com/ngtcp2/nghttp3 HEAD | cut -f1)
-          ng2=$(git ls-remote https://github.com/ngtcp2/ngtcp2 HEAD | cut -f1)
-          echo "nghttp3=$ng3" >> "$GITHUB_OUTPUT"
-          echo "ngtcp2=$ng2" >> "$GITHUB_OUTPUT"
-      - name: Cache ngtcp2 + nghttp3 builds
-        id: ngtcp2-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            third_party/native/nghttp3
-            third_party/native/ngtcp2
-          key: ngtcp2-${{ runner.os }}-gnutls-${{ steps.native-shas.outputs.ngtcp2 }}-${{ steps.native-shas.outputs.nghttp3 }}
-      - name: Build nghttp3 + ngtcp2 (gnutls)
-        if: steps.ngtcp2-cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p third_party/native
-          cd third_party/native
-          git clone --depth 1 --recurse-submodules https://github.com/ngtcp2/nghttp3
-          (cd nghttp3 && autoreconf -i && \
-            ./configure --enable-lib-only --prefix=$(pwd)/inst && \
-            make -j$(nproc) install)
-          git clone --depth 1 --recurse-submodules https://github.com/ngtcp2/ngtcp2
-          (cd ngtcp2 && autoreconf -i && \
-            PKG_CONFIG_PATH=$(pwd)/../nghttp3/inst/lib/pkgconfig \
-            ./configure --with-gnutls --with-libnghttp3=$(pwd)/../nghttp3/inst && \
-            make -j$(nproc))
-      - name: Clone s2n-quic (interop peer)
-        # Clone BEFORE the cache step: Swatinem/rust-cache runs `cargo
-        # metadata` in the workspace to build its key, so the source tree must
-        # already exist (otherwise it errors "cwd does not exist" on a cache
-        # miss). Pinned to a release tag for reproducibility (its deps still
-        # float — see the toolchain note below).
-        run: |
-          if [ ! -d s2n-quic ]; then
-            git clone --depth 1 --branch v1.83.0 https://github.com/aws/s2n-quic
-          fi
-      - name: Cargo cache for s2n-quic
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: s2n-quic -> s2n-quic/target
-          shared-key: s2n-quic-qns
-      - name: Install Rust toolchain
-        # @beta, not @stable: s2n-quic has no committed Cargo.lock, so cargo
-        # resolves s2n-tls to its newest 0.3.x, whose MSRV can outrun the
-        # runner's current stable (s2n-tls 0.3.39 needs rustc 1.89 while
-        # stable was still 1.88). beta is always stable+1, covering that lag
-        # window; it folds back to matching stable once stable catches up.
-        uses: dtolnay/rust-toolchain@beta
-      - name: Build s2n-quic-qns
-        # `cargo +beta`: s2n-quic ships a rust-toolchain.toml that pins the
-        # channel, overriding the installed default — so the build must select
-        # beta explicitly, else it falls back to the workspace-pinned stable
-        # and trips the s2n-tls MSRV above.
-        run: |
-          if [ ! -x s2n-quic/target/release/s2n-quic-qns ]; then
-            (cd s2n-quic && cargo +beta build --release --bin s2n-quic-qns)
-          fi
-      - name: Run native peer interop tests
-        timeout-minutes: 12
-        env:
-          NGTCP2_CLIENT: ${{ github.workspace }}/third_party/native/ngtcp2/examples/h09client
-          NGTCP2_SERVER: ${{ github.workspace }}/third_party/native/ngtcp2/examples/h09server
-          S2N_QUIC_QNS: ${{ github.workspace }}/s2n-quic/target/release/s2n-quic-qns
-        run: |
-          python -m pytest \
-            tests/interop/test_ngtcp2.py \
-            tests/interop/test_s2n_quic.py \
-            -v --tb=short
+  # peer-interop-native retired: s2n-quic tests are deleted (unimplemented
+  # stub) and every ngtcp2 directional test is an adapter-pending skip, so
+  # the job built two native stacks per run for zero test signal. ngtcp2
+  # remains an optional developer-machine peer (tests/interop/README.md);
+  # picoquicdemo (vendored, h09 + h3/WT) is the planned in-tree native peer.
 
   benchmark:
     name: benchmark / ${{ matrix.os }}
