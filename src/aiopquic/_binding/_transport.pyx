@@ -258,6 +258,7 @@ cdef extern from "c/callback.h":
         uint32_t rx_data_ring_cap
         uint64_t keep_alive_us
         char* wt_supported_protocols
+        void* dual_wt_params
         uint64_t worker_mark_active_processed
         uint64_t worker_prepare_to_send_calls
         uint64_t worker_prepare_to_send_pulled_bytes
@@ -522,6 +523,11 @@ cdef extern from "c/h3wt_callback.h":
         picoquic_cnx_t* cnx, uint8_t* bytes, size_t length,
         int event,
         h3zero_stream_ctx_t* stream_ctx, void* path_app_ctx)
+    int aiopquic_dispatch_cb(
+        picoquic_cnx_t* cnx, uint64_t stream_id,
+        uint8_t* bytes, size_t length,
+        int event,
+        void* callback_ctx, void* v_stream_ctx)
     # Per-WT-stream link, owned by h3zero's stream_ctx->path_callback_ctx.
     # We only ever destroy these from drain_rx on a LINK_RELEASE event;
     # the worker thread allocates them in h3wt_callback.h.
@@ -2087,7 +2093,8 @@ cdef class TransportContext:
               int socket_buffer_size=0,
               qlog_dir=None,
               wt_supported_protocols=None,
-              alpn_list=None):
+              alpn_list=None,
+              bint dual=False):
         """
         Create the picoquic context and start the network thread.
 
@@ -2160,8 +2167,17 @@ cdef class TransportContext:
             self._wt_params.web_folder = NULL
             self._wt_params.path_table = &self._wt_path_item
             self._wt_params.path_table_nb = 1
-            default_cb_fn = h3zero_callback
-            default_cb_ctx = <void*>&self._wt_params
+            if dual:
+                # Single-port dual stack: default callback dispatches
+                # per connection by negotiated ALPN. The default ctx
+                # stays the bridge (aiopquic_ctx_t*), which the ALPN
+                # selector also expects; the shim bootstraps h3
+                # connections from these server params.
+                self._ctx.dual_wt_params = <void*>&self._wt_params
+                default_cb_fn = aiopquic_dispatch_cb
+            else:
+                default_cb_fn = h3zero_callback
+                default_cb_ctx = <void*>&self._wt_params
             # Server WT subprotocol allowlist (CSV, e.g. "moqt-18, moqt-16").
             # Held as bytes on self so the borrowed pointer the bridge reads
             # in the WT path callback stays valid for picoquic's lifetime.

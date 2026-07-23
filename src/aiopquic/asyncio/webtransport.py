@@ -828,16 +828,21 @@ class _Dispatcher:
         self._acceptor = acceptor
 
     def _drain(self) -> None:
-        events = self._transport.drain_rx()
-        for ev in events:
-            evt_type = ev[0]
-            stream_ctx_ptr = ev[6]
-            if evt_type == _EVT_WT_NEW_SESSION and self._acceptor is not None:
-                self._spawn_server_session(ev)
-                continue
-            session = self._sessions.get(stream_ctx_ptr)
-            if session is not None:
-                session._on_event(ev)
+        for ev in self._transport.drain_rx():
+            self.route_event(ev)
+
+    def route_event(self, ev) -> None:
+        """Route one already-drained event (also the entry point for an
+        external router that owns the eventfd reader, e.g. single-port
+        dual-stack dispatch)."""
+        evt_type = ev[0]
+        stream_ctx_ptr = ev[6]
+        if evt_type == _EVT_WT_NEW_SESSION and self._acceptor is not None:
+            self._spawn_server_session(ev)
+            return
+        session = self._sessions.get(stream_ctx_ptr)
+        if session is not None:
+            session._on_event(ev)
 
     def set_session_factory(self, factory) -> None:
         """factory(transport, state) -> WebTransportSession; defaults

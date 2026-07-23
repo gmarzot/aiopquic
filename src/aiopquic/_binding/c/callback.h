@@ -319,6 +319,14 @@ typedef struct {
      * aiopquic_ctx_destroy. NULL/0 = single-ALPN path (default_alpn). */
     char**          alpn_list;
     size_t          alpn_list_count;
+    /* Single-port dual-stack dispatch (raw QUIC + h3/WT on one port):
+     * when non-NULL, the quic ctx's default callback is
+     * aiopquic_dispatch_cb (h3wt_callback.h), which routes each
+     * connection by negotiated ALPN — "h3" bootstraps an h3zero
+     * per-cnx context from these server parameters
+     * (picohttp_server_parameters_t*); everything else re-points to
+     * aiopquic_stream_cb with this bridge. */
+    void*           dual_wt_params;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */

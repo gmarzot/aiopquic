@@ -1268,6 +1268,47 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
     }
 }
 
+/*
+ * Single-port dual-stack dispatch: the quic ctx's default callback when
+ * raw QUIC and h3/WebTransport share one UDP port. Each connection is
+ * routed exactly once by its negotiated ALPN: "h3" bootstraps the
+ * h3zero stack the same way h3zero_callback's own default branch would
+ * (per-cnx ctx from the shared server parameters — that branch is
+ * unreachable here because the quic default ctx is the bridge, not the
+ * params); anything else re-points to the raw aiopquic bridge. ALPN is
+ * selected during ClientHello processing, so it is available from the
+ * first connection callback; NULL means an event predates negotiation —
+ * ignore it and let the next event re-enter.
+ */
+static int aiopquic_dispatch_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
+    uint8_t* bytes, size_t length, picoquic_call_back_event_t event,
+    void* callback_ctx, void* v_stream_ctx)
+{
+    aiopquic_ctx_t* bridge = (aiopquic_ctx_t*)callback_ctx;
+    const char* alpn = picoquic_tls_get_negotiated_alpn(cnx);
+    if (alpn == NULL) {
+        return 0;
+    }
+    if (bridge->dual_wt_params != NULL && strcmp(alpn, "h3") == 0) {
+        h3zero_callback_ctx_t* hctx = h3zero_callback_create_context(
+            (picohttp_server_parameters_t*)bridge->dual_wt_params);
+        if (hctx == NULL) {
+            picoquic_close(cnx, PICOQUIC_ERROR_MEMORY);
+            return -1;
+        }
+        picoquic_set_callback(cnx, h3zero_callback, hctx);
+        int ret = h3zero_protocol_init_safe(cnx, hctx);
+        if (ret != 0) {
+            return ret;
+        }
+        return h3zero_callback(cnx, stream_id, bytes, length,
+                               event, hctx, v_stream_ctx);
+    }
+    picoquic_set_callback(cnx, aiopquic_stream_cb, bridge);
+    return aiopquic_stream_cb(cnx, stream_id, bytes, length,
+                              event, bridge, v_stream_ctx);
+}
+
 #ifdef __cplusplus
 }
 #endif
