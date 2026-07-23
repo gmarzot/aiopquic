@@ -922,7 +922,10 @@ class QuicEngine:
         self._connections: dict[int, QuicConnection] = {}
         self._protocols: dict[int, "object"] = {}
 
-    def _start_transport(self, port: int = 0) -> None:
+    def _start_transport(self, port: int = 0, **extra) -> None:
+        """extra kwargs pass straight through to TransportContext.start,
+        overriding the configuration-derived defaults (single-port
+        dual-stack serving threads wt_path/dual/alpn_list this way)."""
         if self._transport is not None:
             return
         cfg = self._configuration
@@ -932,15 +935,15 @@ class QuicEngine:
         else:
             self._transport = TransportContext()
         keylog = cfg.secrets_log_file or os.environ.get('SSLKEYLOGFILE')
-        self._transport.start(
+        # Single configured ALPN keeps the simple default_alpn path
+        # (byte-identical to before). Multiple ALPNs switch to the
+        # negotiation path: client offers the list (request_alpn_list),
+        # server selects (alpn_select_fn) — both require default_alpn
+        # NULL, which start() sets when alpn_list is given.
+        kwargs = dict(
             port=port,
             cert_file=cfg.certificate_file,
             key_file=cfg.private_key_file,
-            # Single configured ALPN keeps the simple default_alpn path
-            # (byte-identical to before). Multiple ALPNs switch to the
-            # negotiation path: client offers the list (request_alpn_list),
-            # server selects (alpn_select_fn) — both require default_alpn
-            # NULL, which start() sets when alpn_list is given.
             alpn=(cfg.alpn_protocols[0]
                   if cfg.alpn_protocols and len(cfg.alpn_protocols) == 1
                   else None),
@@ -961,6 +964,8 @@ class QuicEngine:
             socket_buffer_size=(cfg.socket_buffer_size or 0),
             qlog_dir=cfg.qlog_dir,
         )
+        kwargs.update(extra)
+        self._transport.start(**kwargs)
 
     @property
     def eventfd(self) -> int:
@@ -980,34 +985,40 @@ class QuicEngine:
         """
         if self._transport is None:
             return
-        raw_events = self._transport.drain_rx()
-        for (evt_type, stream_id, data, is_fin, error_code,
-             cnx_ptr, stream_ctx_ptr, _sc_ptr) in raw_events:
-            if cnx_ptr == 0:
-                continue  # engine-level event, not per-cnx
-            conn = self._connections.get(cnx_ptr)
-            if conn is None:
-                conn = QuicConnection(
-                    configuration=self._configuration,
-                    engine=self, cnx_ptr=cnx_ptr,
-                )
-                self._connections[cnx_ptr] = conn
-                proto = self._create_protocol(
-                    conn, stream_handler=self._stream_handler,
-                )
-                # Engine owns the eventfd reader; bind protocol to the
-                # loop without adding a second reader (which would
-                # replace ours and break demux for all other cnx).
-                import asyncio as _asyncio
-                proto._loop = _asyncio.get_event_loop()
-                self._protocols[cnx_ptr] = proto
-            conn._enqueue_raw(evt_type, stream_id, data, is_fin,
-                              error_code, stream_ctx_ptr)
-            proto = self._protocols[cnx_ptr]
-            proto._process_events()
-            if evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
-                self._connections.pop(cnx_ptr, None)
-                self._protocols.pop(cnx_ptr, None)
+        for ev in self._transport.drain_rx():
+            self.route_event(ev)
+
+    def route_event(self, ev) -> None:
+        """Route one already-drained event (also the entry point for an
+        external router that owns the eventfd reader, e.g. single-port
+        dual-stack dispatch)."""
+        (evt_type, stream_id, data, is_fin, error_code,
+         cnx_ptr, stream_ctx_ptr, _sc_ptr) = ev
+        if cnx_ptr == 0:
+            return  # engine-level event, not per-cnx
+        conn = self._connections.get(cnx_ptr)
+        if conn is None:
+            conn = QuicConnection(
+                configuration=self._configuration,
+                engine=self, cnx_ptr=cnx_ptr,
+            )
+            self._connections[cnx_ptr] = conn
+            proto = self._create_protocol(
+                conn, stream_handler=self._stream_handler,
+            )
+            # Engine owns the eventfd reader; bind protocol to the
+            # loop without adding a second reader (which would
+            # replace ours and break demux for all other cnx).
+            import asyncio as _asyncio
+            proto._loop = _asyncio.get_event_loop()
+            self._protocols[cnx_ptr] = proto
+        conn._enqueue_raw(evt_type, stream_id, data, is_fin,
+                          error_code, stream_ctx_ptr)
+        proto = self._protocols[cnx_ptr]
+        proto._process_events()
+        if evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
+            self._connections.pop(cnx_ptr, None)
+            self._protocols.pop(cnx_ptr, None)
 
     def close(self) -> None:
         """Tear down all connections and stop the transport.
