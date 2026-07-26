@@ -76,7 +76,6 @@ async def test_aiopquic_client_demo_server_get(cert_paths, doc_bytes):
             sid = client._quic.get_next_available_stream_id()
             client._quic.send_stream_data(
                 sid, f"GET /{doc_bytes}\r\n".encode(), end_stream=True)
-            client.transmit()
             async with asyncio.timeout(60):
                 await client.done
             assert len(client.received) == doc_bytes
@@ -114,7 +113,6 @@ class _H09Server(QuicConnectionProtocol):
         self._answered.add(event.stream_id)
         self._quic.send_stream_data(
             event.stream_id, counted_pad(n), end_stream=True)
-        self.transmit()
 
 
 async def test_demo_client_aiopquic_server_get(cert_paths):

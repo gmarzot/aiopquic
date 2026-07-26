@@ -33,7 +33,6 @@ class _EchoServer(QuicConnectionProtocol):
             self._quic.send_stream_data(
                 event.stream_id, bytes(event.data),
                 end_stream=event.end_stream)
-            self.transmit()
 
 
 class _EchoClient(QuicConnectionProtocol):
@@ -72,7 +71,6 @@ async def _raw_roundtrip(port, payload=256 * 1024):
                        create_protocol=_EchoClient) as client:
         sid = client._quic.get_next_available_stream_id()
         client._quic.send_stream_data(sid, pad, end_stream=True)
-        client.transmit()
         async with asyncio.timeout(30):
             await client.done
         assert zlib.crc32(bytes(client.received)) == zlib.crc32(pad)
