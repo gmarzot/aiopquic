@@ -40,7 +40,7 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_WT_STREAM_DATA, SPSC_EVT_WT_STREAM_FIN,
     SPSC_EVT_WT_STREAM_LINK_RELEASE,
     SPSC_EVT_TX_EVENT_RING_DRAINED,
-    SPSC_EVT_TX_DATAGRAM, SPSC_EVT_TX_CLOSE,
+    SPSC_EVT_TX_CLOSE,
     SPSC_EVT_TX_MARK_ACTIVE, SPSC_EVT_TX_CONNECT,
     SPSC_EVT_TX_WT_OPEN, SPSC_EVT_TX_WT_CREATE_STREAM,
     SPSC_EVT_TX_WT_CLOSE, SPSC_EVT_TX_WT_DRAIN,
@@ -49,6 +49,8 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_OPEN_FLOW_CONTROL,
     SPSC_EVT_TX_SET_APP_FLOW_CONTROL,
     SPSC_EVT_TX_WT_SESSION_CLEANUP,
+    SPSC_EVT_TX_MARK_DATAGRAM_READY,
+    SPSC_EVT_DATAGRAM_TX_DRAINED,
 )
 
 # Socket address helpers (needed by picoquic declarations)
@@ -264,6 +266,10 @@ cdef extern from "c/callback.h":
         uint64_t worker_prepare_to_send_pulled_bytes
         uint64_t worker_rx_event_drops
         uint64_t worker_rx_event_drops_stream_data
+        uint64_t worker_dgram_mark_ready_processed
+        uint64_t worker_dgram_prepare_calls
+        uint64_t worker_dgram_records_sent
+        uint64_t worker_dgram_bytes_sent
         uint64_t cnt_rx_data_event_coalesced
         uint64_t worker_rx_byte_ring_overflow
         uint32_t rx_notify_pending
@@ -323,6 +329,9 @@ cdef extern from "c/callback.h":
 # Per-stream byte ring (PULL-model send path). Allocated by Python,
 # owned by Python (refcount-style); picoquic-pthread reads from it via
 # stream_ctx in aiopquic_stream_cb.
+cdef extern from "c/callback.h":
+    uint32_t aiopquic_datagram_payload_ceiling(picoquic_cnx_t* cnx)
+
 cdef extern from "c/stream_buf.h":
     ctypedef struct aiopquic_stream_buf_t:
         pass
@@ -344,6 +353,31 @@ cdef extern from "c/stream_buf.h":
     uint64_t aiopquic_stream_buf_popped(aiopquic_stream_buf_t* sb)
     uint32_t aiopquic_stream_buf_push_hash(aiopquic_stream_buf_t* sb)
     uint32_t aiopquic_stream_buf_pop_hash(aiopquic_stream_buf_t* sb)
+
+
+# Per-connection datagram TX record ring — pull-model datagram send.
+# Producer: dgram_send (this thread). Consumer: picoquic worker in
+# prepare_datagram. Refcounted; the Python connection and the worker's
+# cnx→ring table each hold one reference.
+cdef extern from "c/datagram_buf.h":
+    ctypedef struct aiopquic_dgram_buf_t:
+        uint32_t capacity
+        uint32_t max_record
+        uint64_t records_pushed
+        uint64_t push_full
+        uint64_t push_oversize
+        uint64_t records_popped
+        uint64_t bytes_popped
+        uint64_t head_deferred
+
+    aiopquic_dgram_buf_t* aiopquic_dgram_buf_create(
+        uint32_t capacity, uint32_t max_record)
+    void aiopquic_dgram_buf_addref(aiopquic_dgram_buf_t* db)
+    void aiopquic_dgram_buf_unref(aiopquic_dgram_buf_t* db)
+    int aiopquic_dgram_buf_push_record(
+        aiopquic_dgram_buf_t* db, const uint8_t* data, uint32_t length)
+    uint32_t aiopquic_dgram_buf_used(aiopquic_dgram_buf_t* db)
+    void aiopquic_dgram_buf_arm_drain(aiopquic_dgram_buf_t* db)
 
 
 # Per-stream wrapper holding both TX and RX byte rings + flow-control
@@ -2013,6 +2047,116 @@ cdef class TransportContext:
             raise MemoryError(
                 f"tx_send_stream alloc failed (stream={stream_id})"
             )
+
+    # ------------------------------------------------------------------
+    # Pull-model datagram TX. The per-connection record ring is owned by
+    # the caller (QuicConnection) via an opaque pointer; the worker's
+    # cnx→ring table takes its own reference on first MARK. Payload
+    # never rides the shared TX event ring.
+    # ------------------------------------------------------------------
+
+    def dgram_ring_create(self, uint32_t capacity, uint32_t max_record):
+        """Allocate a per-connection datagram TX record ring.
+
+        capacity is rounded up to a power of two; max_record is the
+        producer-enforced payload cap (a QUIC DATAGRAM frame cannot be
+        fragmented, so records larger than a fresh packet's space could
+        never drain). Returns an opaque pointer; release with
+        dgram_ring_release exactly once.
+        """
+        cdef aiopquic_dgram_buf_t* db = aiopquic_dgram_buf_create(
+            capacity, max_record)
+        if db is NULL:
+            raise MemoryError("aiopquic_dgram_buf_create failed")
+        return <uintptr_t>db
+
+    def dgram_ring_release(self, uintptr_t db_ptr):
+        """Drop the caller's reference (worker table may still hold one;
+        the last reference frees)."""
+        aiopquic_dgram_buf_unref(<aiopquic_dgram_buf_t*>db_ptr)
+
+    def dgram_mark_ready(self, uintptr_t cnx_ptr, uintptr_t db_ptr):
+        """Post (or re-post) the MARK_DATAGRAM_READY event for a ring
+        with committed records. Returns 0 posted, 1 TX event ring full
+        (retry later)."""
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_MARK_DATAGRAM_READY
+        entry.cnx = <void*>cnx_ptr
+        entry.stream_ctx = <void*>db_ptr
+        if spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
+            return 1
+        self._ctx.cnt_tx_event_ring_pushes += 1
+        if self._thread_ctx is not NULL:
+            if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+                picoquic_wake_up_network_thread(self._thread_ctx)
+        return 0
+
+    def dgram_send(self, uintptr_t cnx_ptr, uintptr_t db_ptr, bytes data):
+        """Commit one datagram record and arm the scheduler.
+
+        Returns:
+          1  accepted (record committed, mark posted)
+          2  accepted, mark NOT posted (TX event ring full) — caller
+             must re-post via dgram_mark_ready before going idle, else
+             the record may sit unscheduled
+          0  record ring full — backpressure; retry the SAME payload
+             after SPSC_EVT_DATAGRAM_TX_DRAINED (drain signal armed)
+         -1  payload exceeds max_record — permanent, do not retry
+        """
+        cdef aiopquic_dgram_buf_t* db = <aiopquic_dgram_buf_t*>db_ptr
+        cdef const uint8_t* buf = <const uint8_t*>PyBytes_AsString(data)
+        cdef uint32_t n = <uint32_t>len(data)
+        cdef int rc = aiopquic_dgram_buf_push_record(db, buf, n)
+        if rc == 0:
+            aiopquic_dgram_buf_arm_drain(db)
+            return 0
+        if rc < 0:
+            return -1
+        if self.dgram_mark_ready(cnx_ptr, db_ptr) != 0:
+            return 2
+        return 1
+
+    def dgram_ring_stats(self, uintptr_t db_ptr):
+        """Producer/consumer counters for one datagram ring."""
+        cdef aiopquic_dgram_buf_t* db = <aiopquic_dgram_buf_t*>db_ptr
+        return {
+            'capacity': db.capacity,
+            'max_record': db.max_record,
+            'used': aiopquic_dgram_buf_used(db),
+            'records_pushed': db.records_pushed,
+            'push_full': db.push_full,
+            'push_oversize': db.push_oversize,
+            'records_popped': db.records_popped,
+            'bytes_popped': db.bytes_popped,
+            'head_deferred': db.head_deferred,
+        }
+
+    def datagram_payload_ceiling(self, uintptr_t cnx_ptr):
+        """Guaranteed max datagram payload for this connection:
+        min(local TP, remote TP, 1200). 0 = peer did not negotiate
+        datagrams (doubles as the capability check). Valid post-READY;
+        TPs are immutable after the handshake."""
+        if cnx_ptr == 0:
+            return 0
+        return aiopquic_datagram_payload_ceiling(<picoquic_cnx_t*>cnx_ptr)
+
+    @property
+    def worker_dgram_mark_ready_processed(self):
+        return self._ctx.worker_dgram_mark_ready_processed
+
+    @property
+    def worker_dgram_prepare_calls(self):
+        return self._ctx.worker_dgram_prepare_calls
+
+    @property
+    def worker_dgram_records_sent(self):
+        return self._ctx.worker_dgram_records_sent
+
+    @property
+    def worker_dgram_bytes_sent(self):
+        return self._ctx.worker_dgram_bytes_sent
 
     @property
     def send_calls(self):

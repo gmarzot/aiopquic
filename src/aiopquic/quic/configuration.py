@@ -51,6 +51,20 @@ class QuicConfiguration:
     # Enables datagrams by default (h3zero only advertises h3_datagram
     # + webtransport_max_sessions when this is non-zero).
     max_datagram_frame_size: int | None = 65535
+    # Per-connection datagram TX record ring (pull-model send path).
+    # Bounded capacity IS the backpressure: send_datagram_frame returns
+    # 0 when full instead of queueing unboundedly. Steady-state datagram
+    # queuing latency ~ ring_bytes / throughput — unlike the stream TX
+    # budgets this is meant to stay SMALL, because for datagram traffic
+    # dropping at the producer is a legitimate policy, not an error.
+    # Allocated lazily on first datagram send; stream-only connections
+    # pay nothing.
+    datagram_ring_bytes: int = 64 * 1024
+    # Producer-enforced per-datagram payload cap. A DATAGRAM frame
+    # cannot be fragmented, so a record that can't fit one fresh packet
+    # could never drain and would wedge the ring. Conservative default
+    # for a 1500-MTU path; raise only if the path MTU supports it.
+    datagram_max_payload: int = 1200
     server_name: str | None = None
     certificate_file: str | None = None
     private_key_file: str | None = None

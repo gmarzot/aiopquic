@@ -67,6 +67,10 @@ typedef enum {
     SPSC_EVT_PATH_DELETED = 13,
     SPSC_EVT_PACING_CHANGED = 14,
     SPSC_EVT_STREAM_TX_DRAINED = 15,    /* edge: sc->tx had a waiter and worker just drained */
+    SPSC_EVT_DATAGRAM_TX_DRAINED = 19,  /* edge: per-cnx datagram TX record ring
+                                           had a blocked writer (drain_pending)
+                                           and the worker just popped a record.
+                                           cnx field = picoquic_cnx_t*. */
     SPSC_EVT_TX_EVENT_RING_DRAINED = 16, /* edge: connection-global TX event ring
                                             fill dropped below low_water while a
                                             Python writer had armed
@@ -100,8 +104,12 @@ typedef enum {
      * uses the pull-model path (per-stream sc->tx ring + MARK_ACTIVE event);
      * tests use TransportContext.tx_send_stream which composes the same
      * primitives. Codepoints 128 and 129 are reserved-unused for one
-     * release cycle to avoid silent re-use confusion. */
-    SPSC_EVT_TX_DATAGRAM = 130,
+     * release cycle to avoid silent re-use confusion.
+     *
+     * SPSC_EVT_TX_DATAGRAM = 130 (push-model datagram: payload rode the
+     * shared TX event ring into picoquic_queue_datagram_frame's uncapped
+     * malloc'd list) was retired with the pull-model datagram path —
+     * see SPSC_EVT_TX_MARK_DATAGRAM_READY. Reserved-unused. */
     SPSC_EVT_TX_CLOSE = 131,
     SPSC_EVT_TX_STREAM_RESET = 132,
     SPSC_EVT_TX_STOP_SENDING = 133,
@@ -136,6 +144,14 @@ typedef enum {
      * the wire. The session object survives so the Python wrapper's
      * __dealloc__ can later push TX_WT_DEREGISTER for full teardown. */
     SPSC_EVT_TX_WT_SESSION_CLEANUP = 145,
+
+    /* Pull-model datagram TX (asyncio → picoquic worker). Producer has
+     * already committed a record to the per-connection
+     * aiopquic_dgram_buf_t; this event registers the ring for the cnx
+     * (worker cnx→ring table, idempotent) and calls
+     * picoquic_mark_datagram_ready. entry.stream_ctx carries the
+     * aiopquic_dgram_buf_t*; no payload rides the event ring. */
+    SPSC_EVT_TX_MARK_DATAGRAM_READY = 146,
 
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the

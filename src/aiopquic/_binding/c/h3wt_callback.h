@@ -767,17 +767,14 @@ static int aiopquic_wt_path_callback(
                                 bytes, (uint32_t)length);
         break;
 
-    case picohttp_callback_provide_datagram: {
-        spsc_entry_t* tx = spsc_ring_peek(s->bridge->tx_event_ring);
-        if (tx && tx->event_type == SPSC_EVT_TX_DATAGRAM) {
-            uint32_t to_send = tx->data_length;
-            if (to_send > length) to_send = (uint32_t)length;
-            void* buf = h3zero_provide_datagram_buffer(stream_ctx, to_send, 0);
-            if (buf && tx->data_buf) memcpy(buf, tx->data_buf, to_send);
-            spsc_ring_pop(s->bridge->tx_event_ring);
-        }
+    case picohttp_callback_provide_datagram:
+        /* WT datagram TX is not wired yet (nothing calls
+         * h3zero_set_datagram_ready, so this cannot fire today).
+         * When it lands it will pull from the session's record ring —
+         * same pull model as raw QUIC's prepare_datagram path. Provide
+         * nothing and deactivate defensively. */
+        (void)h3zero_provide_datagram_buffer(stream_ctx, 0, 0);
         break;
-    }
 
     case picohttp_callback_reset:
         if (aiopquic_wt_diag_enabled()) {

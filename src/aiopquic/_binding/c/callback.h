@@ -18,6 +18,7 @@
 #include "spsc_ring.h"
 #include "stream_buf.h"
 #include "stream_ctx.h"
+#include "datagram_buf.h"
 #include <picoquic.h>
 #include <picoquic_packet_loop.h>
 
@@ -327,6 +328,15 @@ typedef struct {
      * (picohttp_server_parameters_t*); everything else re-points to
      * aiopquic_stream_cb with this bridge. */
     void*           dual_wt_params;
+    /* Pull-model datagram TX: worker-owned cnx→record-ring table
+     * (insert on MARK_DATAGRAM_READY, lookup on prepare_datagram,
+     * remove on cnx close, sweep at destroy). Per-ring counters live
+     * on the aiopquic_dgram_buf_t; these aggregate across the ctx. */
+    aiopquic_dgram_table_t dgram_table;
+    uint64_t        worker_dgram_mark_ready_processed;
+    uint64_t        worker_dgram_prepare_calls;
+    uint64_t        worker_dgram_records_sent;
+    uint64_t        worker_dgram_bytes_sent;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -354,6 +364,7 @@ static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
     if (!ctx->rx_event_ring || !ctx->tx_event_ring) {
         spsc_ring_destroy(ctx->rx_event_ring);
         spsc_ring_destroy(ctx->tx_event_ring);
+        aiopquic_dgram_table_destroy(&ctx->dgram_table);
         free(ctx);
         return NULL;
     }
@@ -376,6 +387,7 @@ static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
     if (ctx->eventfd < 0) {
         spsc_ring_destroy(ctx->rx_event_ring);
         spsc_ring_destroy(ctx->tx_event_ring);
+        aiopquic_dgram_table_destroy(&ctx->dgram_table);
         free(ctx);
         return NULL;
     }
@@ -388,6 +400,7 @@ static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
     if (pipe(p) < 0) {
         spsc_ring_destroy(ctx->rx_event_ring);
         spsc_ring_destroy(ctx->tx_event_ring);
+        aiopquic_dgram_table_destroy(&ctx->dgram_table);
         free(ctx);
         return NULL;
     }
@@ -412,6 +425,7 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
         }
         spsc_ring_destroy(ctx->rx_event_ring);
         spsc_ring_destroy(ctx->tx_event_ring);
+        aiopquic_dgram_table_destroy(&ctx->dgram_table);
         if (ctx->alpn_list) {
             for (size_t i = 0; i < ctx->alpn_list_count; i++)
                 free(ctx->alpn_list[i]);
@@ -419,6 +433,26 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
         }
         free(ctx);
     }
+}
+
+/* Usable datagram payload ceiling for this cnx: min(local TP, remote
+ * TP, PICOQUIC_ENFORCED_INITIAL_MTU). The MTU term is the GUARANTEED
+ * floor — picoquic admits any payload <= 1200 without consulting the
+ * live path MTU (PICOQUIC_DATAGRAM_QUEUE_CAUTIOUS_LENGTH); larger may
+ * work after PMTUD but there is no public send_mtu getter to promise
+ * it. Returns 0 when the peer did not negotiate datagrams — doubling
+ * as the capability check. TP values are immutable after handshake, so
+ * this is safe to call from the asyncio thread post-READY. */
+static inline uint32_t aiopquic_datagram_payload_ceiling(picoquic_cnx_t* cnx) {
+    if (!cnx) return 0;
+    const picoquic_tp_t* lt = picoquic_get_transport_parameters(cnx, 1);
+    const picoquic_tp_t* rt = picoquic_get_transport_parameters(cnx, 0);
+    if (!lt || !rt) return 0;
+    uint32_t cap = lt->max_datagram_frame_size;
+    if (rt->max_datagram_frame_size < cap) cap = rt->max_datagram_frame_size;
+    if (cap == 0) return 0;
+    if (cap > 1200) cap = 1200;
+    return cap;
 }
 
 /* TX wake-coalescing: producer-side helper. Returns 1 if a wake is
@@ -644,6 +678,10 @@ static inline int aiopquic_map_event(picoquic_call_back_event_t ev) {
         case picoquic_callback_datagram:        return SPSC_EVT_DATAGRAM;
         case picoquic_callback_datagram_acked:  return SPSC_EVT_DATAGRAM_ACKED;
         case picoquic_callback_datagram_lost:   return SPSC_EVT_DATAGRAM_LOST;
+        /* "Spurious loss" = a datagram earlier reported lost was in fact
+         * delivered — surface it as an ACK so consumers keep one net
+         * delivered/lost pair of counters. */
+        case picoquic_callback_datagram_spurious: return SPSC_EVT_DATAGRAM_ACKED;
         case picoquic_callback_path_available:  return SPSC_EVT_PATH_AVAILABLE;
         case picoquic_callback_path_suspended:  return SPSC_EVT_PATH_SUSPENDED;
         case picoquic_callback_path_deleted:    return SPSC_EVT_PATH_DELETED;
@@ -894,6 +932,63 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         picoquic_enable_keep_alive(cnx, ctx->keep_alive_us);
     }
 
+    /* Pull-model datagram TX. picoquic asks for the next datagram:
+     * 'bytes' is the opaque provide-context, 'length' is the space
+     * available in the packet under construction (already capped at
+     * the peer's max_datagram_frame_size). Copy the head record from
+     * the cnx's record ring straight into the packet. A head record
+     * larger than THIS packet's leftover space stays queued — producer-
+     * side max_record enforcement guarantees it fits a fresh packet. */
+    if (fin_or_event == picoquic_callback_prepare_datagram) {
+        ctx->worker_dgram_prepare_calls++;
+        aiopquic_dgram_buf_t* db =
+            aiopquic_dgram_table_get(&ctx->dgram_table, cnx);
+        uint32_t rec = db ? aiopquic_dgram_buf_peek_len(db) : 0;
+        if (rec == 0) {
+            (void)picoquic_provide_datagram_buffer_ex(
+                bytes, 0, picoquic_datagram_not_active);
+        } else if (rec <= (uint32_t)length) {
+            /* More records after this one? Keep the mark active. */
+            uint32_t used = aiopquic_dgram_buf_used(db);
+            picoquic_datagram_active_enum still =
+                (used > AIOPQUIC_DGRAM_REC_HDR + rec)
+                    ? picoquic_datagram_active_any_path
+                    : picoquic_datagram_not_active;
+            uint8_t* buf = picoquic_provide_datagram_buffer_ex(
+                bytes, rec, still);
+            if (buf) {
+                aiopquic_dgram_buf_pop_into(db, buf, rec);
+                ctx->worker_dgram_records_sent++;
+                ctx->worker_dgram_bytes_sent += rec;
+                /* Edge-trigger producer wakeup, mirroring the stream
+                 * sc->tx_drain_pending contract: only the CAS winner
+                 * emits the event. */
+                uint32_t expected = 1;
+                if (atomic_compare_exchange_strong_explicit(
+                        &db->drain_pending, &expected, 0,
+                        memory_order_acq_rel, memory_order_relaxed)) {
+                    spsc_entry_t drain_entry = {0};
+                    drain_entry.event_type = SPSC_EVT_DATAGRAM_TX_DRAINED;
+                    drain_entry.cnx = cnx;
+                    if (spsc_ring_push(ctx->rx_event_ring,
+                                       &drain_entry, NULL, 0) == 0) {
+                        aiopquic_notify_rx(ctx);
+                    } else {
+                        /* Ring full: re-arm so a later pop retries. */
+                        atomic_store_explicit(&db->drain_pending, 1,
+                                              memory_order_release);
+                        ctx->worker_rx_event_drops++;
+                    }
+                }
+            }
+        } else {
+            db->head_deferred++;
+            (void)picoquic_provide_datagram_buffer_ex(
+                bytes, 0, picoquic_datagram_active_any_path);
+        }
+        return 0;
+    }
+
     int evt = aiopquic_map_event(fin_or_event);
     if (evt < 0) {
         return 0;
@@ -915,8 +1010,10 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         entry.error_code = picoquic_get_remote_stream_error(cnx, stream_id);
     } else if (fin_or_event == picoquic_callback_application_close) {
         entry.error_code = picoquic_get_application_error(cnx);
+        aiopquic_dgram_table_remove(&ctx->dgram_table, cnx);
     } else if (fin_or_event == picoquic_callback_close) {
         entry.error_code = picoquic_get_remote_error(cnx);
+        aiopquic_dgram_table_remove(&ctx->dgram_table, cnx);
     }
 
     /* Canonical RX path: stream_data / stream_fin bytes are pushed
@@ -1029,6 +1126,14 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             }
             coalesce_sc = sc;
         }
+        ret = spsc_ring_push(ctx->rx_event_ring, &entry, NULL, 0);
+    } else if (entry.event_type == SPSC_EVT_DATAGRAM_ACKED ||
+               entry.event_type == SPSC_EVT_DATAGRAM_LOST) {
+        /* Delivery signals, not data: picoquic hands us the ORIGINAL
+         * datagram body here. Copying it into the ring paid a malloc +
+         * memcpy per event for payloads no consumer read. Surface the
+         * event with its length only. */
+        entry.data_length = (uint32_t)length;
         ret = spsc_ring_push(ctx->rx_event_ring, &entry, NULL, 0);
     } else {
         ret = spsc_ring_push(ctx->rx_event_ring, &entry, bytes, (uint32_t)length);
@@ -1209,9 +1314,19 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                      * pull-model path: producer commits to sc->tx and
                      * pushes a MARK_ACTIVE event; picoquic later drains
                      * via the prepare_to_send callback. */
-                    case SPSC_EVT_TX_DATAGRAM: {
-                        const uint8_t* data = (const uint8_t*)entry->data_buf;
-                        picoquic_queue_datagram_frame(cnx, entry->data_length, data);
+                    case SPSC_EVT_TX_MARK_DATAGRAM_READY: {
+                        /* Producer already committed the record(s) to the
+                         * per-cnx ring; register the ring (idempotent,
+                         * takes a worker-side ref on first sight) and
+                         * arm picoquic's datagram scheduler. */
+                        aiopquic_dgram_buf_t* db =
+                            (aiopquic_dgram_buf_t*)entry->stream_ctx;
+                        if (db) {
+                            (void)aiopquic_dgram_table_put(
+                                &ctx->dgram_table, cnx, db);
+                            (void)picoquic_mark_datagram_ready(cnx, 1);
+                        }
+                        ctx->worker_dgram_mark_ready_processed++;
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;

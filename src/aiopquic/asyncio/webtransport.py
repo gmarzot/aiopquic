@@ -966,8 +966,11 @@ async def connect_webtransport(
                 ring_capacity=configuration.event_ring_capacity)
         else:
             transport = TransportContext()
-        start_kwargs = dict(is_client=True, alpn="h3",
-                            max_datagram_frame_size=64 * 1024)
+        start_kwargs = dict(
+            is_client=True, alpn="h3",
+            max_datagram_frame_size=(
+                configuration.max_datagram_frame_size or 64 * 1024
+                if configuration is not None else 64 * 1024))
         if configuration is not None:
             # Thread FC sizing, stream caps, idle timeout, and the CC
             # algorithm through to picoquic. Without this the peer
@@ -1075,7 +1078,9 @@ async def serve_webtransport(
             cert_file=cert_file, key_file=key_file,
             alpn="h3",
             is_client=False,
-            max_datagram_frame_size=64 * 1024,
+            max_datagram_frame_size=(
+                configuration.max_datagram_frame_size or 64 * 1024
+                if configuration is not None else 64 * 1024),
             wt_path=path,
         )
         if configuration is not None:

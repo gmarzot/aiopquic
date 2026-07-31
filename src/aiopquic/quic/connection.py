@@ -55,13 +55,15 @@ _EVT_APP_CLOSE = 5
 _EVT_READY = 6
 _EVT_ALMOST_READY = 7
 _EVT_DATAGRAM = 8
+_EVT_DATAGRAM_ACKED = 9
+_EVT_DATAGRAM_LOST = 10
 _EVT_STREAM_TX_DRAINED = 15
 _EVT_STREAM_DESTROY = 17
+_EVT_DATAGRAM_TX_DRAINED = 19
 
 # TX event types
 _TX_STREAM_DATA = 128
 _TX_STREAM_FIN = 129
-_TX_DATAGRAM = 130
 _TX_CLOSE = 131
 _TX_STREAM_RESET = 132
 _TX_STOP_SENDING = 133
@@ -146,6 +148,20 @@ class QuicConnection:
         # Destroyed via lifecycle hooks (Landing C); for now leak until
         # process exit to avoid use-after-free with the picoquic worker.
         self._stream_ctxs: dict[int, int] = {}
+        # Pull-model datagram TX: opaque record-ring pointer (lazy,
+        # created on first send so stream-only connections pay nothing),
+        # a mark-owed flag for the rare TX-event-ring-full case, and the
+        # writer backpressure event (starts set = writable).
+        self._dgram_ring: int = 0
+        self._dgram_mark_owed: bool = False
+        self._dgram_tx_drain_event = asyncio.Event()
+        self._dgram_tx_drain_event.set()
+        # Net per-datagram delivery signals from picoquic (spurious
+        # losses are re-reported as acked by the C mapper). The only
+        # loss visibility datagrams have — there are no stream resets
+        # to infer it from.
+        self._datagrams_acked: int = 0
+        self._datagrams_lost: int = 0
         # Per-stream "sc->tx drained" events for event-driven TX
         # backpressure. Set by _handle_raw_event when the picoquic
         # worker fires SPSC_EVT_STREAM_TX_DRAINED for a stream;
@@ -362,6 +378,12 @@ class QuicConnection:
             # free per-stream wrappers; without this they'd leak until
             # process exit.
             self._destroy_stream_ctxs()
+            # Datagram ring: worker already dropped its table ref in the
+            # close callback (before this event was queued), so this
+            # release is the last one. Wake any parked datagram writer
+            # first so it observes _closed instead of deadlocking.
+            self._dgram_tx_drain_event.set()
+            self._release_dgram_ring()
             # Zero the cached cnx ptr; picoquic frees the cnx_t shortly
             # after this callback. cnx_data_sent / cnx_data_received /
             # path_quality already short-circuit on cnx_ptr == 0, so
@@ -394,6 +416,18 @@ class QuicConnection:
                 event = asyncio.Event()
                 self._stream_tx_drain_events[stream_id] = event
             event.set()
+        elif evt_type == _EVT_DATAGRAM_TX_DRAINED:
+            # Worker popped a record from a ring that had a blocked
+            # writer (edge-triggered via db->drain_pending).
+            self._dgram_tx_drain_event.set()
+            if self._dgram_mark_owed and self._dgram_ring and self._cnx_ptr:
+                if self._transport.dgram_mark_ready(
+                        self._cnx_ptr, self._dgram_ring) == 0:
+                    self._dgram_mark_owed = False
+        elif evt_type == _EVT_DATAGRAM_ACKED:
+            self._datagrams_acked += 1
+        elif evt_type == _EVT_DATAGRAM_LOST:
+            self._datagrams_lost += 1
         elif evt_type == _EVT_STREAM_DESTROY:
             # Stream fully retired by picoquic — drop our cached
             # pointer so the dict doesn't accumulate stale entries.
@@ -579,6 +613,10 @@ class QuicConnection:
             if ring_ev is not None:
                 ring_ev.set()
             self._destroy_stream_ctxs()
+            # Companion of the client-path close block: last datagram
+            # ring release + wake parked datagram writers.
+            self._dgram_tx_drain_event.set()
+            self._release_dgram_ring()
             # See companion block: zero cnx ptr so observer accessors
             # short-circuit cleanly rather than UAF on the freed cnx.
             self._cnx_ptr = 0
@@ -602,6 +640,18 @@ class QuicConnection:
                 event = asyncio.Event()
                 self._stream_tx_drain_events[stream_id] = event
             event.set()
+        elif evt_type == _EVT_DATAGRAM_TX_DRAINED:
+            # Worker popped a record from a ring that had a blocked
+            # writer (edge-triggered via db->drain_pending).
+            self._dgram_tx_drain_event.set()
+            if self._dgram_mark_owed and self._dgram_ring and self._cnx_ptr:
+                if self._transport.dgram_mark_ready(
+                        self._cnx_ptr, self._dgram_ring) == 0:
+                    self._dgram_mark_owed = False
+        elif evt_type == _EVT_DATAGRAM_ACKED:
+            self._datagrams_acked += 1
+        elif evt_type == _EVT_DATAGRAM_LOST:
+            self._datagrams_lost += 1
         elif evt_type == _EVT_STREAM_DESTROY:
             self._stream_ctxs.pop(stream_id, None)
             self._stream_tx_drain_events.pop(stream_id, None)
@@ -816,13 +866,90 @@ class QuicConnection:
                 if self._closed:
                     return
 
-    def send_datagram_frame(self, data: bytes) -> None:
-        """Send a datagram frame."""
-        self._transport.push_tx_event(
-            _TX_DATAGRAM, 0,
-            data=data, cnx_ptr=self._cnx_ptr,
-        )
-        self._transport.wake_up()
+    def send_datagram_frame(self, data: bytes) -> int:
+        """Queue one datagram for the pull-model send path.
+
+        Returns the number of payload bytes accepted: len(data) on
+        success, 0 when the per-connection record ring is full —
+        backpressure; wait on get_datagram_tx_drain_event() and retry
+        the SAME payload (records are all-or-nothing, nothing was
+        committed).
+
+        Raises:
+            ValueError: payload exceeds datagram_max_payload. A QUIC
+                DATAGRAM frame cannot be fragmented, so an oversize
+                record could never be sent — permanent, do not retry.
+            ConnectionError: connection not ready or already closed.
+        """
+        if self._closed or self._cnx_ptr == 0:
+            raise ConnectionError(
+                "send_datagram_frame: connection not ready or closed")
+        if self._dgram_ring == 0:
+            cfg = self._configuration
+            self._dgram_ring = self._transport.dgram_ring_create(
+                cfg.datagram_ring_bytes, cfg.datagram_max_payload)
+        if self._dgram_mark_owed:
+            if self._transport.dgram_mark_ready(
+                    self._cnx_ptr, self._dgram_ring) == 0:
+                self._dgram_mark_owed = False
+        if not isinstance(data, bytes):
+            data = bytes(data)
+        rc = self._transport.dgram_send(
+            self._cnx_ptr, self._dgram_ring, data)
+        if rc == -1:
+            raise ValueError(
+                f"datagram payload {len(data)} exceeds "
+                f"datagram_max_payload="
+                f"{self._configuration.datagram_max_payload} "
+                f"(DATAGRAM frames cannot be fragmented)")
+        if rc == 0:
+            self._dgram_tx_drain_event.clear()
+            return 0
+        if rc == 2:
+            # Record committed but the mark didn't post (TX event ring
+            # full). Re-posted at the next send or drained-ring event.
+            self._dgram_mark_owed = True
+        return len(data)
+
+    def get_datagram_tx_drain_event(self) -> asyncio.Event:
+        """Event set when the worker drains room in the datagram record
+        ring after a full send_datagram_frame (return 0), and on close
+        so waiters never park forever."""
+        return self._dgram_tx_drain_event
+
+    def datagram_ring_stats(self):
+        """Producer/consumer counters for this connection's datagram
+        TX record ring (None before the first datagram send)."""
+        if self._dgram_ring == 0:
+            return None
+        return self._transport.dgram_ring_stats(self._dgram_ring)
+
+    @property
+    def datagrams_acked(self) -> int:
+        return self._datagrams_acked
+
+    @property
+    def datagrams_lost(self) -> int:
+        return self._datagrams_lost
+
+    def max_datagram_payload(self) -> int:
+        """Guaranteed per-datagram payload ceiling right now:
+        min(local TP, peer TP, 1200 — the size picoquic admits without
+        consulting live path MTU). 0 = peer did not negotiate datagrams
+        or handshake not complete; doubles as the capability check."""
+        if self._cnx_ptr == 0:
+            return 0
+        cap = self._transport.datagram_payload_ceiling(self._cnx_ptr)
+        # Keep the H3Connection-compat attribute honest now that the
+        # peer's TP is actually consulted.
+        if cap:
+            self._remote_max_datagram_frame_size = cap
+        return cap
+
+    def _release_dgram_ring(self) -> None:
+        if self._dgram_ring:
+            self._transport.dgram_ring_release(self._dgram_ring)
+            self._dgram_ring = 0
 
     def get_stream_buf_stats(self, stream_id: int):
         """Return (pushed, popped, push_hash, pop_hash) for the per-stream
