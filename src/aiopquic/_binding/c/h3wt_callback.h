@@ -545,6 +545,14 @@ static int aiopquic_wt_path_callback(
                                 s->control_stream_id, 0, NULL, 0);
         break;
 
+    case picohttp_callback_drain:
+        /* picoquic >= 1.1.50 parses the DRAIN capsule itself and
+         * surfaces it as this event; emit the same signal our own
+         * capsule branch pushes when it sees the raw capsule. */
+        aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_DRAINING,
+                                s->control_stream_id, 0, NULL, 0);
+        break;
+
     case picohttp_callback_post_data:
         if (is_control) {
             int rc = picowt_receive_capsule(cnx, bytes, bytes + length,
