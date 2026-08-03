@@ -332,7 +332,16 @@ advance_one() {
     while read -r cand; do
         [ -n "${cand}" ] || continue
         say "  trying $(short "${path}" "${cand}") ($(version_at "${name}" "${path}" "${cand}"))"
+        # Build patches leave the tree dirty and checkout then refuses;
+        # under `advance_one || fail=1` set -e is inert, so the refusal
+        # was silently ignored and the gate re-tested the current pin.
+        # Reset first, and verify the checkout actually landed.
+        git -C "${path}" reset --hard -q
         git -C "${path}" checkout -q "${cand}"
+        if [ "$(git -C "${path}" rev-parse HEAD)" != "$(git -C "${path}" rev-parse "${cand}^{commit}")" ]; then
+            warn "  checkout of ${cand} did not land — aborting ${name}"
+            return 1
+        fi
         local rc=0
         run_gate || rc=$?
         if [ "${rc}" = "0" ]; then
@@ -348,6 +357,7 @@ advance_one() {
     done <<< "${cands}"
 
     warn "  gate failed; reverting ${name} to pin $(short "${path}" "${orig}")"
+    git -C "${path}" reset --hard -q
     git -C "${path}" checkout -q "${orig}"
     if [ "${NO_BUILD}" != "1" ]; then
         say "  rebuilding at original pin..."
