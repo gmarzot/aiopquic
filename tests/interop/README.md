@@ -21,9 +21,6 @@ genuinely independent QUIC stacks during dev and pre-release.
 ```
 # Default (CI shape) — runs qh3 only:
 pytest tests/interop/ -v
-
-# Full local stress (after building the ngtcp2 binaries below):
-pytest tests/interop/ -v
 ```
 
 ## qh3
