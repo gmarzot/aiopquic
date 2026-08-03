@@ -282,9 +282,12 @@ status_table() {
             "${status}" "${vp:-?}" "${vu:-?}"
     done
     # Footnotes: held pins are pinned locally and skipped by default.
+    # `cond && warn` as a bare list is not exempt from set -e: with a
+    # single unheld selection the list returns 1 and kills the script.
     for name in "${SELECTED[@]}"; do
-        [ "${SUB_HELD[$name]:-0}" = "1" ] \
-            && warn "${name}: pinned locally (use --only ${name} to attempt update)"
+        if [ "${SUB_HELD[$name]:-0}" = "1" ]; then
+            warn "${name}: pinned locally (use --only ${name} to attempt update)"
+        fi
     done
 }
 
