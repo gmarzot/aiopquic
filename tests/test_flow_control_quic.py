@@ -45,13 +45,7 @@ CERTS_DIR = os.path.join(
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
 
-_port_counter = 36500
-
-
-def next_port():
-    global _port_counter
-    _port_counter += 1
-    return _port_counter
+from ._ports import next_port
 
 
 def _server_cfg(_port):

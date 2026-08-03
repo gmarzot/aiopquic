@@ -34,13 +34,7 @@ KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
 ALPN = "hq-interop"
 
 # Use unique high ports per test to avoid TIME_WAIT conflicts
-_port_counter = 24567
-
-
-def next_port():
-    global _port_counter
-    _port_counter += 1
-    return _port_counter
+from ._ports import next_port
 
 
 def wait_for_ready(ctx, timeout=2.0):
