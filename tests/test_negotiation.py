@@ -35,7 +35,10 @@ pytestmark = pytest.mark.skipif(
     reason="picoquic certs not found",
 )
 
-from ._ports import next_port
+try:
+    from ._ports import next_port
+except ImportError:      # loaded bare, outside the package (bench helpers)
+    from _ports import next_port
 
 
 def _server_cfg(alpn_protocols):

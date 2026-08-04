@@ -45,7 +45,10 @@ CERTS_DIR = os.path.join(
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
 
-from ._ports import next_port
+try:
+    from ._ports import next_port
+except ImportError:      # loaded bare, outside the package (bench helpers)
+    from _ports import next_port
 
 
 def _server_cfg(_port):
