@@ -416,7 +416,8 @@ cdef class StreamChain:
 
     cpdef object parse_object_subgroup(self,
                                        bint extensions_present,
-                                       Py_ssize_t exts_len_limit):
+                                       Py_ssize_t exts_len_limit,
+                                       bint kvp_delta=False):
         """Parse one subgroup-stream object body in Cython.
 
         Body format (common to d14/d16/d18+):
@@ -437,6 +438,7 @@ cdef class StreamChain:
         """
         cdef object delta = self.pull_uint_var()
         cdef object exts = None
+        cdef object prev_id
         cdef object ext_id
         cdef object ext_value
         cdef object exts_len_obj
@@ -460,8 +462,14 @@ cdef class StreamChain:
             if exts_len > 0:
                 exts_end = self._pos + exts_len
                 exts = {}
+                prev_id = 0
                 while self._pos < exts_end:
                     ext_id = self.pull_uint_var()
+                    if kvp_delta:
+                        # d16+ KVP Type is a delta from the previous
+                        # absolute Type; parity follows the absolute.
+                        ext_id = prev_id + ext_id
+                        prev_id = ext_id
                     if not (ext_id & 1):
                         ext_value = self.pull_uint_var()
                     else:
@@ -484,13 +492,15 @@ cdef class StreamChain:
 
     cpdef object parse_object_subgroup_vi64(self,
                                             bint extensions_present,
-                                            Py_ssize_t exts_len_limit):
+                                            Py_ssize_t exts_len_limit,
+                                            bint kvp_delta=False):
         """draft-18 twin of parse_object_subgroup: identical body shape,
         vi64 codec (§1.4.1) instead of the RFC 9000 varint. Kept separate
         so the d14/d16 hot path is untouched. Returns
         (object_id_delta, exts_or_None, status, payload)."""
         cdef object delta = self.pull_uint_vi64()
         cdef object exts = None
+        cdef object prev_id
         cdef object ext_id
         cdef object ext_value
         cdef object exts_len_obj
@@ -514,8 +524,14 @@ cdef class StreamChain:
             if exts_len > 0:
                 exts_end = self._pos + exts_len
                 exts = {}
+                prev_id = 0
                 while self._pos < exts_end:
                     ext_id = self.pull_uint_vi64()
+                    if kvp_delta:
+                        # d16+ KVP Type is a delta from the previous
+                        # absolute Type; parity follows the absolute.
+                        ext_id = prev_id + ext_id
+                        prev_id = ext_id
                     if not (ext_id & 1):
                         ext_value = self.pull_uint_vi64()
                     else:
@@ -677,7 +693,7 @@ cdef inline Py_ssize_t _vi64_write(uint8_t* dst, uint64_t v):
 
 cpdef bytes encode_object_subgroup(
     object delta, object exts, int status,
-    bytes payload, bint extensions_present):
+    bytes payload, bint extensions_present, bint kvp_delta=False):
     """Build one subgroup-stream object body in Cython.
 
     Wire format (common to d14/d16/d18+):
@@ -714,13 +730,28 @@ cpdef bytes encode_object_subgroup(
 
     write_exts = extensions_present and status == 0 and exts is not None
 
+    # d16+ KVP Type is a delta from the previous absolute Type (types
+    # ascending on the wire); parity follows the absolute type. Wire id
+    # and absolute id are precomputed once for both passes.
+    cdef list ext_pairs = None
+    cdef uint64_t prev_v = 0
+    if write_exts:
+        ext_pairs = []
+        for ext_id, ext_value in (sorted(exts.items()) if kvp_delta
+                                  else exts.items()):
+            ext_id_v = <uint64_t>ext_id
+            ext_pairs.append(
+                (ext_id_v - prev_v if kvp_delta else ext_id_v,
+                 ext_id_v, ext_value))
+            if kvp_delta:
+                prev_v = ext_id_v
+
     total_size += _varint_size(delta_v)
     if extensions_present:
         if write_exts:
-            for ext_id, ext_value in exts.items():
-                ext_id_v = <uint64_t>ext_id
-                ext_block_size += _varint_size(ext_id_v)
-                if not (ext_id_v & 1):
+            for wire_id, abs_id, ext_value in ext_pairs:
+                ext_block_size += _varint_size(<uint64_t>wire_id)
+                if not (<uint64_t>abs_id & 1):
                     ext_block_size += _varint_size(<uint64_t>ext_value)
                 else:
                     value_len = <Py_ssize_t>len(ext_value)
@@ -741,10 +772,9 @@ cpdef bytes encode_object_subgroup(
     if extensions_present:
         off += _varint_write(p + off, <uint64_t>ext_block_size)
         if write_exts:
-            for ext_id, ext_value in exts.items():
-                ext_id_v = <uint64_t>ext_id
-                off += _varint_write(p + off, ext_id_v)
-                if not (ext_id_v & 1):
+            for wire_id, abs_id, ext_value in ext_pairs:
+                off += _varint_write(p + off, <uint64_t>wire_id)
+                if not (<uint64_t>abs_id & 1):
                     off += _varint_write(p + off, <uint64_t>ext_value)
                 else:
                     value_len = <Py_ssize_t>len(ext_value)
@@ -767,7 +797,7 @@ cpdef bytes encode_object_subgroup(
 
 cpdef bytes encode_object_subgroup_vi64(
     object delta, object exts, int status,
-    bytes payload, bint extensions_present):
+    bytes payload, bint extensions_present, bint kvp_delta=False):
     """draft-18 twin of encode_object_subgroup: identical body shape, vi64
     codec (§1.4.1). Kept separate so the d14/d16 hot path is untouched."""
     cdef uint64_t delta_v = <uint64_t>delta
@@ -782,13 +812,28 @@ cpdef bytes encode_object_subgroup_vi64(
 
     write_exts = extensions_present and status == 0 and exts is not None
 
+    # d16+ KVP Type is a delta from the previous absolute Type (types
+    # ascending on the wire); parity follows the absolute type. Wire id
+    # and absolute id are precomputed once for both passes.
+    cdef list ext_pairs = None
+    cdef uint64_t prev_v = 0
+    if write_exts:
+        ext_pairs = []
+        for ext_id, ext_value in (sorted(exts.items()) if kvp_delta
+                                  else exts.items()):
+            ext_id_v = <uint64_t>ext_id
+            ext_pairs.append(
+                (ext_id_v - prev_v if kvp_delta else ext_id_v,
+                 ext_id_v, ext_value))
+            if kvp_delta:
+                prev_v = ext_id_v
+
     total_size += _vi64_size(delta_v)
     if extensions_present:
         if write_exts:
-            for ext_id, ext_value in exts.items():
-                ext_id_v = <uint64_t>ext_id
-                ext_block_size += _vi64_size(ext_id_v)
-                if not (ext_id_v & 1):
+            for wire_id, abs_id, ext_value in ext_pairs:
+                ext_block_size += _vi64_size(<uint64_t>wire_id)
+                if not (<uint64_t>abs_id & 1):
                     ext_block_size += _vi64_size(<uint64_t>ext_value)
                 else:
                     value_len = <Py_ssize_t>len(ext_value)
@@ -809,10 +854,9 @@ cpdef bytes encode_object_subgroup_vi64(
     if extensions_present:
         off += _vi64_write(p + off, <uint64_t>ext_block_size)
         if write_exts:
-            for ext_id, ext_value in exts.items():
-                ext_id_v = <uint64_t>ext_id
-                off += _vi64_write(p + off, ext_id_v)
-                if not (ext_id_v & 1):
+            for wire_id, abs_id, ext_value in ext_pairs:
+                off += _vi64_write(p + off, <uint64_t>wire_id)
+                if not (<uint64_t>abs_id & 1):
                     off += _vi64_write(p + off, <uint64_t>ext_value)
                 else:
                     value_len = <Py_ssize_t>len(ext_value)
