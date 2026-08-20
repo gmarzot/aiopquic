@@ -284,6 +284,32 @@ class QuicConnection:
             return
         self._transport.drain_rx_callback(self._handle_raw_event)
 
+    @property
+    def peer_transport_parameters(self):
+        """The remote side's negotiated transport parameters as a dict,
+        or None before the handshake delivers them. Unknown/GREASE ids
+        and wire order are not preserved (picoquic struct parse) — use
+        qlog for those signals."""
+        if self._cnx_ptr and self._transport is not None:
+            return self._transport.transport_parameters(self._cnx_ptr)
+        return None
+
+    @property
+    def local_transport_parameters(self):
+        """This side's transport parameters as a dict (see peer_...)."""
+        if self._cnx_ptr and self._transport is not None:
+            return self._transport.transport_parameters(
+                self._cnx_ptr, local=True)
+        return None
+
+    @property
+    def connection_ids(self):
+        """{'local', 'remote', 'initial'} connection IDs as bytes, or
+        None when no live cnx. QUIC-LB / routable-CID detection."""
+        if self._cnx_ptr and self._transport is not None:
+            return self._transport.connection_ids(self._cnx_ptr)
+        return None
+
     def _negotiated_alpn(self, cnx_ptr):
         """The ALPN TLS actually negotiated for this cnx, falling back
         to the first configured ALPN if picoquic can't report it.

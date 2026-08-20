@@ -151,10 +151,16 @@ cdef extern from *:
 
     int picoquic_set_default_tp(picoquic_quic_t* quic, picoquic_tp_t* tp)
     const picoquic_tp_t* picoquic_get_default_tp(picoquic_quic_t* quic)
+    const picoquic_tp_t* picoquic_get_transport_parameters(
+        picoquic_cnx_t* cnx, int get_local)
 
     ctypedef struct picoquic_connection_id_t:
         uint8_t id[20]
         uint8_t id_len
+
+    picoquic_connection_id_t picoquic_get_local_cnxid(picoquic_cnx_t* cnx)
+    picoquic_connection_id_t picoquic_get_remote_cnxid(picoquic_cnx_t* cnx)
+    picoquic_connection_id_t picoquic_get_initial_cnxid(picoquic_cnx_t* cnx)
 
     picoquic_cnx_t* picoquic_create_client_cnx(
         picoquic_quic_t* quic, sockaddr* addr,
@@ -1317,6 +1323,60 @@ cdef class TransportContext:
         if alpn == NULL:
             return None
         return (<bytes>alpn).decode('ascii', 'replace')
+
+    def transport_parameters(self, uintptr_t cnx_ptr, bint local=False):
+        """Negotiated transport parameters as a dict — the REMOTE
+        side's advertisement by default (local=False), i.e. what the
+        peer sent in its TLS extension. The probe/fingerprinting
+        surface: reads the values picoquic parsed, no qlog round trip.
+
+        Limitations (picoquic parses into a struct): unknown/GREASE
+        parameter ids are dropped and wire ORDER is not preserved —
+        fall back to qlog/keylog+tshark for those signals.
+        """
+        if cnx_ptr == 0:
+            return None
+        cdef picoquic_cnx_t* cnx = <picoquic_cnx_t*><void*>cnx_ptr
+        cdef const picoquic_tp_t* tp = \
+            picoquic_get_transport_parameters(cnx, 1 if local else 0)
+        if tp == NULL:
+            return None
+        return {
+            'initial_max_data': tp.initial_max_data,
+            'initial_max_stream_data_bidi_local':
+                tp.initial_max_stream_data_bidi_local,
+            'initial_max_stream_data_bidi_remote':
+                tp.initial_max_stream_data_bidi_remote,
+            'initial_max_stream_data_uni': tp.initial_max_stream_data_uni,
+            'initial_max_streams_bidi': tp.initial_max_stream_id_bidir,
+            'initial_max_streams_uni': tp.initial_max_stream_id_unidir,
+            'max_idle_timeout': tp.max_idle_timeout,
+            'max_udp_payload_size': tp.max_packet_size,
+            'max_ack_delay': tp.max_ack_delay,
+            'ack_delay_exponent': tp.ack_delay_exponent,
+            'active_connection_id_limit': tp.active_connection_id_limit,
+            'disable_active_migration': bool(tp.migration_disabled),
+            'max_datagram_frame_size': tp.max_datagram_frame_size,
+            'min_ack_delay': tp.min_ack_delay,
+            'grease_quic_bit': bool(tp.do_grease_quic_bit),
+            'enable_loss_bit': tp.enable_loss_bit,
+            'enable_time_stamp': tp.enable_time_stamp,
+        }
+
+    def connection_ids(self, uintptr_t cnx_ptr):
+        """Current connection IDs as bytes: local, remote (peer's), and
+        the client's initial DCID. QUIC-LB / routable-CID detection."""
+        if cnx_ptr == 0:
+            return None
+        cdef picoquic_cnx_t* cnx = <picoquic_cnx_t*><void*>cnx_ptr
+        cdef picoquic_connection_id_t lo = picoquic_get_local_cnxid(cnx)
+        cdef picoquic_connection_id_t re = picoquic_get_remote_cnxid(cnx)
+        cdef picoquic_connection_id_t ini = picoquic_get_initial_cnxid(cnx)
+        return {
+            'local': PyBytes_FromStringAndSize(<char*>lo.id, lo.id_len),
+            'remote': PyBytes_FromStringAndSize(<char*>re.id, re.id_len),
+            'initial': PyBytes_FromStringAndSize(<char*>ini.id, ini.id_len),
+        }
 
     def path_quality(self, uintptr_t cnx_ptr):
         """Snapshot of picoquic's path-quality metrics for the cnx.
