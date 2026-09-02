@@ -39,8 +39,9 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         VERSION="${{ inputs.version }}"
-        if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          echo "error: version must be N.N.N, got '$VERSION'" >&2
+        if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
+          echo "error: version must be N.N.N or N.N.N{a,b,rc}N," \
+               "got '$VERSION'" >&2
           exit 1
         fi
         # pyproject.toml is dynamic = ["version"] via setuptools_scm,
@@ -216,7 +217,11 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         TAG="v${{ needs.tag.outputs.version }}"
+        # PEP 440 pre-release suffix => mark the GitHub Release
+        # prerelease, so it is not offered as the latest download.
+        PRE=""
+        [[ "$TAG" =~ (a|b|rc)[0-9]+$ ]] && PRE="--prerelease"
         gh release create "$TAG" \
           --title "$TAG" \
           --generate-notes \
-          --verify-tag
+          --verify-tag $PRE

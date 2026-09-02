@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.4.0rc1
+
+Pre-release for MoQ community interop testing. Pairs with aiomoqt
+0.11.0rc1. The full v0.4.0 notes land with the release.
+
+### Features
+
+- **Single-port ALPN dispatch.** `serve_dispatch()` advertises the union
+  of `h3` and the raw ALPNs on one UDP port and re-points each accepted
+  connection to the h3/WebTransport stack or the raw stack by its
+  negotiated ALPN. Retires the two-port split. Concurrent raw + WT
+  clients on one port are a core-tier test.
+- **Pull-model datagram TX**, with size and loss observability.
+- **Peer transport-parameter and connection-ID accessors**, and
+  `picohttp_callback_drain` surfaced as `SESSION_DRAINING`.
+- **`aiopquic.qlog`** — `load()` / `load_header()` for both qlog formats.
+
+### Fixes
+
+- **Delta-coded KVP extension types** in the subgroup object codec
+  (d16+ §1.4.2).
+- **NULL `FILE*` guard** in the h3zero client data path, and a patch
+  relaxing picoquic's WebTransport CONNECT capability gate (runtime
+  switchable).
+- Carries the two post-v0.3.11 crash fixes that never reached a PyPI
+  wheel: the picoquic ALPN NULL-deref guard and the WebTransport
+  reset-stream use-after-free.
+
+### Build
+
+- **picoquic advanced 1.1.49.2 → 1.1.51.1.**
+- io_uring is **not** in this release: the upstream implementation is an
+  open PR, maintainer-blocked on a wake-pipe bug that sits on our
+  wake-heavy TX path, and the flag does not compile at our pin.
+- s2n-quic interop retired; picoquicdemo is now the in-tree native peer.
+
 ## v0.3.11
 
 Pairs with aiomoqt 0.10.6.
