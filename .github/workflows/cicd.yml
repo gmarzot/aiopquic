@@ -82,7 +82,13 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/setup-aiopquic
       - name: Install Python QUIC peer stacks
-        run: pip install aioquic qh3
+        # qh3 is held below 2.0: that release rebuilt QuicConnection on a
+        # Rust core and states its private internals are no longer
+        # compatible. tests/interop/peers/qh3_echo.py monkeypatches the
+        # private QuicConnectionProtocol._create_stream, so the peer needs
+        # porting before the pin lifts. Unpinned, this job floats onto
+        # every qh3 release and fails on their schedule, not ours.
+        run: pip install aioquic 'qh3<2'
       - name: Run Python-peer interop tests
         timeout-minutes: 10
         run: |
