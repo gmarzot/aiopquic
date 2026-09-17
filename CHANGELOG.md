@@ -4,51 +4,15 @@
 
 Pairs with aiomoqt 0.11.0.
 
-### Features
-
-- **Single-port ALPN dispatch.** `serve_dispatch()` advertises the union
-  of `h3` and the raw ALPNs on one UDP port and re-points each accepted
-  connection to the h3/WebTransport stack or the raw stack by its
-  negotiated ALPN. Retires the two-port split. Concurrent raw + WT
-  clients on one port are a core-tier test.
-- **Pull-model datagram TX**, with size and loss observability.
-- **Peer transport-parameter and connection-ID accessors**, and
-  `picohttp_callback_drain` surfaced as `SESSION_DRAINING`.
-- **`aiopquic.qlog`** — `load()` / `load_header()` for both qlog formats.
-
-### Fixes
-
-- **Connection accessors no longer read picoquic memory from the asyncio
-  thread.** ALPN, transport parameters, connection IDs, path quality,
-  byte counters and the datagram ceiling read copies the worker thread
-  delivers on the existing event ring: with READY, with WebTransport
-  session READY, with a new per-connection stack event under single-port
-  dispatch, and in answer to a refresh command. Reading a connection the
-  worker had already freed, at close or after the transport stopped,
-  could segfault. Live values (path quality, byte counters, connection
-  IDs) are as of the last snapshot; each read asks for a fresh one.
-- Single-port dispatch routes each connection by the stack the worker
-  chose, announced ahead of the connection's other events, instead of
-  looking up its ALPN on the first event.
-- `QuicConnection.bytes_sent` / `bytes_received` read the snapshot; the
-  module-level `cnx_data_sent()` / `cnx_data_received()` are removed in
-  favour of `TransportContext.cnx_data_counters()`.
-- **Delta-coded KVP extension types** in the subgroup object codec
-  (d16+ §1.4.2).
-- **NULL `FILE*` guard** in the h3zero client data path, and a patch
-  relaxing picoquic's WebTransport CONNECT capability gate (runtime
-  switchable).
-- Carries the two post-v0.3.11 crash fixes that never reached a PyPI
-  wheel: the picoquic ALPN NULL-deref guard and the WebTransport
-  reset-stream use-after-free.
-
-### Build
-
-- **picoquic advanced 1.1.49.2 → 1.1.51.1.**
-- io_uring is **not** in this release: the upstream implementation is an
-  open PR, maintainer-blocked on a wake-pipe bug that sits on our
-  wake-heavy TX path, and the flag does not compile at our pin.
-- s2n-quic interop retired; picoquicdemo is now the in-tree native peer.
+- Single-port dispatch: raw QUIC and WebTransport on one UDP port.
+- Pull-model datagram TX; transport-parameter, connection-ID and qlog
+  accessors.
+- Fix: connection accessors no longer read picoquic memory from the
+  asyncio thread (crash after close).
+- Crash fixes: ALPN NULL-deref, WebTransport reset-stream use-after-free,
+  h3zero NULL `FILE*`.
+- Delta-coded KVP extension types (d16+).
+- picoquic 1.1.51.1.
 
 ## v0.4.0rc1
 
