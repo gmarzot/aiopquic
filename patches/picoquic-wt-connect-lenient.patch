@@ -1,0 +1,27 @@
+diff --git a/picohttp/webtransport.c b/picohttp/webtransport.c
+index fb49cd6d..5dcdf38d 100644
+--- a/picohttp/webtransport.c
++++ b/picohttp/webtransport.c
+@@ -357,6 +357,22 @@ static int picowt_webtransport_requirements_met(picoquic_cnx_t* cnx, h3zero_call
+     int has_connect_settings = ctx != NULL &&
+         (ctx->settings.webtransport_enabled == 0 || ctx->settings.enable_connect_protocol);
+ 
++    /* aiopquic: default is lenient — keep the RFC 9220 ordering
++     * (CONNECT only after the server's SETTINGS) but drop the
++     * capability vetoes. Deployed relays (mvfst/moxygen, quinn/moq-rs)
++     * do not yet advertise reset_stream_at or the draft-02 WT
++     * settings, so the strict gate refuses the entire field ecosystem.
++     * AIOPQUIC_WT_STRICT_CONNECT=1 restores the upstream gate for
++     * conformance testing. */
++    static int strict_connect = -1;
++    if (strict_connect < 0) {
++        const char* e = getenv("AIOPQUIC_WT_STRICT_CONNECT");
++        strict_connect = (e != NULL && e[0] == '1') ? 1 : 0;
++    }
++    if (!strict_connect) {
++        return ctx != NULL &&
++            ctx->settings.settings_received;
++    }
+     return ctx != NULL &&
+         ctx->settings.settings_received &&
+         ctx->settings.h3_datagram &&

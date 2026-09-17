@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.4.0
+
+Pairs with aiomoqt 0.11.0.
+
+- Single-port dispatch: raw QUIC and WebTransport on one UDP port.
+- Pull-model datagram TX; transport-parameter, connection-ID and qlog
+  accessors.
+- Fix: connection accessors no longer read picoquic memory from the
+  asyncio thread (crash after close).
+- Crash fixes: ALPN NULL-deref, WebTransport reset-stream use-after-free,
+  h3zero NULL `FILE*`.
+- Delta-coded KVP extension types (d16+).
+- picoquic 1.1.51.1.
+
+## v0.4.0rc1
+
+Pre-release for MoQ community interop testing, paired with aiomoqt
+0.11.0rc1. Its notes are folded into v0.4.0.
+
 ## v0.3.11
 
 Pairs with aiomoqt 0.10.6.

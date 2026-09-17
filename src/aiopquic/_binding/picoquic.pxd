@@ -73,7 +73,25 @@ cdef extern from "picoquic.h":
         uint64_t initial_max_stream_id_unidir
         uint64_t max_idle_timeout
         uint32_t max_packet_size
+        uint32_t max_ack_delay
+        uint32_t active_connection_id_limit
+        uint8_t ack_delay_exponent
+        unsigned int migration_disabled
         uint32_t max_datagram_frame_size
+        int enable_loss_bit
+        int enable_time_stamp
+        uint64_t min_ack_delay
+        int do_grease_quic_bit
+
+    # Peer/local negotiated transport parameters (get_local=0 → the
+    # REMOTE side's advertisement — the probe/fingerprinting surface).
+    const picoquic_tp_t* picoquic_get_transport_parameters(
+        picoquic_cnx_t* cnx, int get_local)
+
+    # Connection IDs (QUIC-LB / routable-CID detection).
+    picoquic_connection_id_t picoquic_get_local_cnxid(picoquic_cnx_t* cnx)
+    picoquic_connection_id_t picoquic_get_remote_cnxid(picoquic_cnx_t* cnx)
+    picoquic_connection_id_t picoquic_get_initial_cnxid(picoquic_cnx_t* cnx)
 
     # Callback function type
     ctypedef int (*picoquic_stream_data_cb_fn)(

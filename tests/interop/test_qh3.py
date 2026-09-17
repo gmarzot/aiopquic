@@ -131,7 +131,6 @@ async def test_aiopquic_client_qh3_server_sink(cert_paths, payload_bytes):
                             stream_id, chunk,
                             end_stream=(remaining == n),
                         )
-                        client.transmit()
                         break
                     except BufferError:
                         await asyncio.sleep(0.001)

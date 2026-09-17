@@ -536,12 +536,26 @@ static int aiopquic_wt_path_callback(
             picoquic_enable_keep_alive(cnx, s->bridge->keep_alive_us);
         }
         aiopquic_wt_log_cnxid("client-cnx-ready", cnx, UINT64_MAX);
-        aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_READY,
-                                s->control_stream_id, 0, NULL, 0);
+        {
+            /* The handshake-time state asyncio needs rides with READY. */
+            aiopquic_cnx_snapshot_t snap;
+            aiopquic_cnx_snapshot_fill(cnx, &snap);
+            aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_READY,
+                                    s->control_stream_id, 0,
+                                    (const uint8_t*)&snap, sizeof(snap));
+        }
         break;
 
     case picohttp_callback_connect_refused:
         aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_REFUSED,
+                                s->control_stream_id, 0, NULL, 0);
+        break;
+
+    case picohttp_callback_drain:
+        /* picoquic >= 1.1.50 parses the DRAIN capsule itself and
+         * surfaces it as this event; emit the same signal our own
+         * capsule branch pushes when it sees the raw capsule. */
+        aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_DRAINING,
                                 s->control_stream_id, 0, NULL, 0);
         break;
 
@@ -767,17 +781,14 @@ static int aiopquic_wt_path_callback(
                                 bytes, (uint32_t)length);
         break;
 
-    case picohttp_callback_provide_datagram: {
-        spsc_entry_t* tx = spsc_ring_peek(s->bridge->tx_event_ring);
-        if (tx && tx->event_type == SPSC_EVT_TX_DATAGRAM) {
-            uint32_t to_send = tx->data_length;
-            if (to_send > length) to_send = (uint32_t)length;
-            void* buf = h3zero_provide_datagram_buffer(stream_ctx, to_send, 0);
-            if (buf && tx->data_buf) memcpy(buf, tx->data_buf, to_send);
-            spsc_ring_pop(s->bridge->tx_event_ring);
-        }
+    case picohttp_callback_provide_datagram:
+        /* WT datagram TX is not wired yet (nothing calls
+         * h3zero_set_datagram_ready, so this cannot fire today).
+         * When it lands it will pull from the session's record ring —
+         * same pull model as raw QUIC's prepare_datagram path. Provide
+         * nothing and deactivate defensively. */
+        (void)h3zero_provide_datagram_buffer(stream_ctx, 0, 0);
         break;
-    }
 
     case picohttp_callback_reset:
         if (aiopquic_wt_diag_enabled()) {
@@ -1266,6 +1277,69 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
     default:
         return 0;
     }
+}
+
+/*
+ * Single-port dual-stack dispatch: the quic ctx's default callback when
+ * raw QUIC and h3/WebTransport share one UDP port. Each connection is
+ * routed exactly once by its negotiated ALPN: "h3" bootstraps the
+ * h3zero stack the same way h3zero_callback's own default branch would
+ * (per-cnx ctx from the shared server parameters — that branch is
+ * unreachable here because the quic default ctx is the bridge, not the
+ * params); anything else re-points to the raw aiopquic bridge. ALPN is
+ * selected during ClientHello processing, so it is available from the
+ * first connection callback; NULL means an event predates negotiation —
+ * ignore it and let the next event re-enter.
+ */
+
+/* Tell the asyncio side which stack owns this connection, with a snapshot
+ * of its state, ahead of the connection's first routed event, so asyncio
+ * never reads picoquic state itself. */
+static void aiopquic_dispatch_announce(aiopquic_ctx_t* bridge,
+                                       picoquic_cnx_t* cnx, int is_h3) {
+    aiopquic_cnx_snapshot_t snap;
+    aiopquic_cnx_snapshot_fill(cnx, &snap);
+    spsc_entry_t entry = {0};
+    entry.event_type = SPSC_EVT_CNX_STACK;
+    entry.cnx = cnx;
+    entry.is_fin = (uint8_t)(is_h3 ? 1 : 0);
+    if (spsc_ring_push(bridge->rx_event_ring, &entry,
+                       (const uint8_t*)&snap, sizeof(snap)) == 0) {
+        aiopquic_notify_rx(bridge);
+    } else {
+        bridge->worker_rx_event_drops++;
+    }
+}
+
+static int aiopquic_dispatch_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
+    uint8_t* bytes, size_t length, picoquic_call_back_event_t event,
+    void* callback_ctx, void* v_stream_ctx)
+{
+    aiopquic_ctx_t* bridge = (aiopquic_ctx_t*)callback_ctx;
+    const char* alpn = picoquic_tls_get_negotiated_alpn(cnx);
+    if (alpn == NULL) {
+        return 0;
+    }
+    if (bridge->dual_wt_params != NULL && strcmp(alpn, "h3") == 0) {
+        h3zero_callback_ctx_t* hctx = h3zero_callback_create_context(
+            (picohttp_server_parameters_t*)bridge->dual_wt_params);
+        if (hctx == NULL) {
+            picoquic_close(cnx, PICOQUIC_ERROR_MEMORY);
+            return -1;
+        }
+        picoquic_set_callback(cnx, h3zero_callback, hctx);
+        int ret = h3zero_protocol_init_safe(cnx, hctx);
+        if (ret != 0) {
+            return ret;
+        }
+        aiopquic_dispatch_announce(bridge, cnx, 1);
+        return h3zero_callback(cnx, stream_id, bytes, length,
+                               event, hctx, v_stream_ctx);
+    }
+    picoquic_set_callback(cnx, aiopquic_stream_cb, bridge);
+    aiopquic_dispatch_announce(bridge, cnx, 0);
+    return aiopquic_stream_cb(cnx, stream_id, bytes, length,
+                              event, bridge, v_stream_ctx);
 }
 
 #ifdef __cplusplus

@@ -45,13 +45,10 @@ CERTS_DIR = os.path.join(
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
 
-_port_counter = 36600
-
-
-def next_port():
-    global _port_counter
-    _port_counter += 1
-    return _port_counter
+try:
+    from ._ports import next_port
+except ImportError:      # loaded bare, outside the package (bench helpers)
+    from _ports import next_port
 
 
 pytestmark = pytest.mark.skipif(

@@ -67,6 +67,10 @@ typedef enum {
     SPSC_EVT_PATH_DELETED = 13,
     SPSC_EVT_PACING_CHANGED = 14,
     SPSC_EVT_STREAM_TX_DRAINED = 15,    /* edge: sc->tx had a waiter and worker just drained */
+    SPSC_EVT_DATAGRAM_TX_DRAINED = 19,  /* edge: per-cnx datagram TX record ring
+                                           had a blocked writer (drain_pending)
+                                           and the worker just popped a record.
+                                           cnx field = picoquic_cnx_t*. */
     SPSC_EVT_TX_EVENT_RING_DRAINED = 16, /* edge: connection-global TX event ring
                                             fill dropped below low_water while a
                                             Python writer had armed
@@ -94,14 +98,30 @@ typedef enum {
                                            runs. Mirrors SPSC_EVT_WT_STREAM_LINK_RELEASE
                                            for raw QUIC. entry.stream_ctx = sc;
                                            not exposed to Python. */
+    SPSC_EVT_CNX_STACK = 20,            /* Single-port dispatch: pushed once per
+                                           connection when the worker routes it,
+                                           ahead of any other event for that cnx.
+                                           cnx field = picoquic_cnx_t*;
+                                           is_fin = 1 for h3/WebTransport,
+                                           0 for raw QUIC. Payload:
+                                           aiopquic_cnx_snapshot_t. */
+    SPSC_EVT_CNX_SNAPSHOT = 21,         /* Answer to SPSC_EVT_TX_CNX_REFRESH.
+                                           cnx field = picoquic_cnx_t*;
+                                           payload: aiopquic_cnx_snapshot_t.
+                                           Consumed by drain_rx into the
+                                           per-cnx snapshot cache. */
 
     /* Legacy push-model byte-bearing events (SPSC_EVT_TX_STREAM_DATA=128,
      * SPSC_EVT_TX_STREAM_FIN=129) were removed in 0.3.5. Production code
      * uses the pull-model path (per-stream sc->tx ring + MARK_ACTIVE event);
      * tests use TransportContext.tx_send_stream which composes the same
      * primitives. Codepoints 128 and 129 are reserved-unused for one
-     * release cycle to avoid silent re-use confusion. */
-    SPSC_EVT_TX_DATAGRAM = 130,
+     * release cycle to avoid silent re-use confusion.
+     *
+     * SPSC_EVT_TX_DATAGRAM = 130 (push-model datagram: payload rode the
+     * shared TX event ring into picoquic_queue_datagram_frame's uncapped
+     * malloc'd list) was retired with the pull-model datagram path —
+     * see SPSC_EVT_TX_MARK_DATAGRAM_READY. Reserved-unused. */
     SPSC_EVT_TX_CLOSE = 131,
     SPSC_EVT_TX_STREAM_RESET = 132,
     SPSC_EVT_TX_STOP_SENDING = 133,
@@ -137,13 +157,27 @@ typedef enum {
      * __dealloc__ can later push TX_WT_DEREGISTER for full teardown. */
     SPSC_EVT_TX_WT_SESSION_CLEANUP = 145,
 
+    /* Pull-model datagram TX (asyncio → picoquic worker). Producer has
+     * already committed a record to the per-connection
+     * aiopquic_dgram_buf_t; this event registers the ring for the cnx
+     * (worker cnx→ring table, idempotent) and calls
+     * picoquic_mark_datagram_ready. entry.stream_ctx carries the
+     * aiopquic_dgram_buf_t*; no payload rides the event ring. */
+    SPSC_EVT_TX_MARK_DATAGRAM_READY = 146,
+
+    /* Snapshot request (asyncio → picoquic worker). picoquic cnx state is
+     * owned by the worker and freed there, so asyncio never reads it;
+     * the worker answers with SPSC_EVT_CNX_SNAPSHOT for a live cnx. */
+    SPSC_EVT_TX_CNX_REFRESH = 147,
+
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
      * WT control stream for session events, or the WT stream for
      * stream events. error_code carries WT error code for refused/
      * closed/reset/stop_sending. data_buf carries reason text for
      * close events, payload for stream/datagram events. */
-    SPSC_EVT_WT_SESSION_READY = 64,        /* CONNECT accepted by peer */
+    SPSC_EVT_WT_SESSION_READY = 64,        /* CONNECT accepted by peer. Payload:
+                                              aiopquic_cnx_snapshot_t. */
     SPSC_EVT_WT_SESSION_REFUSED = 65,      /* CONNECT refused */
     SPSC_EVT_WT_SESSION_CLOSED = 66,       /* CLOSE_WEBTRANSPORT_SESSION received */
     SPSC_EVT_WT_SESSION_DRAINING = 67,     /* DRAIN_WEBTRANSPORT_SESSION received */

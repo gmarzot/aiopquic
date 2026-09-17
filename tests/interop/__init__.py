@@ -1,11 +1,11 @@
 """Cross-implementation interop tests for aiopquic.
 
-Drives aiopquic against three independent QUIC stacks to catch protocol
+Drives aiopquic against independent QUIC stacks to catch protocol
 deviations testing-against-picoquic alone would miss:
 
   - qh3       (Python; same TLS lineage, different transport)
-  - s2n-quic  (Rust; AWS)
-  - ngtcp2    (C; canonical reference, gnutls/openssl)
+  - aioquic   (Python; reference asyncio QUIC)
+  - ngtcp2    (C; canonical reference, gnutls/openssl — optional, local-only)
 
 Each test exercises both directions: aiopquic-as-client and
 aiopquic-as-server. Pass criteria are byte conservation across the

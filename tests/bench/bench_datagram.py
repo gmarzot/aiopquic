@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from _helpers import SPSC_EVT_DATAGRAM, SPSC_EVT_TX_DATAGRAM
+from _helpers import SPSC_EVT_DATAGRAM
 
 
 @pytest.mark.bench
@@ -18,12 +18,14 @@ def test_bench_datagram_throughput(benchmark, datagram_pair, count):
     """
     server, client, client_cnx, _ = datagram_pair
     payload = b"x" * 256
+    ring = client.dgram_ring_create(1 << 20, 1200)
 
     def fire_and_count():
         for _ in range(count):
-            client.push_tx_event(SPSC_EVT_TX_DATAGRAM, 0,
-                           data=payload, cnx_ptr=client_cnx)
-        client.wake_up()
+            # Ring-full (rc==0) is legal under sustained fire — spin
+            # briefly; the worker drains as fast as it can pack frames.
+            while client.dgram_send(client_cnx, ring, payload) == 0:
+                time.sleep(0.0005)
         deadline = time.monotonic() + 5.0
         received = 0
         last_arrival = time.monotonic()

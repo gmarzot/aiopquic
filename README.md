@@ -102,7 +102,6 @@ async with connect("server", 4433, configuration=configuration) as protocol:
     quic = protocol._quic
     stream_id = quic.get_next_available_stream_id()
     quic.send_stream_data(stream_id, payload, end_stream=True)
-    protocol.transmit()
 ```
 
 `payload` is opaque bytes; the library doesn't impose framing. Consumers

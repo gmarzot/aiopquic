@@ -470,13 +470,14 @@ build_native() {
 
     # Native test drivers (picoquic_ct, picohttp_ct) are built alongside
     # the libraries so that `pytest -m native` validates picoquic itself
-    # on every submodule bump. Adds ~25s to build time; negligible vs the
-    # value of catching upstream regressions early.
+    # on every submodule bump. picoquicdemo is the in-tree interop peer
+    # (h09 + h3/WT reference implementation driving aiopquic from the
+    # other side of the socket — tests/interop/test_picoquicdemo.py).
     cmake -S "${PICOQUIC_DIR}" -B "${BUILD_DIR}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -Dpicoquic_BUILD_TESTS=ON \
-        -DBUILD_DEMO=OFF \
+        -DBUILD_DEMO=ON \
         -DBUILD_LOGREADER=OFF \
         -DBUILD_HTTP=ON \
         -DBUILD_LOGLIB=ON \
@@ -491,7 +492,7 @@ build_native() {
         ${PICOQUIC_PERF_ARGS[@]+"${PICOQUIC_PERF_ARGS[@]}"}
 
     cmake --build "${BUILD_DIR}" -j "${NPROC}" --target picoquic-core picohttp-core picoquic-log
-    cmake --build "${BUILD_DIR}" -j "${NPROC}" --target picoquic_ct picohttp_ct
+    cmake --build "${BUILD_DIR}" -j "${NPROC}" --target picoquic_ct picohttp_ct picoquicdemo
 
     PICOQUIC_LIB=$(find "${BUILD_DIR}" -name "libpicoquic-core.a" -print -quit 2>/dev/null || true)
     if [ -z "${PICOQUIC_LIB}" ]; then

@@ -18,7 +18,7 @@ SPSC_EVT_DATAGRAM = 8
 # TX events (128+). SPSC_EVT_TX_STREAM_DATA / SPSC_EVT_TX_STREAM_FIN
 # (legacy push-model) removed in 0.3.5; use TransportContext.tx_send_stream
 # (the low-level pull primitive) instead.
-SPSC_EVT_TX_DATAGRAM = 130
+SPSC_EVT_TX_MARK_DATAGRAM_READY = 146
 SPSC_EVT_TX_CLOSE = 131
 SPSC_EVT_TX_STREAM_RESET = 132
 SPSC_EVT_TX_STOP_SENDING = 133
@@ -34,13 +34,10 @@ KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
 ALPN = "hq-interop"
 
 # Use unique high ports per test to avoid TIME_WAIT conflicts
-_port_counter = 24567
-
-
-def next_port():
-    global _port_counter
-    _port_counter += 1
-    return _port_counter
+try:
+    from ._ports import next_port
+except ImportError:      # loaded bare, outside the package (bench helpers)
+    from _ports import next_port
 
 
 def wait_for_ready(ctx, timeout=2.0):
@@ -490,13 +487,12 @@ class TestLoopback:
                 srv_events, srv_cnx = wait_for_server_cnx(server)
                 assert srv_cnx != 0
 
-                # Client sends datagram
+                # Client sends datagram (pull model: commit the record
+                # to a per-cnx ring, then MARK_DATAGRAM_READY).
                 payload = b"hello datagram"
-                client.push_tx_event(
-                    SPSC_EVT_TX_DATAGRAM, 0,
-                    data=payload, cnx_ptr=cnx_ptr,
-                )
-                client.wake_up()
+                cli_ring = client.dgram_ring_create(65536, 1200)
+                rc = client.dgram_send(cnx_ptr, cli_ring, payload)
+                assert rc == 1, f"dgram_send rc={rc}"
 
                 # Server should receive it
                 deadline = time.monotonic() + 5.0
@@ -516,11 +512,9 @@ class TestLoopback:
 
                 # Server sends datagram back
                 reply = b"datagram reply"
-                server.push_tx_event(
-                    SPSC_EVT_TX_DATAGRAM, 0,
-                    data=reply, cnx_ptr=srv_cnx,
-                )
-                server.wake_up()
+                srv_ring = server.dgram_ring_create(65536, 1200)
+                rc = server.dgram_send(srv_cnx, srv_ring, reply)
+                assert rc == 1, f"dgram_send rc={rc}"
 
                 # Client should receive it
                 deadline = time.monotonic() + 5.0
@@ -537,8 +531,52 @@ class TestLoopback:
                 assert received == reply, (
                     f"Expected {reply!r}, got {received!r}"
                 )
+                # Oversize record is rejected up front (frames can't
+                # fragment), ring-full returns 0 without committing.
+                assert client.dgram_send(cnx_ptr, cli_ring, b"x" * 1201) == -1
+                stats = client.dgram_ring_stats(cli_ring)
+                assert stats['records_pushed'] == 1
+                assert stats['push_oversize'] == 1
+                client.dgram_ring_release(cli_ring)
+                server.dgram_ring_release(srv_ring)
             finally:
                 client.stop()
+        finally:
+            server.stop()
+
+    def test_datagram_backpressure(self):
+        """The datagram record ring is the backpressure boundary: with
+        the consumer never draining (cnx=0, the mark event is dropped
+        by the worker's liveness guard), pushes must hit ring-full and
+        return 0 — never queue unboundedly."""
+        port = next_port()
+        server = TransportContext()
+        server.start(port=port, cert_file=CERT_FILE, key_file=KEY_FILE,
+                     alpn=ALPN, is_client=False, max_datagram_frame_size=1200)
+        assert wait_for_ready(server), "Server not ready"
+        try:
+            # capacity 2048 fits three 512B records (4B header each);
+            # the fourth must be refused, not queued.
+            ring = server.dgram_ring_create(2048, 512)
+            payload = b"y" * 512
+            accepted = 0
+            refused = 0
+            for _ in range(8):
+                rc = server.dgram_send(0, ring, payload)
+                if rc in (1, 2):
+                    accepted += 1
+                elif rc == 0:
+                    refused += 1
+            assert accepted == 3, f"expected 3 accepted, got {accepted}"
+            assert refused == 5, f"expected 5 refused, got {refused}"
+            stats = server.dgram_ring_stats(ring)
+            assert stats['records_pushed'] == 3
+            assert stats['push_full'] == 5
+            assert stats['used'] <= stats['capacity']
+            # Oversize is permanent, not backpressure.
+            assert server.dgram_send(0, ring, b"z" * 513) == -1
+            assert server.dgram_ring_stats(ring)['push_oversize'] == 1
+            server.dgram_ring_release(ring)
         finally:
             server.stop()
 
