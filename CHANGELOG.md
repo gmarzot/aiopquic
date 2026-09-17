@@ -1,9 +1,8 @@
 # Changelog
 
-## v0.4.0rc1
+## v0.4.0
 
-Pre-release for MoQ community interop testing. Pairs with aiomoqt
-0.11.0rc1. The full v0.4.0 notes land with the release.
+Pairs with aiomoqt 0.11.0.
 
 ### Features
 
@@ -19,6 +18,21 @@ Pre-release for MoQ community interop testing. Pairs with aiomoqt
 
 ### Fixes
 
+- **Connection accessors no longer read picoquic memory from the asyncio
+  thread.** ALPN, transport parameters, connection IDs, path quality,
+  byte counters and the datagram ceiling read copies the worker thread
+  delivers on the existing event ring: with READY, with WebTransport
+  session READY, with a new per-connection stack event under single-port
+  dispatch, and in answer to a refresh command. Reading a connection the
+  worker had already freed, at close or after the transport stopped,
+  could segfault. Live values (path quality, byte counters, connection
+  IDs) are as of the last snapshot; each read asks for a fresh one.
+- Single-port dispatch routes each connection by the stack the worker
+  chose, announced ahead of the connection's other events, instead of
+  looking up its ALPN on the first event.
+- `QuicConnection.bytes_sent` / `bytes_received` read the snapshot; the
+  module-level `cnx_data_sent()` / `cnx_data_received()` are removed in
+  favour of `TransportContext.cnx_data_counters()`.
 - **Delta-coded KVP extension types** in the subgroup object codec
   (d16+ §1.4.2).
 - **NULL `FILE*` guard** in the h3zero client data path, and a patch
@@ -35,6 +49,11 @@ Pre-release for MoQ community interop testing. Pairs with aiomoqt
   open PR, maintainer-blocked on a wake-pipe bug that sits on our
   wake-heavy TX path, and the flag does not compile at our pin.
 - s2n-quic interop retired; picoquicdemo is now the in-tree native peer.
+
+## v0.4.0rc1
+
+Pre-release for MoQ community interop testing, paired with aiomoqt
+0.11.0rc1. Its notes are folded into v0.4.0.
 
 ## v0.3.11
 
