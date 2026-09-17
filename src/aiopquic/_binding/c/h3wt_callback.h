@@ -536,8 +536,14 @@ static int aiopquic_wt_path_callback(
             picoquic_enable_keep_alive(cnx, s->bridge->keep_alive_us);
         }
         aiopquic_wt_log_cnxid("client-cnx-ready", cnx, UINT64_MAX);
-        aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_READY,
-                                s->control_stream_id, 0, NULL, 0);
+        {
+            /* The handshake-time state asyncio needs rides with READY. */
+            aiopquic_cnx_snapshot_t snap;
+            aiopquic_cnx_snapshot_fill(cnx, &snap);
+            aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_READY,
+                                    s->control_stream_id, 0,
+                                    (const uint8_t*)&snap, sizeof(snap));
+        }
         break;
 
     case picohttp_callback_connect_refused:
@@ -1285,6 +1291,26 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
  * first connection callback; NULL means an event predates negotiation —
  * ignore it and let the next event re-enter.
  */
+
+/* Tell the asyncio side which stack owns this connection, with a snapshot
+ * of its state, ahead of the connection's first routed event, so asyncio
+ * never reads picoquic state itself. */
+static void aiopquic_dispatch_announce(aiopquic_ctx_t* bridge,
+                                       picoquic_cnx_t* cnx, int is_h3) {
+    aiopquic_cnx_snapshot_t snap;
+    aiopquic_cnx_snapshot_fill(cnx, &snap);
+    spsc_entry_t entry = {0};
+    entry.event_type = SPSC_EVT_CNX_STACK;
+    entry.cnx = cnx;
+    entry.is_fin = (uint8_t)(is_h3 ? 1 : 0);
+    if (spsc_ring_push(bridge->rx_event_ring, &entry,
+                       (const uint8_t*)&snap, sizeof(snap)) == 0) {
+        aiopquic_notify_rx(bridge);
+    } else {
+        bridge->worker_rx_event_drops++;
+    }
+}
+
 static int aiopquic_dispatch_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
     uint8_t* bytes, size_t length, picoquic_call_back_event_t event,
     void* callback_ctx, void* v_stream_ctx)
@@ -1306,10 +1332,12 @@ static int aiopquic_dispatch_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
         if (ret != 0) {
             return ret;
         }
+        aiopquic_dispatch_announce(bridge, cnx, 1);
         return h3zero_callback(cnx, stream_id, bytes, length,
                                event, hctx, v_stream_ctx);
     }
     picoquic_set_callback(cnx, aiopquic_stream_cb, bridge);
+    aiopquic_dispatch_announce(bridge, cnx, 0);
     return aiopquic_stream_cb(cnx, stream_id, bytes, length,
                               event, bridge, v_stream_ctx);
 }

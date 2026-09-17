@@ -60,6 +60,7 @@ _EVT_DATAGRAM_LOST = 10
 _EVT_STREAM_TX_DRAINED = 15
 _EVT_STREAM_DESTROY = 17
 _EVT_DATAGRAM_TX_DRAINED = 19
+_EVT_CNX_STACK = 20
 
 # TX event types
 _TX_STREAM_DATA = 128
@@ -263,15 +264,19 @@ class QuicConnection:
         """Cumulative bytes this cnx has placed on the wire (picoquic-
         accounting). Differs from bytes-queued: send_stream_data only
         appends to picoquic's per-stream send buffer; bytes_sent is
-        the on-wire count after cwnd/pacing has done its work."""
-        from aiopquic._binding._transport import cnx_data_sent
-        return cnx_data_sent(self._cnx_ptr)
+        the on-wire count after cwnd/pacing has done its work. As of the
+        last worker snapshot."""
+        if self._transport is None:
+            return 0
+        return self._transport.cnx_data_counters(self._cnx_ptr)[0]
 
     @property
     def bytes_received(self) -> int:
-        """Cumulative bytes this cnx has received from the wire."""
-        from aiopquic._binding._transport import cnx_data_received
-        return cnx_data_received(self._cnx_ptr)
+        """Cumulative bytes this cnx has received from the wire, as of the
+        last worker snapshot."""
+        if self._transport is None:
+            return 0
+        return self._transport.cnx_data_counters(self._cnx_ptr)[1]
 
     def _drain_and_convert(self) -> None:
         """Drain SPSC ring and convert to QuicEvent objects.
@@ -410,11 +415,9 @@ class QuicConnection:
             # first so it observes _closed instead of deadlocking.
             self._dgram_tx_drain_event.set()
             self._release_dgram_ring()
-            # Zero the cached cnx ptr; picoquic frees the cnx_t shortly
-            # after this callback. cnx_data_sent / cnx_data_received /
-            # path_quality already short-circuit on cnx_ptr == 0, so
-            # any subsequent observer call returns cleanly rather than
-            # dereferencing a freed pointer.
+            # picoquic may already have freed the cnx_t. The accessors
+            # read worker snapshots, never the cnx, and return empty
+            # values for a zero ptr.
             self._cnx_ptr = 0
         elif evt_type == _EVT_READY:
             if cnx_ptr != 0:

@@ -98,6 +98,18 @@ typedef enum {
                                            runs. Mirrors SPSC_EVT_WT_STREAM_LINK_RELEASE
                                            for raw QUIC. entry.stream_ctx = sc;
                                            not exposed to Python. */
+    SPSC_EVT_CNX_STACK = 20,            /* Single-port dispatch: pushed once per
+                                           connection when the worker routes it,
+                                           ahead of any other event for that cnx.
+                                           cnx field = picoquic_cnx_t*;
+                                           is_fin = 1 for h3/WebTransport,
+                                           0 for raw QUIC. Payload:
+                                           aiopquic_cnx_snapshot_t. */
+    SPSC_EVT_CNX_SNAPSHOT = 21,         /* Answer to SPSC_EVT_TX_CNX_REFRESH.
+                                           cnx field = picoquic_cnx_t*;
+                                           payload: aiopquic_cnx_snapshot_t.
+                                           Consumed by drain_rx into the
+                                           per-cnx snapshot cache. */
 
     /* Legacy push-model byte-bearing events (SPSC_EVT_TX_STREAM_DATA=128,
      * SPSC_EVT_TX_STREAM_FIN=129) were removed in 0.3.5. Production code
@@ -153,13 +165,19 @@ typedef enum {
      * aiopquic_dgram_buf_t*; no payload rides the event ring. */
     SPSC_EVT_TX_MARK_DATAGRAM_READY = 146,
 
+    /* Snapshot request (asyncio → picoquic worker). picoquic cnx state is
+     * owned by the worker and freed there, so asyncio never reads it;
+     * the worker answers with SPSC_EVT_CNX_SNAPSHOT for a live cnx. */
+    SPSC_EVT_TX_CNX_REFRESH = 147,
+
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
      * WT control stream for session events, or the WT stream for
      * stream events. error_code carries WT error code for refused/
      * closed/reset/stop_sending. data_buf carries reason text for
      * close events, payload for stream/datagram events. */
-    SPSC_EVT_WT_SESSION_READY = 64,        /* CONNECT accepted by peer */
+    SPSC_EVT_WT_SESSION_READY = 64,        /* CONNECT accepted by peer. Payload:
+                                              aiopquic_cnx_snapshot_t. */
     SPSC_EVT_WT_SESSION_REFUSED = 65,      /* CONNECT refused */
     SPSC_EVT_WT_SESSION_CLOSED = 66,       /* CLOSE_WEBTRANSPORT_SESSION received */
     SPSC_EVT_WT_SESSION_DRAINING = 67,     /* DRAIN_WEBTRANSPORT_SESSION received */

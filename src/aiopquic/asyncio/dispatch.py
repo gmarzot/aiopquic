@@ -5,18 +5,22 @@ One TransportContext advertises the ALPN union ("h3" + the caller's raw
 list); the C-side default callback (aiopquic_dispatch_cb) re-points each
 connection to its stack at handshake time. On the asyncio side a single
 eventfd reader drains the shared SPSC ring and routes each event to the
-raw QuicEngine or the WebTransport dispatcher by the connection's
-negotiated ALPN — queried once per connection through the transport
-accessor (the same one QuicConnection uses at READY) and cached until
-the connection closes.
+raw QuicEngine or the WebTransport dispatcher. The worker announces each
+connection's stack with SPSC_EVT_CNX_STACK ahead of the connection's
+other events; the router records that choice and never reads picoquic
+state itself.
 """
 
 import asyncio
 
 from aiopquic.quic.configuration import QuicConfiguration
-from aiopquic.quic.connection import QuicEngine, _EVT_CLOSE, _EVT_APP_CLOSE
+from aiopquic.quic.connection import (
+    QuicEngine, _EVT_CLOSE, _EVT_APP_CLOSE, _EVT_CNX_STACK,
+)
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
-from aiopquic.asyncio.webtransport import serve_webtransport
+from aiopquic.asyncio.webtransport import (
+    serve_webtransport, _EVT_WT_SESSION_READY,
+)
 
 
 class _DualRouter:
@@ -38,13 +42,16 @@ class _DualRouter:
                 # WT dispatcher consumes these (the engine ignores them).
                 self._wt.route_event(ev)
                 continue
+            if ev[0] == _EVT_CNX_STACK:
+                # The worker's routing choice. Always taken, so a new cnx
+                # reusing a freed cnx's address replaces the old entry.
+                self._is_h3[cnx_ptr] = bool(ev[3])
+                continue
             is_h3 = self._is_h3.get(cnx_ptr)
             if is_h3 is None:
-                alpn = self._transport.get_negotiated_alpn(cnx_ptr)
-                if not alpn:
-                    continue   # cnx already gone — drop, mirroring close
-                is_h3 = alpn == "h3"
-                self._is_h3[cnx_ptr] = is_h3
+                # The stack event was lost to a full ring: route this
+                # event by its type alone.
+                is_h3 = ev[0] >= _EVT_WT_SESSION_READY
             (self._wt if is_h3 else self._engine).route_event(ev)
             if ev[0] in (_EVT_CLOSE, _EVT_APP_CLOSE):
                 self._is_h3.pop(cnx_ptr, None)

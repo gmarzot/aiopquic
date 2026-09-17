@@ -51,6 +51,10 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_WT_SESSION_CLEANUP,
     SPSC_EVT_TX_MARK_DATAGRAM_READY,
     SPSC_EVT_DATAGRAM_TX_DRAINED,
+    SPSC_EVT_TX_CNX_REFRESH,
+    SPSC_EVT_CNX_STACK, SPSC_EVT_CNX_SNAPSHOT,
+    SPSC_EVT_WT_SESSION_READY,
+    SPSC_EVT_WT_SESSION_REFUSED, SPSC_EVT_WT_SESSION_CLOSED,
 )
 
 # Socket address helpers (needed by picoquic declarations)
@@ -336,7 +340,19 @@ cdef extern from "c/callback.h":
 # owned by Python (refcount-style); picoquic-pthread reads from it via
 # stream_ctx in aiopquic_stream_cb.
 cdef extern from "c/callback.h":
-    uint32_t aiopquic_datagram_payload_ceiling(picoquic_cnx_t* cnx)
+    ctypedef struct aiopquic_cnx_snapshot_t:
+        char alpn[32]
+        uint8_t has_tp_local
+        uint8_t has_tp_remote
+        uint32_t dgram_ceiling
+        picoquic_tp_t tp_local
+        picoquic_tp_t tp_remote
+        picoquic_connection_id_t cid_local
+        picoquic_connection_id_t cid_remote
+        picoquic_connection_id_t cid_initial
+        picoquic_path_quality_t path_quality
+        uint64_t data_sent
+        uint64_t data_received
 
 cdef extern from "c/stream_buf.h":
     ctypedef struct aiopquic_stream_buf_t:
@@ -943,6 +959,12 @@ cdef class TransportContext:
     # _stream_ctxs dict; this dict is for the bare-TransportContext
     # test path where there's no QuicConnection wrapper.
     cdef object _test_stream_ctxs
+    # Per-cnx aiopquic_cnx_snapshot_t bytes, keyed by cnx ptr; closed
+    # cnxs whose snapshot drops at the next drain; cnxs already sent a
+    # refresh this drain cycle.
+    cdef dict _cnx_snapshots
+    cdef list _snapshot_drops
+    cdef set _refresh_posted
 
     def __cinit__(self,
                   uint32_t ring_capacity=0,
@@ -971,6 +993,9 @@ cdef class TransportContext:
         self._send_alloc_fail = 0
         self._tx_event_ring_drain_event = None
         self._test_stream_ctxs = {}
+        self._cnx_snapshots = {}
+        self._snapshot_drops = []
+        self._refresh_posted = set()
         if self._ctx is NULL:
             raise MemoryError("Failed to create transport context")
         # Register for module-level SIGUSR2 counter dump.
@@ -1308,21 +1333,82 @@ cdef class TransportContext:
         cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*><void*>sc_ptr
         aiopquic_clear_tx_data_drain_pending(sc)
 
+    # -- connection snapshots ------------------------------------------
+    # picoquic cnx state belongs to the worker thread, which frees it. The
+    # worker sends copies (aiopquic_cnx_snapshot_t) with READY, with WT
+    # session READY, with SPSC_EVT_CNX_STACK and in answer to
+    # SPSC_EVT_TX_CNX_REFRESH; the accessors below read only those copies.
+
+    cdef object _store_snapshot(self, uintptr_t cnx_ptr, void* buf,
+                                Py_ssize_t length):
+        if length == sizeof(aiopquic_cnx_snapshot_t):
+            self._cnx_snapshots[cnx_ptr] = PyBytes_FromStringAndSize(
+                <char*>buf, length)
+        free(buf)
+
+    cdef object _forget_snapshot(self, uintptr_t cnx_ptr):
+        """Drop a closed cnx's snapshot at the next drain, so this drain's
+        handlers still read final values. Skipped if a new cnx at the same
+        address has replaced it by then."""
+        snap = self._cnx_snapshots.get(cnx_ptr)
+        if snap is not None:
+            self._snapshot_drops.append((cnx_ptr, snap))
+
+    cdef object _begin_drain_cycle(self):
+        """Apply snapshot drops deferred from the last drain and reopen
+        refreshes for every cnx."""
+        if self._refresh_posted:
+            self._refresh_posted.clear()
+        if not self._snapshot_drops:
+            return
+        for cnx_ptr, snap in self._snapshot_drops:
+            if self._cnx_snapshots.get(cnx_ptr) is snap:
+                del self._cnx_snapshots[cnx_ptr]
+        self._snapshot_drops = []
+
+    cdef object _post_refresh(self, uintptr_t cnx_ptr):
+        """Ask the worker for a fresh snapshot, at most once per cnx per
+        drain cycle. With the TX event ring full this refresh is skipped;
+        a later call asks again."""
+        cdef spsc_entry_t entry
+        if self._thread_ctx is NULL or cnx_ptr in self._refresh_posted:
+            return
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_CNX_REFRESH
+        entry.cnx = <void*>cnx_ptr
+        if spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            return
+        self._refresh_posted.add(cnx_ptr)
+        self._ctx.cnt_tx_event_ring_pushes += 1
+        if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+            picoquic_wake_up_network_thread(self._thread_ctx)
+
+    cdef object _snapshot(self, uintptr_t cnx_ptr, bint refresh):
+        """The cached snapshot bytes for a cnx, or None. Posts a refresh
+        when asked to, or when nothing is cached yet."""
+        snap = self._cnx_snapshots.get(cnx_ptr)
+        if refresh or snap is None:
+            self._post_refresh(cnx_ptr)
+        return snap
+
     def get_negotiated_alpn(self, uintptr_t cnx_ptr):
         """The ALPN protocol TLS actually negotiated for this cnx.
 
         picoquic settles the real ALPN at handshake; this returns it so
         callers don't have to assume their first offered protocol was
         selected (it isn't, when offering multiple). Returns None on a
-        NULL cnx or before negotiation completes.
+        NULL cnx or before the cnx's first snapshot (READY, or
+        SPSC_EVT_CNX_STACK under single-port dispatch).
         """
         if cnx_ptr == 0:
             return None
-        cdef picoquic_cnx_t* cnx = <picoquic_cnx_t*><void*>cnx_ptr
-        cdef const char* alpn = picoquic_tls_get_negotiated_alpn(cnx)
-        if alpn == NULL:
+        snap = self._snapshot(cnx_ptr, False)
+        if snap is None:
             return None
-        return (<bytes>alpn).decode('ascii', 'replace')
+        cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
+        if s.alpn[0] == 0:
+            return None
+        return (<bytes>(<char*>s.alpn)).decode('ascii', 'replace')
 
     def transport_parameters(self, uintptr_t cnx_ptr, bint local=False):
         """Negotiated transport parameters as a dict — the REMOTE
@@ -1336,11 +1422,13 @@ cdef class TransportContext:
         """
         if cnx_ptr == 0:
             return None
-        cdef picoquic_cnx_t* cnx = <picoquic_cnx_t*><void*>cnx_ptr
-        cdef const picoquic_tp_t* tp = \
-            picoquic_get_transport_parameters(cnx, 1 if local else 0)
-        if tp == NULL:
+        snap = self._snapshot(cnx_ptr, False)
+        if snap is None:
             return None
+        cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
+        if not (s.has_tp_local if local else s.has_tp_remote):
+            return None
+        cdef const picoquic_tp_t* tp = &s.tp_local if local else &s.tp_remote
         return {
             'initial_max_data': tp.initial_max_data,
             'initial_max_stream_data_bidi_local':
@@ -1364,14 +1452,19 @@ cdef class TransportContext:
         }
 
     def connection_ids(self, uintptr_t cnx_ptr):
-        """Current connection IDs as bytes: local, remote (peer's), and
-        the client's initial DCID. QUIC-LB / routable-CID detection."""
+        """Connection IDs as bytes: local, remote (peer's), and the
+        client's initial DCID, as of the last worker snapshot; each call
+        asks for a fresh one. QUIC-LB / routable-CID detection. None
+        before the first snapshot."""
         if cnx_ptr == 0:
             return None
-        cdef picoquic_cnx_t* cnx = <picoquic_cnx_t*><void*>cnx_ptr
-        cdef picoquic_connection_id_t lo = picoquic_get_local_cnxid(cnx)
-        cdef picoquic_connection_id_t re = picoquic_get_remote_cnxid(cnx)
-        cdef picoquic_connection_id_t ini = picoquic_get_initial_cnxid(cnx)
+        snap = self._snapshot(cnx_ptr, True)
+        if snap is None:
+            return None
+        cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
+        cdef const picoquic_connection_id_t* lo = &s.cid_local
+        cdef const picoquic_connection_id_t* re = &s.cid_remote
+        cdef const picoquic_connection_id_t* ini = &s.cid_initial
         return {
             'local': PyBytes_FromStringAndSize(<char*>lo.id, lo.id_len),
             'remote': PyBytes_FromStringAndSize(<char*>re.id, re.id_len),
@@ -1389,14 +1482,18 @@ cdef class TransportContext:
         diagnostic signature of the BBR Startup-exit freeze observed
         on raw-QUIC P=1 loopback).
 
-        Returns an empty dict on NULL cnx_ptr (cnx already torn down
-        or never opened); callers should treat empty as 'no data'.
+        Values are as of the last worker snapshot; each call asks for a
+        fresh one. Returns an empty dict on NULL cnx_ptr (cnx torn down
+        or never opened) or before the first snapshot; callers should
+        treat empty as 'no data'.
         """
         if cnx_ptr == 0:
             return {}
-        cdef picoquic_cnx_t* cnx = <picoquic_cnx_t*><void*>cnx_ptr
-        cdef picoquic_path_quality_t q
-        picoquic_get_default_path_quality(cnx, &q)
+        snap = self._snapshot(cnx_ptr, True)
+        if snap is None:
+            return {}
+        cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
+        cdef const picoquic_path_quality_t* q = &s.path_quality
         return {
             'receive_rate_estimate': q.receive_rate_estimate,
             'pacing_rate': q.pacing_rate,
@@ -1517,6 +1614,7 @@ cdef class TransportContext:
         # tx_event_ring traffic at ~max(streams_per_cycle, advance_rate
         # / hysteresis_bytes) instead of per-chunk.
         cdef dict pending_fc = {}
+        self._begin_drain_cycle()
         for i in range(max_events):
             entry = spsc_ring_peek(self._ctx.rx_event_ring)
             if entry is NULL:
@@ -1586,6 +1684,15 @@ cdef class TransportContext:
                 spsc_ring_pop(self._ctx.rx_event_ring)
                 continue
 
+            # A cnx snapshot answering a refresh: cache it, never deliver.
+            if entry.event_type == SPSC_EVT_CNX_SNAPSHOT:
+                if entry.data_length > 0 and entry.data_buf is not NULL:
+                    length = entry.data_length
+                    self._store_snapshot(<uintptr_t>entry.cnx,
+                                         spsc_ring_take_data(entry), length)
+                spsc_ring_pop(self._ctx.rx_event_ring)
+                continue
+
             data = None
             sc_ptr = 0
             if entry.data_length > 0 and entry.data_buf is not NULL:
@@ -1593,8 +1700,14 @@ cdef class TransportContext:
                 # etc.) — not tied to a per-stream sc, no FC accounting.
                 length = entry.data_length
                 buf = spsc_ring_take_data(entry)
-                data = memoryview(StreamChunk._wrap(
-                    buf, length, NULL, NULL, NULL, 0))
+                if (entry.event_type == SPSC_EVT_READY or
+                        entry.event_type == SPSC_EVT_CNX_STACK or
+                        entry.event_type == SPSC_EVT_WT_SESSION_READY):
+                    # A cnx snapshot: cache it; deliver the event bare.
+                    self._store_snapshot(<uintptr_t>entry.cnx, buf, length)
+                else:
+                    data = memoryview(StreamChunk._wrap(
+                        buf, length, NULL, NULL, NULL, 0))
             elif (entry.event_type == SPSC_EVT_STREAM_DATA or
                   entry.event_type == SPSC_EVT_STREAM_FIN) and \
                   entry.stream_ctx is not NULL:
@@ -1680,6 +1793,11 @@ cdef class TransportContext:
                 <uintptr_t>entry.stream_ctx,
                 sc_ptr,
             ))
+            if (entry.event_type == SPSC_EVT_CLOSE or
+                    entry.event_type == SPSC_EVT_APP_CLOSE or
+                    entry.event_type == SPSC_EVT_WT_SESSION_CLOSED or
+                    entry.event_type == SPSC_EVT_WT_SESSION_REFUSED):
+                self._forget_snapshot(<uintptr_t>entry.cnx)
             spsc_ring_pop(self._ctx.rx_event_ring)
 
         # Per-cycle FC dedupe flush: emit at most one push per stream
@@ -1773,6 +1891,7 @@ cdef class TransportContext:
         cdef aiopquic_stream_buf_t* rx_sb
         cdef uint32_t avail
         cdef dict pending_fc = {}
+        self._begin_drain_cycle()
         for i in range(max_events):
             entry = spsc_ring_peek(self._ctx.rx_event_ring)
             if entry is NULL:
@@ -1831,13 +1950,28 @@ cdef class TransportContext:
                 count += 1
                 continue
 
+            if entry.event_type == SPSC_EVT_CNX_SNAPSHOT:
+                if entry.data_length > 0 and entry.data_buf is not NULL:
+                    length = entry.data_length
+                    self._store_snapshot(<uintptr_t>entry.cnx,
+                                         spsc_ring_take_data(entry), length)
+                spsc_ring_pop(self._ctx.rx_event_ring)
+                count += 1
+                continue
+
             data = None
             sc_ptr = 0
             if entry.data_length > 0 and entry.data_buf is not NULL:
                 length = entry.data_length
                 buf = spsc_ring_take_data(entry)
-                data = memoryview(StreamChunk._wrap(
-                    buf, length, NULL, NULL, NULL, 0))
+                if (entry.event_type == SPSC_EVT_READY or
+                        entry.event_type == SPSC_EVT_CNX_STACK or
+                        entry.event_type == SPSC_EVT_WT_SESSION_READY):
+                    # A cnx snapshot: cache it; deliver the event bare.
+                    self._store_snapshot(<uintptr_t>entry.cnx, buf, length)
+                else:
+                    data = memoryview(StreamChunk._wrap(
+                        buf, length, NULL, NULL, NULL, 0))
             elif (entry.event_type == SPSC_EVT_STREAM_DATA or
                   entry.event_type == SPSC_EVT_STREAM_FIN) and \
                   entry.stream_ctx is not NULL:
@@ -1905,6 +2039,11 @@ cdef class TransportContext:
                 <uintptr_t>entry.stream_ctx,
                 sc_ptr,
             )
+            if (entry.event_type == SPSC_EVT_CLOSE or
+                    entry.event_type == SPSC_EVT_APP_CLOSE or
+                    entry.event_type == SPSC_EVT_WT_SESSION_CLOSED or
+                    entry.event_type == SPSC_EVT_WT_SESSION_REFUSED):
+                self._forget_snapshot(<uintptr_t>entry.cnx)
             spsc_ring_pop(self._ctx.rx_event_ring)
             count += 1
 
@@ -2196,11 +2335,29 @@ cdef class TransportContext:
     def datagram_payload_ceiling(self, uintptr_t cnx_ptr):
         """Guaranteed max datagram payload for this connection:
         min(local TP, remote TP, 1200). 0 = peer did not negotiate
-        datagrams (doubles as the capability check). Valid post-READY;
-        TPs are immutable after the handshake."""
+        datagrams (doubles as the capability check). Read from the
+        cnx snapshot taken at READY; TPs are immutable after the
+        handshake."""
         if cnx_ptr == 0:
             return 0
-        return aiopquic_datagram_payload_ceiling(<picoquic_cnx_t*>cnx_ptr)
+        snap = self._snapshot(cnx_ptr, False)
+        if snap is None:
+            return 0
+        cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
+        return s.dgram_ceiling
+
+    def cnx_data_counters(self, uintptr_t cnx_ptr):
+        """(bytes placed on the wire, bytes received from the wire) for
+        the cnx, picoquic-side accounting, as of the last worker snapshot;
+        each call asks for a fresh one. (0, 0) before the first snapshot.
+        """
+        if cnx_ptr == 0:
+            return (0, 0)
+        snap = self._snapshot(cnx_ptr, True)
+        if snap is None:
+            return (0, 0)
+        cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
+        return (s.data_sent, s.data_received)
 
     @property
     def worker_dgram_mark_ready_processed(self):
@@ -3090,27 +3247,6 @@ cdef class WebTransportSessionState:
         if ret != 0:
             raise BufferError("TX ring full (WT_STOP_SENDING)")
         self._transport.wake_up()
-
-
-# ---------------------------------------------------------------------------
-# Wire-level cnx counters — picoquic-side accounting of bytes that actually
-# crossed the UDP socket. send_stream_data only queues into picoquic's
-# per-stream send buffer; cwnd/pacing/pacing-fairness then governs when
-# bytes leave the wire. data_sent / data_received expose that ground truth.
-# ---------------------------------------------------------------------------
-
-def cnx_data_sent(uintptr_t cnx_ptr):
-    """Cumulative bytes the cnx has placed on the wire."""
-    if cnx_ptr == 0:
-        return 0
-    return picoquic_get_data_sent(<picoquic_cnx_t*>cnx_ptr)
-
-
-def cnx_data_received(uintptr_t cnx_ptr):
-    """Cumulative bytes the cnx has received from the wire."""
-    if cnx_ptr == 0:
-        return 0
-    return picoquic_get_data_received(<picoquic_cnx_t*>cnx_ptr)
 
 
 # ---------------------------------------------------------------------------

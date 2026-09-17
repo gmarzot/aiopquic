@@ -441,8 +441,8 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
  * live path MTU (PICOQUIC_DATAGRAM_QUEUE_CAUTIOUS_LENGTH); larger may
  * work after PMTUD but there is no public send_mtu getter to promise
  * it. Returns 0 when the peer did not negotiate datagrams — doubling
- * as the capability check. TP values are immutable after handshake, so
- * this is safe to call from the asyncio thread post-READY. */
+ * as the capability check. Worker thread only: asyncio reads it from
+ * aiopquic_cnx_snapshot_t. */
 static inline uint32_t aiopquic_datagram_payload_ceiling(picoquic_cnx_t* cnx) {
     if (!cnx) return 0;
     const picoquic_tp_t* lt = picoquic_get_transport_parameters(cnx, 1);
@@ -453,6 +453,54 @@ static inline uint32_t aiopquic_datagram_payload_ceiling(picoquic_cnx_t* cnx) {
     if (cap == 0) return 0;
     if (cap > 1200) cap = 1200;
     return cap;
+}
+
+/* A copy of a connection's picoquic state, taken on the worker thread and
+ * delivered to asyncio as an event payload. asyncio reads the copy and
+ * never touches picoquic memory, which the worker owns and frees. Sent
+ * with READY (raw stack), with SPSC_EVT_WT_SESSION_READY (WebTransport
+ * client), with SPSC_EVT_CNX_STACK (single-port dispatch) and in answer
+ * to SPSC_EVT_TX_CNX_REFRESH. */
+typedef struct {
+    char alpn[32];                      /* NUL-terminated; empty if unknown */
+    uint8_t has_tp_local;
+    uint8_t has_tp_remote;
+    uint32_t dgram_ceiling;
+    picoquic_tp_t tp_local;
+    picoquic_tp_t tp_remote;
+    picoquic_connection_id_t cid_local;
+    picoquic_connection_id_t cid_remote;
+    picoquic_connection_id_t cid_initial;
+    picoquic_path_quality_t path_quality;
+    uint64_t data_sent;
+    uint64_t data_received;
+} aiopquic_cnx_snapshot_t;
+
+/* Worker thread only. */
+static inline void aiopquic_cnx_snapshot_fill(picoquic_cnx_t* cnx,
+                                              aiopquic_cnx_snapshot_t* s) {
+    memset(s, 0, sizeof(*s));
+    const char* alpn = picoquic_tls_get_negotiated_alpn(cnx);
+    if (alpn) {
+        strncpy(s->alpn, alpn, sizeof(s->alpn) - 1);
+    }
+    const picoquic_tp_t* lt = picoquic_get_transport_parameters(cnx, 1);
+    const picoquic_tp_t* rt = picoquic_get_transport_parameters(cnx, 0);
+    if (lt) {
+        s->tp_local = *lt;
+        s->has_tp_local = 1;
+    }
+    if (rt) {
+        s->tp_remote = *rt;
+        s->has_tp_remote = 1;
+    }
+    s->dgram_ceiling = aiopquic_datagram_payload_ceiling(cnx);
+    s->cid_local = picoquic_get_local_cnxid(cnx);
+    s->cid_remote = picoquic_get_remote_cnxid(cnx);
+    s->cid_initial = picoquic_get_initial_cnxid(cnx);
+    picoquic_get_default_path_quality(cnx, &s->path_quality);
+    s->data_sent = picoquic_get_data_sent(cnx);
+    s->data_received = picoquic_get_data_received(cnx);
 }
 
 /* TX wake-coalescing: producer-side helper. Returns 1 if a wake is
@@ -1135,6 +1183,12 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
          * event with its length only. */
         entry.data_length = (uint32_t)length;
         ret = spsc_ring_push(ctx->rx_event_ring, &entry, NULL, 0);
+    } else if (fin_or_event == picoquic_callback_ready) {
+        /* The handshake-time state asyncio needs rides with READY. */
+        aiopquic_cnx_snapshot_t snap;
+        aiopquic_cnx_snapshot_fill(cnx, &snap);
+        ret = spsc_ring_push(ctx->rx_event_ring, &entry,
+                             (const uint8_t*)&snap, sizeof(snap));
     } else {
         ret = spsc_ring_push(ctx->rx_event_ring, &entry, bytes, (uint32_t)length);
     }
@@ -1327,6 +1381,25 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                             (void)picoquic_mark_datagram_ready(cnx, 1);
                         }
                         ctx->worker_dgram_mark_ready_processed++;
+                        ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
+                        aiopquic_maybe_fire_tx_event_ring_drained(ctx);
+                        break;
+                    }
+                    case SPSC_EVT_TX_CNX_REFRESH: {
+                        /* cnx liveness already verified by the outer
+                         * aiopquic_cnx_is_alive() guard above. */
+                        aiopquic_cnx_snapshot_t snap;
+                        aiopquic_cnx_snapshot_fill(cnx, &snap);
+                        spsc_entry_t out = {0};
+                        out.event_type = SPSC_EVT_CNX_SNAPSHOT;
+                        out.cnx = cnx;
+                        if (spsc_ring_push(ctx->rx_event_ring, &out,
+                                           (const uint8_t*)&snap,
+                                           sizeof(snap)) == 0) {
+                            aiopquic_notify_rx(ctx);
+                        } else {
+                            ctx->worker_rx_event_drops++;
+                        }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;
