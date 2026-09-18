@@ -1325,8 +1325,10 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                  * live-cnx list with a wt_session pointer always misses
                  * and drops the event. WT sessions track their own
                  * lifecycle inside aiopquic_wt_handle_tx. */
-                if (entry->event_type >= SPSC_EVT_TX_WT_OPEN &&
-                    entry->event_type <= SPSC_EVT_TX_WT_STOP_SENDING) {
+                if ((entry->event_type >= SPSC_EVT_TX_WT_OPEN &&
+                     entry->event_type <= SPSC_EVT_TX_WT_STOP_SENDING) ||
+                    entry->event_type == SPSC_EVT_TX_WT_SESSION_CLEANUP ||
+                    entry->event_type == SPSC_EVT_TX_MARK_WT_DATAGRAM_READY) {
                     (void)aiopquic_wt_handle_tx(quic, ctx, entry);
                     ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                     aiopquic_maybe_fire_tx_event_ring_drained(ctx);

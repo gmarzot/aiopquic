@@ -170,6 +170,15 @@ typedef enum {
      * the worker answers with SPSC_EVT_CNX_SNAPSHOT for a live cnx. */
     SPSC_EVT_TX_CNX_REFRESH = 147,
 
+    /* Pull-model datagram TX for a WebTransport session (asyncio →
+     * picoquic worker). The producer has committed a record to the
+     * session's aiopquic_dgram_buf_t; this event hands the ring to the
+     * session and arms h3zero's datagram scheduler for its control
+     * stream. entry.stream_ctx carries the aiopquic_wt_session_t*,
+     * entry.error_code the ring pointer, entry.stream_id the control
+     * stream id. */
+    SPSC_EVT_TX_MARK_WT_DATAGRAM_READY = 148,
+
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
      * WT control stream for session events, or the WT stream for

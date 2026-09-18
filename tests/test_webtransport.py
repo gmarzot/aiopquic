@@ -278,3 +278,48 @@ async def test_wt_sender_side_sc_returns_to_baseline_across_streams():
                 f"counters: {wt._transport.counters}")
     finally:
         server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_datagram_client_to_server():
+    """Client sends a WT datagram; server receives the payload alone
+    (h3zero owns the RFC 9297 quarter-stream-id prefix)."""
+    from aiopquic.quic.events import WebTransportDatagramReceived
+    port = next_port()
+    got: asyncio.Queue = asyncio.Queue()
+
+    async def handler(session):
+        async for ev in session.events():
+            if isinstance(ev, WebTransportDatagramReceived):
+                await got.put(bytes(ev.data))
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            assert wt.send_datagram_frame(b"hello-datagram") == 14
+            payload = await asyncio.wait_for(got.get(), timeout=5.0)
+            assert payload == b"hello-datagram"
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_datagram_oversize_is_refused():
+    """A payload past the record cap can never drain, so it raises
+    rather than queuing forever."""
+    port = next_port()
+
+    async def handler(session):
+        pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            with pytest.raises(ValueError):
+                wt.send_datagram_frame(b"x" * 4096)
+    finally:
+        server.close()
