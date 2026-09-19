@@ -1233,6 +1233,13 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         return 1;
     }
 
+    case SPSC_EVT_TX_WT_SET_STREAM_PRIORITY: {
+        if (!s || !s->cnx) return 1;
+        (void)picoquic_set_stream_priority(s->cnx, entry->stream_id,
+                                            (uint8_t)entry->error_code);
+        return 1;
+    }
+
     case SPSC_EVT_TX_WT_STOP_SENDING: {
         if (!s || !s->cnx) return 1;
         picoquic_stop_sending(s->cnx, entry->stream_id,

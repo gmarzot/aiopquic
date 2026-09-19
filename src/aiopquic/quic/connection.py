@@ -1023,6 +1023,32 @@ class QuicConnection:
         )
         self._transport.wake_up()
 
+    def set_stream_priority(self, stream_id: int, priority: int) -> None:
+        """Relative send priority for one stream (RFC 9000 §2.3).
+
+        0 is highest, 255 lowest; picoquic's default is 9. Takes effect
+        on an already-open stream, so a subscription that re-prioritises
+        mid-track is applied to whatever has not been scheduled yet.
+
+        The LSB selects the scheduling discipline among streams of EQUAL
+        priority, it is not a priority bit: even means round robin (the
+        stream sent on least recently), odd means FIFO (lowest stream
+        id). Adjacent values therefore behave qualitatively differently.
+        aiopquic applies no policy — the caller owns that choice and
+        should clear the LSB when it wants round robin.
+        """
+        self._transport.set_stream_priority(
+            self._cnx_ptr, stream_id, priority)
+
+    def set_default_stream_priority(self, priority: int) -> None:
+        """Priority that newly created streams start at.
+
+        Set on the QUIC context, not the connection, and applies only to
+        streams created after the call. Same LSB semantics as
+        set_stream_priority().
+        """
+        self._transport.set_default_stream_priority(priority)
+
     def close(self, error_code: int = 0, frame_type: int | None = None,
               reason_phrase: str = "") -> None:
         """Close the connection."""

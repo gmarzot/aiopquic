@@ -51,6 +51,8 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_WT_SESSION_CLEANUP,
     SPSC_EVT_TX_MARK_DATAGRAM_READY,
     SPSC_EVT_TX_MARK_WT_DATAGRAM_READY,
+    SPSC_EVT_TX_SET_STREAM_PRIORITY,
+    SPSC_EVT_TX_WT_SET_STREAM_PRIORITY,
     SPSC_EVT_DATAGRAM_TX_DRAINED,
     SPSC_EVT_TX_CNX_REFRESH,
     SPSC_EVT_CNX_STACK, SPSC_EVT_CNX_SNAPSHOT,
@@ -78,6 +80,8 @@ cdef extern from "<arpa/inet.h>":
 cdef extern from "picoquic.h":
     ctypedef struct picoquic_quic_t:
         pass
+    void picoquic_set_default_priority(picoquic_quic_t* quic,
+                                       uint8_t default_stream_priority)
     ctypedef struct picoquic_cnx_t:
         pass
 
@@ -2318,6 +2322,33 @@ cdef class TransportContext:
             return 2
         return 1
 
+    def set_stream_priority(self, uintptr_t cnx_ptr, uint64_t stream_id,
+                            uint8_t priority):
+        """Relative send priority for one stream (RFC 9000 §2.3). 0 is
+        highest; picoquic's default is 9. Returns 0 posted, 1 TX event
+        ring full (retry)."""
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_SET_STREAM_PRIORITY
+        entry.cnx = <void*>cnx_ptr
+        entry.stream_id = stream_id
+        entry.error_code = priority
+        if spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
+            return 1
+        self._ctx.cnt_tx_event_ring_pushes += 1
+        if self._thread_ctx is not NULL:
+            if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+                picoquic_wake_up_network_thread(self._thread_ctx)
+        return 0
+
+    def set_default_stream_priority(self, uint8_t priority):
+        """Priority newly created streams start at (picoquic default 9).
+        Applies to streams created after the call."""
+        if self._quic is NULL:
+            raise ConnectionError("quic context not started")
+        picoquic_set_default_priority(self._quic, priority)
+
     def dgram_push(self, uintptr_t db_ptr, bytes data):
         """Commit one datagram record WITHOUT arming a scheduler — the
         WebTransport path arms per control stream, not per connection.
@@ -3265,6 +3296,23 @@ cdef class WebTransportSessionState:
         entry.cnx = <void*>self._wt
         entry.stream_ctx = <void*>self._wt
         entry.error_code = <uint64_t>db_ptr
+        if spsc_ring_push(
+                self._transport._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            return 1
+        self._transport.wake_up()
+        return 0
+
+    def push_stream_priority(self, uint64_t stream_id, uint8_t priority):
+        """Relative send priority for one WT stream (RFC 9000 §2.3)."""
+        cdef spsc_entry_t entry
+        if self._wt is NULL:
+            raise ConnectionError("WT session closed")
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_WT_SET_STREAM_PRIORITY
+        entry.cnx = <void*>self._wt
+        entry.stream_ctx = <void*>self._wt
+        entry.stream_id = stream_id
+        entry.error_code = priority
         if spsc_ring_push(
                 self._transport._ctx.tx_event_ring, &entry, NULL, 0) != 0:
             return 1

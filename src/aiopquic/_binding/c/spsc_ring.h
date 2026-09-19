@@ -179,6 +179,15 @@ typedef enum {
      * stream id. */
     SPSC_EVT_TX_MARK_WT_DATAGRAM_READY = 148,
 
+    /* Stream priority (asyncio → picoquic worker). RFC 9000 §2.3: a QUIC
+     * implementation SHOULD let the application say how streams relate
+     * in priority; picoquic takes a uint8 per stream, 0 highest,
+     * PICOQUIC_DEFAULT_STREAM_PRIORITY (9) the default. entry.stream_id
+     * is the stream, entry.error_code the priority. The WT twin carries
+     * a wt_session pointer in entry.cnx instead of a picoquic_cnx_t. */
+    SPSC_EVT_TX_SET_STREAM_PRIORITY = 149,
+    SPSC_EVT_TX_WT_SET_STREAM_PRIORITY = 150,
+
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
      * WT control stream for session events, or the WT stream for

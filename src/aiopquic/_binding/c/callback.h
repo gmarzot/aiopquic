@@ -1328,7 +1328,8 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                 if ((entry->event_type >= SPSC_EVT_TX_WT_OPEN &&
                      entry->event_type <= SPSC_EVT_TX_WT_STOP_SENDING) ||
                     entry->event_type == SPSC_EVT_TX_WT_SESSION_CLEANUP ||
-                    entry->event_type == SPSC_EVT_TX_MARK_WT_DATAGRAM_READY) {
+                    entry->event_type == SPSC_EVT_TX_MARK_WT_DATAGRAM_READY ||
+                    entry->event_type == SPSC_EVT_TX_WT_SET_STREAM_PRIORITY) {
                     (void)aiopquic_wt_handle_tx(quic, ctx, entry);
                     ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                     aiopquic_maybe_fire_tx_event_ring_drained(ctx);
@@ -1383,6 +1384,14 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                             (void)picoquic_mark_datagram_ready(cnx, 1);
                         }
                         ctx->worker_dgram_mark_ready_processed++;
+                        ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
+                        aiopquic_maybe_fire_tx_event_ring_drained(ctx);
+                        break;
+                    }
+                    case SPSC_EVT_TX_SET_STREAM_PRIORITY: {
+                        (void)picoquic_set_stream_priority(
+                            cnx, entry->stream_id,
+                            (uint8_t)entry->error_code);
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;
