@@ -476,6 +476,15 @@ cdef class StreamChain:
                         value_len_obj = self.pull_uint_var()
                         value_len = <Py_ssize_t>value_len_obj
                         ext_value = self.pull_bytes(value_len)
+                    if self._pos > exts_end:
+                        # §1.4.3 bounds the sequence by the block's
+                        # declared length; pull_bytes is bounded by the
+                        # chain, so an over-declared value would
+                        # otherwise eat payload.
+                        raise RuntimeError(
+                            f"extensions decode overrun: pos={self._pos} "
+                            f"exts_end={exts_end} ext_id=0x{ext_id:x}"
+                        )
                     exts[ext_id] = ext_value
                 if not exts:
                     exts = None
@@ -538,6 +547,15 @@ cdef class StreamChain:
                         value_len_obj = self.pull_uint_vi64()
                         value_len = <Py_ssize_t>value_len_obj
                         ext_value = self.pull_bytes(value_len)
+                    if self._pos > exts_end:
+                        # §1.4.3 bounds the sequence by the block's
+                        # declared length; pull_bytes is bounded by the
+                        # chain, so an over-declared value would
+                        # otherwise eat payload.
+                        raise RuntimeError(
+                            f"extensions decode overrun: pos={self._pos} "
+                            f"exts_end={exts_end} ext_id=0x{ext_id:x}"
+                        )
                     exts[ext_id] = ext_value
                 if not exts:
                     exts = None
