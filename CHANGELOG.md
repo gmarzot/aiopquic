@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.1
 
 Pairs with aiomoqt 0.11.1.
 
