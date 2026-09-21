@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.4.1
+
+Pairs with aiomoqt 0.11.1.
+
+- WebTransport datagram TX. WT-typed TX events are routed before the
+  raw-connection guard, which also revives the stalled-link reaper.
+- Per-stream priority (RFC 9000 §2.3): `set_stream_priority()`,
+  `set_default_stream_priority()` and the WebTransport twin. Settable on
+  an open stream. **Experimental** — opt-in and unexercised; without a
+  call every stream keeps picoquic's default priority as before.
+- Fix: the per-KVP read is clamped to the extensions block, so an
+  over-declared value length no longer reads on into the payload.
+- Fix: a KVP delta type past the 64-bit Type space is refused.
+
 ## v0.4.0
 
 Pairs with aiomoqt 0.11.0.

@@ -469,6 +469,11 @@ cdef class StreamChain:
                         # d16+ KVP Type is a delta from the previous
                         # absolute Type; parity follows the absolute.
                         ext_id = prev_id + ext_id
+                        if ext_id > 0xFFFFFFFFFFFFFFFF:
+                            # The Type space is 64 bits; the caller maps
+                            # this to its own protocol-violation close.
+                            raise OverflowError(
+                                f"KVP delta type overflow: {ext_id}")
                         prev_id = ext_id
                     if not (ext_id & 1):
                         ext_value = self.pull_uint_var()
@@ -476,6 +481,15 @@ cdef class StreamChain:
                         value_len_obj = self.pull_uint_var()
                         value_len = <Py_ssize_t>value_len_obj
                         ext_value = self.pull_bytes(value_len)
+                    if self._pos > exts_end:
+                        # §1.4.3 bounds the sequence by the block's
+                        # declared length; pull_bytes is bounded by the
+                        # chain, so an over-declared value would
+                        # otherwise eat payload.
+                        raise RuntimeError(
+                            f"extensions decode overrun: pos={self._pos} "
+                            f"exts_end={exts_end} ext_id=0x{ext_id:x}"
+                        )
                     exts[ext_id] = ext_value
                 if not exts:
                     exts = None
@@ -531,6 +545,11 @@ cdef class StreamChain:
                         # d16+ KVP Type is a delta from the previous
                         # absolute Type; parity follows the absolute.
                         ext_id = prev_id + ext_id
+                        if ext_id > 0xFFFFFFFFFFFFFFFF:
+                            # The Type space is 64 bits; the caller maps
+                            # this to its own protocol-violation close.
+                            raise OverflowError(
+                                f"KVP delta type overflow: {ext_id}")
                         prev_id = ext_id
                     if not (ext_id & 1):
                         ext_value = self.pull_uint_vi64()
@@ -538,6 +557,15 @@ cdef class StreamChain:
                         value_len_obj = self.pull_uint_vi64()
                         value_len = <Py_ssize_t>value_len_obj
                         ext_value = self.pull_bytes(value_len)
+                    if self._pos > exts_end:
+                        # §1.4.3 bounds the sequence by the block's
+                        # declared length; pull_bytes is bounded by the
+                        # chain, so an over-declared value would
+                        # otherwise eat payload.
+                        raise RuntimeError(
+                            f"extensions decode overrun: pos={self._pos} "
+                            f"exts_end={exts_end} ext_id=0x{ext_id:x}"
+                        )
                     exts[ext_id] = ext_value
                 if not exts:
                     exts = None

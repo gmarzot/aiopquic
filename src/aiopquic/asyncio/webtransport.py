@@ -113,6 +113,10 @@ class WebTransportSession:
         self._pending_creates: deque[asyncio.Future] = deque()
         # Per-stream incoming queues
         self._stream_inbox: dict[int, asyncio.Queue] = {}
+        # Datagram TX record ring, created on first send.
+        self._dgram_ring: int = 0
+        self._dgram_max_payload: int = 1200
+        self._dgram_ring_bytes: int = 64 * 1024
         # Per-stream drain events. Set by _on_event when the picoquic
         # worker fires SPSC_EVT_STREAM_TX_DRAINED for a stream; awaited
         # by send_stream_data_drained / external callers via
@@ -475,11 +479,39 @@ class WebTransportSession:
         """Send STOP_SENDING on a WT stream (peer should reset)."""
         self._state.push_stop_sending(stream_id, error_code)
 
-    def send_datagram_frame(self, data: bytes) -> None:
-        """Send a WebTransport datagram. Not yet wired through the C
-        bridge; raises NotImplementedError until the WT datagram TX
-        path lands."""
-        raise NotImplementedError("WT datagram TX not yet supported")
+    def send_datagram_frame(self, data: bytes) -> int:
+        """Queue one WebTransport datagram for the pull-model send path.
+
+        h3zero frames the payload as an HTTP datagram on this session's
+        control stream, so the caller passes the payload alone. Returns
+        len(data) on success, 0 when the record ring is full —
+        backpressure: wait on get_datagram_tx_drain_event() and retry
+        the SAME payload.
+
+        Raises:
+            ValueError: payload exceeds datagram_max_payload; a datagram
+                frame cannot be fragmented, so this can never drain.
+            ConnectionError: session closed.
+        """
+        if self._state is None or self._session_closed.is_set():
+            raise ConnectionError("send_datagram_frame: session closed")
+        if self._dgram_ring == 0:
+            self._dgram_ring = self._transport.dgram_ring_create(
+                self._dgram_ring_bytes, self._dgram_max_payload)
+        rc = self._transport.dgram_push(self._dgram_ring, data)
+        if rc == 0:
+            return 0
+        if rc < 0:
+            raise ValueError(
+                f"datagram payload {len(data)} exceeds "
+                f"{self._dgram_max_payload}")
+        # Records are committed; arming can fail on a full TX event ring,
+        # in which case a later push re-arms and nothing is lost.
+        try:
+            self._state.push_dgram_ready(self._dgram_ring)
+        except ConnectionError:
+            raise
+        return len(data)
 
     async def receive_stream_data(self, stream_id: int):
         """Async-generator: yield WebTransportStreamDataReceived (and
@@ -590,6 +622,11 @@ class WebTransportSession:
             ev = WebTransportSessionClosed(error_code=error_code, reason=reason)
             self._session_close_event = ev
             self._session_closed.set()
+            if self._dgram_ring:
+                # The worker's session holds its own reference until the
+                # session struct is freed.
+                self._transport.dgram_ring_release(self._dgram_ring)
+                self._dgram_ring = 0
             if (self._session_ready
                     and not self._session_ready.done()):
                 self._session_ready.set_exception(WebTransportError(

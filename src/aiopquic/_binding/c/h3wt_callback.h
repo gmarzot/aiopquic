@@ -107,6 +107,11 @@ struct st_aiopquic_wt_session_t {
     int                           session_ready;   /* CONNECT accepted */
     int                           session_closing; /* close/drain seen or initiated */
     char*                         wt_protocol;     /* negotiated WT subprotocol (owned copy), NULL if none */
+    /* Pull-model datagram TX for this session. The producer commits
+     * records from Python; h3zero pulls them in provide_datagram and
+     * frames each as an HTTP datagram on the session's control stream
+     * (RFC 9297 quarter-stream-id prefix is h3zero's business). */
+    aiopquic_dgram_buf_t*         dgram_ring;
 };
 
 /*
@@ -163,6 +168,10 @@ static inline aiopquic_wt_session_t* aiopquic_wt_session_create(
 
 static inline void aiopquic_wt_session_destroy(aiopquic_wt_session_t* s) {
     if (!s) return;
+    if (s->dgram_ring) {
+        aiopquic_dgram_buf_unref(s->dgram_ring);
+        s->dgram_ring = NULL;
+    }
     picowt_release_capsule(&s->capsule);
     free(s->wt_protocol);  /* free(NULL) is a no-op when unnegotiated */
     s->kind = 0;  /* clear canary so post-free dispatch fails fast */
@@ -781,14 +790,54 @@ static int aiopquic_wt_path_callback(
                                 bytes, (uint32_t)length);
         break;
 
-    case picohttp_callback_provide_datagram:
-        /* WT datagram TX is not wired yet (nothing calls
-         * h3zero_set_datagram_ready, so this cannot fire today).
-         * When it lands it will pull from the session's record ring —
-         * same pull model as raw QUIC's prepare_datagram path. Provide
-         * nothing and deactivate defensively. */
-        (void)h3zero_provide_datagram_buffer(stream_ctx, 0, 0);
+    case picohttp_callback_provide_datagram: {
+        /* Pull one record from the session ring, same model as raw
+         * QUIC's prepare_datagram: h3zero offers `length` bytes of
+         * packet space and frames what we copy in as an HTTP datagram.
+         * A record too large for THIS packet stays queued — producer-
+         * side max_record guarantees it fits a fresh one. */
+        aiopquic_dgram_buf_t* db = s->dgram_ring;
+        uint32_t rec = db ? aiopquic_dgram_buf_peek_len(db) : 0;
+        if (aiopquic_wt_diag_enabled()) {
+            fprintf(stderr, "[wt-diag] provide_datagram ring=%p rec=%u "
+                    "space=%zu\n", (void*)db, rec, length);
+            fflush(stderr);
+        }
+        if (rec == 0) {
+            (void)h3zero_provide_datagram_buffer(bytes, 0, 0);
+            break;
+        }
+        if (rec > (uint32_t)length) {
+            db->head_deferred++;
+            (void)h3zero_provide_datagram_buffer(bytes, 0, 1);
+            break;
+        }
+        int more = (aiopquic_dgram_buf_used(db)
+                    > AIOPQUIC_DGRAM_REC_HDR + rec) ? 1 : 0;
+        uint8_t* buf = h3zero_provide_datagram_buffer(bytes, rec, more);
+        if (buf) {
+            aiopquic_dgram_buf_pop_into(db, buf, rec);
+            s->bridge->worker_dgram_records_sent++;
+            s->bridge->worker_dgram_bytes_sent += rec;
+            /* Edge-triggered producer wakeup, as on the raw path. */
+            uint32_t expected = 1;
+            if (atomic_compare_exchange_strong_explicit(
+                    &db->drain_pending, &expected, 0,
+                    memory_order_acq_rel, memory_order_relaxed)) {
+                spsc_entry_t drain_entry = {0};
+                drain_entry.event_type = SPSC_EVT_DATAGRAM_TX_DRAINED;
+                drain_entry.cnx = cnx;
+                if (spsc_ring_push(s->bridge->rx_event_ring,
+                                   &drain_entry, NULL, 0) == 0) {
+                    aiopquic_notify_rx(s->bridge);
+                } else {
+                    atomic_store_explicit(&db->drain_pending, 1,
+                                          memory_order_release);
+                }
+            }
+        }
         break;
+    }
 
     case picohttp_callback_reset:
         if (aiopquic_wt_diag_enabled()) {
@@ -1160,6 +1209,34 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (st) {
             picowt_reset_stream(s->cnx, st, entry->error_code);
         }
+        return 1;
+    }
+
+    case SPSC_EVT_TX_MARK_WT_DATAGRAM_READY: {
+        /* WT twin of MARK_DATAGRAM_READY: the ring hangs off the
+         * session — h3zero pulls from it in provide_datagram — and the
+         * scheduler is armed per control stream, not per connection. */
+        aiopquic_dgram_buf_t* db =
+            (aiopquic_dgram_buf_t*)(uintptr_t)entry->error_code;
+        if (!s || !s->cnx || !db) return 1;
+        if (s->dgram_ring != db) {
+            if (s->dgram_ring) aiopquic_dgram_buf_unref(s->dgram_ring);
+            aiopquic_dgram_buf_addref(db);
+            s->dgram_ring = db;
+        }
+        int armed = h3zero_set_datagram_ready(s->cnx, s->control_stream_id);
+        if (aiopquic_wt_diag_enabled()) {
+            fprintf(stderr, "[wt-diag] mark_wt_dgram ready sid=%llu ret=%d\n",
+                    (unsigned long long)s->control_stream_id, armed);
+            fflush(stderr);
+        }
+        return 1;
+    }
+
+    case SPSC_EVT_TX_WT_SET_STREAM_PRIORITY: {
+        if (!s || !s->cnx) return 1;
+        (void)picoquic_set_stream_priority(s->cnx, entry->stream_id,
+                                            (uint8_t)entry->error_code);
         return 1;
     }
 
