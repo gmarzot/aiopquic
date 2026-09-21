@@ -469,6 +469,11 @@ cdef class StreamChain:
                         # d16+ KVP Type is a delta from the previous
                         # absolute Type; parity follows the absolute.
                         ext_id = prev_id + ext_id
+                        if ext_id > 0xFFFFFFFFFFFFFFFF:
+                            # The Type space is 64 bits; the caller maps
+                            # this to its own protocol-violation close.
+                            raise OverflowError(
+                                f"KVP delta type overflow: {ext_id}")
                         prev_id = ext_id
                     if not (ext_id & 1):
                         ext_value = self.pull_uint_var()
@@ -540,6 +545,11 @@ cdef class StreamChain:
                         # d16+ KVP Type is a delta from the previous
                         # absolute Type; parity follows the absolute.
                         ext_id = prev_id + ext_id
+                        if ext_id > 0xFFFFFFFFFFFFFFFF:
+                            # The Type space is 64 bits; the caller maps
+                            # this to its own protocol-violation close.
+                            raise OverflowError(
+                                f"KVP delta type overflow: {ext_id}")
                         prev_id = ext_id
                     if not (ext_id & 1):
                         ext_value = self.pull_uint_vi64()
