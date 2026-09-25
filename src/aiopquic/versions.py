@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from importlib import metadata as _md
@@ -172,6 +173,87 @@ def _meta(module, name: str | None = None) -> str:
     return out
 
 
+def _git(root: str, *args: str) -> str | None:
+    """One `git -C root` invocation, or None on any failure."""
+    try:
+        out = subprocess.run(("git", "-C", root, *args),
+                             capture_output=True, text=True, timeout=2.0)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def _own_source_tree(root: str, pkg: str) -> bool:
+    """True iff `root` sits in a git tree that is `pkg`'s own source.
+
+    Guards against reporting an unrelated enclosing repo: a wheel
+    installed into a venv inside someone else's git project would
+    otherwise have that project's revision attributed to it. Matching
+    pyproject's `name` works for flat and src layouts alike."""
+    top = _git(root, "rev-parse", "--show-toplevel")
+    if top is None:
+        return False
+    try:
+        text = (Path(top) / "pyproject.toml").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return re.search(rf'(?m)^\s*name\s*=\s*["\']{re.escape(pkg)}["\']',
+                     text) is not None
+
+
+def _ext_stale(root: str) -> bool:
+    """True when a hand-written native source under `root` is newer than
+    the newest built extension.
+
+    The binding is compiled, so a checked-out source is not necessarily
+    the code being executed — editing a header without rebuilding leaves
+    the old `.so` loaded, which silently invalidates any measurement
+    taken against it. Generated `.c` is excluded: it is regenerated on
+    build, so its mtime tracks the `.so` rather than an author's edit."""
+    newest_so = newest_src = 0.0
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for f in files:
+            try:
+                mt = os.path.getmtime(os.path.join(dirpath, f))
+            except OSError:
+                continue
+            if f.endswith(".so"):
+                newest_so = max(newest_so, mt)
+            elif f.endswith((".h", ".pyx", ".pxd")):
+                newest_src = max(newest_src, mt)
+    return bool(newest_so and newest_src and newest_src > newest_so)
+
+
+def _git_state(root: str, ver: str, pkg: str) -> str | None:
+    """Working-tree identity for a from-source install: ' git:REV BRANCH'.
+
+    A from-source install imports from the tree, but its dist metadata
+    version is written once at install time — it cannot track a branch
+    switch or an uncommitted edit, so it is the wrong answer to "what am
+    I running". `--dirty` is what surfaces uncommitted changes, and the
+    version is marked stale when it names a commit that is not HEAD.
+    Returns None for a wheel install, outside a repo, or without git."""
+    if not _own_source_tree(root, pkg):
+        return None
+    desc = _git(root, "describe", "--tags", "--dirty", "--always")
+    if desc is None:
+        return None
+    out = f" git:{desc}"
+    branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+    if branch and branch != "HEAD":
+        out += f" {branch}"
+    m = re.search(r"\+g([0-9a-f]{7,})", ver)
+    head = _git(root, "rev-parse", "HEAD")
+    if m and head and not head.startswith(m.group(1)):
+        out += " (metadata version STALE)"
+    if _ext_stale(root):
+        out += " (EXTENSION STALE — rebuild)"
+    return out
+
+
 def _compact_describe(describe: str) -> str | None:
     """'v1.1.30-12-g2b1e14d5' -> '1.1.30-12-2b1e14d5'. Returns None when
     describe carries no reachable tag (a bare --always short SHA), so the
@@ -268,7 +350,12 @@ def print_versions(file=sys.stdout) -> None:
     import aiopquic
     dist = _dist("aiopquic")
     ver = dist.version if dist is not None else __version__
-    print(f"{'aiopquic:':<{_LABEL_W}}{_version(ver)}{_meta(aiopquic, 'aiopquic')}", file=file)
+    line = (f"{'aiopquic:':<{_LABEL_W}}{_version(ver)}"
+            f"{_meta(aiopquic, 'aiopquic')}")
+    if dist is None or _is_editable(dist):
+        line += _git_state(os.path.dirname(os.path.abspath(aiopquic.__file__)),
+                           ver, "aiopquic") or ""
+    print(line, file=file)
     print(_format_submodule("picoquic", _submodule_info("PICOQUIC")), file=file)
     print(_format_submodule("picotls",  _submodule_info("PICOTLS")),  file=file)
     ossl = _openssl_info()
