@@ -337,6 +337,19 @@ typedef struct {
     uint64_t        worker_dgram_prepare_calls;
     uint64_t        worker_dgram_records_sent;
     uint64_t        worker_dgram_bytes_sent;
+    /* Appended at the tail: the struct carries no padding or alignment
+     * discipline, so splicing fields in mid-struct shifts every later
+     * offset, the cross-thread tx_event_ring_drain_pending included.
+     *
+     * Priority outcomes. Ring drain alone cannot separate these: the
+     * stale-cnx guard pops an event exactly as a successful apply does.
+     * last_err holds the most recent picoquic return (0 = none seen). */
+    uint64_t        worker_set_priority_applied;
+    uint64_t        worker_set_priority_rejected;
+    uint64_t        worker_set_priority_last_err;
+    /* TX events discarded because their cnx was freed between push
+     * and pop. Covers every event type behind the stale-cnx guard. */
+    uint64_t        cnt_tx_event_dropped_dead_cnx;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -1341,6 +1354,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                  * any picoquic_* call below UAFs. See
                  * aiopquic_cnx_is_alive() comment for cost notes. */
                 if (!cnx || !aiopquic_cnx_is_alive(quic, cnx)) {
+                    ctx->cnt_tx_event_dropped_dead_cnx++;
                     ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                     aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                     continue;
@@ -1389,9 +1403,16 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     }
                     case SPSC_EVT_TX_SET_STREAM_PRIORITY: {
-                        (void)picoquic_set_stream_priority(
+                        int pri_ret = picoquic_set_stream_priority(
                             cnx, entry->stream_id,
                             (uint8_t)entry->error_code);
+                        if (pri_ret == 0) {
+                            ctx->worker_set_priority_applied++;
+                        } else {
+                            ctx->worker_set_priority_rejected++;
+                            ctx->worker_set_priority_last_err =
+                                (uint64_t)pri_ret;
+                        }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;
