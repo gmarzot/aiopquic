@@ -1,12 +1,14 @@
 """Per-stream send priority (RFC 9000 §2.3) over a loopback connection.
 
 Drives the Python -> SPSC TX ring -> picoquic_set_stream_priority path and
-asserts the event is CONSUMED, not merely posted: tx_event_ring_count
-returning to 0 is what proves the C handler popped it.
+asserts on `set_priority_applied`, which counts picoquic accepting the
+call. Ring drain is not enough: the stale-cnx guard pops an event exactly
+as a successful apply does, so draining proves only that the worker saw
+it.
 
 These cover the binding, not the scheduler. picoquic reordering streams by
 priority is not observable on loopback, where there is no congestion to
-schedule against.
+schedule against — see tests/bench/sim_link for that.
 """
 
 import os
@@ -39,17 +41,20 @@ pytestmark = pytest.mark.skipif(
 # quic context's connection list.
 BOGUS_CNX = 0xDEADBEEF
 
-DEFAULT_PRIORITY = 9
 
-
-def wait_tx_ring_empty(ctx, timeout=2.0):
-    """Wait for the TX event ring to drain, i.e. the C side popped."""
+def wait_counter(ctx, key, target, timeout=2.0):
+    """Wait for a counter to reach `target`. Returns its final value."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if ctx.tx_event_ring_count == 0:
-            return True
+        v = ctx.counters[key]
+        if v >= target:
+            return v
         time.sleep(0.01)
-    return False
+    return ctx.counters[key]
+
+
+def applied(ctx):
+    return ctx.counters['set_priority_applied']
 
 
 def send_and_confirm(client, server, cnx_ptr, stream_id, payload):
@@ -63,20 +68,21 @@ def send_and_confirm(client, server, cnx_ptr, stream_id, payload):
 
 class TestStreamPriority:
 
-    def test_posts_and_is_consumed(self):
-        """Priority on an open stream posts, drains, and does not
-        disturb delivery."""
+    def test_picoquic_applies_it(self):
+        """picoquic accepts the priority for an open stream, and delivery
+        is undisturbed."""
         port = next_port()
         server = start_server(port)
         try:
             client, cnx_ptr = connect_client(port)
             try:
                 send_and_confirm(client, server, cnx_ptr, 0, b"before")
+                before = applied(client)
 
                 assert client.set_stream_priority(cnx_ptr, 0, 2) == 0
-                assert wait_tx_ring_empty(client), (
-                    "priority event was never popped by the C handler"
-                )
+                assert wait_counter(client, 'set_priority_applied',
+                                    before + 1) == before + 1
+                assert client.counters['set_priority_rejected'] == 0
 
                 send_and_confirm(client, server, cnx_ptr, 0, b"after")
             finally:
@@ -93,11 +99,14 @@ class TestStreamPriority:
             client, cnx_ptr = connect_client(port)
             try:
                 send_and_confirm(client, server, cnx_ptr, 0, b"first")
+                before = applied(client)
 
                 for priority in (1, 200, 4):
                     assert client.set_stream_priority(
                         cnx_ptr, 0, priority) == 0
-                    assert wait_tx_ring_empty(client)
+                assert wait_counter(client, 'set_priority_applied',
+                                    before + 3) == before + 3
+                assert client.counters['set_priority_rejected'] == 0
 
                 send_and_confirm(client, server, cnx_ptr, 0, b"last")
             finally:
@@ -105,20 +114,20 @@ class TestStreamPriority:
         finally:
             server.stop()
 
-    @pytest.mark.parametrize("priority", [0, 1, 8, 9, 254, 255])
+    @pytest.mark.parametrize("priority", [0, 1, 254, 255])
     def test_byte_range_is_accepted(self, priority):
-        """The full uint8_t range posts. 8/9 are the even/odd pair that
-        selects picoquic's scheduling discipline among equals — the
-        binding applies no policy and must treat them alike."""
+        """picoquic accepts the full uint8_t range."""
         port = next_port()
         server = start_server(port)
         try:
             client, cnx_ptr = connect_client(port)
             try:
                 send_and_confirm(client, server, cnx_ptr, 0, b"x")
+                before = applied(client)
                 assert client.set_stream_priority(
                     cnx_ptr, 0, priority) == 0
-                assert wait_tx_ring_empty(client)
+                assert wait_counter(client, 'set_priority_applied',
+                                    before + 1) == before + 1
             finally:
                 client.stop()
         finally:
@@ -127,7 +136,7 @@ class TestStreamPriority:
     @pytest.mark.parametrize("priority", [-1, 256])
     def test_out_of_range_is_refused(self, priority):
         """Values outside uint8_t raise rather than wrapping — a wrapped
-        255 is the lowest priority, the opposite of an intended 256."""
+        256 is 0, the *highest* priority, the opposite of the intent."""
         port = next_port()
         server = start_server(port)
         try:
@@ -140,26 +149,49 @@ class TestStreamPriority:
         finally:
             server.stop()
 
-    def test_unknown_cnx_is_dropped_not_fatal(self):
+    def test_unknown_cnx_is_dropped_not_applied(self):
         """A cnx freed between push and pop is dropped by the liveness
-        guard. The connection stays usable."""
+        guard: the drop counter advances, `applied` does not, and the
+        connection stays usable. Ring drain cannot tell this from a
+        successful apply — both pop the event."""
         port = next_port()
         server = start_server(port)
         try:
             client, cnx_ptr = connect_client(port)
             try:
                 send_and_confirm(client, server, cnx_ptr, 0, b"live")
+                before_applied = applied(client)
+                before_dropped = client.counters['tx_event_dropped_dead_cnx']
 
                 assert client.set_stream_priority(BOGUS_CNX, 0, 3) == 0
-                assert wait_tx_ring_empty(client), (
-                    "stale-cnx event was not drained"
-                )
+                assert wait_counter(client, 'tx_event_dropped_dead_cnx',
+                                    before_dropped + 1) == before_dropped + 1
+                assert applied(client) == before_applied
 
                 send_and_confirm(client, server, cnx_ptr, 4, b"still up")
             finally:
                 client.stop()
         finally:
             server.stop()
+
+
+class TestRingFull:
+    """An unstarted context has no worker, so nothing drains the ring —
+    which makes overflow deterministic rather than a race."""
+
+    def test_full_ring_returns_one_and_arms_the_drain(self):
+        ctx = TransportContext(tx_ring_cap=2)
+        posted = 0
+        while ctx.set_stream_priority(BOGUS_CNX, 0, 5) == 0:
+            posted += 1
+            assert posted <= 64, "ring never filled"
+        assert posted == ctx.tx_event_ring_capacity
+
+        arms = ctx.counters['tx_event_ring_arms']
+        assert ctx.set_stream_priority(BOGUS_CNX, 0, 5) == 1
+        assert ctx.counters['tx_event_ring_arms'] > arms, (
+            "ring-full must arm the drain or a waiter never wakes")
+        assert applied(ctx) == 0, "no worker ran, so nothing can be applied"
 
 
 class TestDefaultStreamPriority:
