@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Priority outcome counters: `set_priority_applied`, `set_priority_rejected`,
+  `set_priority_last_err`. picoquic's return was discarded, so an applied
+  priority and one dropped by the stale-cnx guard were indistinguishable.
+- `tx_event_dropped_dead_cnx` counts TX events whose cnx was freed between
+  push and pop, for every event type behind that guard.
+- Fix: the WebTransport ring-full paths arm the drain before returning 1, so a
+  caller awaiting `tx_event_ring_drain_event` wakes.
+- Fix: `tx_event_ring_pushes` was counted on the raw push sites only, so the
+  documented push/pop invariant read pops > pushes on WebTransport.
+- Version reporter: a from-source install reports `git describe --dirty` plus
+  the branch, flags a metadata version that names another commit, and flags a
+  built extension older than its hand-written sources. Wheels unchanged.
+- Fix: `sim_link_bench` links `libpicotls-fusion.a`, without which it fails to
+  link.
+- Tests: the stream-priority binding is exercised on a live connection; it
+  shipped in 0.4.1 with none.
+
 ## v0.4.1
 
 Pairs with aiomoqt 0.11.1.
