@@ -323,3 +323,78 @@ async def test_wt_datagram_oversize_is_refused():
                 wt.send_datagram_frame(b"x" * 4096)
     finally:
         server.close()
+
+
+async def _wait_counter(transport, key, target, timeout=2.0):
+    """Wait for a worker counter to reach `target`; return its value."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        v = transport.counters[key]
+        if v >= target:
+            return v
+        await asyncio.sleep(0.01)
+    return transport.counters[key]
+
+
+@pytest.mark.asyncio
+async def test_wt_set_stream_priority_reaches_picoquic():
+    """picoquic accepts a priority set on an open WT stream.
+
+    The WT priority handler is dispatched ahead of the raw stale-cnx
+    guard, so raw-side counting covers none of it; this is the only
+    coverage that path has.
+    """
+    port = next_port()
+
+    async def handler(session):
+        pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            sid = await wt.create_stream(bidir=True)
+            wt.send_stream_data(sid, b"hello", end_stream=False)
+            tx = wt._transport
+            before = tx.counters['set_priority_applied']
+
+            assert wt.set_stream_priority(sid, 2) == 0
+            assert await _wait_counter(
+                tx, 'set_priority_applied', before + 1) == before + 1
+            assert tx.counters['set_priority_rejected'] == 0
+
+            # Still usable: re-prioritising mid-stream is the point.
+            assert wt.set_stream_priority(sid, 200) == 0
+            assert await _wait_counter(
+                tx, 'set_priority_applied', before + 2) == before + 2
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_set_stream_priority_on_closed_session_raises():
+    """A closed session raises rather than reporting a posted priority.
+
+    Matches send_datagram_frame; stop_stream is a silent no-op instead.
+    Note leaving the context manager does not itself mark the session
+    closed — both guards key on _session_closed.
+    """
+    port = next_port()
+
+    async def handler(session):
+        pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            sid = await wt.create_stream(bidir=True)
+            assert wt.set_stream_priority(sid, 2) == 0
+            wt._session_closed.set()
+            with pytest.raises(ConnectionError):
+                wt.set_stream_priority(sid, 2)
+    finally:
+        server.close()

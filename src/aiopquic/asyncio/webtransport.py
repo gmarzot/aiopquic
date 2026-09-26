@@ -479,6 +479,30 @@ class WebTransportSession:
         """Send STOP_SENDING on a WT stream (peer should reset)."""
         self._state.push_stop_sending(stream_id, error_code)
 
+    def set_stream_priority(self, stream_id: int, priority: int) -> int:
+        """Relative send priority for one WT stream (RFC 9000 §2.3).
+
+        0 is highest, 255 lowest; picoquic's default is 9. Takes effect on
+        an already-open stream, so a subscription re-prioritising
+        mid-track applies to whatever has not been scheduled yet.
+
+        The LSB selects the scheduling discipline among streams of EQUAL
+        priority, it is not a priority bit: even means round robin (the
+        stream sent on least recently), odd means FIFO (lowest stream id).
+        Adjacent values therefore behave qualitatively differently. No
+        policy is applied here — the caller owns that choice.
+
+        Returns 0 posted, 1 TX event ring full. On 1 the priority is NOT
+        applied and the stream keeps its current one; wait on the
+        transport's tx_event_ring_drain_event and retry.
+
+        Raises:
+            ConnectionError: session closed.
+        """
+        if self._state is None or self._session_closed.is_set():
+            raise ConnectionError("set_stream_priority: session closed")
+        return self._state.push_stream_priority(stream_id, priority)
+
     def send_datagram_frame(self, data: bytes) -> int:
         """Queue one WebTransport datagram for the pull-model send path.
 

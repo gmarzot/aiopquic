@@ -1234,9 +1234,20 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
     }
 
     case SPSC_EVT_TX_WT_SET_STREAM_PRIORITY: {
-        if (!s || !s->cnx) return 1;
-        (void)picoquic_set_stream_priority(s->cnx, entry->stream_id,
-                                            (uint8_t)entry->error_code);
+        /* WT events are dispatched ahead of the raw stale-cnx guard, so
+         * this is the only place a dead WT session is counted. */
+        if (!s || !s->cnx) {
+            ctx->cnt_tx_event_dropped_dead_cnx++;
+            return 1;
+        }
+        int pri_ret = picoquic_set_stream_priority(
+            s->cnx, entry->stream_id, (uint8_t)entry->error_code);
+        if (pri_ret == 0) {
+            ctx->worker_set_priority_applied++;
+        } else {
+            ctx->worker_set_priority_rejected++;
+            ctx->worker_set_priority_last_err = (uint64_t)pri_ret;
+        }
         return 1;
     }
 
