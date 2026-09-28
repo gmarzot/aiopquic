@@ -878,6 +878,11 @@ class _Dispatcher:
         # can retire exactly its own on close and leave a client sharing
         # the same (loop, transport) alone.
         self._spawned: set[int] = set()
+        # Acceptor coroutines we started. An accept handler typically runs
+        # until its session closes, so without ownership it is still
+        # pending at teardown, holding the session and transport while
+        # stop() frees the engine under it.
+        self._tasks: set[asyncio.Task] = set()
         self._acceptor = None  # callable(session) -> None|coroutine
         loop.add_reader(transport.eventfd, self._drain)
 
@@ -930,9 +935,21 @@ class _Dispatcher:
         self._spawned.add(stream_ctx_ptr)
         result = self._acceptor(session)
         if asyncio.iscoroutine(result):
-            self._loop.create_task(result)
+            task = self._loop.create_task(result)
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    def cancel_tasks(self) -> list:
+        """Cancel the acceptor coroutines this dispatcher started and
+        return them, so a caller on the loop can await the cancellation
+        before the transport is freed."""
+        pending = [t for t in self._tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        return pending
 
     def detach(self) -> None:
+        self.cancel_tasks()
         try:
             self._loop.remove_reader(self._transport.eventfd)
         except Exception:
@@ -988,6 +1005,12 @@ class _DispatcherRegistry:
         if not d._sessions:
             d.detach()
             del self._dispatchers[key]
+
+    def cancel_tasks(self, loop: asyncio.AbstractEventLoop,
+                      transport: TransportContext) -> list:
+        """Cancel the acceptor coroutines for this (loop, transport)."""
+        d = self._dispatchers.get((id(loop), id(transport)))
+        return d.cancel_tasks() if d is not None else []
 
     def detach(self, loop: asyncio.AbstractEventLoop,
                 transport: TransportContext,
@@ -1095,7 +1118,14 @@ async def connect_webtransport(
                 await asyncio.wait_for(client.wait_closed(), timeout=2.0)
             except asyncio.TimeoutError:
                 pass
-        _get_dispatcher_registry().detach(loop, transport, client)
+        # Reap anything the dispatcher started before the engine goes
+        # away: a pending acceptor coroutine still holds this session and
+        # transport, and stop() would free them underneath it.
+        reg = _get_dispatcher_registry()
+        pending = reg.cancel_tasks(loop, transport)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        reg.detach(loop, transport, client)
         if own_transport:
             try:
                 transport.stop()
