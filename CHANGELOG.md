@@ -18,6 +18,18 @@
   link.
 - Tests: the stream-priority binding is exercised on a live connection; it
   shipped in 0.4.1 with none.
+- WebTransport: `set_stream_priority()` on a session. The Cython binding and both
+  C handlers existed with no Python caller, so priority was unreachable over
+  WebTransport and the handler had never run.
+- `QuicConnection.set_stream_priority()` returns the post result instead of
+  `None`, so a full TX event ring is no longer a silent loss, and raises
+  `ConnectionError` on a cnx that is not open.
+- Fix: a closing WebTransport server retires its dispatcher registry entry.
+  Entries accumulated for the life of the process, keeping dead
+  loop/transport pairs addressable.
+- Fix: `TransportContext.stop()` drains queued TX events (bounded, default
+  50 ms) before deleting the network thread, which discarded them — a close
+  pushed just before `stop()` never reached picoquic.
 
 ## v0.4.1
 
