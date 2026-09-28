@@ -12,6 +12,7 @@ from aiopquic.asyncio.webtransport import (
     connect_webtransport, serve_webtransport,
 )
 from aiopquic.quic.events import (
+    WebTransportStreamReset,
     WebTransportNewStream, WebTransportStreamDataReceived,
 )
 
@@ -430,3 +431,56 @@ async def test_registry_does_not_leak_entries_across_sessions():
     assert len(reg._dispatchers) == baseline, (
         f"registry grew from {baseline} to {len(reg._dispatchers)} "
         f"over 3 serve/close cycles")
+
+
+@pytest.mark.asyncio
+async def test_wt_close_resets_streams_with_session_gone():
+    """The peer sees WT_SESSION_GONE on this session's streams.
+
+    draft-ietf-webtrans-http3 §6: on termination the endpoint MUST reset
+    the send side and abort reading on the receive side of every stream in
+    the session, using WT_SESSION_GONE — so the peer can tell session
+    teardown from an ordinary stream reset. picowt_deregister unlinks the
+    streams but sends nothing; the code is WebTransport-layer.
+    """
+    from aiopquic.asyncio.webtransport import WT_SESSION_GONE
+
+    port = next_port()
+    reset_codes = []
+    saw_stream = asyncio.get_event_loop().create_future()
+
+    async def handler(session):
+        async def _watch():
+            async for ev in session.events():
+                if isinstance(ev, WebTransportNewStream):
+                    if not saw_stream.done():
+                        saw_stream.set_result(ev.stream_id)
+                    asyncio.create_task(_watch_stream(session, ev.stream_id))
+
+        async def _watch_stream(session, sid):
+            async for sev in session.receive_stream_data(sid):
+                if isinstance(sev, WebTransportStreamReset):
+                    reset_codes.append(sev.error_code)
+                    return
+        asyncio.create_task(_watch())
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            sid = await wt.create_stream(bidir=True)
+            wt.send_stream_data(sid, b"hello", end_stream=False)
+            await asyncio.wait_for(saw_stream, timeout=5.0)
+        # Leaving the context closes the session; the reset rides out with it.
+        for _ in range(200):
+            if reset_codes:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        server.close()
+
+    assert reset_codes, "peer saw no stream reset after session close"
+    assert reset_codes[0] == WT_SESSION_GONE, (
+        f"expected WT_SESSION_GONE ({WT_SESSION_GONE:#x}), "
+        f"got {reset_codes[0]:#x}")

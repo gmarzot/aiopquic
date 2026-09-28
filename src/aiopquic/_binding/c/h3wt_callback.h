@@ -49,6 +49,10 @@ typedef enum {
     AIOPQUIC_WT_CTX_LINK    = 0x57544c01u,  /* 'WTL\1' */
 } aiopquic_wt_ctx_kind_t;
 
+/* WT_SESSION_GONE (draft-ietf-webtrans-http3 §6, IANA 0x170d7b68). The code
+ * a peer needs to tell session teardown from an ordinary stream reset. */
+#define AIOPQUIC_WT_SESSION_GONE 0x170d7b68u
+
 /*
  * Packed payload for SPSC_EVT_TX_WT_OPEN. Stored as data_buf:
  *   header + sni + path + protocols.
@@ -1259,13 +1263,18 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
     }
 
     case SPSC_EVT_TX_WT_SESSION_CLEANUP: {
-        /* Bulk-free this session's per-stream wt_links without
-         * tearing down the session itself. Mirrors step 1 of
-         * TX_WT_DEREGISTER. Used by SESSION_CLOSED handler when the
-         * cnx is stalled (cwin pinned, peer disconnected, BBR #2118
-         * freeze) and per-sid RESETs can't be transmitted. The
-         * session object survives so the Python wrapper's __dealloc__
-         * can later push TX_WT_DEREGISTER for full teardown.
+        /* Terminate this session's streams and free their per-stream
+         * wt_links, without tearing down the session itself. Mirrors
+         * step 1 of TX_WT_DEREGISTER. The session object survives so
+         * the Python wrapper's __dealloc__ can later push
+         * TX_WT_DEREGISTER for full teardown.
+         *
+         * One event covers N streams: the splay tree is the
+         * authoritative per-session stream set, so this walk both sends
+         * the §6 resets and frees, in one SPSC slot rather than N. A
+         * stalled cnx (cwin pinned, peer disconnected, BBR #2118) may
+         * never flush the resets; queueing them costs nothing and the
+         * frees still happen.
          *
          * Idempotent: subsequent calls find empty splay tree and
          * no-op. */
@@ -1283,6 +1292,19 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                             (aiopquic_wt_stream_link_t*)
                                 st->path_callback_ctx;
                         if (lk->session == s) {
+                            /* §6: on termination the endpoint MUST reset
+                             * the send side and abort reading on the
+                             * receive side of every stream in the
+                             * session, with WT_SESSION_GONE.
+                             * picowt_deregister unlinks these streams but
+                             * sends nothing — the code is
+                             * WebTransport-layer, so it is ours. Before
+                             * the link is destroyed, while stream_id is
+                             * still readable. */
+                            picoquic_reset_stream(s->cnx, st->stream_id,
+                                                  AIOPQUIC_WT_SESSION_GONE);
+                            picoquic_stop_sending(s->cnx, st->stream_id,
+                                                  AIOPQUIC_WT_SESSION_GONE);
                             st->path_callback = NULL;
                             st->path_callback_ctx = NULL;
                             if (s->bridge) {
