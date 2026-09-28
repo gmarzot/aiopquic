@@ -554,9 +554,64 @@ class WebTransportSession:
 
     # --- session close ------------------------------------------------
 
+    def _release_session_resources(self) -> None:
+        """Release everything this session holds. Idempotent.
+
+        Runs on either direction of termination. A session is terminated
+        when a WT_CLOSE_SESSION capsule is sent *or* received
+        (draft-ietf-webtrans-http3 §6), so a close we initiate must
+        reclaim exactly what an inbound one does. Skipping it leaves
+        inbox chunks pinned, and a chunk holds its stream context as a
+        raw pointer — once the transport is torn down, deallocating that
+        chunk frees memory that is already gone.
+        """
+        if self._dgram_ring:
+            # The worker's session holds its own reference until the
+            # session struct is freed.
+            self._transport.dgram_ring_release(self._dgram_ring)
+            self._dgram_ring = 0
+        # Bulk-free this session's wt_link sc's via a single
+        # worker-thread splay-tree walk (TX_WT_SESSION_CLEANUP).
+        # Worker-local; no wire frames, so it succeeds even when the cnx
+        # is stalled (cwin pinned post-disconnect, BBR #2118, etc.) and
+        # per-sid RESETs can't be transmitted. O(1) ring cost — does not
+        # depend on stream count.
+        try:
+            self._state.push_session_cleanup()
+        except (BufferError, ConnectionError):
+            pass
+        self._stream_tx_ctxs.clear()
+        # Wake any producer parked in send_stream_data_drained awaiting a
+        # per-stream sc_event or the connection-global ring_event. After
+        # close the worker stops invoking drain callbacks for this
+        # session's streams, so without these explicit sets the waiter
+        # would deadlock until process exit. It wakes, loops, observes
+        # session_closed and returns cleanly.
+        for tx_ev in self._stream_tx_drain_events.values():
+            tx_ev.set()
+        ring_ev = getattr(self._transport,
+                            '_tx_event_ring_drain_event', None)
+        if ring_ev is not None:
+            ring_ev.set()
+        # Inbox queues are only popped on per-stream STREAM_DESTROY, so
+        # without this every stream that arrived leaks its asyncio.Queue
+        # and any undrained payload keeps a Cython chunk alive.
+        for q in self._stream_inbox.values():
+            while True:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+        self._stream_inbox.clear()
+
     def close(self, error_code: int = 0, reason: bytes = b"") -> None:
         if not self.session_closed:
             self._state.push_close(error_code, reason)
+            # Terminated the moment the capsule is sent, per §6, so the
+            # state and the reclaim both happen here — an inbound
+            # SESSION_CLOSED may never arrive for a close we initiated.
+            self._session_closed.set()
+            self._release_session_resources()
 
     def drain(self) -> None:
         self._state.push_drain()
@@ -646,11 +701,7 @@ class WebTransportSession:
             ev = WebTransportSessionClosed(error_code=error_code, reason=reason)
             self._session_close_event = ev
             self._session_closed.set()
-            if self._dgram_ring:
-                # The worker's session holds its own reference until the
-                # session struct is freed.
-                self._transport.dgram_ring_release(self._dgram_ring)
-                self._dgram_ring = 0
+            self._release_session_resources()
             if (self._session_ready
                     and not self._session_ready.done()):
                 self._session_ready.set_exception(WebTransportError(
@@ -662,44 +713,6 @@ class WebTransportSession:
                 if not fut.done():
                     fut.set_exception(WebTransportError(
                         "WT session closed"))
-            # Bulk-free this session's wt_link sc's via a single
-            # worker-thread splay-tree walk (TX_WT_SESSION_CLEANUP).
-            # Worker-local; no wire frames, so it succeeds even when
-            # the cnx is stalled (cwin pinned post-disconnect, BBR
-            # #2118, etc.) and per-sid RESETs can't be transmitted.
-            # O(1) ring cost — does not depend on stream count.
-            try:
-                self._state.push_session_cleanup()
-            except BufferError:
-                pass
-            self._stream_tx_ctxs.clear()
-            # Wake any producer parked in send_stream_data_drained
-            # awaiting per-stream sc_event or connection-global
-            # ring_event. After close the worker stops invoking drain
-            # callbacks for this session's streams, so without these
-            # explicit sets the waiter would deadlock until process
-            # exit. Producer wakes, loops, observes session_closed
-            # and raises / returns cleanly.
-            for tx_ev in self._stream_tx_drain_events.values():
-                tx_ev.set()
-            ring_ev = getattr(self._transport,
-                                '_tx_event_ring_drain_event', None)
-            if ring_ev is not None:
-                ring_ev.set()
-            # Stream-inbox queues are only popped on per-stream
-            # STREAM_DESTROY; without an explicit reclaim here, every
-            # WT data stream that arrived and was fully drained leaks
-            # its asyncio.Queue (plus any undrained payloads pinning
-            # Cython chunk buffers) for the lifetime of this session
-            # object. Drain each queue to release pinned chunks, then
-            # clear the dict.
-            for q in self._stream_inbox.values():
-                while True:
-                    try:
-                        q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-            self._stream_inbox.clear()
             self._event_queue.put_nowait(ev)
         elif evt_type == _EVT_WT_SESSION_DRAINING:
             self._draining = True
