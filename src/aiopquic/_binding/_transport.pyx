@@ -2835,8 +2835,33 @@ cdef class TransportContext:
 
         self._started = True
 
-    def stop(self):
-        """Stop the network thread and free the picoquic context."""
+    def stop(self, double drain_timeout=0.05):
+        """Stop the network thread and free the picoquic context.
+
+        Waits up to `drain_timeout` seconds for queued TX events to reach
+        picoquic first. picoquic_delete_network_thread discards whatever
+        is still in the ring, so a close pushed immediately before stop()
+        would otherwise never be handed over at all.
+
+        Draining the ring is not the same as the frames being sent:
+        picoquic may still hold an unsent packet when the thread goes
+        away. Callers that need the peer to see a clean close must wait
+        on that themselves.
+
+        __dealloc__ shuts down without this — sleeping during GC is not
+        acceptable, and an abandoned context has no one left to wait for.
+        """
+        import time
+        if self._thread_ctx is not NULL and self._ctx is not NULL:
+            deadline = time.monotonic() + drain_timeout
+            while spsc_ring_count(self._ctx.tx_event_ring) > 0:
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    self.wake_up()
+                except Exception:
+                    break
+                time.sleep(0.001)
         self._shutdown()
 
     @property

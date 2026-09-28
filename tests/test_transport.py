@@ -124,3 +124,29 @@ class TestTransportLifecycle:
         ctx.start(alpn="h3", idle_timeout_ms=5000)
         assert ctx.started
         ctx.stop()
+
+    def test_stop_drain_is_bounded(self):
+        """stop() waits for queued TX events but never indefinitely.
+
+        delete_network_thread discards whatever is left in the ring, so a
+        close pushed just before stop() would never be handed to picoquic.
+        The wait has to be bounded: a teardown that hangs is worse than a
+        dropped frame.
+        """
+        ctx = TransportContext(tx_ring_cap=2)
+        ctx.start(alpn="h3")
+        assert ctx.started
+        t0 = time.monotonic()
+        ctx.stop(drain_timeout=0.05)
+        assert time.monotonic() - t0 < 2.0, "stop() exceeded its drain bound"
+        assert not ctx.started
+
+    def test_stop_without_a_thread_does_not_wait(self):
+        """An unstarted context has no worker, so a queued event can
+        never drain — stop() must not spend its bound waiting."""
+        ctx = TransportContext(tx_ring_cap=2)
+        assert ctx.set_stream_priority(0xDEADBEEF, 0, 5) == 0
+        assert ctx.tx_event_ring_count == 1
+        t0 = time.monotonic()
+        ctx.stop(drain_timeout=5.0)
+        assert time.monotonic() - t0 < 0.5, "waited despite having no worker"
