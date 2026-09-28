@@ -27,6 +27,11 @@
 - Fix: a closing WebTransport server retires its dispatcher registry entry.
   Entries accumulated for the life of the process, keeping dead
   loop/transport pairs addressable.
+- Fix: a WebTransport session no longer dereferences a cleared transport in
+  `__dealloc__`. Cython does not None-check a typed cdef reference, so once
+  `tp_clear` dropped it — on a GC cycle break or at interpreter shutdown — the
+  deregister push was an unchecked NULL dereference. It segfaulted the aiomoqt
+  suite on every run.
 - Fix: `TransportContext.stop()` drains queued TX events (bounded, default
   50 ms) before deleting the network thread, which discarded them — a close
   pushed just before `stop()` never reached picoquic.
