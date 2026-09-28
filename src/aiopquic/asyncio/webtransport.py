@@ -874,6 +874,10 @@ class _Dispatcher:
         self._loop = loop
         self._transport = transport
         self._sessions: dict[int, WebTransportSession] = {}
+        # Session ptrs this dispatcher's acceptor created, so the server
+        # can retire exactly its own on close and leave a client sharing
+        # the same (loop, transport) alone.
+        self._spawned: set[int] = set()
         self._acceptor = None  # callable(session) -> None|coroutine
         loop.add_reader(transport.eventfd, self._drain)
 
@@ -923,6 +927,7 @@ class _Dispatcher:
         else:
             session = factory(self._transport, state)
         self._sessions[stream_ctx_ptr] = session
+        self._spawned.add(stream_ctx_ptr)
         result = self._acceptor(session)
         if asyncio.iscoroutine(result):
             self._loop.create_task(result)
@@ -962,6 +967,27 @@ class _DispatcherRegistry:
             self._dispatchers[key] = d
         d.set_acceptor(acceptor)
         return d
+
+    def detach_acceptor(self, loop: asyncio.AbstractEventLoop,
+                         transport: TransportContext) -> None:
+        """Drop a server's acceptor and retire the dispatcher if it holds
+        no sessions.
+
+        The entry must go, not just the acceptor: keys are
+        (id(loop), id(transport)) and id() is unique only among live
+        objects, so a retained entry keeps a dead pair addressable.
+        """
+        key = (id(loop), id(transport))
+        d = self._dispatchers.get(key)
+        if d is None:
+            return
+        d.set_acceptor(None)
+        for ptr in d._spawned:
+            d._sessions.pop(ptr, None)
+        d._spawned.clear()
+        if not d._sessions:
+            d.detach()
+            del self._dispatchers[key]
 
     def detach(self, loop: asyncio.AbstractEventLoop,
                 transport: TransportContext,
@@ -1093,8 +1119,8 @@ class WebTransportServer:
 
     def close(self) -> None:
         try:
-            self._dispatcher.set_acceptor(None)
-            self._dispatcher.detach()
+            _get_dispatcher_registry().detach_acceptor(
+                self._dispatcher._loop, self._transport)
         except Exception:
             pass
         if self._own_transport:

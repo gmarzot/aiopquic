@@ -398,3 +398,35 @@ async def test_wt_set_stream_priority_on_closed_session_raises():
                 wt.set_stream_priority(sid, 2)
     finally:
         server.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_does_not_leak_entries_across_sessions():
+    """Serving then closing must retire the dispatcher entry.
+
+    The registry keys on (id(loop), id(transport)) and id() is unique
+    only among live objects, so a retained entry keeps a dead pair
+    addressable by a later one that lands on the same addresses.
+    """
+    from aiopquic.asyncio.webtransport import _get_dispatcher_registry
+
+    reg = _get_dispatcher_registry()
+    baseline = len(reg._dispatchers)
+
+    async def handler(session):
+        pass
+
+    for _ in range(3):
+        port = next_port()
+        server = await serve_webtransport(
+            "127.0.0.1", port, "/wt",
+            handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+        try:
+            async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+                assert wt.session_ready
+        finally:
+            server.close()
+
+    assert len(reg._dispatchers) == baseline, (
+        f"registry grew from {baseline} to {len(reg._dispatchers)} "
+        f"over 3 serve/close cycles")
