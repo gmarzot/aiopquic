@@ -27,6 +27,14 @@
 - Fix: a closing WebTransport server retires its dispatcher registry entry.
   Entries accumulated for the life of the process, keeping dead
   loop/transport pairs addressable.
+- WebTransport session teardown now follows draft-ietf-webtrans-http3 §6. A
+  session is terminated once a WT_CLOSE_SESSION capsule is sent *or* received,
+  so a close we initiate records the state and runs the same reclaim an inbound
+  one does, and resets the session's streams with WT_SESSION_GONE. Previously a
+  self-initiated close left `wait_closed()` unable to complete (2 s per context
+  exit), left §6's "MUST NOT send new datagrams or open new streams" guards
+  inert, and skipped the reclaim entirely — which left Cython chunks holding
+  raw pointers to stream contexts the transport teardown had already freed.
 - Fix: a WebTransport session no longer dereferences a cleared transport in
   `__dealloc__`. Cython does not None-check a typed cdef reference, so once
   `tp_clear` dropped it — on a GC cycle break or at interpreter shutdown — the
