@@ -3015,24 +3015,35 @@ cdef class WebTransportSessionState:
 
         If never opened, free directly (picoquic has no reference)."""
         cdef spsc_entry_t entry
+        cdef TransportContext tp
         if self._wt is NULL:
             return
-        if self._opened:
+        # _transport is a typed cdef reference, so attribute access on it
+        # is not None-checked. tp_clear drops it to None before
+        # __dealloc__ whenever GC breaks a cycle or the interpreter is
+        # shutting down, and TransportContext.__dealloc__ nulls _ctx once
+        # the context is destroyed. Either way there is no ring left to
+        # post to, and reaching for one is an unchecked NULL dereference.
+        tp = self._transport
+        if self._opened and tp is not None and tp._ctx is not NULL:
             # Push deregister; the picoquic thread will free wt.
             memset(&entry, 0, sizeof(entry))
             entry.event_type = SPSC_EVT_TX_WT_DEREGISTER
             entry.cnx = <void*>self._wt
             entry.stream_ctx = <void*>self._wt
-            if spsc_ring_push(self._transport._ctx.tx_event_ring, &entry,
+            if spsc_ring_push(tp._ctx.tx_event_ring, &entry,
                               NULL, 0) == 0:
-                self._transport._ctx.cnt_tx_event_ring_pushes += 1
+                tp._ctx.cnt_tx_event_ring_pushes += 1
             try:
-                self._transport.wake_up()
+                tp.wake_up()
             except Exception:
                 pass
             self._wt = NULL
         else:
+            # No worker to race: the context is gone, so the session
+            # struct is ours to free.
             aiopquic_wt_session_destroy(self._wt)
+            self._wt = NULL
             self._wt = NULL
 
     @property
