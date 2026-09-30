@@ -729,9 +729,10 @@ static int aiopquic_wt_path_callback(
         aiopquic_stream_ctx_t* sc = link->sc;
         aiopquic_stream_buf_t* sb = sc->tx;
         uint32_t want = (uint32_t)length;
+        /* FIN before the tail; see the raw prepare_to_send path. */
+        int fin_after = aiopquic_stream_buf_fin_pending(sb);
         uint32_t avail = aiopquic_stream_buf_used(sb);
         uint32_t to_send = (avail < want) ? avail : want;
-        int fin_after = aiopquic_stream_buf_fin_pending(sb);
         int is_fin = (fin_after && to_send == avail) ? 1 : 0;
         int still_active = (avail > to_send) ? 1 : 0;
         uint8_t* buf = picoquic_provide_stream_data_buffer(
