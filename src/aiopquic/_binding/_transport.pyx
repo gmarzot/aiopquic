@@ -723,6 +723,10 @@ cdef class StreamChunk:
                 self._sc, <uint64_t>self._len)
 
     def __dealloc__(self):
+        # Touches only memory this chunk owns: _buf, and _sc through the
+        # reference it holds. A chunk keeps no TransportContext reference
+        # and so may outlive one — reaching for ctx state here (an event
+        # ring, a counter) would be a use-after-free.
         if self._buf is not NULL:
             # Fallback release: chunk dropped without consumer read.
             # No-op when _delivered=True (FC already released at
