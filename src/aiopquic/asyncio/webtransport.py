@@ -46,6 +46,7 @@ from aiopquic.quic.events import (
 _EVT_STREAM_TX_DRAINED = 15
 _EVT_STREAM_DESTROY = 17
 _EVT_WT_STREAM_DESTROY = 18
+_EVT_DATAGRAM_TX_DRAINED = 19
 
 # Must match spsc_ring.h SPSC_EVT_WT_* values.
 _EVT_WT_SESSION_READY = 64
@@ -113,10 +114,15 @@ class WebTransportSession:
         self._pending_creates: deque[asyncio.Future] = deque()
         # Per-stream incoming queues
         self._stream_inbox: dict[int, asyncio.Queue] = {}
-        # Datagram TX record ring, created on first send.
+        # Datagram TX record ring, created on first send; a mark owed
+        # when the TX event ring was full, and the writer's backpressure
+        # event (starts set = writable), as on QuicConnection.
         self._dgram_ring: int = 0
         self._dgram_max_payload: int = 1200
         self._dgram_ring_bytes: int = 64 * 1024
+        self._dgram_mark_owed: bool = False
+        self._dgram_tx_drain_event = asyncio.Event()
+        self._dgram_tx_drain_event.set()
         # Per-stream drain events. Set by _on_event when the picoquic
         # worker fires SPSC_EVT_STREAM_TX_DRAINED for a stream; awaited
         # by send_stream_data_drained / external callers via
@@ -522,20 +528,28 @@ class WebTransportSession:
         if self._dgram_ring == 0:
             self._dgram_ring = self._transport.dgram_ring_create(
                 self._dgram_ring_bytes, self._dgram_max_payload)
+        if self._dgram_mark_owed:
+            if self._state.push_dgram_ready(self._dgram_ring) == 0:
+                self._dgram_mark_owed = False
         rc = self._transport.dgram_push(self._dgram_ring, data)
         if rc == 0:
+            self._dgram_tx_drain_event.clear()
             return 0
         if rc < 0:
             raise ValueError(
                 f"datagram payload {len(data)} exceeds "
                 f"{self._dgram_max_payload}")
-        # Records are committed; arming can fail on a full TX event ring,
-        # in which case a later push re-arms and nothing is lost.
-        try:
-            self._state.push_dgram_ready(self._dgram_ring)
-        except ConnectionError:
-            raise
+        # Records are committed. A full TX event ring leaves the mark
+        # owed; it is re-posted at the next send or drain.
+        if self._state.push_dgram_ready(self._dgram_ring) != 0:
+            self._dgram_mark_owed = True
         return len(data)
+
+    def get_datagram_tx_drain_event(self) -> asyncio.Event:
+        """Event set when the worker drains room in the datagram record
+        ring after a full send_datagram_frame (return 0), and on close
+        so waiters never park forever."""
+        return self._dgram_tx_drain_event
 
     async def receive_stream_data(self, stream_id: int):
         """Async-generator: yield WebTransportStreamDataReceived (and
@@ -565,6 +579,8 @@ class WebTransportSession:
         raw pointer — once the transport is torn down, deallocating that
         chunk frees memory that is already gone.
         """
+        # A datagram writer parked on a full ring sees the close.
+        self._dgram_tx_drain_event.set()
         if self._dgram_ring:
             # The worker's session holds its own reference until the
             # session struct is freed.
@@ -761,6 +777,13 @@ class WebTransportSession:
             payload = data if data is not None else memoryview(b"")
             self._event_queue.put_nowait(
                 WebTransportDatagramReceived(data=payload))
+        elif evt_type == _EVT_DATAGRAM_TX_DRAINED:
+            # The worker popped a record from a ring a writer found full.
+            self._dgram_tx_drain_event.set()
+            if (self._dgram_mark_owed and self._dgram_ring
+                    and not self._session_closed.is_set()):
+                if self._state.push_dgram_ready(self._dgram_ring) == 0:
+                    self._dgram_mark_owed = False
         elif evt_type == _EVT_WT_NEW_STREAM:
             # Mirror of the _EVT_WT_STREAM_CREATED race: SESSION_CLOSED
             # may have been processed before this peer-initiated NEW

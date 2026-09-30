@@ -27,6 +27,8 @@
 - Fix: a closing WebTransport server retires its dispatcher registry entry.
   Entries accumulated for the life of the process, keeping dead
   loop/transport pairs addressable.
+- Fix: WebTransport datagram TX backpressure. The drained event carries the session
+  pointer, and `WebTransportSession.get_datagram_tx_drain_event()` exists.
 - WebTransport session teardown now follows draft-ietf-webtrans-http3 §6. A
   session is terminated once a WT_CLOSE_SESSION capsule is sent *or* received,
   so a close we initiate records the state and runs the same reclaim an inbound
