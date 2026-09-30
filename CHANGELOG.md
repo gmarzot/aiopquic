@@ -16,6 +16,7 @@
   built extension older than its hand-written sources. Wheels unchanged.
 - Fix: `sim_link_bench` links `libpicotls-fusion.a`, without which it fails to
   link.
+- `AIOPQUIC_WT_DEBUG` is read once instead of per WebTransport data packet.
 - Tests: the stream-priority binding is exercised on a live connection; it
   shipped in 0.4.1 with none.
 - WebTransport: `set_stream_priority()` on a session. The Cython binding and both
