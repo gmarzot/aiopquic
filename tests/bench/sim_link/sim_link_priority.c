@@ -37,11 +37,20 @@ typedef struct stream_slot {
     int64_t bytes_recv;
     int64_t bytes_sent;
     int active;
+    /* Bytes per second this stream is allowed to offer, 0 = greedy. A
+     * greedy urgent stream starves everything below it by definition; a
+     * capped one is the interesting case, since strict priority serves
+     * the lowest band that has data READY and a stream under its cap has
+     * none. Budget is topped up from the driver loop: offering zero bytes
+     * while still_active spins, because nothing advances time. */
+    double cap_bps;
+    int64_t budget;
 } stream_slot_t;
 
 typedef struct prio_ctx {
     int is_client;
     int n_streams;
+    uint64_t send_start_us;
     stream_slot_t slots[MAX_STREAMS];
 } prio_ctx_t;
 
@@ -117,13 +126,24 @@ static int prio_callback(picoquic_cnx_t* cnx,
     case picoquic_callback_prepare_to_send: {
         stream_slot_t* s = slot_of(ctx, stream_id);
         if (s == NULL || ctx->is_client) break;
-        /* Always have more to send: the point is contention, so no
-         * stream may run dry and free the link for the others. */
+        size_t take = length;
+        int still_active = 1;
+        if (s->cap_bps > 0.0) {
+            if (s->budget <= 0) {
+                /* Out of budget: go inactive so the scheduler drops to a
+                 * lower band. The driver loop reactivates us. */
+                (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
+                break;
+            }
+            if ((size_t)s->budget < take) take = (size_t)s->budget;
+            s->budget -= (int64_t)take;
+            still_active = s->budget > 0;
+        }
         uint8_t* buf = picoquic_provide_stream_data_buffer(
-            bytes, length, /* fin */ 0, /* still_active */ 1);
+            bytes, take, /* fin */ 0, still_active);
         if (buf != NULL) {
-            memset(buf, 0xA5, length);
-            s->bytes_sent += (int64_t)length;
+            memset(buf, 0xA5, take);
+            s->bytes_sent += (int64_t)take;
         }
         break;
     }
@@ -158,7 +178,9 @@ static void usage(const char* argv0)
         "  --rtt-us         round-trip latency (default 1000)\n"
         "  --base-priority  priority of stream 0 (default 1)\n"
         "  --step           added per stream; keep even to hold one\n"
-        "                   discipline (default 2)\n",
+        "                   discipline (default 2)\n"
+        "  --cap0-mbps      rate-limit stream 0 so it does not saturate;\n"
+        "                   0 = greedy (default)\n",
         argv0, MAX_STREAMS);
 }
 
@@ -170,6 +192,7 @@ int main(int argc, char** argv)
     int64_t rtt_us = 1000;
     int base_priority = 1;
     int step = 2;
+    double cap0_mbps = 0.0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--streams") && i + 1 < argc) {
@@ -184,6 +207,8 @@ int main(int argc, char** argv)
             base_priority = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--step") && i + 1 < argc) {
             step = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--cap0-mbps") && i + 1 < argc) {
+            cap0_mbps = strtod(argv[++i], NULL);
         } else {
             usage(argv[0]);
             return 1;
@@ -208,6 +233,9 @@ int main(int argc, char** argv)
         int p = base_priority + i * step;
         if (p > 255) p = 255;
         server_ctx.slots[i].priority = (uint8_t)p;
+    }
+    if (cap0_mbps > 0.0) {
+        server_ctx.slots[0].cap_bps = cap0_mbps * 1e6;
     }
 
     uint64_t simulated_time = 0;
@@ -251,6 +279,7 @@ int main(int argc, char** argv)
     uint64_t sim_time_out = deadline + 60000000ULL;
     int was_active = 0;
     int64_t rounds = 0;
+    uint64_t send_start_us = 0;
 
     while (ret == 0 && simulated_time < deadline &&
            picoquic_get_cnx_state(tctx->cnx_client) !=
@@ -258,6 +287,27 @@ int main(int argc, char** argv)
         ret = tls_api_one_sim_round(tctx, &simulated_time, sim_time_out,
                                     &was_active);
         if (ret < 0) break;
+
+        /* Refill capped streams against simulated time, and reactivate
+         * any that had run dry. */
+        if (tctx->cnx_server != NULL) {
+            if (send_start_us == 0) send_start_us = simulated_time;
+            double elapsed = (double)(simulated_time - send_start_us) / 1e6;
+            for (int i = 0; i < n_streams; i++) {
+                stream_slot_t* s = &server_ctx.slots[i];
+                if (s->cap_bps <= 0.0 || !s->active) continue;
+                int64_t allowed = (int64_t)(s->cap_bps * elapsed / 8.0);
+                int64_t fresh = allowed - s->bytes_sent - s->budget;
+                if (fresh > 0) {
+                    int was_dry = s->budget <= 0;
+                    s->budget += fresh;
+                    if (was_dry) {
+                        picoquic_mark_active_stream(tctx->cnx_server,
+                                                    s->stream_id, 1, NULL);
+                    }
+                }
+            }
+        }
         if (++rounds > 1000000000) {
             fprintf(stderr, "abort: round count exceeded\n");
             return 1;
@@ -278,16 +328,25 @@ int main(int argc, char** argv)
                total ? (100.0 * (double)got / (double)total) : 0.0);
     }
 
-    /* A strict scheduler serves the most urgent stream first, so its share
-     * must exceed the least urgent. Equal shares mean priority changed
-     * nothing — either the link was not actually contended, or the values
-     * landed in one band. */
     int64_t first = client_ctx.slots[0].bytes_recv;
     int64_t last = client_ctx.slots[n_streams - 1].bytes_recv;
     if (total == 0) {
         printf("VERDICT: no data — nothing was measured\n");
         return 1;
     }
+    if (cap0_mbps > 0.0) {
+        /* Capped urgent band: strict priority is an ordering, not an
+         * exclusion. It should take roughly its cap and leave the rest,
+         * so raw shares say nothing — compare against the cap instead. */
+        double got_mbps = (first * 8.0) / (duration_s * 1e6);
+        printf("VERDICT: urgent band ran at %.2f Mbps against a %.2f cap; "
+               "lower bands took %" PRId64 " of the remainder\n",
+               got_mbps, cap0_mbps, total - first);
+        return 0;
+    }
+    /* Greedy urgent band: it has data every round, so a strict scheduler
+     * must starve the band below it. Equal shares mean either the link was
+     * never contended or the values landed in one band. */
     printf("VERDICT: %s (most urgent %" PRId64 " vs least %" PRId64 ")\n",
            first > last ? "priority honoured" : "PRIORITY HAD NO EFFECT",
            first, last);
