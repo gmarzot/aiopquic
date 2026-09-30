@@ -9,8 +9,8 @@
  * is responsible for freeing data_buf (or transferring ownership
  * elsewhere, as drain_rx does to StreamChunk).
  *
- * spsc_ring_destroy walks any unread entries and frees their data_buf
- * to avoid leaks on shutdown.
+ * spsc_ring_destroy walks any unread entries and frees the data_buf of
+ * those that own one (data_length > 0) to avoid leaks on shutdown.
  *
  * Copyright (c) 2026, aiopquic contributors. BSD-3-Clause license.
  */
@@ -278,14 +278,16 @@ static inline spsc_ring_t* spsc_ring_create(uint32_t capacity) {
     return ring;
 }
 
-/* Destroy a ring buffer; frees any pending entries' data_buf. */
+/* Destroy a ring buffer; frees the data_buf of pending entries that own
+ * one. Borrowed pointers (data_length == 0) belong elsewhere, as in
+ * spsc_ring_pop. */
 static inline void spsc_ring_destroy(spsc_ring_t* ring) {
     if (!ring) return;
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
     uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
     while (head < tail) {
         spsc_entry_t* e = &ring->entries[head & ring->mask];
-        if (e->data_buf) {
+        if (e->data_buf && e->data_length > 0) {
             free(e->data_buf);
             e->data_buf = NULL;
         }

@@ -7,6 +7,8 @@
   priority and one dropped by the stale-cnx guard were indistinguishable.
 - `tx_event_dropped_dead_cnx` counts TX events whose cnx was freed between
   push and pop, for every event type behind that guard.
+- Fix: `spsc_ring_destroy` frees only buffers an entry owns; it freed the borrowed
+  stream contexts that queued WebTransport events carry.
 - Fix: the WebTransport ring-full paths arm the drain before returning 1, so a
   caller awaiting `tx_event_ring_drain_event` wakes.
 - Fix: `tx_event_ring_pushes` was counted on the raw push sites only, so the
