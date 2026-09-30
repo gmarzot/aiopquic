@@ -11,6 +11,8 @@
   caller awaiting `tx_event_ring_drain_event` wakes.
 - Fix: `tx_event_ring_pushes` was counted on the raw push sites only, so the
   documented push/pop invariant read pops > pushes on WebTransport.
+- Fix: a server (engine-routed) STREAM_DESTROY wakes a writer parked on that
+  stream, as the client path already did.
 - Version reporter: a from-source install reports `git describe --dirty` plus
   the branch, flags a metadata version that names another commit, and flags a
   built extension older than its hand-written sources. Wheels unchanged.

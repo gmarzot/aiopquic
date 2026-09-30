@@ -682,6 +682,11 @@ class QuicConnection:
         elif evt_type == _EVT_DATAGRAM_LOST:
             self._datagrams_lost += 1
         elif evt_type == _EVT_STREAM_DESTROY:
+            # Wake a producer parked on this stream before dropping the
+            # Event it holds; see the client-path branch.
+            ev = self._stream_tx_drain_events.get(stream_id)
+            if ev is not None:
+                ev.set()
             self._stream_ctxs.pop(stream_id, None)
             self._stream_tx_drain_events.pop(stream_id, None)
 
