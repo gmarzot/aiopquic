@@ -682,6 +682,11 @@ class QuicConnection:
         elif evt_type == _EVT_DATAGRAM_LOST:
             self._datagrams_lost += 1
         elif evt_type == _EVT_STREAM_DESTROY:
+            # Wake a producer parked on this stream before dropping the
+            # Event it holds; see the client-path branch.
+            ev = self._stream_tx_drain_events.get(stream_id)
+            if ev is not None:
+                ev.set()
             self._stream_ctxs.pop(stream_id, None)
             self._stream_tx_drain_events.pop(stream_id, None)
 
@@ -847,6 +852,11 @@ class QuicConnection:
             # task cancellation can never be delivered (100% spin).
             if self._closed:
                 await asyncio.sleep(0)
+                return
+            # STREAM_DESTROY retired the stream while we waited and took
+            # its Event with it; a retry would allocate a fresh sc for a
+            # stream picoquic no longer has.
+            if self._stream_tx_drain_events.get(stream_id) is not sc_event:
                 return
             # Connection-global ring pressure: tx_event_ring_fill reads the
             # SPSC TX event ring. Wait on the connection-global ring
