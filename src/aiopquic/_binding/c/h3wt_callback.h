@@ -843,6 +843,7 @@ static int aiopquic_wt_path_callback(
                 spsc_entry_t drain_entry = {0};
                 drain_entry.event_type = SPSC_EVT_DATAGRAM_TX_DRAINED;
                 drain_entry.cnx = cnx;
+                drain_entry.stream_ctx = s;  /* session ptr for routing */
                 if (spsc_ring_push(s->bridge->rx_event_ring,
                                    &drain_entry, NULL, 0) == 0) {
                     aiopquic_notify_rx(s->bridge);
