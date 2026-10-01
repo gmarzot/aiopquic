@@ -853,6 +853,11 @@ class QuicConnection:
             if self._closed:
                 await asyncio.sleep(0)
                 return
+            # STREAM_DESTROY retired the stream while we waited and took
+            # its Event with it; a retry would allocate a fresh sc for a
+            # stream picoquic no longer has.
+            if self._stream_tx_drain_events.get(stream_id) is not sc_event:
+                return
             # Connection-global ring pressure: tx_event_ring_fill reads the
             # SPSC TX event ring. Wait on the connection-global ring
             # event, NOT the per-stream sc->tx event (which is only
