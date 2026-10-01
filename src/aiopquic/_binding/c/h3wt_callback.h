@@ -132,6 +132,17 @@ static inline int aiopquic_wt_diag_enabled(void) {
     return cached;
 }
 
+/* AIOPQUIC_WT_DEBUG: per-packet TX hex dump. Read once — provide_data
+ * runs per packet on the worker, where getenv() would also race a
+ * setenv() from Python. */
+static inline int aiopquic_wt_debug_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("AIOPQUIC_WT_DEBUG") != NULL;
+    }
+    return cached;
+}
+
 static inline void aiopquic_wt_log_cnxid(const char* tag,
                                           picoquic_cnx_t* cnx,
                                           uint64_t sid) {
@@ -740,7 +751,7 @@ static int aiopquic_wt_path_callback(
         if (buf && to_send > 0) {
             aiopquic_stream_buf_pop(sb, buf, to_send);
             aiopquic_tx_data_bytes_pulled_add(to_send);
-            if (getenv("AIOPQUIC_WT_DEBUG") != NULL) {
+            if (aiopquic_wt_debug_enabled()) {
                 fprintf(stderr, "[wt-debug] provide sid=%llu len=%u "
                         "is_fin=%d still_active=%d hex=",
                         (unsigned long long)sid, to_send,
