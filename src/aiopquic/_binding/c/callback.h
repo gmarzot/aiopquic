@@ -885,9 +885,13 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                 return 0;
             }
             uint32_t want = (uint32_t)length;
+            /* FIN first: the producer sets it after publishing the
+             * tail, so an acquire of a set FIN makes every byte
+             * written before it visible to the tail load below. The
+             * other order can FIN at an old tail and drop the rest. */
+            int fin_after = aiopquic_stream_buf_fin_pending(sb);
             uint32_t avail = aiopquic_stream_buf_used(sb);
             uint32_t to_send = (avail < want) ? avail : want;
-            int fin_after = aiopquic_stream_buf_fin_pending(sb);
             int is_fin = (fin_after && to_send == avail) ? 1 : 0;
             int is_still_active = (avail > to_send) ? 1 : 0;
             uint8_t* buf = picoquic_provide_stream_data_buffer(

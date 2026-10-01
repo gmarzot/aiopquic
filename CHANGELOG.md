@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix: a FIN no longer overtakes the last bytes of a stream. The worker read the
+  ring's tail before `fin_pending`, so a data+FIN write landing between the two
+  loads sent FIN at the old tail and dropped the rest (raw and WebTransport).
 - Priority outcome counters: `set_priority_applied`, `set_priority_rejected`,
   `set_priority_last_err`. picoquic's return was discarded, so an applied
   priority and one dropped by the stale-cnx guard were indistinguishable.
