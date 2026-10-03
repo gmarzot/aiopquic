@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix: closing a WebTransport session while data was arriving could crash.
+  The session-cleanup walk freed each stream's context while data events still
+  queued for it held a pointer to it; the free now waits for those events, and
+  bytes left unsent are credited to the queued-bytes total at close.
 - Fix: a FIN no longer overtakes the last bytes of a stream. The worker read the
   ring's tail before `fin_pending`, so a data+FIN write landing between the two
   loads sent FIN at the old tail and dropped the rest (raw and WebTransport).

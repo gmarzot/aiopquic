@@ -484,3 +484,39 @@ async def test_wt_close_resets_streams_with_session_gone():
     assert reset_codes[0] == WT_SESSION_GONE, (
         f"expected WT_SESSION_GONE ({WT_SESSION_GONE:#x}), "
         f"got {reset_codes[0]:#x}")
+
+
+
+def _run_close_scenario(mode, **env):
+    import subprocess
+    import sys
+    script = os.path.join(os.path.dirname(__file__), "wt_close_scenarios.py")
+    return subprocess.run(
+        [sys.executable, script, mode, str(next_port()), CERT_FILE, KEY_FILE],
+        env=dict(os.environ, **env),
+        capture_output=True, text=True, timeout=180)
+
+
+def test_wt_close_credits_unsent_bytes():
+    """Bytes queued unsent when a session closes are credited at close.
+
+    The process-wide queued total gates stream creation on every
+    connection in the process, so it cannot wait for the stream's final
+    free, which follows the stream's LINK_RELEASE being drained. Runs in a
+    fresh process so the total starts at zero.
+    """
+    proc = _run_close_scenario("unsent")
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\n{proc.stderr[-3000:]}")
+
+
+def test_wt_close_while_receiving_survives_poisoned_frees():
+    """Closing a session while the peer sends must not touch freed memory.
+
+    A stream's link and sc must outlive the data events still queued for
+    it, or drain_rx copies out of a freed ring. MALLOC_PERTURB_ poisons
+    freed memory so such a read faults instead of returning stale bytes.
+    """
+    proc = _run_close_scenario("receive", MALLOC_PERTURB_="165")
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\n{proc.stderr[-3000:]}")

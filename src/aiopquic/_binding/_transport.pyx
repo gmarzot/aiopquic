@@ -1017,9 +1017,25 @@ cdef class TransportContext:
     def __dealloc__(self):
         self._shutdown()
         if self._ctx is not NULL:
+            self._release_undrained_links()
             aiopquic_ctx_destroy(self._ctx)
             self._ctx = NULL
         # WeakSet auto-removes; no explicit discard needed.
+
+    cdef void _release_undrained_links(self):
+        """Free the links of LINK_RELEASE events nobody drained. Runs after
+        the worker stopped and picoquic was freed, so this thread is the
+        ring's only user; ring destroy would skip these borrowed pointers."""
+        cdef spsc_entry_t* entry
+        while True:
+            entry = spsc_ring_peek(self._ctx.rx_event_ring)
+            if entry is NULL:
+                break
+            if (entry.event_type == SPSC_EVT_WT_STREAM_LINK_RELEASE
+                    and entry.data_buf is not NULL):
+                aiopquic_wt_stream_link_destroy(
+                    <aiopquic_wt_stream_link_t*>entry.data_buf)
+            spsc_ring_pop(self._ctx.rx_event_ring)
 
     cdef void _shutdown(self):
         """Stop the network thread and free picoquic context."""

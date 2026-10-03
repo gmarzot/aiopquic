@@ -1276,21 +1276,24 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
     }
 
     case SPSC_EVT_TX_WT_SESSION_CLEANUP: {
-        /* Terminate this session's streams and free their per-stream
+        /* Terminate this session's streams and release their per-stream
          * wt_links, without tearing down the session itself. Mirrors
          * step 1 of TX_WT_DEREGISTER. The session object survives so
          * the Python wrapper's __dealloc__ can later push
          * TX_WT_DEREGISTER for full teardown.
          *
          * One event covers N streams: the splay tree is the
-         * authoritative per-session stream set, so this walk both sends
-         * the §6 resets and frees, in one SPSC slot rather than N. A
-         * stalled cnx (cwin pinned, peer disconnected, BBR #2118) may
-         * never flush the resets; queueing them costs nothing and the
-         * frees still happen.
+         * authoritative per-session stream set, so this walk sends the
+         * §6 resets and releases the links in one SPSC slot rather than
+         * N. A stalled cnx may never flush the resets; queueing them
+         * costs nothing.
          *
-         * Idempotent: subsequent calls find empty splay tree and
-         * no-op. */
+         * Links go through LINK_RELEASE, never an inline destroy: data
+         * events still queued for the stream hold its borrowed sc, and
+         * drain_rx must consume them before the sc is freed.
+         *
+         * Idempotent: a released stream's path_callback_ctx is NULL, so
+         * a later walk skips it. */
         if (s && s->cnx && s->h3_ctx) {
             picosplay_node_t* node =
                 picosplay_first(&s->h3_ctx->h3_stream_tree);
@@ -1311,19 +1314,15 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                              * session, with WT_SESSION_GONE.
                              * picowt_deregister unlinks these streams but
                              * sends nothing — the code is
-                             * WebTransport-layer, so it is ours. Before
-                             * the link is destroyed, while stream_id is
-                             * still readable. */
+                             * WebTransport-layer, so it is ours. */
                             picoquic_reset_stream(s->cnx, st->stream_id,
                                                   AIOPQUIC_WT_SESSION_GONE);
                             picoquic_stop_sending(s->cnx, st->stream_id,
                                                   AIOPQUIC_WT_SESSION_GONE);
                             st->path_callback = NULL;
                             st->path_callback_ctx = NULL;
-                            if (s->bridge) {
-                                s->bridge->cnt_sc_destroy_wt_link_close_walker++;
-                            }
-                            aiopquic_wt_stream_link_destroy(lk);
+                            aiopquic_stream_ctx_tx_abandon(lk->sc);
+                            aiopquic_wt_push_link_release(s, st->stream_id, lk);
                         }
                     }
                 }
@@ -1337,14 +1336,15 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         /* Python is releasing this session. Cleanup has three steps
          * that MUST happen in order, all on the worker thread:
          *
-         * 1. Walk h3zero's splay tree and free any per-stream links
-         *    that belong to THIS session. We must do this BEFORE
-         *    picowt_deregister because picowt_deregister nulls each
+         * 1. Walk h3zero's splay tree and release any per-stream links
+         *    that belong to THIS session, via LINK_RELEASE so queued
+         *    data events holding the borrowed sc are consumed first.
+         *    This must precede picowt_deregister, which nulls each
          *    data stream's path_callback_ctx before deleting the
-         *    h3zero stream_ctx — which means picohttp_callback_free
-         *    is NOT dispatched for our streams, and our link+sc
-         *    memory would be orphaned (leak). The kind discriminator
-         *    + session pointer check ensures we only free our own.
+         *    h3zero stream_ctx — picohttp_callback_free is then NOT
+         *    dispatched for our streams, and our link+sc would be
+         *    orphaned. The kind discriminator + session pointer check
+         *    ensures we only release our own.
          *
          * 2. Null the control stream's path_callback / _ctx. picowt_
          *    deregister does NOT touch the control stream's callback;
@@ -1375,10 +1375,9 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                             if (lk->session == s) {
                                 st->path_callback = NULL;
                                 st->path_callback_ctx = NULL;
-                                if (s->bridge) {
-                                    s->bridge->cnt_sc_destroy_wt_link_close_walker++;
-                                }
-                                aiopquic_wt_stream_link_destroy(lk);
+                                aiopquic_stream_ctx_tx_abandon(lk->sc);
+                                aiopquic_wt_push_link_release(
+                                    s, st->stream_id, lk);
                             }
                         }
                     }
