@@ -46,6 +46,7 @@ from aiopquic.quic.events import (
 _EVT_STREAM_TX_DRAINED = 15
 _EVT_STREAM_DESTROY = 17
 _EVT_WT_STREAM_DESTROY = 18
+_EVT_DATAGRAM_TX_DRAINED = 19
 
 # Must match spsc_ring.h SPSC_EVT_WT_* values.
 _EVT_WT_SESSION_READY = 64
@@ -113,10 +114,15 @@ class WebTransportSession:
         self._pending_creates: deque[asyncio.Future] = deque()
         # Per-stream incoming queues
         self._stream_inbox: dict[int, asyncio.Queue] = {}
-        # Datagram TX record ring, created on first send.
+        # Datagram TX record ring, created on first send; a mark owed
+        # when the TX event ring was full, and the writer's backpressure
+        # event (starts set = writable), as on QuicConnection.
         self._dgram_ring: int = 0
         self._dgram_max_payload: int = 1200
         self._dgram_ring_bytes: int = 64 * 1024
+        self._dgram_mark_owed: bool = False
+        self._dgram_tx_drain_event = asyncio.Event()
+        self._dgram_tx_drain_event.set()
         # Per-stream drain events. Set by _on_event when the picoquic
         # worker fires SPSC_EVT_STREAM_TX_DRAINED for a stream; awaited
         # by send_stream_data_drained / external callers via
@@ -479,6 +485,30 @@ class WebTransportSession:
         """Send STOP_SENDING on a WT stream (peer should reset)."""
         self._state.push_stop_sending(stream_id, error_code)
 
+    def set_stream_priority(self, stream_id: int, priority: int) -> int:
+        """Relative send priority for one WT stream (RFC 9000 §2.3).
+
+        0 is highest, 255 lowest; picoquic's default is 9. Takes effect on
+        an already-open stream, so a subscription re-prioritising
+        mid-track applies to whatever has not been scheduled yet.
+
+        The LSB selects the scheduling discipline among streams of EQUAL
+        priority, it is not a priority bit: even means round robin (the
+        stream sent on least recently), odd means FIFO (lowest stream id).
+        Adjacent values therefore behave qualitatively differently. No
+        policy is applied here — the caller owns that choice.
+
+        Returns 0 posted, 1 TX event ring full. On 1 the priority is NOT
+        applied and the stream keeps its current one; wait on the
+        transport's tx_event_ring_drain_event and retry.
+
+        Raises:
+            ConnectionError: session closed.
+        """
+        if self._state is None or self._session_closed.is_set():
+            raise ConnectionError("set_stream_priority: session closed")
+        return self._state.push_stream_priority(stream_id, priority)
+
     def send_datagram_frame(self, data: bytes) -> int:
         """Queue one WebTransport datagram for the pull-model send path.
 
@@ -498,20 +528,28 @@ class WebTransportSession:
         if self._dgram_ring == 0:
             self._dgram_ring = self._transport.dgram_ring_create(
                 self._dgram_ring_bytes, self._dgram_max_payload)
+        if self._dgram_mark_owed:
+            if self._state.push_dgram_ready(self._dgram_ring) == 0:
+                self._dgram_mark_owed = False
         rc = self._transport.dgram_push(self._dgram_ring, data)
         if rc == 0:
+            self._dgram_tx_drain_event.clear()
             return 0
         if rc < 0:
             raise ValueError(
                 f"datagram payload {len(data)} exceeds "
                 f"{self._dgram_max_payload}")
-        # Records are committed; arming can fail on a full TX event ring,
-        # in which case a later push re-arms and nothing is lost.
-        try:
-            self._state.push_dgram_ready(self._dgram_ring)
-        except ConnectionError:
-            raise
+        # Records are committed. A full TX event ring leaves the mark
+        # owed; it is re-posted at the next send or drain.
+        if self._state.push_dgram_ready(self._dgram_ring) != 0:
+            self._dgram_mark_owed = True
         return len(data)
+
+    def get_datagram_tx_drain_event(self) -> asyncio.Event:
+        """Event set when the worker drains room in the datagram record
+        ring after a full send_datagram_frame (return 0), and on close
+        so waiters never park forever."""
+        return self._dgram_tx_drain_event
 
     async def receive_stream_data(self, stream_id: int):
         """Async-generator: yield WebTransportStreamDataReceived (and
@@ -530,9 +568,66 @@ class WebTransportSession:
 
     # --- session close ------------------------------------------------
 
+    def _release_session_resources(self) -> None:
+        """Release everything this session holds. Idempotent.
+
+        Runs on either direction of termination. A session is terminated
+        when a WT_CLOSE_SESSION capsule is sent *or* received
+        (draft-ietf-webtrans-http3 §6), so a close we initiate must
+        reclaim exactly what an inbound one does. Skipping it leaves
+        inbox chunks pinned, and a chunk holds its stream context as a
+        raw pointer — once the transport is torn down, deallocating that
+        chunk frees memory that is already gone.
+        """
+        # A datagram writer parked on a full ring sees the close.
+        self._dgram_tx_drain_event.set()
+        if self._dgram_ring:
+            # The worker's session holds its own reference until the
+            # session struct is freed.
+            self._transport.dgram_ring_release(self._dgram_ring)
+            self._dgram_ring = 0
+        # Bulk-free this session's wt_link sc's via a single
+        # worker-thread splay-tree walk (TX_WT_SESSION_CLEANUP).
+        # Worker-local; no wire frames, so it succeeds even when the cnx
+        # is stalled (cwin pinned post-disconnect, BBR #2118, etc.) and
+        # per-sid RESETs can't be transmitted. O(1) ring cost — does not
+        # depend on stream count.
+        try:
+            self._state.push_session_cleanup()
+        except (BufferError, ConnectionError):
+            pass
+        self._stream_tx_ctxs.clear()
+        # Wake any producer parked in send_stream_data_drained awaiting a
+        # per-stream sc_event or the connection-global ring_event. After
+        # close the worker stops invoking drain callbacks for this
+        # session's streams, so without these explicit sets the waiter
+        # would deadlock until process exit. It wakes, loops, observes
+        # session_closed and returns cleanly.
+        for tx_ev in self._stream_tx_drain_events.values():
+            tx_ev.set()
+        ring_ev = getattr(self._transport,
+                            '_tx_event_ring_drain_event', None)
+        if ring_ev is not None:
+            ring_ev.set()
+        # Inbox queues are only popped on per-stream STREAM_DESTROY, so
+        # without this every stream that arrived leaks its asyncio.Queue
+        # and any undrained payload keeps a Cython chunk alive.
+        for q in self._stream_inbox.values():
+            while True:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+        self._stream_inbox.clear()
+
     def close(self, error_code: int = 0, reason: bytes = b"") -> None:
         if not self.session_closed:
             self._state.push_close(error_code, reason)
+            # Terminated the moment the capsule is sent, per §6, so the
+            # state and the reclaim both happen here — an inbound
+            # SESSION_CLOSED may never arrive for a close we initiated.
+            self._session_closed.set()
+            self._release_session_resources()
 
     def drain(self) -> None:
         self._state.push_drain()
@@ -622,11 +717,7 @@ class WebTransportSession:
             ev = WebTransportSessionClosed(error_code=error_code, reason=reason)
             self._session_close_event = ev
             self._session_closed.set()
-            if self._dgram_ring:
-                # The worker's session holds its own reference until the
-                # session struct is freed.
-                self._transport.dgram_ring_release(self._dgram_ring)
-                self._dgram_ring = 0
+            self._release_session_resources()
             if (self._session_ready
                     and not self._session_ready.done()):
                 self._session_ready.set_exception(WebTransportError(
@@ -638,44 +729,6 @@ class WebTransportSession:
                 if not fut.done():
                     fut.set_exception(WebTransportError(
                         "WT session closed"))
-            # Bulk-free this session's wt_link sc's via a single
-            # worker-thread splay-tree walk (TX_WT_SESSION_CLEANUP).
-            # Worker-local; no wire frames, so it succeeds even when
-            # the cnx is stalled (cwin pinned post-disconnect, BBR
-            # #2118, etc.) and per-sid RESETs can't be transmitted.
-            # O(1) ring cost — does not depend on stream count.
-            try:
-                self._state.push_session_cleanup()
-            except BufferError:
-                pass
-            self._stream_tx_ctxs.clear()
-            # Wake any producer parked in send_stream_data_drained
-            # awaiting per-stream sc_event or connection-global
-            # ring_event. After close the worker stops invoking drain
-            # callbacks for this session's streams, so without these
-            # explicit sets the waiter would deadlock until process
-            # exit. Producer wakes, loops, observes session_closed
-            # and raises / returns cleanly.
-            for tx_ev in self._stream_tx_drain_events.values():
-                tx_ev.set()
-            ring_ev = getattr(self._transport,
-                                '_tx_event_ring_drain_event', None)
-            if ring_ev is not None:
-                ring_ev.set()
-            # Stream-inbox queues are only popped on per-stream
-            # STREAM_DESTROY; without an explicit reclaim here, every
-            # WT data stream that arrived and was fully drained leaks
-            # its asyncio.Queue (plus any undrained payloads pinning
-            # Cython chunk buffers) for the lifetime of this session
-            # object. Drain each queue to release pinned chunks, then
-            # clear the dict.
-            for q in self._stream_inbox.values():
-                while True:
-                    try:
-                        q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-            self._stream_inbox.clear()
             self._event_queue.put_nowait(ev)
         elif evt_type == _EVT_WT_SESSION_DRAINING:
             self._draining = True
@@ -724,6 +777,13 @@ class WebTransportSession:
             payload = data if data is not None else memoryview(b"")
             self._event_queue.put_nowait(
                 WebTransportDatagramReceived(data=payload))
+        elif evt_type == _EVT_DATAGRAM_TX_DRAINED:
+            # The worker popped a record from a ring a writer found full.
+            self._dgram_tx_drain_event.set()
+            if (self._dgram_mark_owed and self._dgram_ring
+                    and not self._session_closed.is_set()):
+                if self._state.push_dgram_ready(self._dgram_ring) == 0:
+                    self._dgram_mark_owed = False
         elif evt_type == _EVT_WT_NEW_STREAM:
             # Mirror of the _EVT_WT_STREAM_CREATED race: SESSION_CLOSED
             # may have been processed before this peer-initiated NEW
@@ -850,6 +910,15 @@ class _Dispatcher:
         self._loop = loop
         self._transport = transport
         self._sessions: dict[int, WebTransportSession] = {}
+        # Session ptrs this dispatcher's acceptor created, so the server
+        # can retire exactly its own on close and leave a client sharing
+        # the same (loop, transport) alone.
+        self._spawned: set[int] = set()
+        # Acceptor coroutines we started. An accept handler typically runs
+        # until its session closes, so without ownership it is still
+        # pending at teardown, holding the session and transport while
+        # stop() frees the engine under it.
+        self._tasks: set[asyncio.Task] = set()
         self._acceptor = None  # callable(session) -> None|coroutine
         loop.add_reader(transport.eventfd, self._drain)
 
@@ -899,11 +968,24 @@ class _Dispatcher:
         else:
             session = factory(self._transport, state)
         self._sessions[stream_ctx_ptr] = session
+        self._spawned.add(stream_ctx_ptr)
         result = self._acceptor(session)
         if asyncio.iscoroutine(result):
-            self._loop.create_task(result)
+            task = self._loop.create_task(result)
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    def cancel_tasks(self) -> list:
+        """Cancel the acceptor coroutines this dispatcher started and
+        return them, so a caller on the loop can await the cancellation
+        before the transport is freed."""
+        pending = [t for t in self._tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        return pending
 
     def detach(self) -> None:
+        self.cancel_tasks()
         try:
             self._loop.remove_reader(self._transport.eventfd)
         except Exception:
@@ -938,6 +1020,33 @@ class _DispatcherRegistry:
             self._dispatchers[key] = d
         d.set_acceptor(acceptor)
         return d
+
+    def detach_acceptor(self, loop: asyncio.AbstractEventLoop,
+                         transport: TransportContext) -> None:
+        """Drop a server's acceptor and retire the dispatcher if it holds
+        no sessions.
+
+        The entry must go, not just the acceptor: keys are
+        (id(loop), id(transport)) and id() is unique only among live
+        objects, so a retained entry keeps a dead pair addressable.
+        """
+        key = (id(loop), id(transport))
+        d = self._dispatchers.get(key)
+        if d is None:
+            return
+        d.set_acceptor(None)
+        for ptr in d._spawned:
+            d._sessions.pop(ptr, None)
+        d._spawned.clear()
+        if not d._sessions:
+            d.detach()
+            del self._dispatchers[key]
+
+    def cancel_tasks(self, loop: asyncio.AbstractEventLoop,
+                      transport: TransportContext) -> list:
+        """Cancel the acceptor coroutines for this (loop, transport)."""
+        d = self._dispatchers.get((id(loop), id(transport)))
+        return d.cancel_tasks() if d is not None else []
 
     def detach(self, loop: asyncio.AbstractEventLoop,
                 transport: TransportContext,
@@ -1045,7 +1154,14 @@ async def connect_webtransport(
                 await asyncio.wait_for(client.wait_closed(), timeout=2.0)
             except asyncio.TimeoutError:
                 pass
-        _get_dispatcher_registry().detach(loop, transport, client)
+        # Reap anything the dispatcher started before the engine goes
+        # away: a pending acceptor coroutine still holds this session and
+        # transport, and stop() would free them underneath it.
+        reg = _get_dispatcher_registry()
+        pending = reg.cancel_tasks(loop, transport)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        reg.detach(loop, transport, client)
         if own_transport:
             try:
                 transport.stop()
@@ -1069,8 +1185,8 @@ class WebTransportServer:
 
     def close(self) -> None:
         try:
-            self._dispatcher.set_acceptor(None)
-            self._dispatcher.detach()
+            _get_dispatcher_registry().detach_acceptor(
+                self._dispatcher._loop, self._transport)
         except Exception:
             pass
         if self._own_transport:

@@ -682,6 +682,11 @@ class QuicConnection:
         elif evt_type == _EVT_DATAGRAM_LOST:
             self._datagrams_lost += 1
         elif evt_type == _EVT_STREAM_DESTROY:
+            # Wake a producer parked on this stream before dropping the
+            # Event it holds; see the client-path branch.
+            ev = self._stream_tx_drain_events.get(stream_id)
+            if ev is not None:
+                ev.set()
             self._stream_ctxs.pop(stream_id, None)
             self._stream_tx_drain_events.pop(stream_id, None)
 
@@ -847,6 +852,11 @@ class QuicConnection:
             # task cancellation can never be delivered (100% spin).
             if self._closed:
                 await asyncio.sleep(0)
+                return
+            # STREAM_DESTROY retired the stream while we waited and took
+            # its Event with it; a retry would allocate a fresh sc for a
+            # stream picoquic no longer has.
+            if self._stream_tx_drain_events.get(stream_id) is not sc_event:
                 return
             # Connection-global ring pressure: tx_event_ring_fill reads the
             # SPSC TX event ring. Wait on the connection-global ring
@@ -1023,29 +1033,46 @@ class QuicConnection:
         )
         self._transport.wake_up()
 
-    def set_stream_priority(self, stream_id: int, priority: int) -> None:
+    def set_stream_priority(self, stream_id: int, priority: int) -> int:
         """Relative send priority for one stream (RFC 9000 §2.3).
 
-        0 is highest, 255 lowest; picoquic's default is 9. Takes effect
-        on an already-open stream, so a subscription that re-prioritises
-        mid-track is applied to whatever has not been scheduled yet.
+        0 is highest, 255 lowest; picoquic's default is 9. Applies to an
+        already-open stream, and picoquic creates the stream if it has
+        not seen the id yet, so a subscription may re-prioritise
+        mid-track and the change lands on whatever is not yet scheduled.
 
         The LSB selects the scheduling discipline among streams of EQUAL
-        priority, it is not a priority bit: even means round robin (the
-        stream sent on least recently), odd means FIFO (lowest stream
-        id). Adjacent values therefore behave qualitatively differently.
-        aiopquic applies no policy — the caller owns that choice and
-        should clear the LSB when it wants round robin.
+        priority, it is not a priority bit: even orders by
+        least-recently-sent (round robin), odd orders by lowest stream id
+        (FIFO), and only an even band is reordered after a send — an odd
+        band never rotates. Adjacent values therefore behave
+        qualitatively differently. No policy is applied here; the caller
+        owns that choice and should clear the LSB to get round robin.
+
+        Returns 0 when the event was posted, 1 when the TX event ring is
+        full — in which case the priority is NOT applied and the stream
+        keeps its current one; wait on tx_event_ring_drain_event and
+        retry. Posting only queues the call: picoquic can still refuse it
+        with an invalid stream id (wrong parity for this endpoint), an
+        already-closed stream, or an allocation failure. Those outcomes
+        are visible in the transport's set_priority_rejected and
+        set_priority_last_err counters, not in this return value.
+
+        Raises:
+            ConnectionError: no transport, or the cnx is not open.
         """
-        self._transport.set_stream_priority(
+        if self._cnx_ptr == 0 or self._transport is None:
+            raise ConnectionError("set_stream_priority: cnx not open")
+        return self._transport.set_stream_priority(
             self._cnx_ptr, stream_id, priority)
 
     def set_default_stream_priority(self, priority: int) -> None:
         """Priority that newly created streams start at.
 
-        Set on the QUIC context, not the connection, and applies only to
-        streams created after the call. Same LSB semantics as
-        set_stream_priority().
+        Reached through a connection but **not scoped to one**: it writes
+        the QUIC context's default, shared by every connection on this
+        TransportContext, and applies only to streams created after the
+        call. Same LSB semantics as set_stream_priority().
         """
         self._transport.set_default_stream_priority(priority)
 

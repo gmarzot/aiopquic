@@ -12,6 +12,7 @@ from aiopquic.asyncio.webtransport import (
     connect_webtransport, serve_webtransport,
 )
 from aiopquic.quic.events import (
+    WebTransportStreamReset,
     WebTransportNewStream, WebTransportStreamDataReceived,
 )
 
@@ -323,3 +324,199 @@ async def test_wt_datagram_oversize_is_refused():
                 wt.send_datagram_frame(b"x" * 4096)
     finally:
         server.close()
+
+
+async def _wait_counter(transport, key, target, timeout=2.0):
+    """Wait for a worker counter to reach `target`; return its value."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        v = transport.counters[key]
+        if v >= target:
+            return v
+        await asyncio.sleep(0.01)
+    return transport.counters[key]
+
+
+@pytest.mark.asyncio
+async def test_wt_set_stream_priority_reaches_picoquic():
+    """picoquic accepts a priority set on an open WT stream.
+
+    The WT priority handler is dispatched ahead of the raw stale-cnx
+    guard, so raw-side counting covers none of it; this is the only
+    coverage that path has.
+    """
+    port = next_port()
+
+    async def handler(session):
+        pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            sid = await wt.create_stream(bidir=True)
+            wt.send_stream_data(sid, b"hello", end_stream=False)
+            tx = wt._transport
+            before = tx.counters['set_priority_applied']
+
+            assert wt.set_stream_priority(sid, 2) == 0
+            assert await _wait_counter(
+                tx, 'set_priority_applied', before + 1) == before + 1
+            assert tx.counters['set_priority_rejected'] == 0
+
+            # Still usable: re-prioritising mid-stream is the point.
+            assert wt.set_stream_priority(sid, 200) == 0
+            assert await _wait_counter(
+                tx, 'set_priority_applied', before + 2) == before + 2
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_set_stream_priority_on_closed_session_raises():
+    """A closed session raises rather than reporting a posted priority.
+
+    Matches send_datagram_frame; stop_stream is a silent no-op instead.
+    Note leaving the context manager does not itself mark the session
+    closed — both guards key on _session_closed.
+    """
+    port = next_port()
+
+    async def handler(session):
+        pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            sid = await wt.create_stream(bidir=True)
+            assert wt.set_stream_priority(sid, 2) == 0
+            wt._session_closed.set()
+            with pytest.raises(ConnectionError):
+                wt.set_stream_priority(sid, 2)
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_does_not_leak_entries_across_sessions():
+    """Serving then closing must retire the dispatcher entry.
+
+    The registry keys on (id(loop), id(transport)) and id() is unique
+    only among live objects, so a retained entry keeps a dead pair
+    addressable by a later one that lands on the same addresses.
+    """
+    from aiopquic.asyncio.webtransport import _get_dispatcher_registry
+
+    reg = _get_dispatcher_registry()
+    baseline = len(reg._dispatchers)
+
+    async def handler(session):
+        pass
+
+    for _ in range(3):
+        port = next_port()
+        server = await serve_webtransport(
+            "127.0.0.1", port, "/wt",
+            handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+        try:
+            async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+                assert wt.session_ready
+        finally:
+            server.close()
+
+    assert len(reg._dispatchers) == baseline, (
+        f"registry grew from {baseline} to {len(reg._dispatchers)} "
+        f"over 3 serve/close cycles")
+
+
+@pytest.mark.asyncio
+async def test_wt_close_resets_streams_with_session_gone():
+    """The peer sees WT_SESSION_GONE on this session's streams.
+
+    draft-ietf-webtrans-http3 §6: on termination the endpoint MUST reset
+    the send side and abort reading on the receive side of every stream in
+    the session, using WT_SESSION_GONE — so the peer can tell session
+    teardown from an ordinary stream reset. picowt_deregister unlinks the
+    streams but sends nothing; the code is WebTransport-layer.
+    """
+    from aiopquic.asyncio.webtransport import WT_SESSION_GONE
+
+    port = next_port()
+    reset_codes = []
+    saw_stream = asyncio.get_event_loop().create_future()
+
+    async def handler(session):
+        async def _watch():
+            async for ev in session.events():
+                if isinstance(ev, WebTransportNewStream):
+                    if not saw_stream.done():
+                        saw_stream.set_result(ev.stream_id)
+                    asyncio.create_task(_watch_stream(session, ev.stream_id))
+
+        async def _watch_stream(session, sid):
+            async for sev in session.receive_stream_data(sid):
+                if isinstance(sev, WebTransportStreamReset):
+                    reset_codes.append(sev.error_code)
+                    return
+        asyncio.create_task(_watch())
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            sid = await wt.create_stream(bidir=True)
+            wt.send_stream_data(sid, b"hello", end_stream=False)
+            await asyncio.wait_for(saw_stream, timeout=5.0)
+        # Leaving the context closes the session; the reset rides out with it.
+        for _ in range(200):
+            if reset_codes:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        server.close()
+
+    assert reset_codes, "peer saw no stream reset after session close"
+    assert reset_codes[0] == WT_SESSION_GONE, (
+        f"expected WT_SESSION_GONE ({WT_SESSION_GONE:#x}), "
+        f"got {reset_codes[0]:#x}")
+
+
+
+def _run_close_scenario(mode, **env):
+    import subprocess
+    import sys
+    script = os.path.join(os.path.dirname(__file__), "wt_close_scenarios.py")
+    return subprocess.run(
+        [sys.executable, script, mode, str(next_port()), CERT_FILE, KEY_FILE],
+        env=dict(os.environ, **env),
+        capture_output=True, text=True, timeout=180)
+
+
+def test_wt_close_credits_unsent_bytes():
+    """Bytes queued unsent when a session closes are credited at close.
+
+    The process-wide queued total gates stream creation on every
+    connection in the process, so it cannot wait for the stream's final
+    free, which follows the stream's LINK_RELEASE being drained. Runs in a
+    fresh process so the total starts at zero.
+    """
+    proc = _run_close_scenario("unsent")
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\n{proc.stderr[-3000:]}")
+
+
+def test_wt_close_while_receiving_survives_poisoned_frees():
+    """Closing a session while the peer sends must not touch freed memory.
+
+    A stream's link and sc must outlive the data events still queued for
+    it, or drain_rx copies out of a freed ring. MALLOC_PERTURB_ poisons
+    freed memory so such a read faults instead of returning stale bytes.
+    """
+    proc = _run_close_scenario("receive", MALLOC_PERTURB_="165")
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\n{proc.stderr[-3000:]}")

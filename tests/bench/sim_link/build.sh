@@ -37,19 +37,27 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 
 CC=${CC:-cc}
-${CC} -O3 -DNDEBUG ${EXTRA_CFLAGS} \
-    -I"${PQ}/picoquic" -I"${PQ}/picoquictest" -I"${PQ}/picohttp" \
-    -I"${PQ}/loglib" -I"${PT}/include" \
-    "${SCRIPT_DIR}/sim_link_bench.c" \
-    "${PQ}/build/libpicoquic-test.a" \
-    "${PQ}/build/libpicohttp-core.a" \
-    "${PQ}/build/libpicoquic-log.a" \
-    "${PQ}/build/libpicoquic-core.a" \
-    "${PQ}/build/picotls-build/libpicotls-openssl.a" \
-    "${PQ}/build/picotls-build/libpicotls-minicrypto.a" \
-    "${PQ}/build/picotls-build/libpicotls-core.a" \
-    ${EXTRA_LDFLAGS} \
-    -lssl -lcrypto -lpthread -lm \
-    -o "${SCRIPT_DIR}/sim_link_bench"
 
-echo "built: ${SCRIPT_DIR}/sim_link_bench"
+build_one() {
+    local src="$1" out="$2"
+    ${CC} -O3 -DNDEBUG ${EXTRA_CFLAGS} \
+        -I"${PQ}/picoquic" -I"${PQ}/picoquictest" -I"${PQ}/picohttp" \
+        -I"${PQ}/loglib" -I"${PT}/include" \
+        "${src}" \
+        "${PQ}/build/libpicoquic-test.a" \
+        "${PQ}/build/libpicohttp-core.a" \
+        "${PQ}/build/libpicoquic-log.a" \
+        "${PQ}/build/libpicoquic-core.a" \
+        "${PQ}/build/picotls-build/libpicotls-openssl.a" \
+        "${PQ}/build/picotls-build/libpicotls-minicrypto.a" \
+        $([ -f "${PQ}/build/picotls-build/libpicotls-fusion.a" ] && \
+            echo "${PQ}/build/picotls-build/libpicotls-fusion.a") \
+        "${PQ}/build/picotls-build/libpicotls-core.a" \
+        ${EXTRA_LDFLAGS} \
+        -lssl -lcrypto -lpthread -lm \
+        -o "${out}"
+    echo "built: ${out}"
+}
+
+build_one "${SCRIPT_DIR}/sim_link_bench.c"    "${SCRIPT_DIR}/sim_link_bench"
+build_one "${SCRIPT_DIR}/sim_link_priority.c" "${SCRIPT_DIR}/sim_link_priority"
