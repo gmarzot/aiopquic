@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix: stopping a transport on macOS took up to 10 s. picoquic closed its
+  wake-up pipe to end the network loop, which does not interrupt `select()`;
+  a picoquic patch now wakes the thread before joining it.
 - Fix: a WebTransport session's TX budget (`tx_max_queued_bytes`) applies to
   that session. It was checked against the process-wide queued total, so a peer
   that vanished with bytes queued stalled stream creation on every session in
