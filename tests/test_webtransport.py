@@ -486,7 +486,6 @@ async def test_wt_close_resets_streams_with_session_gone():
         f"got {reset_codes[0]:#x}")
 
 
-
 def _run_close_scenario(mode, **env):
     import subprocess
     import sys
@@ -518,5 +517,15 @@ def test_wt_close_while_receiving_survives_poisoned_frees():
     freed memory so such a read faults instead of returning stale bytes.
     """
     proc = _run_close_scenario("receive", MALLOC_PERTURB_="165")
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\n{proc.stderr[-3000:]}")
+
+
+def test_vanished_peer_does_not_stall_other_sessions():
+    """A peer that vanishes without closing leaves its bytes queued until
+    its connection times out. The server must still open streams to other
+    peers: the TX budget is per connection, not per process.
+    """
+    proc = _run_close_scenario("starve")
     assert proc.returncode == 0, (
         f"exit {proc.returncode}\n{proc.stderr[-3000:]}")

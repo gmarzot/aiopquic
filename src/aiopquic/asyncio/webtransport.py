@@ -221,22 +221,21 @@ class WebTransportSession:
     stream_ring_cap: int = 4 * 1024 * 1024
 
     async def _await_tx_data_capacity(self) -> None:
-        """Park while aggregate TX-queued bytes exceed the budget.
+        """Park while this session's TX-queued bytes exceed the budget.
 
-        The green-light is connection-drain capacity (any stream's
-        drain frees budget), not any single stream's state — one
-        wedged stream costs at most its own queued bytes against the
-        budget and can never stall the gate by itself. Hysteresis:
-        park above cap, resume below cap/2. 2 ms poll on three
-        relaxed atomic loads; the producer is far ahead of the wire
-        whenever this engages, so poll granularity is immaterial.
-        Session close exits the park (queued also drains to the
-        discarded sink as streams tear down)."""
+        The budget is per session, so a stalled or vanished peer parks
+        only its own session. The green-light is drain capacity (any of
+        this session's streams draining frees budget), not any single
+        stream's state. The process-wide total, one load, gates the
+        per-stream sum. Hysteresis: park above cap, resume below cap/2;
+        a 2 ms poll, since the producer is far ahead of the wire
+        whenever this engages. Session close exits the park."""
         cap = self.tx_max_queued_bytes
-        if not cap or tx_data_bytes_queued() <= cap:
+        if (not cap or tx_data_bytes_queued() <= cap
+                or self._tx_backlog() <= cap):
             return
         low = cap // 2
-        while not self.session_closed and tx_data_bytes_queued() > low:
+        while not self.session_closed and self._tx_backlog() > low:
             await asyncio.sleep(0.002)
 
     async def create_stream(self, bidir: bool = True,
@@ -335,6 +334,11 @@ class WebTransportSession:
         if not sc_ptr:
             return 0
         return self._transport.tx_data_ring_used(sc_ptr)
+
+    def _tx_backlog(self) -> int:
+        """Bytes queued in this session's stream rings, not yet pulled."""
+        return sum(self._transport.tx_data_ring_used(sc_ptr)
+                   for sc_ptr in list(self._stream_tx_ctxs.values()))
 
     def set_tx_data_drain_pending(self, stream_id: int) -> None:
         """Arm the per-stream sc->tx_drain_pending flag so the next

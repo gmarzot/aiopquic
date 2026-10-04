@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix: a WebTransport session's TX budget (`tx_max_queued_bytes`) applies to
+  that session. It was checked against the process-wide queued total, so a peer
+  that vanished with bytes queued stalled stream creation on every session in
+  the process until its connection timed out.
 - Fix: closing a WebTransport session while data was arriving could crash.
   The session-cleanup walk freed each stream's context while data events still
   queued for it held a pointer to it; the free now waits for those events, and
