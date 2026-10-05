@@ -7,7 +7,7 @@ Cross-stack tests against independent QUIC implementations.
 | stack    | language | install                         | runs in CI? | role                                      |
 |----------|----------|---------------------------------|-------------|-------------------------------------------|
 | qh3      | Python   | `pip install qh3` (transitive)  | **yes**     | basic byte-conservation smoke (1MB/10MB) |
-| aioquic  | Python   | `pip install aioquic`           | **yes**     | reference asyncio QUIC cross-check        |
+| aioquic  | Python   | `pip install aioquic`           | **yes**     | reference asyncio QUIC cross-check; strict WebTransport peer |
 
 CI runs the pure-Python qh3 and aioquic tests by default — they need no extra
 binaries; they're an optional developer-machine harness, not a release gate.
@@ -35,10 +35,12 @@ clear reason.
 | target  | test pattern                        | what it stresses                |
 |---------|-------------------------------------|---------------------------------|
 | qh3     | 1 stream × 1MB / 10MB transfer      | TX byte-conservation correctness|
+| aioquic | stream transfers, both directions   | byte conservation               |
+| aioquic WebTransport | session close; `reset_stream` | §6 teardown frames in each stream's direction; RESET_STREAM when reset_stream_at is not negotiated |
 
 ## Pass criteria
 
-Every test verifies:
+Every transfer test verifies:
 
 1. **Handshake completes** within 5s.
 2. **Byte conservation** per stream — bytes received == bytes sent.
@@ -47,3 +49,7 @@ Every test verifies:
 
 Throughput floors are loose (>50 Mbps) — these are correctness tests, not
 benchmarks. Performance regression tests live in `tests/bench/`.
+
+The WebTransport tests (`test_aioquic_wt.py`) check the peer's view instead:
+it never closes the connection during our teardown, and a reset arrives with
+its code.

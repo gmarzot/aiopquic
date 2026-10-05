@@ -304,6 +304,7 @@ cdef extern from "c/callback.h":
         uint64_t worker_set_priority_rejected
         uint64_t worker_set_priority_last_err
         uint64_t cnt_tx_event_dropped_dead_cnx
+        uint64_t cnt_tx_wrong_direction_dropped
         uint64_t last_tx_event_ring_arm_ns
         uint64_t last_tx_event_ring_fire_ns
         uint64_t cnt_fc_credit_pushed
@@ -1083,6 +1084,8 @@ cdef class TransportContext:
             Ring drain alone cannot tell these from a dead-cnx drop
           tx_event_dropped_dead_cnx > 0: events whose cnx was freed between
             push and pop — silently discarded, every event type
+          tx_wrong_direction_dropped > 0: RESET_STREAM / STOP_SENDING requested
+            on a stream without that direction; dropped
           tx_event_ring_fire_dropped > 0: rx_event_ring full at fire time (re-arm path)
           wake_calls vs wake_skipped_coalesced: wake-coalescing efficiency
           prepare_to_send_calls vs prepare_to_send_pulled_bytes: worker
@@ -1108,6 +1111,7 @@ cdef class TransportContext:
             'set_priority_rejected': self._ctx.worker_set_priority_rejected,
             'set_priority_last_err': self._ctx.worker_set_priority_last_err,
             'tx_event_dropped_dead_cnx': self._ctx.cnt_tx_event_dropped_dead_cnx,
+            'tx_wrong_direction_dropped': self._ctx.cnt_tx_wrong_direction_dropped,
             'rx_event_drops': self._ctx.worker_rx_event_drops,
             'rx_event_drops_stream_data': self._ctx.worker_rx_event_drops_stream_data,
             'rx_data_event_coalesced': self._ctx.cnt_rx_data_event_coalesced,
@@ -3340,12 +3344,14 @@ cdef class WebTransportSessionState:
         self._transport.wake_up()
 
     def push_session_cleanup(self):
-        """Bulk-free this session's per-stream wt_link sc's via the
-        worker-thread splay-tree walk. Single SPSC slot vs N RESETs;
-        bypasses the wire path so it works under cwin-pinned / stalled
-        cnx conditions where per-sid RESETs can't be transmitted.
+        """Terminate this session's streams in one worker-thread
+        splay-tree walk: §6 RESET_STREAM / STOP_SENDING (WT_SESSION_GONE)
+        in each stream's own direction, then release the per-stream
+        wt_link sc's. One SPSC slot regardless of stream count; the link
+        release does not wait on the wire, so it completes on a stalled
+        cnx.
 
-        Idempotent: subsequent calls find empty splay tree, no-op.
+        Idempotent: a later walk skips streams already released.
         Does NOT tear down the session itself — __dealloc__ still
         pushes TX_WT_DEREGISTER for the full close + free."""
         cdef spsc_entry_t entry

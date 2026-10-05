@@ -16,15 +16,30 @@ at zero, and a fault kills only the child.
         A peer vanishes without closing while the server holds more than
         the TX budget queued for it. Exits 0 when the server still opens
         a stream to a second peer.
+
+    python tests/wt_close_scenarios.py directions PORT CERT KEY
+        Each end holds an open uni and bidi stream; the client closes the
+        session, then the server closes a second one. From both ends'
+        qlogs: the closing end sent WT_SESSION_GONE frames, RESET_STREAM_AT
+        on the streams it opened (WT §4.4; both ends negotiate
+        reset_stream_at) and STOP_SENDING on those it receives on, and no
+        end sent STOP_SENDING on a stream it only sends on or a reset on one
+        it only receives on. Exits 0 when both hold.
 """
 import asyncio
+import glob
+import json
+import os
+import re
 import sys
+import tempfile
 import time
 
 from aiopquic._binding._transport import TransportContext
 from aiopquic.asyncio.webtransport import (
-    connect_webtransport, serve_webtransport,
+    WT_SESSION_GONE, connect_webtransport, serve_webtransport,
 )
+from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.events import (
     WebTransportNewStream, WebTransportStreamDataReceived,
 )
@@ -192,7 +207,141 @@ async def _receive_new_stream(wt):
             return
 
 
+def _frames_sent(path):
+    """(frame_type, stream_id, error_code) of every RESET_STREAM,
+    RESET_STREAM_AT and STOP_SENDING one endpoint sent."""
+    with open(path) as f:
+        text = f.read()
+    # picoquic writes this transport parameter without its opening brace.
+    text = re.sub(r'"version_negotiation": ("chosen": [^}]*})',
+                  r'"version_negotiation": {\1', text)
+    out = []
+    for _t, _cat, name, data in json.loads(text)["traces"][0]["events"]:
+        if name != "packet_sent":
+            continue
+        for fr in data.get("frames", []):
+            if fr.get("frame_type") in (
+                    "reset_stream", "reset_stream_at", "stop_sending"):
+                out.append((fr["frame_type"], fr["stream_id"], fr["error_code"]))
+    return out
+
+
+def _wrong_direction(frames, is_client):
+    """Frames the peer must answer with STREAM_STATE_ERROR: STOP_SENDING
+    on our own uni stream (RFC 9000 §19.5), RESET_STREAM on the peer's
+    (§19.4)."""
+    bad = []
+    for ftype, sid, code in frames:
+        if (sid & 2) == 0:
+            continue
+        own = ((sid & 1) == 0) == is_client
+        if (ftype == "stop_sending") == own:
+            bad.append((ftype, sid, code))
+    return bad
+
+
+async def _hold_streams(session, sids):
+    sids["uni"] = await session.create_stream(bidir=False)
+    session.send_stream_data(sids["uni"], b"u" * 1000)
+    sids["bidi"] = await session.create_stream(bidir=True)
+    session.send_stream_data(sids["bidi"], b"b" * 100)
+
+
+async def _count_data(session, seen):
+    async def one(sid):
+        async for ev in session.receive_stream_data(sid):
+            if isinstance(ev, WebTransportStreamDataReceived) and len(ev.data):
+                seen.add(sid)
+
+    async for ev in session.events():
+        if isinstance(ev, WebTransportNewStream):
+            asyncio.create_task(one(ev.stream_id))
+
+
+async def _until(cond, what):
+    for _ in range(500):
+        if cond():
+            return
+        await asyncio.sleep(0.01)
+    sys.exit(f"timed out waiting for {what}")
+
+
+async def directions(port, cert, key):
+    runs = []
+    with tempfile.TemporaryDirectory() as root:
+        sdir = os.path.join(root, "server-qlog")
+        os.makedirs(sdir)
+        srv = {}
+
+        async def handler(session):
+            srv.update(session=session, seen=set(), sids={})
+            asyncio.create_task(_count_data(session, srv["seen"]))
+            await _hold_streams(session, srv["sids"])
+
+        server = await serve_webtransport(
+            "127.0.0.1", port, "/wt", handler=handler,
+            cert_file=cert, key_file=key,
+            configuration=QuicConfiguration(is_client=False, qlog_dir=sdir))
+        try:
+            for closer in ("client", "server"):
+                cdir = os.path.join(root, f"{closer}-close")
+                os.makedirs(cdir)
+                srv.clear()
+                seen, sids = set(), {}
+                async with connect_webtransport(
+                        "127.0.0.1", port, "/wt",
+                        configuration=QuicConfiguration(qlog_dir=cdir)) as wt:
+                    asyncio.create_task(_count_data(wt, seen))
+                    await _hold_streams(wt, sids)
+                    await _until(lambda: len(srv.get("sids", ())) == 2
+                                 and len(srv["seen"]) == 2 and len(seen) == 2,
+                                 "data on all four streams")
+                    if closer == "client":
+                        wt.close()
+                    else:
+                        srv["session"].close()
+                        await wt.wait_closed(timeout=5.0)
+                    # Loopback: the teardown packet leaves well within this.
+                    await asyncio.sleep(0.3)
+                [cpath] = glob.glob(os.path.join(cdir, "*.client.qlog"))
+                cid = os.path.basename(cpath).split(".")[0]
+                c_uni, s_uni = sids["uni"], srv["sids"]["uni"]
+                c_bidi, s_bidi = sids["bidi"], srv["sids"]["bidi"]
+                # The §6 frames each end must have sent; without them the
+                # direction check below would pass vacuously.
+                if closer == "client":
+                    need = [("client", "reset_stream_at", c_uni),
+                            ("client", "stop_sending", s_uni),
+                            ("client", "reset_stream_at", c_bidi),
+                            ("client", "stop_sending", c_bidi)]
+                else:
+                    need = [("server", "reset_stream_at", s_uni),
+                            ("server", "stop_sending", c_uni),
+                            ("server", "reset_stream_at", s_bidi),
+                            ("server", "stop_sending", s_bidi),
+                            ("client", "reset_stream_at", c_uni)]
+                runs.append((closer, cpath,
+                             os.path.join(sdir, f"{cid}.server.qlog"), need))
+        finally:
+            # The server's qlog of each connection is complete only now.
+            server.close()
+
+        errors = []
+        for closer, cpath, spath, need in runs:
+            sent = {"client": _frames_sent(cpath), "server": _frames_sent(spath)}
+            for role, ftype, sid in need:
+                if (ftype, sid, WT_SESSION_GONE) not in sent[role]:
+                    errors.append(f"{closer} close: {role} sent no WT_SESSION_GONE "
+                                  f"{ftype} on {sid}; sent {sent[role]}")
+            for role in ("client", "server"):
+                bad = _wrong_direction(sent[role], role == "client")
+                if bad:
+                    errors.append(f"{closer} close: {role} sent {bad}")
+    if errors:
+        sys.exit("\n".join(errors))
+
+
 if __name__ == "__main__":
     mode, port, cert, key = sys.argv[1:5]
-    asyncio.run({"receive": receive, "unsent": unsent, "starve": starve}[mode](
-        int(port), cert, key))
+    asyncio.run({"receive": receive, "unsent": unsent, "starve": starve,
+                 "directions": directions}[mode](int(port), cert, key))

@@ -483,10 +483,19 @@ class WebTransportSession:
                     return
 
     def reset_stream(self, stream_id: int, error_code: int = 0) -> None:
+        """Reset a WT stream we send on. A stream we opened is reset with
+        RESET_STREAM_AT once reset_stream_at is negotiated and its header is
+        sent, else with RESET_STREAM. Unsent bytes stop counting against the
+        TX budget, and later or parked writes on the stream raise
+        WebTransportError. On a stream we only receive on, the request is
+        dropped and counted in tx_wrong_direction_dropped."""
         self._state.push_reset_stream(stream_id, error_code)
+        self._drop_stream_tx(stream_id)
 
     def stop_stream(self, stream_id: int, error_code: int = 0) -> None:
-        """Send STOP_SENDING on a WT stream (peer should reset)."""
+        """Send STOP_SENDING on a WT stream we receive on (the peer should
+        reset it). On our own uni stream, the request is dropped and
+        counted in tx_wrong_direction_dropped."""
         self._state.push_stop_sending(stream_id, error_code)
 
     def set_stream_priority(self, stream_id: int, priority: int) -> int:
@@ -590,12 +599,9 @@ class WebTransportSession:
             # session struct is freed.
             self._transport.dgram_ring_release(self._dgram_ring)
             self._dgram_ring = 0
-        # Bulk-free this session's wt_link sc's via a single
-        # worker-thread splay-tree walk (TX_WT_SESSION_CLEANUP).
-        # Worker-local; no wire frames, so it succeeds even when the cnx
-        # is stalled (cwin pinned post-disconnect, BBR #2118, etc.) and
-        # per-sid RESETs can't be transmitted. O(1) ring cost — does not
-        # depend on stream count.
+        # One worker-thread walk (TX_WT_SESSION_CLEANUP) sends the §6
+        # resets and stop-sendings and releases the session's wt_link
+        # sc's; the release does not wait on the wire. O(1) ring cost.
         try:
             self._state.push_session_cleanup()
         except (BufferError, ConnectionError):
@@ -795,9 +801,11 @@ class WebTransportSession:
             # into the cleared _stream_tx_ctxs and a NewStream event
             # delivered to an application that no longer has a session.
             if self._session_closed.is_set():
+                # The cleanup walk is idempotent: it ends the late stream
+                # in its own direction and releases its link.
                 if sc_ptr and sid:
                     try:
-                        self._state.push_reset_stream(sid, WT_SESSION_GONE)
+                        self._state.push_session_cleanup()
                     except BufferError:
                         pass
                 return

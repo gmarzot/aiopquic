@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Fix: a reset of a WebTransport stream we opened reaches peers that did not
+  negotiate reset_stream_at (mvfst/moqx, quinn, aioquic). picowt's
+  RESET_STREAM_AT was refused there and nothing was sent; it now falls back to
+  RESET_STREAM. A reset stream's unsent bytes no longer count against the
+  session's TX budget, and later or parked writes on it raise
+  `WebTransportError`.
+- Fix: STOP_SENDING is no longer sent on a stream we only send on, such as our
+  own uni stream; peers close the connection on it (RFC 9000 §19.5). Such a
+  request is dropped and counted in `tx_wrong_direction_dropped`, as is a
+  RESET_STREAM request on a stream we only receive on, which picoquic already
+  refused.
 - Fix: stopping a transport on macOS took up to 10 s. picoquic closed its
   wake-up pipe to end the network loop, which does not interrupt `select()`;
   a picoquic patch now wakes the thread before joining it.
@@ -52,11 +63,13 @@
 - WebTransport session teardown now follows draft-ietf-webtrans-http3 §6. A
   session is terminated once a WT_CLOSE_SESSION capsule is sent *or* received,
   so a close we initiate records the state and runs the same reclaim an inbound
-  one does, and resets the session's streams with WT_SESSION_GONE. Previously a
-  self-initiated close left `wait_closed()` unable to complete (2 s per context
-  exit), left §6's "MUST NOT send new datagrams or open new streams" guards
-  inert, and skipped the reclaim entirely — which left Cython chunks holding
-  raw pointers to stream contexts the transport teardown had already freed.
+  one does. It resets each stream we send on (RESET_STREAM_AT on streams we
+  opened, where negotiated, §4.4) and stops each stream we receive on, with
+  WT_SESSION_GONE, including streams that arrive after the close. Previously a self-initiated close left
+  `wait_closed()` unable to complete (2 s per context exit), left §6's "MUST
+  NOT send new datagrams or open new streams" guards inert, and skipped the
+  reclaim entirely — which left Cython chunks holding raw pointers to stream
+  contexts the transport teardown had already freed.
 - Fix: a WebTransport session no longer dereferences a cleared transport in
   `__dealloc__`. Cython does not None-check a typed cdef reference, so once
   `tp_clear` dropped it — on a GC cycle break or at interpreter shutdown — the

@@ -1018,7 +1018,9 @@ class QuicConnection:
         return stream_id
 
     def reset_stream(self, stream_id: int, error_code: int) -> None:
-        """Reset a stream with the given error code."""
+        """Reset a stream with the given error code. On a stream we only
+        receive on, the request is dropped and counted in
+        tx_wrong_direction_dropped."""
         self._transport.push_tx_event(
             _TX_STREAM_RESET, stream_id,
             error_code=error_code, cnx_ptr=self._cnx_ptr,
@@ -1026,7 +1028,8 @@ class QuicConnection:
         self._transport.wake_up()
 
     def stop_stream(self, stream_id: int, error_code: int) -> None:
-        """Send STOP_SENDING on a stream."""
+        """Send STOP_SENDING on a stream. On a stream we only send on, the
+        request is dropped and counted in tx_wrong_direction_dropped."""
         self._transport.push_tx_event(
             _TX_STOP_SENDING, stream_id,
             error_code=error_code, cnx_ptr=self._cnx_ptr,

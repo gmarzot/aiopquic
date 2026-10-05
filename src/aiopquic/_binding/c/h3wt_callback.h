@@ -1066,6 +1066,34 @@ static int aiopquic_wt_server_path_callback(
     return 0;
 }
 
+/* WT §4.4: reset a WebTransport data stream with RESET_STREAM_AT so its
+ * header, which names the session, still arrives. picowt does that for a
+ * stream we opened; picoquic refuses it unless reset_stream_at was
+ * negotiated and the header has been sent, and RESET_STREAM is then the
+ * only reset. The caller checks that the stream has a send side.
+ * Returns 0 when the stream is reset. */
+static int aiopquic_wt_reset_stream(picoquic_cnx_t* cnx,
+                                    h3zero_stream_ctx_t* st, uint64_t code) {
+    if (picowt_reset_stream(cnx, st, code) == 0) {
+        return 0;
+    }
+    return picoquic_reset_stream(cnx, st->stream_id, code);
+}
+
+/* picoquic sends nothing more on a reset stream: release what is still
+ * queued in its ring, crediting the TX totals. */
+static void aiopquic_wt_abandon_stream_tx(aiopquic_wt_session_t* s,
+                                          h3zero_stream_ctx_t* st) {
+    if (st->path_callback_ctx != NULL
+            && *(uint32_t*)st->path_callback_ctx == AIOPQUIC_WT_CTX_LINK) {
+        aiopquic_wt_stream_link_t* lk =
+            (aiopquic_wt_stream_link_t*)st->path_callback_ctx;
+        if (lk->session == s) {
+            aiopquic_stream_ctx_tx_abandon(lk->sc);
+        }
+    }
+}
+
 /*
  * WT TX-event dispatch — called from aiopquic_loop_cb in callback.h.
  * Returns 1 if event was a recognized WT command, 0 otherwise.
@@ -1223,8 +1251,15 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (!h3_ctx) return 1;
         h3zero_stream_ctx_t* st =
             h3zero_find_stream(h3_ctx, entry->stream_id);
-        if (st) {
-            picowt_reset_stream(s->cnx, st, entry->error_code);
+        /* Untracked: a retired stream, or one of h3zero's own control or
+         * QPACK streams; neither is ours to reset. */
+        if (!st) return 1;
+        if (!aiopquic_stream_can_send(s->cnx, entry->stream_id)) {
+            ctx->cnt_tx_wrong_direction_dropped++;
+            return 1;
+        }
+        if (aiopquic_wt_reset_stream(s->cnx, st, entry->error_code) == 0) {
+            aiopquic_wt_abandon_stream_tx(s, st);
         }
         return 1;
     }
@@ -1270,8 +1305,12 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
 
     case SPSC_EVT_TX_WT_STOP_SENDING: {
         if (!s || !s->cnx) return 1;
-        picoquic_stop_sending(s->cnx, entry->stream_id,
-                               entry->error_code);
+        if (aiopquic_stream_can_receive(s->cnx, entry->stream_id)) {
+            picoquic_stop_sending(s->cnx, entry->stream_id,
+                                   entry->error_code);
+        } else {
+            ctx->cnt_tx_wrong_direction_dropped++;
+        }
         return 1;
     }
 
@@ -1284,8 +1323,9 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
          *
          * One event covers N streams: the splay tree is the
          * authoritative per-session stream set, so this walk sends the
-         * §6 resets and releases the links in one SPSC slot rather than
-         * N. A stalled cnx may never flush the resets; queueing them
+         * §6 resets and stop-sendings, each only in a direction the
+         * stream has, and releases the links in one SPSC slot rather
+         * than N. A stalled cnx may never flush them; queueing them
          * costs nothing.
          *
          * Links go through LINK_RELEASE, never an inline destroy: data
@@ -1308,17 +1348,19 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                             (aiopquic_wt_stream_link_t*)
                                 st->path_callback_ctx;
                         if (lk->session == s) {
-                            /* §6: on termination the endpoint MUST reset
-                             * the send side and abort reading on the
-                             * receive side of every stream in the
-                             * session, with WT_SESSION_GONE.
-                             * picowt_deregister unlinks these streams but
-                             * sends nothing — the code is
-                             * WebTransport-layer, so it is ours. */
-                            picoquic_reset_stream(s->cnx, st->stream_id,
-                                                  AIOPQUIC_WT_SESSION_GONE);
-                            picoquic_stop_sending(s->cnx, st->stream_id,
-                                                  AIOPQUIC_WT_SESSION_GONE);
+                            /* §6: reset the send side and abort reading on
+                             * the receive side of every stream in the
+                             * session, with WT_SESSION_GONE; a uni stream
+                             * has only one side. picowt_deregister would
+                             * reset with code 0 and never stop reading. */
+                            if (aiopquic_stream_can_send(s->cnx, st->stream_id)) {
+                                (void)aiopquic_wt_reset_stream(
+                                    s->cnx, st, AIOPQUIC_WT_SESSION_GONE);
+                            }
+                            if (aiopquic_stream_can_receive(s->cnx, st->stream_id)) {
+                                picoquic_stop_sending(s->cnx, st->stream_id,
+                                                      AIOPQUIC_WT_SESSION_GONE);
+                            }
                             st->path_callback = NULL;
                             st->path_callback_ctx = NULL;
                             aiopquic_stream_ctx_tx_abandon(lk->sc);

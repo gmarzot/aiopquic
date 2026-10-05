@@ -9,11 +9,12 @@ import gc
 import os
 import pytest
 
+from aiopquic._binding._transport import tx_data_bytes_queued
 from aiopquic.asyncio.webtransport import (
-    connect_webtransport, serve_webtransport,
+    WebTransportError, connect_webtransport, serve_webtransport,
 )
 from aiopquic.quic.events import (
-    WebTransportStreamReset,
+    WebTransportStreamReset, WebTransportStopSending,
     WebTransportNewStream, WebTransportStreamDataReceived,
 )
 
@@ -452,8 +453,8 @@ async def test_wt_close_resets_streams_with_session_gone():
     draft-ietf-webtrans-http3 §6: on termination the endpoint MUST reset
     the send side and abort reading on the receive side of every stream in
     the session, using WT_SESSION_GONE — so the peer can tell session
-    teardown from an ordinary stream reset. picowt_deregister unlinks the
-    streams but sends nothing; the code is WebTransport-layer.
+    teardown from an ordinary stream reset. picowt_deregister would reset
+    with code 0 and never stop reading; WT_SESSION_GONE is ours to send.
     """
     from aiopquic.asyncio.webtransport import WT_SESSION_GONE
 
@@ -541,3 +542,202 @@ def test_vanished_peer_does_not_stall_other_sessions():
     proc = _run_close_scenario("starve")
     assert proc.returncode == 0, (
         f"exit {proc.returncode}\n{proc.stderr[-3000:]}")
+
+
+def test_wt_close_resets_and_stops_by_direction():
+    """§6 teardown frames go only where the stream has that direction.
+
+    STOP_SENDING on a stream we only send on (RFC 9000 §19.5), or
+    RESET_STREAM on one we only receive on (§19.4), is a connection error
+    at the peer. A picoquic peer ignores the first when the RESET just
+    before it already retired the stream, so the check reads both ends'
+    qlogs.
+    """
+    proc = _run_close_scenario("directions")
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\n{proc.stderr[-3000:]}")
+
+
+@pytest.mark.asyncio
+async def test_wt_stop_sending_on_own_uni_is_dropped():
+    """An app STOP_SENDING on our own uni stream is dropped and counted.
+
+    The stream is receive-only at the peer, where STOP_SENDING on it is a
+    connection error (RFC 9000 §19.5): a picoquic server closes the
+    connection, and the session with it.
+    """
+    port = next_port()
+    srv = {}
+    seen = set()
+    stops = []
+    both_seen = asyncio.Event()
+
+    async def handler(session):
+        srv["session"] = session
+
+        async def _read(sid):
+            async for ev in session.receive_stream_data(sid):
+                if isinstance(ev, WebTransportStreamDataReceived) and ev.data:
+                    seen.add(sid)
+                    if len(seen) == 2:
+                        both_seen.set()
+
+        async for ev in session.events():
+            if isinstance(ev, WebTransportNewStream):
+                asyncio.create_task(_read(ev.stream_id))
+            elif isinstance(ev, WebTransportStopSending):
+                stops.append((ev.stream_id, ev.error_code))
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            uni = await wt.create_stream(bidir=False)
+            wt.send_stream_data(uni, b"x" * 100)
+            bidi = await wt.create_stream(bidir=True)
+            wt.send_stream_data(bidi, b"y")
+            await asyncio.wait_for(both_seen.wait(), timeout=5.0)
+            before = wt._transport.counters.get(
+                'tx_wrong_direction_dropped', 0)
+
+            wt.stop_stream(uni, 0x10)
+            wt.stop_stream(bidi, 0x10)
+
+            try:
+                await srv["session"].wait_closed(timeout=0.5)
+                closed = True
+            except asyncio.TimeoutError:
+                closed = False
+            assert not closed, (
+                "peer closed the session: STOP_SENDING reached a stream "
+                "that is receive-only there")
+            dropped = wt._transport.counters.get(
+                'tx_wrong_direction_dropped', 0) - before
+            assert dropped == 1, f"expected 1 dropped request, got {dropped}"
+            # Ids only: a received STOP_SENDING's code is not exposed by
+            # picoquic's public API, so it surfaces as 0.
+            assert [sid for sid, _ in stops] == [bidi], (
+                f"peer saw STOP_SENDING {stops}, expected only bidi {bidi}")
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_reset_stream_by_direction():
+    """reset_stream reaches the peer on our own uni stream. On the peer's
+    uni stream, which has no send side here, it is dropped and counted."""
+    port = next_port()
+    srv = {}
+    resets = []
+    data_seen = asyncio.Event()
+    peer_uni = asyncio.get_event_loop().create_future()
+
+    async def handler(session):
+        srv["session"] = session
+        sid = await session.create_stream(bidir=False)
+        session.send_stream_data(sid, b"s" * 100)
+
+        async def _read(sid):
+            async for ev in session.receive_stream_data(sid):
+                if isinstance(ev, WebTransportStreamDataReceived) and ev.data:
+                    data_seen.set()
+                elif isinstance(ev, WebTransportStreamReset):
+                    resets.append((sid, ev.error_code))
+                    return
+
+        async for ev in session.events():
+            if isinstance(ev, WebTransportNewStream):
+                asyncio.create_task(_read(ev.stream_id))
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            async def _watch():
+                async for ev in wt.events():
+                    if (isinstance(ev, WebTransportNewStream)
+                            and not peer_uni.done()):
+                        peer_uni.set_result(ev.stream_id)
+            watcher = asyncio.create_task(_watch())
+
+            uni = await wt.create_stream(bidir=False)
+            wt.send_stream_data(uni, b"x" * 100)
+            await asyncio.wait_for(data_seen.wait(), timeout=5.0)
+            s_uni = await asyncio.wait_for(peer_uni, timeout=5.0)
+            before = wt._transport.counters.get(
+                'tx_wrong_direction_dropped', 0)
+
+            wt.reset_stream(uni, 0x10)
+            wt.reset_stream(s_uni, 0x10)
+
+            for _ in range(200):
+                if resets:
+                    break
+                await asyncio.sleep(0.01)
+            watcher.cancel()
+            assert resets == [(uni, 0x10)], f"peer saw resets {resets}"
+            dropped = wt._transport.counters.get(
+                'tx_wrong_direction_dropped', 0) - before
+            assert dropped == 1, f"expected 1 dropped request, got {dropped}"
+            assert not srv["session"].session_closed
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_reset_releases_queued_bytes():
+    """A reset stream sends nothing more, so its queued bytes must leave
+    the session's TX backlog and the process total. Otherwise they count
+    against the session's TX budget until the session closes."""
+    port = next_port()
+
+    async def handler(session):
+        async for _ in session.events():
+            pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            sid = await wt.create_stream(bidir=False)
+            wt.send_stream_data(sid, b"y" * 1000)
+            await asyncio.sleep(0.2)
+            # The peer vanishes: nothing more is acked, so the rest queues.
+            server.close()
+            for _ in range(64):
+                try:
+                    wt.send_stream_data(sid, b"x" * 65536)
+                except BufferError:
+                    break
+            await asyncio.sleep(0.3)
+            stranded = wt._tx_backlog()
+            assert stranded > 1 << 20, (
+                f"only {stranded} B queued; the test needs a backlog")
+            queued = tx_data_bytes_queued()
+            producer = asyncio.create_task(
+                wt.send_stream_data_drained(sid, b"z" * (1 << 20)))
+            await asyncio.sleep(0.1)
+            assert not producer.done(), "writer did not park on the full ring"
+
+            wt.reset_stream(sid, 0x10)
+
+            # The parked writer wakes, and later writes fail fast.
+            with pytest.raises(WebTransportError):
+                await asyncio.wait_for(producer, timeout=2.0)
+            with pytest.raises(WebTransportError):
+                wt.send_stream_data(sid, b"w")
+            for _ in range(200):
+                if (wt._tx_backlog() == 0
+                        and tx_data_bytes_queued() <= queued - stranded):
+                    break
+                await asyncio.sleep(0.01)
+            assert wt._tx_backlog() == 0, (
+                f"session backlog {wt._tx_backlog()} B after the reset")
+            assert tx_data_bytes_queued() <= queued - stranded, (
+                f"process total {tx_data_bytes_queued()} B, expected at most "
+                f"{queued - stranded} B")
+    finally:
+        server.close()

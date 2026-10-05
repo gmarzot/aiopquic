@@ -112,6 +112,28 @@ static inline int aiopquic_cnx_is_alive(picoquic_quic_t* quic,
     }
     return 0;
 }
+
+/* RFC 9000 §2.1: a unidirectional stream carries data only from its
+ * initiator. RESET_STREAM on a receive-only stream (§19.4) or
+ * STOP_SENDING on a send-only one (§19.5) is a connection error at the
+ * peer, so each is sent only on a stream that has that direction. */
+static inline int aiopquic_stream_is_local(picoquic_cnx_t* cnx,
+                                           uint64_t stream_id) {
+    return PICOQUIC_IS_CLIENT_STREAM_ID(stream_id)
+           == (unsigned int)(picoquic_is_client(cnx) != 0);
+}
+
+static inline int aiopquic_stream_can_send(picoquic_cnx_t* cnx,
+                                           uint64_t stream_id) {
+    return PICOQUIC_IS_BIDIR_STREAM_ID(stream_id)
+           || aiopquic_stream_is_local(cnx, stream_id);
+}
+
+static inline int aiopquic_stream_can_receive(picoquic_cnx_t* cnx,
+                                              uint64_t stream_id) {
+    return PICOQUIC_IS_BIDIR_STREAM_ID(stream_id)
+           || !aiopquic_stream_is_local(cnx, stream_id);
+}
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -350,6 +372,10 @@ typedef struct {
     /* TX events discarded because their cnx was freed between push
      * and pop. Covers every event type behind the stale-cnx guard. */
     uint64_t        cnt_tx_event_dropped_dead_cnx;
+    /* App RESET_STREAM / STOP_SENDING requests dropped because the
+     * stream has no such direction (aiopquic_stream_can_send /
+     * aiopquic_stream_can_receive). */
+    uint64_t        cnt_tx_wrong_direction_dropped;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -1449,13 +1475,21 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     }
                     case SPSC_EVT_TX_STREAM_RESET: {
-                        picoquic_reset_stream(cnx, entry->stream_id, entry->error_code);
+                        if (aiopquic_stream_can_send(cnx, entry->stream_id)) {
+                            picoquic_reset_stream(cnx, entry->stream_id, entry->error_code);
+                        } else {
+                            ctx->cnt_tx_wrong_direction_dropped++;
+                        }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;
                     }
                     case SPSC_EVT_TX_STOP_SENDING: {
-                        picoquic_stop_sending(cnx, entry->stream_id, entry->error_code);
+                        if (aiopquic_stream_can_receive(cnx, entry->stream_id)) {
+                            picoquic_stop_sending(cnx, entry->stream_id, entry->error_code);
+                        } else {
+                            ctx->cnt_tx_wrong_direction_dropped++;
+                        }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;
