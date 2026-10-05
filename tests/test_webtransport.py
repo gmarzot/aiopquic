@@ -5,6 +5,7 @@ Exercises CONNECT, bidi/uni stream creation, bidi data round-trip
 uni stream data, FIN, RESET, and graceful close.
 """
 import asyncio
+import gc
 import os
 import pytest
 
@@ -39,13 +40,18 @@ async def _drain_stream(session, stream_id, *, want=None, timeout=5.0):
     """Collect bytes from stream_id until FIN or `want` bytes received."""
     got = bytearray()
     async def _collect():
-        async for ev in session.receive_stream_data(stream_id):
-            if isinstance(ev, WebTransportStreamDataReceived):
-                got.extend(ev.data)
-                if want is not None and len(got) >= want:
-                    return
-                if ev.end_stream:
-                    return
+        # A suspended reader keeps its last chunk, and with it the sc.
+        reader = session.receive_stream_data(stream_id)
+        try:
+            async for ev in reader:
+                if isinstance(ev, WebTransportStreamDataReceived):
+                    got.extend(ev.data)
+                    if want is not None and len(got) >= want:
+                        return
+                    if ev.end_stream:
+                        return
+        finally:
+            await reader.aclose()
     await asyncio.wait_for(_collect(), timeout=timeout)
     return bytes(got)
 
@@ -258,8 +264,9 @@ async def test_wt_sender_side_sc_returns_to_baseline_across_streams():
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
         async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
-            # Capture baseline AFTER session setup so control/CONNECT
-            # streams are already accounted for.
+            # Process-wide count, read after session setup. Collect earlier
+            # tests' garbage first: chunks and stopped transports hold sc refs.
+            gc.collect()
             baseline = wt._transport.counters['sc_alive_total']
 
             for _ in range(n_streams):
@@ -270,13 +277,18 @@ async def test_wt_sender_side_sc_returns_to_baseline_across_streams():
             # propagate and StreamChunks to dealloc.
             await asyncio.sleep(3.0)
 
-            final = wt._transport.counters['sc_alive_total']
+            gc.collect()
+            c = wt._transport.counters
+            assert (c['sc_create_wt_link'],
+                    c['sc_destroy_wt_link_callback_free']) == (
+                        n_streams, n_streams), f"counters: {c}"
+            final = c['sc_alive_total']
             delta = final - baseline
             assert delta == 0, (
                 f"sc_alive_total leaked across {n_streams} sender-side "
                 f"streams: baseline={baseline} final={final} "
                 f"(delta={delta})\n"
-                f"counters: {wt._transport.counters}")
+                f"counters: {c}")
     finally:
         server.close()
 
