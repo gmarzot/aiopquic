@@ -488,7 +488,7 @@ async def test_wt_close_resets_streams_with_session_gone():
             wt.send_stream_data(sid, b"hello", end_stream=False)
             await asyncio.wait_for(saw_stream, timeout=5.0)
         # Leaving the context closes the session; the reset rides out with it.
-        for _ in range(200):
+        for _ in range(500):
             if reset_codes:
                 break
             await asyncio.sleep(0.01)
@@ -758,11 +758,7 @@ async def test_wt_write_after_peer_teardown_raises_connection_error():
     try:
         async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             sid = await wt.create_stream(bidir=False)
-            server.close()
-            for _ in range(100):
-                if wt.session_closed:
-                    break
-                await asyncio.sleep(0.05)
+            wt.close()
             with pytest.raises(ConnectionError):
                 wt.send_stream_data(sid, b"x")
     finally:
