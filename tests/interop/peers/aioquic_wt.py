@@ -43,8 +43,8 @@ def emit(**fields):
 
 
 class _H3WithWtEnabled(H3Connection):
-    """Also advertises SETTINGS_WT_ENABLED (0x2c7cf000, draft-15+), which
-    makes a draft-15 client switch to the webtransport-h3 token."""
+    """Also advertises SETTINGS_WT_ENABLED (0x2c7cf000), which makes a
+    draft-ietf-webtrans-http3-16 client switch to the webtransport-h3 token."""
 
     def _get_local_settings(self):
         settings = super()._get_local_settings()
@@ -150,5 +150,5 @@ if __name__ == "__main__":
     p.add_argument("--strict-protocol", action="store_true",
                    help="400 unless :protocol is webtransport")
     p.add_argument("--wt-enabled-setting", action="store_true",
-                   help="advertise SETTINGS_WT_ENABLED (draft-15+)")
+                   help="advertise SETTINGS_WT_ENABLED (draft-16)")
     asyncio.run(main(p.parse_args()))

@@ -216,7 +216,7 @@ async def test_wt_late_peer_stream_after_close_is_stopped():
 
 async def test_wt_connect_protocol_token_is_webtransport():
     """The CONNECT's :protocol stays "webtransport" even when the server
-    advertises SETTINGS_WT_ENABLED, after which draft-15+ wants
+    advertises SETTINGS_WT_ENABLED, after which draft-16 wants
     "webtransport-h3": proxygen advertises the setting and refuses the new
     token with 400.
     """
