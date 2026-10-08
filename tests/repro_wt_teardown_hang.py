@@ -32,6 +32,7 @@ What is established:
 Full history in notes/release-plan-0.5.0-0.12.0-2026-09-24.md under A14.
 """
 import asyncio
+import faulthandler
 import os
 import sys
 
@@ -63,11 +64,15 @@ def rss_kb() -> int:
 
 def main() -> int:
     for name, fn in PHASES:
+        # A teardown that blocks the loop never reaches wait_for's timeout.
+        faulthandler.dump_traceback_later(60.0, exit=True)
         try:
             asyncio.run(asyncio.wait_for(fn(), timeout=45.0))
         except asyncio.TimeoutError:
             print(f"{name}: HUNG  rss={rss_kb()}kB")
             return 1
+        finally:
+            faulthandler.cancel_dump_traceback_later()
         print(f"{name}: ok  rss={rss_kb()}kB")
     print("all phases passed — not reproduced")
     return 0
