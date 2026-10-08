@@ -17,7 +17,9 @@ from aiopquic.asyncio.webtransport import connect_webtransport
 from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.events import StreamDataReceived
 
-from .conftest import counted_pad, _free_port
+from .conftest import counted_pad, _free_port, CA_FILE
+
+SNI = "test.example.com"  # the test certificate's name
 
 RAW_ALPN = "dual-raw"
 WT_PATH = "/dual"
@@ -77,7 +79,8 @@ async def _raw_roundtrip(port, payload=256 * 1024):
 
 
 async def _wt_session(port, wt_accepted):
-    async with connect_webtransport("127.0.0.1", port, WT_PATH):
+    async with connect_webtransport("127.0.0.1", port, WT_PATH,
+                                   sni=SNI, ca_file=CA_FILE):
         async with asyncio.timeout(10):
             await wt_accepted.wait()
 

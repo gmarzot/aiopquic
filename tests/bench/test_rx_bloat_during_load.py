@@ -39,6 +39,8 @@ CERTS_DIR = os.path.join(
 )
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 
 _port_counter = 38600
 
@@ -107,7 +109,8 @@ async def test_rx_bloat_during_load_quic():
         async with connect(
             "127.0.0.1", port,
             configuration=QuicConfiguration(
-                is_client=True, alpn_protocols=["hq-interop"]),
+                is_client=True, alpn_protocols=["hq-interop"],
+                server_name=SNI, cafile=CA_FILE),
             create_protocol=_StreamingClient,
         ) as cli:
             transport_ctx_box["ctx"] = cli._quic._transport
@@ -202,7 +205,7 @@ async def test_rx_bloat_during_load_wt():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             ctx = wt._transport
 
             async def _drain():

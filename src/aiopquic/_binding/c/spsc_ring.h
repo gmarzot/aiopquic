@@ -9,8 +9,8 @@
  * is responsible for freeing data_buf (or transferring ownership
  * elsewhere, as drain_rx does to StreamChunk).
  *
- * spsc_ring_destroy walks any unread entries and frees their data_buf
- * to avoid leaks on shutdown.
+ * spsc_ring_destroy walks any unread entries and frees the data_buf of
+ * those that own one (data_length > 0) to avoid leaks on shutdown.
  *
  * Copyright (c) 2026, aiopquic contributors. BSD-3-Clause license.
  */
@@ -135,9 +135,9 @@ typedef enum {
     SPSC_EVT_TX_WT_CREATE_STREAM = 137, /* picowt_create_local_stream(bidir flag in is_fin) */
     SPSC_EVT_TX_WT_CLOSE = 138,         /* picowt_send_close_session_message */
     SPSC_EVT_TX_WT_DRAIN = 139,         /* picowt_send_drain_session_message */
-    SPSC_EVT_TX_WT_RESET_STREAM = 140,  /* picowt_reset_stream */
+    SPSC_EVT_TX_WT_RESET_STREAM = 140,  /* picowt_reset_stream, else picoquic_reset_stream; send side only */
     SPSC_EVT_TX_WT_DEREGISTER = 141,    /* picowt_deregister + free wt_session */
-    SPSC_EVT_TX_WT_STOP_SENDING = 142,  /* picoquic_request_stop_sending on WT stream */
+    SPSC_EVT_TX_WT_STOP_SENDING = 142,  /* picoquic_stop_sending; receive side only */
 
     /* Flow-control dispatch (asyncio → picoquic worker). picoquic's
      * picoquic_open_flow_control / picoquic_set_app_flow_control APIs
@@ -148,13 +148,12 @@ typedef enum {
     SPSC_EVT_TX_OPEN_FLOW_CONTROL = 143,
     SPSC_EVT_TX_SET_APP_FLOW_CONTROL = 144,
 
-    /* WT session bulk-cleanup of per-stream wt_links — the splay-tree
-     * walk subset of TX_WT_DEREGISTER without the picowt_deregister +
-     * session_destroy steps. Used by SESSION_CLOSED handler to reap
-     * orphan wt_link sc's when the cnx is stalled (BBR freeze, cwin
-     * pinned post-disconnect, etc.) and per-sid RESETs can't get on
-     * the wire. The session object survives so the Python wrapper's
-     * __dealloc__ can later push TX_WT_DEREGISTER for full teardown. */
+    /* WT session termination walk: §6 resets / stop-sendings in each
+     * stream's own direction, then per-stream wt_link release, as in
+     * TX_WT_DEREGISTER's step 1. Pushed on local close, on SESSION_CLOSED,
+     * and when a peer stream arrives after the close. The session object
+     * survives so the Python wrapper's __dealloc__ can later push
+     * TX_WT_DEREGISTER for full teardown. */
     SPSC_EVT_TX_WT_SESSION_CLEANUP = 145,
 
     /* Pull-model datagram TX (asyncio → picoquic worker). Producer has
@@ -278,14 +277,16 @@ static inline spsc_ring_t* spsc_ring_create(uint32_t capacity) {
     return ring;
 }
 
-/* Destroy a ring buffer; frees any pending entries' data_buf. */
+/* Destroy a ring buffer; frees the data_buf of pending entries that own
+ * one. Borrowed pointers (data_length == 0) belong elsewhere, as in
+ * spsc_ring_pop. */
 static inline void spsc_ring_destroy(spsc_ring_t* ring) {
     if (!ring) return;
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
     uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
     while (head < tail) {
         spsc_entry_t* e = &ring->entries[head & ring->mask];
-        if (e->data_buf) {
+        if (e->data_buf && e->data_length > 0) {
             free(e->data_buf);
             e->data_buf = NULL;
         }

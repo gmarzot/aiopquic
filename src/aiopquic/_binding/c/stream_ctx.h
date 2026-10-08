@@ -390,6 +390,22 @@ static inline void aiopquic_stream_ctx_destroy(aiopquic_stream_ctx_t* sc) {
                                memory_order_relaxed);
 }
 
+/* Drop bytes queued in sc->tx that will never be sent (the stream was
+ * reset) and credit them as discarded now, so the process-wide queued
+ * total does not wait for the final free. Consumer side: worker only,
+ * after the stream's send callback is detached. Later pushes are
+ * credited by aiopquic_stream_ctx_destroy. */
+static inline void aiopquic_stream_ctx_tx_abandon(aiopquic_stream_ctx_t* sc) {
+    if (!sc || !sc->tx) return;
+    uint64_t tail = atomic_load_explicit(&sc->tx->tail, memory_order_acquire);
+    uint64_t head = atomic_load_explicit(&sc->tx->head, memory_order_relaxed);
+    if (tail > head) {
+        atomic_fetch_add_explicit(&aiopquic_cnt_tx_data_bytes_discarded,
+                                  tail - head, memory_order_relaxed);
+        atomic_store_explicit(&sc->tx->head, tail, memory_order_release);
+    }
+}
+
 /* Atomic accessors for cross-thread fields. Cython sees plain uint64_t
  * (no _Atomic in the .pyx cdef extern); call these from both Python and
  * C sides for proper memory ordering. */
@@ -501,6 +517,7 @@ static inline int aiopquic_stream_ctx_send_data(
         sc->tx = aiopquic_stream_buf_create(capacity);
         if (!sc->tx) return -1;
     }
+    if (len > sc->tx->capacity) return -2;  /* can never fit */
     if (len > 0) {
         /* All-or-nothing: pre-check free_bytes against full request,
          * then call push only when the whole request fits. push is

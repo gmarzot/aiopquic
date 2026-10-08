@@ -49,3 +49,4 @@ src/aiopquic/_build_info.py
 # update_submodules.sh gate output
 .update_submodules_gate.log
 *_gate.log
+tests/bench/sim_link/sim_link_priority

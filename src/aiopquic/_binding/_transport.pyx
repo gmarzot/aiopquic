@@ -300,6 +300,11 @@ cdef extern from "c/callback.h":
         uint64_t cnt_wake_calls
         uint64_t cnt_wake_skipped_coalesced
         uint64_t cnt_prepare_to_send_empty
+        uint64_t worker_set_priority_applied
+        uint64_t worker_set_priority_rejected
+        uint64_t worker_set_priority_last_err
+        uint64_t cnt_tx_event_dropped_dead_cnx
+        uint64_t cnt_tx_wrong_direction_dropped
         uint64_t last_tx_event_ring_arm_ns
         uint64_t last_tx_event_ring_fire_ns
         uint64_t cnt_fc_credit_pushed
@@ -719,6 +724,10 @@ cdef class StreamChunk:
                 self._sc, <uint64_t>self._len)
 
     def __dealloc__(self):
+        # Touches only memory this chunk owns: _buf, and _sc through the
+        # reference it holds. A chunk keeps no TransportContext reference
+        # and so may outlive one — reaching for ctx state here (an event
+        # ring, a counter) would be a use-after-free.
         if self._buf is not NULL:
             # Fallback release: chunk dropped without consumer read.
             # No-op when _delivered=True (FC already released at
@@ -1009,9 +1018,25 @@ cdef class TransportContext:
     def __dealloc__(self):
         self._shutdown()
         if self._ctx is not NULL:
+            self._release_undrained_links()
             aiopquic_ctx_destroy(self._ctx)
             self._ctx = NULL
         # WeakSet auto-removes; no explicit discard needed.
+
+    cdef void _release_undrained_links(self):
+        """Free the links of LINK_RELEASE events nobody drained. Runs after
+        the worker stopped and picoquic was freed, so this thread is the
+        ring's only user; ring destroy would skip these borrowed pointers."""
+        cdef spsc_entry_t* entry
+        while True:
+            entry = spsc_ring_peek(self._ctx.rx_event_ring)
+            if entry is NULL:
+                break
+            if (entry.event_type == SPSC_EVT_WT_STREAM_LINK_RELEASE
+                    and entry.data_buf is not NULL):
+                aiopquic_wt_stream_link_destroy(
+                    <aiopquic_wt_stream_link_t*>entry.data_buf)
+            spsc_ring_pop(self._ctx.rx_event_ring)
 
     cdef void _shutdown(self):
         """Stop the network thread and free picoquic context."""
@@ -1054,6 +1079,13 @@ cdef class TransportContext:
         Key counters and what mismatches reveal:
           tx_event_ring_pushes vs tx_event_ring_pops: drain lag
           tx_event_ring_arms vs tx_event_ring_fires: missed ring-drain wakes
+          set_priority_applied vs set_priority_rejected: picoquic accepted or
+            refused the priority; set_priority_last_err carries the code.
+            Ring drain alone cannot tell these from a dead-cnx drop
+          tx_event_dropped_dead_cnx > 0: events whose cnx was freed between
+            push and pop — silently discarded, every event type
+          tx_wrong_direction_dropped > 0: RESET_STREAM / STOP_SENDING requested
+            on a stream without that direction; dropped
           tx_event_ring_fire_dropped > 0: rx_event_ring full at fire time (re-arm path)
           wake_calls vs wake_skipped_coalesced: wake-coalescing efficiency
           prepare_to_send_calls vs prepare_to_send_pulled_bytes: worker
@@ -1075,6 +1107,11 @@ cdef class TransportContext:
             'prepare_to_send_pulled_bytes': self._ctx.worker_prepare_to_send_pulled_bytes,
             'prepare_to_send_empty': self._ctx.cnt_prepare_to_send_empty,
             'mark_active_processed': self._ctx.worker_mark_active_processed,
+            'set_priority_applied': self._ctx.worker_set_priority_applied,
+            'set_priority_rejected': self._ctx.worker_set_priority_rejected,
+            'set_priority_last_err': self._ctx.worker_set_priority_last_err,
+            'tx_event_dropped_dead_cnx': self._ctx.cnt_tx_event_dropped_dead_cnx,
+            'tx_wrong_direction_dropped': self._ctx.cnt_tx_wrong_direction_dropped,
             'rx_event_drops': self._ctx.worker_rx_event_drops,
             'rx_event_drops_stream_data': self._ctx.worker_rx_event_drops_stream_data,
             'rx_data_event_coalesced': self._ctx.cnt_rx_data_event_coalesced,
@@ -2154,6 +2191,10 @@ cdef class TransportContext:
         # internally; rc=0 means ring full, rc<0 alloc fail).
         rc = aiopquic_stream_ctx_send_data(
             sc, data_ptr, data_len, stream_ring_cap, end_stream)
+        if rc == -2:
+            raise ValueError(
+                f"write of {data_len} bytes exceeds the stream ring "
+                f"(stream={stream_id}, cap={stream_ring_cap})")
         if rc == 0:
             self._send_busy_stream_ring += 1
             return 2
@@ -2505,7 +2546,9 @@ cdef class TransportContext:
               qlog_dir=None,
               wt_supported_protocols=None,
               alpn_list=None,
-              bint dual=False):
+              bint dual=False,
+              bint verify_peer=True,
+              ca_file=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -2514,7 +2557,13 @@ cdef class TransportContext:
             cert_file: Path to TLS certificate (server mode).
             key_file: Path to TLS private key (server mode).
             alpn: Default ALPN string (e.g. "h3", "moq-chat").
-            is_client: If True, skip cert verification.
+            is_client: Client mode; servers do not verify peers.
+            verify_peer: Client mode: verify the server's certificate chain
+                and its name against the SNI. False accepts any
+                certificate.
+            ca_file: Client mode: PEM bundle of trusted roots. Default:
+                certifi's bundle. A file with no loadable certificate
+                raises rather than leaving verification off.
             idle_timeout_ms: Idle timeout in milliseconds.
             max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
             wt_path: Server-mode WebTransport path (e.g. "/moq").
@@ -2540,7 +2589,21 @@ cdef class TransportContext:
         cdef const char* c_cert = NULL
         cdef const char* c_key = NULL
         cdef const char* c_alpn = NULL
-        cdef bytes b_cert, b_key, b_alpn, b_alpn_csv
+        cdef const char* c_cert_root = NULL
+        cdef bytes b_cert, b_key, b_alpn, b_alpn_csv, b_cert_root
+
+        if is_client and verify_peer:
+            if ca_file is None:
+                import certifi
+                ca_file = certifi.where()
+            # picoquic silently falls back to no verification when its
+            # root store comes up empty, so prove the bundle loads first.
+            import ssl
+            ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(
+                cafile=ca_file)
+            b_cert_root = (ca_file.encode() if isinstance(ca_file, str)
+                           else ca_file)
+            c_cert_root = b_cert_root
 
         if cert_file is not None:
             b_cert = cert_file.encode() if isinstance(cert_file, str) else cert_file
@@ -2616,7 +2679,7 @@ cdef class TransportContext:
         self._quic = picoquic_create(
             256,            # max connections
             c_cert, c_key,
-            NULL,           # cert root (use default)
+            c_cert_root,    # trusted roots; NULL unless a verifying client
             c_alpn,
             default_cb_fn,
             default_cb_ctx,
@@ -2694,7 +2757,7 @@ cdef class TransportContext:
                        else _qlog_dir)
             picoquic_set_qlog(self._quic, _b_qlog)
 
-        if is_client:
+        if is_client and not verify_peer:
             picoquic_set_null_verifier(self._quic)
 
         if wt_path is not None and not is_client:
@@ -2822,8 +2885,33 @@ cdef class TransportContext:
 
         self._started = True
 
-    def stop(self):
-        """Stop the network thread and free the picoquic context."""
+    def stop(self, double drain_timeout=0.05):
+        """Stop the network thread and free the picoquic context.
+
+        Waits up to `drain_timeout` seconds for queued TX events to reach
+        picoquic first. picoquic_delete_network_thread discards whatever
+        is still in the ring, so a close pushed immediately before stop()
+        would otherwise never be handed over at all.
+
+        Draining the ring is not the same as the frames being sent:
+        picoquic may still hold an unsent packet when the thread goes
+        away. Callers that need the peer to see a clean close must wait
+        on that themselves.
+
+        __dealloc__ shuts down without this — sleeping during GC is not
+        acceptable, and an abandoned context has no one left to wait for.
+        """
+        import time
+        if self._thread_ctx is not NULL and self._ctx is not NULL:
+            deadline = time.monotonic() + drain_timeout
+            while spsc_ring_count(self._ctx.tx_event_ring) > 0:
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    self.wake_up()
+                except Exception:
+                    break
+                time.sleep(0.001)
         self._shutdown()
 
     @property
@@ -2923,6 +3011,7 @@ cdef class TransportContext:
         if ret != 0:
             raise BufferError("TX ring buffer is full")
 
+        self._ctx.cnt_tx_event_ring_pushes += 1
         self.wake_up()
 
 
@@ -2976,23 +3065,35 @@ cdef class WebTransportSessionState:
 
         If never opened, free directly (picoquic has no reference)."""
         cdef spsc_entry_t entry
+        cdef TransportContext tp
         if self._wt is NULL:
             return
-        if self._opened:
+        # _transport is a typed cdef reference, so attribute access on it
+        # is not None-checked. tp_clear drops it to None before
+        # __dealloc__ whenever GC breaks a cycle or the interpreter is
+        # shutting down, and TransportContext.__dealloc__ nulls _ctx once
+        # the context is destroyed. Either way there is no ring left to
+        # post to, and reaching for one is an unchecked NULL dereference.
+        tp = self._transport
+        if self._opened and tp is not None and tp._ctx is not NULL:
             # Push deregister; the picoquic thread will free wt.
             memset(&entry, 0, sizeof(entry))
             entry.event_type = SPSC_EVT_TX_WT_DEREGISTER
             entry.cnx = <void*>self._wt
             entry.stream_ctx = <void*>self._wt
-            spsc_ring_push(self._transport._ctx.tx_event_ring, &entry,
-                           NULL, 0)
+            if spsc_ring_push(tp._ctx.tx_event_ring, &entry,
+                              NULL, 0) == 0:
+                tp._ctx.cnt_tx_event_ring_pushes += 1
             try:
-                self._transport.wake_up()
+                tp.wake_up()
             except Exception:
                 pass
             self._wt = NULL
         else:
+            # No worker to race: the context is gone, so the session
+            # struct is ours to free.
             aiopquic_wt_session_destroy(self._wt)
+            self._wt = NULL
             self._wt = NULL
 
     @property
@@ -3085,6 +3186,7 @@ cdef class WebTransportSessionState:
         if ret != 0:
             raise BufferError("TX ring full (WT_OPEN)")
         self._opened = True
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 
     def push_create_stream(self, bint bidir):
@@ -3100,6 +3202,7 @@ cdef class WebTransportSessionState:
             self._transport._ctx.tx_event_ring, &entry, NULL, 0)
         if ret != 0:
             raise BufferError("TX ring full (WT_CREATE_STREAM)")
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 
     def push_close(self, uint32_t error_code, bytes reason=b""):
@@ -3118,6 +3221,7 @@ cdef class WebTransportSessionState:
             self._transport._ctx.tx_event_ring, &entry, data_ptr, data_len)
         if ret != 0:
             raise BufferError("TX ring full (WT_CLOSE)")
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 
     def push_drain(self):
@@ -3130,6 +3234,7 @@ cdef class WebTransportSessionState:
             self._transport._ctx.tx_event_ring, &entry, NULL, 0)
         if ret != 0:
             raise BufferError("TX ring full (WT_DRAIN)")
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 
     def push_stream_data(self, uint64_t stream_id, uintptr_t sc_ptr,
@@ -3167,13 +3272,17 @@ cdef class WebTransportSessionState:
           BufferError: TX-event ring or sc->tx is full. Bytes from
               the failed call were NOT committed; caller can retry
               the SAME data buffer without risk of duplicating bytes.
+          ConnectionError: the WT session is closed.
           RuntimeError: WT session not yet open, or sc_ptr is 0.
+          ValueError: data is larger than the stream's ring.
           MemoryError: sc->tx ring allocation failed.
         """
         cdef picoquic_cnx_t* cnx = NULL
         if self._wt is not NULL:
             cnx = <picoquic_cnx_t*>self._wt.cnx
         if cnx is NULL:
+            if self._wt is not NULL and self._wt.session_closing:
+                raise ConnectionError("WT session closed")
             raise RuntimeError("WT session not yet open")
 
         cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
@@ -3214,6 +3323,10 @@ cdef class WebTransportSessionState:
                 f"WT TX ring full (stream={stream_id}, "
                 f"need={data_len})"
             )
+        if rc == -2:
+            raise ValueError(
+                f"write of {data_len} bytes exceeds the stream ring "
+                f"(stream={stream_id}, cap={stream_ring_cap})")
         if rc < 0:
             raise MemoryError(
                 f"WT sc->tx alloc failed (stream={stream_id})"
@@ -3246,6 +3359,7 @@ cdef class WebTransportSessionState:
             raise BufferError(
                 f"TX event ring full (WT MARK_ACTIVE stream={stream_id})"
             )
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 
     def push_reset_stream(self, uint64_t stream_id, uint64_t error_code):
@@ -3260,15 +3374,18 @@ cdef class WebTransportSessionState:
             self._transport._ctx.tx_event_ring, &entry, NULL, 0)
         if ret != 0:
             raise BufferError("TX ring full (WT_RESET_STREAM)")
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 
     def push_session_cleanup(self):
-        """Bulk-free this session's per-stream wt_link sc's via the
-        worker-thread splay-tree walk. Single SPSC slot vs N RESETs;
-        bypasses the wire path so it works under cwin-pinned / stalled
-        cnx conditions where per-sid RESETs can't be transmitted.
+        """Terminate this session's streams in one worker-thread
+        splay-tree walk: §6 RESET_STREAM / STOP_SENDING (WT_SESSION_GONE)
+        in each stream's own direction, then release the per-stream
+        wt_link sc's. One SPSC slot regardless of stream count; the link
+        release does not wait on the wire, so it completes on a stalled
+        cnx.
 
-        Idempotent: subsequent calls find empty splay tree, no-op.
+        Idempotent: a later walk skips streams already released.
         Does NOT tear down the session itself — __dealloc__ still
         pushes TX_WT_DEREGISTER for the full close + free."""
         cdef spsc_entry_t entry
@@ -3282,6 +3399,7 @@ cdef class WebTransportSessionState:
             self._transport._ctx.tx_event_ring, &entry, NULL, 0)
         if ret != 0:
             raise BufferError("TX ring full (WT_SESSION_CLEANUP)")
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 
     def push_dgram_ready(self, uintptr_t db_ptr):
@@ -3298,7 +3416,9 @@ cdef class WebTransportSessionState:
         entry.error_code = <uint64_t>db_ptr
         if spsc_ring_push(
                 self._transport._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx)
             return 1
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
         return 0
 
@@ -3315,7 +3435,12 @@ cdef class WebTransportSessionState:
         entry.error_code = priority
         if spsc_ring_push(
                 self._transport._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            # Arm before reporting full, as the raw twin does: a caller
+            # that awaits tx_event_ring_drain_event on a 1 never wakes
+            # otherwise.
+            aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx)
             return 1
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
         return 0
 
@@ -3331,6 +3456,7 @@ cdef class WebTransportSessionState:
             self._transport._ctx.tx_event_ring, &entry, NULL, 0)
         if ret != 0:
             raise BufferError("TX ring full (WT_STOP_SENDING)")
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 
 

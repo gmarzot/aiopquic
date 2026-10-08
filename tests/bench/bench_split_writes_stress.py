@@ -41,6 +41,8 @@ CERTS_DIR = os.path.join(
 )
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 ALPN = "hq-interop"
 
 
@@ -56,7 +58,7 @@ def _server_config(event_ring_capacity: int | None = None) -> QuicConfiguration:
 
 def _client_config(event_ring_capacity: int | None = None) -> QuicConfiguration:
     return QuicConfiguration(
-        is_client=True, alpn_protocols=[ALPN],
+        is_client=True, alpn_protocols=[ALPN], server_name=SNI, cafile=CA_FILE,
         max_data=1 << 30, max_stream_data=1 << 22,
         event_ring_capacity=event_ring_capacity,
     )

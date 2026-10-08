@@ -30,6 +30,8 @@ CERTS_DIR = os.path.join(
 )
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 
 ALPN = "hq-interop"
 
@@ -139,13 +141,13 @@ def connect_client(port, max_datagram_frame_size=0):
     READY (handshake complete, cnx != 0).
     """
     client = TransportContext()
-    client.start(port=0, alpn=ALPN, is_client=True,
+    client.start(port=0, alpn=ALPN, is_client=True, ca_file=CA_FILE,
                  max_datagram_frame_size=max_datagram_frame_size)
     assert wait_for_ready(client), "Client not ready"
 
     client.create_client_connection(
         "127.0.0.1", port,
-        sni="localhost", alpn=ALPN,
+        sni=SNI, alpn=ALPN,
     )
 
     # Wait for ALMOST_READY (connection created by network thread)
@@ -634,12 +636,12 @@ class TestLoopback:
         assert wait_for_ready(server), "Server not ready"
         try:
             client = TransportContext()
-            client.start(port=0, alpn="other-alpn", is_client=True)
+            client.start(port=0, alpn="other-alpn", is_client=True, ca_file=CA_FILE)
             assert wait_for_ready(client), "Client not ready"
             try:
                 client.create_client_connection(
                     "127.0.0.1", port,
-                    sni="localhost", alpn="other-alpn",
+                    sni=SNI, alpn="other-alpn",
                 )
 
                 deadline = time.monotonic() + 5.0
@@ -671,13 +673,13 @@ class TestLoopback:
         assert wait_for_ready(server), "Server not ready"
         try:
             client = TransportContext()
-            client.start(port=0, alpn=ALPN, is_client=True,
+            client.start(port=0, alpn=ALPN, is_client=True, ca_file=CA_FILE,
                          idle_timeout_ms=500)
             assert wait_for_ready(client), "Client not ready"
             try:
                 client.create_client_connection(
                     "127.0.0.1", port,
-                    sni="localhost", alpn=ALPN,
+                    sni=SNI, alpn=ALPN,
                 )
                 events = drain_until(
                     client, SPSC_EVT_ALMOST_READY, timeout=5.0,
@@ -843,7 +845,7 @@ class TestLoopback:
         # Small ring so we can actually fill it. The branch's
         # TransportContext takes only ring_capacity (no arena_size).
         client = TransportContext(ring_capacity=8)
-        client.start(port=0, alpn=ALPN, is_client=True)
+        client.start(port=0, alpn=ALPN, is_client=True, ca_file=CA_FILE)
         assert wait_for_ready(client), "Client not ready"
         try:
             import builtins
@@ -865,7 +867,7 @@ class TestLoopback:
         try:
             for sni in ("", "  ", "this.does.not.match"):
                 client = TransportContext()
-                client.start(port=0, alpn=ALPN, is_client=True)
+                client.start(port=0, alpn=ALPN, is_client=True, ca_file=CA_FILE)
                 assert wait_for_ready(client), "Client not ready"
                 try:
                     client.create_client_connection(

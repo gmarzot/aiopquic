@@ -8,7 +8,7 @@ from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.connection import QuicConnection, stream_is_unidirectional
 from aiopquic.quic.events import (
     HandshakeCompleted, StreamDataReceived, DatagramFrameReceived,
-    StreamReset, ConnectionTerminated, ProtocolNegotiated,
+    StreamReset, StopSendingReceived, ConnectionTerminated, ProtocolNegotiated,
 )
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
 from aiopquic.asyncio.client import connect
@@ -20,6 +20,8 @@ CERTS_DIR = os.path.join(
 )
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 
 try:
     from ._ports import next_port
@@ -36,6 +38,7 @@ def server_config(port, max_datagram_frame_size=None):
 
 def client_config(max_datagram_frame_size=None):
     return QuicConfiguration(is_client=True, alpn_protocols=["hq-interop"],
+                             server_name=SNI, cafile=CA_FILE,
                              max_datagram_frame_size=max_datagram_frame_size)
 
 
@@ -170,3 +173,140 @@ class TestAsyncConnect:
         finally:
             srv_protocol._stop()
             srv_quic.stop()
+
+    @pytest.mark.asyncio
+    async def test_stop_sending_on_own_uni_is_dropped(self):
+        """An app STOP_SENDING on our own uni stream is dropped and counted.
+
+        The stream is receive-only at the peer, where STOP_SENDING on it is
+        a connection error (RFC 9000 §19.5): a picoquic server closes the
+        connection with STREAM_STATE_ERROR.
+        """
+        port = next_port()
+        received = asyncio.Event()
+        terminated = asyncio.Event()
+        stops = []
+
+        class ServerProtocol(QuicConnectionProtocol):
+            def quic_event_received(self, event):
+                if isinstance(event, StreamDataReceived) and event.data:
+                    received.set()
+                elif isinstance(event, StopSendingReceived):
+                    stops.append(event.stream_id)
+
+        class ClientProtocol(QuicConnectionProtocol):
+            def quic_event_received(self, event):
+                if isinstance(event, ConnectionTerminated):
+                    terminated.set()
+
+        server = await serve("127.0.0.1", port,
+                             configuration=server_config(port),
+                             create_protocol=ServerProtocol)
+        try:
+            async with connect(
+                "127.0.0.1", port,
+                configuration=client_config(),
+                create_protocol=lambda quic, **kw: ClientProtocol(quic, **kw),
+            ) as client:
+                quic = client._quic
+                uni = quic.get_next_available_stream_id(is_unidirectional=True)
+                quic.send_stream_data(uni, b"x" * 100)
+                await asyncio.wait_for(received.wait(), timeout=5.0)
+                bidi = quic.get_next_available_stream_id()
+                quic.send_stream_data(bidi, b"y")
+                before = quic._transport.counters.get(
+                    'tx_wrong_direction_dropped', 0)
+
+                quic.stop_stream(uni, 0x10)
+                quic.stop_stream(bidi, 0x10)
+
+                try:
+                    await asyncio.wait_for(terminated.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+                assert not terminated.is_set(), (
+                    "peer closed the connection: STOP_SENDING reached a "
+                    "stream that is receive-only there")
+                dropped = quic._transport.counters.get(
+                    'tx_wrong_direction_dropped', 0) - before
+                assert dropped == 1, f"expected 1 dropped request, got {dropped}"
+                assert stops == [bidi], (
+                    f"peer saw STOP_SENDING on {stops}, expected only {bidi}")
+        finally:
+            server.close()
+
+    @pytest.mark.asyncio
+    async def test_reset_stream_by_direction(self):
+        """reset_stream reaches the peer on our own uni stream. On the
+        peer's uni stream, which has no send side here, it is dropped and
+        counted."""
+        port = next_port()
+        received = asyncio.Event()
+        resets = []
+        peer_uni = asyncio.get_event_loop().create_future()
+
+        class ServerProtocol(QuicConnectionProtocol):
+            opened = False
+
+            def quic_event_received(self, event):
+                if isinstance(event, StreamDataReceived) and event.data:
+                    received.set()
+                    if not self.opened:
+                        self.opened = True
+                        sid = self._quic.get_next_available_stream_id(
+                            is_unidirectional=True)
+                        self._quic.send_stream_data(sid, b"s" * 100)
+                elif isinstance(event, StreamReset):
+                    resets.append((event.stream_id, event.error_code))
+
+        class ClientProtocol(QuicConnectionProtocol):
+            def quic_event_received(self, event):
+                if (isinstance(event, StreamDataReceived)
+                        and stream_is_unidirectional(event.stream_id)
+                        and not peer_uni.done()):
+                    peer_uni.set_result(event.stream_id)
+
+        server = await serve("127.0.0.1", port,
+                             configuration=server_config(port),
+                             create_protocol=ServerProtocol)
+        try:
+            async with connect(
+                "127.0.0.1", port,
+                configuration=client_config(),
+                create_protocol=lambda quic, **kw: ClientProtocol(quic, **kw),
+            ) as client:
+                quic = client._quic
+                uni = quic.get_next_available_stream_id(is_unidirectional=True)
+                quic.send_stream_data(uni, b"x" * 100)
+                await asyncio.wait_for(received.wait(), timeout=5.0)
+                s_uni = await asyncio.wait_for(peer_uni, timeout=5.0)
+                before = quic._transport.counters.get(
+                    'tx_wrong_direction_dropped', 0)
+
+                quic.reset_stream(uni, 0x10)
+                quic.reset_stream(s_uni, 0x10)
+
+                for _ in range(200):
+                    if resets:
+                        break
+                    await asyncio.sleep(0.01)
+                assert resets == [(uni, 0x10)], f"peer saw resets {resets}"
+                dropped = quic._transport.counters.get(
+                    'tx_wrong_direction_dropped', 0) - before
+                assert dropped == 1, f"expected 1 dropped request, got {dropped}"
+        finally:
+            server.close()
+
+
+async def test_write_larger_than_the_stream_ring_raises():
+    port = next_port()
+    server = await serve("127.0.0.1", port, configuration=server_config(port))
+    try:
+        async with connect("127.0.0.1", port,
+                           configuration=client_config()) as client:
+            sid = client._quic.get_next_available_stream_id()
+            with pytest.raises(ValueError):
+                client._quic.send_stream_data(sid, b"x" * (5 << 20))
+            client._quic.send_stream_data(sid, b"y" * 1024, end_stream=True)
+    finally:
+        server.close()

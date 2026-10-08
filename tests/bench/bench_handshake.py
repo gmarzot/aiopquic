@@ -4,6 +4,7 @@ import time
 import pytest
 
 from _helpers import (
+    CA_FILE, SNI,
     SPSC_EVT_ALMOST_READY, ALPN,
     next_port, wait_for_ready, drain_until,
     get_cnx_ptr, has_connection_ready,
@@ -20,12 +21,12 @@ def test_bench_handshake_rate(benchmark):
 
     def one_handshake():
         client = TransportContext()
-        client.start(port=0, alpn=ALPN, is_client=True)
+        client.start(port=0, alpn=ALPN, is_client=True, ca_file=CA_FILE)
         assert wait_for_ready(client)
         try:
             client.create_client_connection(
                 "127.0.0.1", port,
-                sni="localhost", alpn=ALPN,
+                sni=SNI, alpn=ALPN,
             )
             events = drain_until(
                 client, SPSC_EVT_ALMOST_READY, timeout=5.0,

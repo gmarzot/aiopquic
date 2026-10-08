@@ -23,6 +23,8 @@ CERTS_DIR = os.path.join(
     os.path.dirname(__file__), "..", "third_party", "picoquic", "certs")
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 
 ALPN = "hq-interop"
 RAW_ALPN = "dual-raw"
@@ -40,6 +42,7 @@ def _server_cfg():
 
 def _client_cfg():
     return QuicConfiguration(is_client=True, alpn_protocols=[ALPN],
+                             server_name=SNI, cafile=CA_FILE,
                              max_datagram_frame_size=1200)
 
 
@@ -149,13 +152,14 @@ async def test_dispatched_connections_carry_their_stack_snapshot():
         create_protocol=lambda conn, stream_handler=None: _EchoServer(conn),
         wt_path=WT_PATH, wt_handler=wt_handler)
     try:
-        raw_cfg = QuicConfiguration(is_client=True,
-                                    alpn_protocols=[RAW_ALPN])
+        raw_cfg = QuicConfiguration(is_client=True, alpn_protocols=[RAW_ALPN],
+                                    server_name=SNI, cafile=CA_FILE)
         async with connect("127.0.0.1", port, configuration=raw_cfg) as c:
             sid = c._quic.get_next_available_stream_id()
             c._quic.send_stream_data(sid, b"ping", end_stream=True)
             await _eventually(lambda: bool(_EchoServer.alpns))
-        async with connect_webtransport("127.0.0.1", port, WT_PATH) as s:
+        async with connect_webtransport("127.0.0.1", port, WT_PATH,
+                                       sni=SNI, ca_file=CA_FILE) as s:
             async with asyncio.timeout(10):
                 await wt_ready.wait()
             # The WT client's snapshot rides its session READY.

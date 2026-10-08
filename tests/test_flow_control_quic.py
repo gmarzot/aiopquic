@@ -35,7 +35,7 @@ import pytest
 from aiopquic.asyncio.client import connect
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
 from aiopquic.quic.configuration import QuicConfiguration
-from aiopquic.quic.connection import QuicConnection
+from aiopquic.quic.connection import QuicConnection, _EVT_STREAM_DESTROY
 from aiopquic.quic.events import StreamDataReceived
 
 CERTS_DIR = os.path.join(
@@ -44,6 +44,8 @@ CERTS_DIR = os.path.join(
 )
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 
 try:
     from ._ports import next_port
@@ -58,7 +60,8 @@ def _server_cfg(_port):
 
 
 def _client_cfg():
-    return QuicConfiguration(is_client=True, alpn_protocols=["hq-interop"])
+    return QuicConfiguration(is_client=True, alpn_protocols=["hq-interop"],
+                             server_name=SNI, cafile=CA_FILE)
 
 
 pytestmark = pytest.mark.skipif(
@@ -204,3 +207,40 @@ async def test_drained_helper_absorbs_backpressure():
     finally:
         srv_protocol._stop()
         srv_quic.stop()
+
+
+class _IdleTransport:
+    """The TransportContext surface send_stream_data_drained reads,
+    with an empty TX event ring."""
+    tx_event_ring_capacity = 0
+    tx_event_ring_count = 0
+
+    def __init__(self):
+        self.tx_event_ring_drain_event = asyncio.Event()
+
+
+@pytest.mark.asyncio
+async def test_stream_destroy_releases_a_parked_drained_writer():
+    """An engine-routed STREAM_DESTROY wakes a writer parked in
+    send_stream_data_drained, and the woken writer returns instead of
+    retrying on the retired stream, which would allocate a fresh sc."""
+    quic = QuicConnection(configuration=QuicConfiguration(
+        is_client=False, tx_max_queued_bytes=0))
+    quic._transport = _IdleTransport()
+    sends = []
+
+    def ring_full(stream_id, data, end_stream=False):
+        sends.append(stream_id)
+        raise BufferError("per-stream send ring full")
+
+    quic.send_stream_data = ring_full
+    stream_id = 3
+    writer = asyncio.create_task(
+        quic.send_stream_data_drained(stream_id, b"x"))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert sends == [stream_id] and not writer.done()
+
+    quic._enqueue_raw(_EVT_STREAM_DESTROY, stream_id, None, False, 0, 0)
+    await asyncio.wait_for(writer, 1.0)
+    assert sends == [stream_id]

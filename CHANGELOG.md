@@ -1,5 +1,105 @@
 # Changelog
 
+## v0.5.0a1
+
+- Fix: clients verify the server's certificate chain and name (RFC 9114 §3.1);
+  every release so far accepted any certificate. `connect_webtransport(verify_peer=False)`
+  or `QuicConfiguration(verify_mode=ssl.CERT_NONE)` opts out; `ca_file` /
+  `QuicConfiguration.cafile` (or `load_verify_locations`) sets the trusted roots,
+  certifi's bundle by default. A root file with no loadable certificate raises.
+- Fix: an exception from one event's handler no longer drops the rest of the
+  drained batch (WebTransport, dual-stack and raw-QUIC server dispatch, and the
+  raw-QUIC client loop); it is logged and the batch continues.
+- Fix: `aiopquic.versions` ignores a caller's `GIT_DIR` / `GIT_WORK_TREE`.
+- Fix: writing to a WebTransport session the peer tore down raises
+  `ConnectionError` instead of `RuntimeError("WT session not yet open")`.
+- Fix: a single write larger than the stream's TX ring raises `ValueError`
+  on raw QUIC and WebTransport; it parked the writer forever.
+- Fix: the subgroup object parsers refuse a KVP value declared longer than
+  its extension block before pulling it (`OverflowError`); waiting for bytes
+  the block could never hold parked the stream.
+- Compatibility (to be removed): the WebTransport CONNECT's `:protocol` is always `webtransport`.
+  picowt followed draft-ietf-webtrans-http3-16 and sent `webtransport-h3` to
+  servers advertising SETTINGS_WT_ENABLED; browsers still send `webtransport`,
+  and proxygen advertises that setting yet refuses the new token with 400, so
+  no release could open a WebTransport session on moqx-main :4433.
+- Fix: a reset of a WebTransport stream we opened reaches peers that did not
+  negotiate reset_stream_at (mvfst/moqx, quinn, aioquic). picowt's
+  RESET_STREAM_AT was refused there and nothing was sent; it now falls back to
+  RESET_STREAM. A reset stream's unsent bytes no longer count against the
+  session's TX budget, and later or parked writes on it raise
+  `WebTransportError`.
+- Fix: STOP_SENDING is no longer sent on a stream we only send on, such as our
+  own uni stream; peers close the connection on it (RFC 9000 §19.5). Such a
+  request is dropped and counted in `tx_wrong_direction_dropped`, as is a
+  RESET_STREAM request on a stream we only receive on, which picoquic already
+  refused.
+- Fix: stopping a transport on macOS took up to 10 s. picoquic closed its
+  wake-up pipe to end the network loop, which does not interrupt `select()`;
+  a picoquic patch now wakes the thread before joining it.
+- Fix: a WebTransport session's TX budget (`tx_max_queued_bytes`) applies to
+  that session. It was checked against the process-wide queued total, so a peer
+  that vanished with bytes queued stalled stream creation on every session in
+  the process until its connection timed out.
+- Fix: closing a WebTransport session while data was arriving could crash.
+  The session-cleanup walk freed each stream's context while data events still
+  queued for it held a pointer to it; the free now waits for those events, and
+  bytes left unsent are credited to the queued-bytes total at close.
+- Fix: a FIN no longer overtakes the last bytes of a stream. The worker read the
+  ring's tail before `fin_pending`, so a data+FIN write landing between the two
+  loads sent FIN at the old tail and dropped the rest (raw and WebTransport).
+- Priority outcome counters: `set_priority_applied`, `set_priority_rejected`,
+  `set_priority_last_err`. picoquic's return was discarded, so an applied
+  priority and one dropped by the stale-cnx guard were indistinguishable.
+- `tx_event_dropped_dead_cnx` counts TX events whose cnx was freed between
+  push and pop, for every event type behind that guard.
+- Fix: `spsc_ring_destroy` frees only buffers an entry owns; it freed the borrowed
+  stream contexts that queued WebTransport events carry.
+- Fix: the WebTransport ring-full paths arm the drain before returning 1, so a
+  caller awaiting `tx_event_ring_drain_event` wakes.
+- Fix: `tx_event_ring_pushes` was counted on the raw push sites only, so the
+  documented push/pop invariant read pops > pushes on WebTransport.
+- Fix: a server (engine-routed) STREAM_DESTROY wakes a writer parked on that
+  stream, as the client path already did, and a woken writer returns instead of
+  allocating a fresh context for the retired stream.
+- Version reporter: a from-source install reports `git describe --dirty` plus
+  the branch, flags a metadata version that names another commit, and flags a
+  built extension older than its hand-written sources. Wheels unchanged.
+- Fix: `sim_link_bench` links `libpicotls-fusion.a`, without which it fails to
+  link.
+- `AIOPQUIC_WT_DEBUG` is read once instead of per WebTransport data packet.
+- Tests: the stream-priority binding is exercised on a live connection; it
+  shipped in 0.4.1 with none.
+- WebTransport: `set_stream_priority()` on a session. The Cython binding and both
+  C handlers existed with no Python caller, so priority was unreachable over
+  WebTransport and the handler had never run.
+- `QuicConnection.set_stream_priority()` returns the post result instead of
+  `None`, so a full TX event ring is no longer a silent loss, and raises
+  `ConnectionError` on a cnx that is not open.
+- Fix: a closing WebTransport server retires its dispatcher registry entry.
+  Entries accumulated for the life of the process, keeping dead
+  loop/transport pairs addressable.
+- Fix: WebTransport datagram TX backpressure. The drained event carries the session
+  pointer, and `WebTransportSession.get_datagram_tx_drain_event()` exists.
+- WebTransport session teardown now follows draft-ietf-webtrans-http3 §6. A
+  session is terminated once a WT_CLOSE_SESSION capsule is sent *or* received,
+  so a close we initiate records the state and runs the same reclaim an inbound
+  one does. It resets each stream we send on (RESET_STREAM_AT on streams we
+  opened, where negotiated, §4.4) and stops each stream we receive on, with
+  WT_SESSION_GONE, including streams that arrive after the close. Previously a self-initiated close left
+  `wait_closed()` unable to complete (2 s per context exit), left §6's "MUST
+  NOT send new datagrams or open new streams" guards inert, and skipped the
+  reclaim entirely — which left Cython chunks holding raw pointers to stream
+  contexts the transport teardown had already freed.
+- Fix: a WebTransport session no longer dereferences a cleared transport in
+  `__dealloc__`. Cython does not None-check a typed cdef reference, so once
+  `tp_clear` dropped it — on a GC cycle break or at interpreter shutdown — the
+  deregister push was an unchecked NULL dereference. It segfaulted the aiomoqt
+  suite on every run.
+- Fix: `TransportContext.stop()` drains queued TX events (bounded, default
+  50 ms) before deleting the network thread, which discarded them — a close
+  pushed just before `stop()` never reached picoquic.
+
 ## v0.4.1
 
 Pairs with aiomoqt 0.11.1.

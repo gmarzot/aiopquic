@@ -6,7 +6,8 @@ name: CI
 # Tiers:
 #   - core: unit + loopback. Required on (linux, macos) x (3.12, 3.13, 3.14).
 #   - native: picoquic_ct + picohttp_ct subprocess smoke. Required.
-#   - peer interop: qh3 + aioquic cross-stack transfers. Required.
+#   - peer interop: qh3 + aioquic cross-stack transfers; aioquic WebTransport
+#     stream teardown and reset. Required.
 #   - benchmark: perf floor on shared runners — advisory only
 #     (continue-on-error); perf noise is not a correctness signal.
 
@@ -67,12 +68,11 @@ jobs:
         run: python -m pytest tests/ -v -m native
 
   peer-interop:
-    # aioquic + qh3 are pip-installable Python QUIC implementations.
-    # tests/interop/test_aioquic.py and test_qh3.py each spawn the
-    # peer as a subprocess (tests/interop/peers/*_echo.py) and exchange
-    # bytes with aiopquic in both directions. Skipped silently in the
-    # core tier because aioquic/qh3 aren't in our dev extras; this job
-    # installs them and runs those test files specifically.
+    # aioquic + qh3 are pip-installable Python QUIC implementations. Each
+    # test file spawns its peer as a subprocess (tests/interop/peers/): byte
+    # exchange in both directions, and aioquic as a strict WebTransport peer.
+    # Skipped silently in the core tier because aioquic/qh3 aren't in our dev
+    # extras; this job installs them and runs those test files specifically.
     name: peer interop
     runs-on: ubuntu-latest
     steps:
@@ -94,6 +94,7 @@ jobs:
         run: |
           python -m pytest \
             tests/interop/test_aioquic.py \
+            tests/interop/test_aioquic_wt.py \
             tests/interop/test_qh3.py \
             -v --tb=short
 

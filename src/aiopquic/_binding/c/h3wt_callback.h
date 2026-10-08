@@ -49,6 +49,10 @@ typedef enum {
     AIOPQUIC_WT_CTX_LINK    = 0x57544c01u,  /* 'WTL\1' */
 } aiopquic_wt_ctx_kind_t;
 
+/* WT_SESSION_GONE (draft-ietf-webtrans-http3 §6, IANA 0x170d7b68). The code
+ * a peer needs to tell session teardown from an ordinary stream reset. */
+#define AIOPQUIC_WT_SESSION_GONE 0x170d7b68u
+
 /*
  * Packed payload for SPSC_EVT_TX_WT_OPEN. Stored as data_buf:
  *   header + sni + path + protocols.
@@ -124,6 +128,17 @@ static inline int aiopquic_wt_diag_enabled(void) {
     if (cached < 0) {
         const char* v = getenv("AIOPQUIC_WT_DIAG");
         cached = (v != NULL && v[0] != '\0' && v[0] != '0');
+    }
+    return cached;
+}
+
+/* AIOPQUIC_WT_DEBUG: per-packet TX hex dump. Read once — provide_data
+ * runs per packet on the worker, where getenv() would also race a
+ * setenv() from Python. */
+static inline int aiopquic_wt_debug_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("AIOPQUIC_WT_DEBUG") != NULL;
     }
     return cached;
 }
@@ -725,9 +740,10 @@ static int aiopquic_wt_path_callback(
         aiopquic_stream_ctx_t* sc = link->sc;
         aiopquic_stream_buf_t* sb = sc->tx;
         uint32_t want = (uint32_t)length;
+        /* FIN before the tail; see the raw prepare_to_send path. */
+        int fin_after = aiopquic_stream_buf_fin_pending(sb);
         uint32_t avail = aiopquic_stream_buf_used(sb);
         uint32_t to_send = (avail < want) ? avail : want;
-        int fin_after = aiopquic_stream_buf_fin_pending(sb);
         int is_fin = (fin_after && to_send == avail) ? 1 : 0;
         int still_active = (avail > to_send) ? 1 : 0;
         uint8_t* buf = picoquic_provide_stream_data_buffer(
@@ -735,7 +751,7 @@ static int aiopquic_wt_path_callback(
         if (buf && to_send > 0) {
             aiopquic_stream_buf_pop(sb, buf, to_send);
             aiopquic_tx_data_bytes_pulled_add(to_send);
-            if (getenv("AIOPQUIC_WT_DEBUG") != NULL) {
+            if (aiopquic_wt_debug_enabled()) {
                 fprintf(stderr, "[wt-debug] provide sid=%llu len=%u "
                         "is_fin=%d still_active=%d hex=",
                         (unsigned long long)sid, to_send,
@@ -827,6 +843,7 @@ static int aiopquic_wt_path_callback(
                 spsc_entry_t drain_entry = {0};
                 drain_entry.event_type = SPSC_EVT_DATAGRAM_TX_DRAINED;
                 drain_entry.cnx = cnx;
+                drain_entry.stream_ctx = s;  /* session ptr for routing */
                 if (spsc_ring_push(s->bridge->rx_event_ring,
                                    &drain_entry, NULL, 0) == 0) {
                     aiopquic_notify_rx(s->bridge);
@@ -1049,6 +1066,34 @@ static int aiopquic_wt_server_path_callback(
     return 0;
 }
 
+/* WT §4.4: reset a WebTransport data stream with RESET_STREAM_AT so its
+ * header, which names the session, still arrives. picowt does that for a
+ * stream we opened; picoquic refuses it unless reset_stream_at was
+ * negotiated and the header has been sent, and RESET_STREAM is then the
+ * only reset. The caller checks that the stream has a send side.
+ * Returns 0 when the stream is reset. */
+static int aiopquic_wt_reset_stream(picoquic_cnx_t* cnx,
+                                    h3zero_stream_ctx_t* st, uint64_t code) {
+    if (picowt_reset_stream(cnx, st, code) == 0) {
+        return 0;
+    }
+    return picoquic_reset_stream(cnx, st->stream_id, code);
+}
+
+/* picoquic sends nothing more on a reset stream: release what is still
+ * queued in its ring, crediting the TX totals. */
+static void aiopquic_wt_abandon_stream_tx(aiopquic_wt_session_t* s,
+                                          h3zero_stream_ctx_t* st) {
+    if (st->path_callback_ctx != NULL
+            && *(uint32_t*)st->path_callback_ctx == AIOPQUIC_WT_CTX_LINK) {
+        aiopquic_wt_stream_link_t* lk =
+            (aiopquic_wt_stream_link_t*)st->path_callback_ctx;
+        if (lk->session == s) {
+            aiopquic_stream_ctx_tx_abandon(lk->sc);
+        }
+    }
+}
+
 /*
  * WT TX-event dispatch — called from aiopquic_loop_cb in callback.h.
  * Returns 1 if event was a recognized WT command, 0 otherwise.
@@ -1206,8 +1251,15 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (!h3_ctx) return 1;
         h3zero_stream_ctx_t* st =
             h3zero_find_stream(h3_ctx, entry->stream_id);
-        if (st) {
-            picowt_reset_stream(s->cnx, st, entry->error_code);
+        /* Untracked: a retired stream, or one of h3zero's own control or
+         * QPACK streams; neither is ours to reset. */
+        if (!st) return 1;
+        if (!aiopquic_stream_can_send(s->cnx, entry->stream_id)) {
+            ctx->cnt_tx_wrong_direction_dropped++;
+            return 1;
+        }
+        if (aiopquic_wt_reset_stream(s->cnx, st, entry->error_code) == 0) {
+            aiopquic_wt_abandon_stream_tx(s, st);
         }
         return 1;
     }
@@ -1234,30 +1286,54 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
     }
 
     case SPSC_EVT_TX_WT_SET_STREAM_PRIORITY: {
-        if (!s || !s->cnx) return 1;
-        (void)picoquic_set_stream_priority(s->cnx, entry->stream_id,
-                                            (uint8_t)entry->error_code);
+        /* WT events are dispatched ahead of the raw stale-cnx guard, so
+         * this is the only place a dead WT session is counted. */
+        if (!s || !s->cnx) {
+            ctx->cnt_tx_event_dropped_dead_cnx++;
+            return 1;
+        }
+        int pri_ret = picoquic_set_stream_priority(
+            s->cnx, entry->stream_id, (uint8_t)entry->error_code);
+        if (pri_ret == 0) {
+            ctx->worker_set_priority_applied++;
+        } else {
+            ctx->worker_set_priority_rejected++;
+            ctx->worker_set_priority_last_err = (uint64_t)pri_ret;
+        }
         return 1;
     }
 
     case SPSC_EVT_TX_WT_STOP_SENDING: {
         if (!s || !s->cnx) return 1;
-        picoquic_stop_sending(s->cnx, entry->stream_id,
-                               entry->error_code);
+        if (aiopquic_stream_can_receive(s->cnx, entry->stream_id)) {
+            picoquic_stop_sending(s->cnx, entry->stream_id,
+                                   entry->error_code);
+        } else {
+            ctx->cnt_tx_wrong_direction_dropped++;
+        }
         return 1;
     }
 
     case SPSC_EVT_TX_WT_SESSION_CLEANUP: {
-        /* Bulk-free this session's per-stream wt_links without
-         * tearing down the session itself. Mirrors step 1 of
-         * TX_WT_DEREGISTER. Used by SESSION_CLOSED handler when the
-         * cnx is stalled (cwin pinned, peer disconnected, BBR #2118
-         * freeze) and per-sid RESETs can't be transmitted. The
-         * session object survives so the Python wrapper's __dealloc__
-         * can later push TX_WT_DEREGISTER for full teardown.
+        /* Terminate this session's streams and release their per-stream
+         * wt_links, without tearing down the session itself. Mirrors
+         * step 1 of TX_WT_DEREGISTER. The session object survives so
+         * the Python wrapper's __dealloc__ can later push
+         * TX_WT_DEREGISTER for full teardown.
          *
-         * Idempotent: subsequent calls find empty splay tree and
-         * no-op. */
+         * One event covers N streams: the splay tree is the
+         * authoritative per-session stream set, so this walk sends the
+         * §6 resets and stop-sendings, each only in a direction the
+         * stream has, and releases the links in one SPSC slot rather
+         * than N. A stalled cnx may never flush them; queueing them
+         * costs nothing.
+         *
+         * Links go through LINK_RELEASE, never an inline destroy: data
+         * events still queued for the stream hold its borrowed sc, and
+         * drain_rx must consume them before the sc is freed.
+         *
+         * Idempotent: a released stream's path_callback_ctx is NULL, so
+         * a later walk skips it. */
         if (s && s->cnx && s->h3_ctx) {
             picosplay_node_t* node =
                 picosplay_first(&s->h3_ctx->h3_stream_tree);
@@ -1272,12 +1348,23 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                             (aiopquic_wt_stream_link_t*)
                                 st->path_callback_ctx;
                         if (lk->session == s) {
+                            /* §6: reset the send side and abort reading on
+                             * the receive side of every stream in the
+                             * session, with WT_SESSION_GONE; a uni stream
+                             * has only one side. picowt_deregister would
+                             * reset with code 0 and never stop reading. */
+                            if (aiopquic_stream_can_send(s->cnx, st->stream_id)) {
+                                (void)aiopquic_wt_reset_stream(
+                                    s->cnx, st, AIOPQUIC_WT_SESSION_GONE);
+                            }
+                            if (aiopquic_stream_can_receive(s->cnx, st->stream_id)) {
+                                picoquic_stop_sending(s->cnx, st->stream_id,
+                                                      AIOPQUIC_WT_SESSION_GONE);
+                            }
                             st->path_callback = NULL;
                             st->path_callback_ctx = NULL;
-                            if (s->bridge) {
-                                s->bridge->cnt_sc_destroy_wt_link_close_walker++;
-                            }
-                            aiopquic_wt_stream_link_destroy(lk);
+                            aiopquic_stream_ctx_tx_abandon(lk->sc);
+                            aiopquic_wt_push_link_release(s, st->stream_id, lk);
                         }
                     }
                 }
@@ -1291,14 +1378,15 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         /* Python is releasing this session. Cleanup has three steps
          * that MUST happen in order, all on the worker thread:
          *
-         * 1. Walk h3zero's splay tree and free any per-stream links
-         *    that belong to THIS session. We must do this BEFORE
-         *    picowt_deregister because picowt_deregister nulls each
+         * 1. Walk h3zero's splay tree and release any per-stream links
+         *    that belong to THIS session, via LINK_RELEASE so queued
+         *    data events holding the borrowed sc are consumed first.
+         *    This must precede picowt_deregister, which nulls each
          *    data stream's path_callback_ctx before deleting the
-         *    h3zero stream_ctx — which means picohttp_callback_free
-         *    is NOT dispatched for our streams, and our link+sc
-         *    memory would be orphaned (leak). The kind discriminator
-         *    + session pointer check ensures we only free our own.
+         *    h3zero stream_ctx — picohttp_callback_free is then NOT
+         *    dispatched for our streams, and our link+sc would be
+         *    orphaned. The kind discriminator + session pointer check
+         *    ensures we only release our own.
          *
          * 2. Null the control stream's path_callback / _ctx. picowt_
          *    deregister does NOT touch the control stream's callback;
@@ -1329,10 +1417,9 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                             if (lk->session == s) {
                                 st->path_callback = NULL;
                                 st->path_callback_ctx = NULL;
-                                if (s->bridge) {
-                                    s->bridge->cnt_sc_destroy_wt_link_close_walker++;
-                                }
-                                aiopquic_wt_stream_link_destroy(lk);
+                                aiopquic_stream_ctx_tx_abandon(lk->sc);
+                                aiopquic_wt_push_link_release(
+                                    s, st->stream_id, lk);
                             }
                         }
                     }

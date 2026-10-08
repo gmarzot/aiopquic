@@ -110,6 +110,13 @@ plumbing; consumers that want WebTransport use `serve_webtransport` /
 `connect_webtransport`. Most direct users of the asyncio API ship their
 own protocol bytes (MoQT, custom binary frames, etc.).
 
+Clients verify the server's certificate chain and name against certifi's
+roots. A private CA goes in `QuicConfiguration.cafile` (or
+`load_verify_locations(cafile=...)`), and `connect_webtransport(ca_file=...)`
+takes the same file. To accept any certificate, such as a self-signed test
+server, set `verify_mode=ssl.CERT_NONE` or pass
+`connect_webtransport(verify_peer=False)`.
+
 ### WebTransport
 
 ```python

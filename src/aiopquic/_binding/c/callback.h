@@ -112,6 +112,28 @@ static inline int aiopquic_cnx_is_alive(picoquic_quic_t* quic,
     }
     return 0;
 }
+
+/* RFC 9000 §2.1: a unidirectional stream carries data only from its
+ * initiator. RESET_STREAM on a receive-only stream (§19.4) or
+ * STOP_SENDING on a send-only one (§19.5) is a connection error at the
+ * peer, so each is sent only on a stream that has that direction. */
+static inline int aiopquic_stream_is_local(picoquic_cnx_t* cnx,
+                                           uint64_t stream_id) {
+    return PICOQUIC_IS_CLIENT_STREAM_ID(stream_id)
+           == (unsigned int)(picoquic_is_client(cnx) != 0);
+}
+
+static inline int aiopquic_stream_can_send(picoquic_cnx_t* cnx,
+                                           uint64_t stream_id) {
+    return PICOQUIC_IS_BIDIR_STREAM_ID(stream_id)
+           || aiopquic_stream_is_local(cnx, stream_id);
+}
+
+static inline int aiopquic_stream_can_receive(picoquic_cnx_t* cnx,
+                                              uint64_t stream_id) {
+    return PICOQUIC_IS_BIDIR_STREAM_ID(stream_id)
+           || !aiopquic_stream_is_local(cnx, stream_id);
+}
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -337,6 +359,23 @@ typedef struct {
     uint64_t        worker_dgram_prepare_calls;
     uint64_t        worker_dgram_records_sent;
     uint64_t        worker_dgram_bytes_sent;
+    /* Appended at the tail: the struct carries no padding or alignment
+     * discipline, so splicing fields in mid-struct shifts every later
+     * offset, the cross-thread tx_event_ring_drain_pending included.
+     *
+     * Priority outcomes. Ring drain alone cannot separate these: the
+     * stale-cnx guard pops an event exactly as a successful apply does.
+     * last_err holds the most recent picoquic return (0 = none seen). */
+    uint64_t        worker_set_priority_applied;
+    uint64_t        worker_set_priority_rejected;
+    uint64_t        worker_set_priority_last_err;
+    /* TX events discarded because their cnx was freed between push
+     * and pop. Covers every event type behind the stale-cnx guard. */
+    uint64_t        cnt_tx_event_dropped_dead_cnx;
+    /* App RESET_STREAM / STOP_SENDING requests dropped because the
+     * stream has no such direction (aiopquic_stream_can_send /
+     * aiopquic_stream_can_receive). */
+    uint64_t        cnt_tx_wrong_direction_dropped;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -872,9 +911,13 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                 return 0;
             }
             uint32_t want = (uint32_t)length;
+            /* FIN first: the producer sets it after publishing the
+             * tail, so an acquire of a set FIN makes every byte
+             * written before it visible to the tail load below. The
+             * other order can FIN at an old tail and drop the rest. */
+            int fin_after = aiopquic_stream_buf_fin_pending(sb);
             uint32_t avail = aiopquic_stream_buf_used(sb);
             uint32_t to_send = (avail < want) ? avail : want;
-            int fin_after = aiopquic_stream_buf_fin_pending(sb);
             int is_fin = (fin_after && to_send == avail) ? 1 : 0;
             int is_still_active = (avail > to_send) ? 1 : 0;
             uint8_t* buf = picoquic_provide_stream_data_buffer(
@@ -1341,6 +1384,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                  * any picoquic_* call below UAFs. See
                  * aiopquic_cnx_is_alive() comment for cost notes. */
                 if (!cnx || !aiopquic_cnx_is_alive(quic, cnx)) {
+                    ctx->cnt_tx_event_dropped_dead_cnx++;
                     ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                     aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                     continue;
@@ -1389,9 +1433,16 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     }
                     case SPSC_EVT_TX_SET_STREAM_PRIORITY: {
-                        (void)picoquic_set_stream_priority(
+                        int pri_ret = picoquic_set_stream_priority(
                             cnx, entry->stream_id,
                             (uint8_t)entry->error_code);
+                        if (pri_ret == 0) {
+                            ctx->worker_set_priority_applied++;
+                        } else {
+                            ctx->worker_set_priority_rejected++;
+                            ctx->worker_set_priority_last_err =
+                                (uint64_t)pri_ret;
+                        }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;
@@ -1424,13 +1475,21 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     }
                     case SPSC_EVT_TX_STREAM_RESET: {
-                        picoquic_reset_stream(cnx, entry->stream_id, entry->error_code);
+                        if (aiopquic_stream_can_send(cnx, entry->stream_id)) {
+                            picoquic_reset_stream(cnx, entry->stream_id, entry->error_code);
+                        } else {
+                            ctx->cnt_tx_wrong_direction_dropped++;
+                        }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;
                     }
                     case SPSC_EVT_TX_STOP_SENDING: {
-                        picoquic_stop_sending(cnx, entry->stream_id, entry->error_code);
+                        if (aiopquic_stream_can_receive(cnx, entry->stream_id)) {
+                            picoquic_stop_sending(cnx, entry->stream_id, entry->error_code);
+                        } else {
+                            ctx->cnt_tx_wrong_direction_dropped++;
+                        }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;

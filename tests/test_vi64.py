@@ -171,3 +171,19 @@ def test_obj_vi64_large_extension_value():
     d, e, s, p = _roundtrip_obj(0, {4: 2 ** 50}, 0, b"p", True)
     assert e == {4: 2 ** 50}
     assert (d, s, p) == (0, 0, b"p")
+
+
+def test_obj_vi64_value_longer_than_its_block_is_refused_before_pulling():
+    # delta 0, block length 3, type 1, value length 0x30, one byte: the
+    # declared value fits neither the block nor the chain.
+    sc = StreamChain()
+    sc.extend(bytes.fromhex("0003013061"))
+    with pytest.raises(OverflowError):
+        sc.parse_object_subgroup_vi64(True, 1 << 20)
+
+
+def test_obj_rfc9000_value_longer_than_its_block_is_refused_before_pulling():
+    sc = StreamChain()
+    sc.extend(bytes.fromhex("0003013061"))
+    with pytest.raises(OverflowError):
+        sc.parse_object_subgroup(True, 1 << 20, False)
