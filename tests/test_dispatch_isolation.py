@@ -33,7 +33,8 @@ pytestmark = pytest.mark.asyncio
 
 class _Transport:
     def __init__(self, batch):
-        self.eventfd = os.eventfd(0)
+        # Any selectable fd serves as the dispatcher's wake-up (macOS has no eventfd).
+        self.eventfd, self._wake_w = os.pipe()
         self._batch = batch
 
     def drain_rx(self):
@@ -42,6 +43,7 @@ class _Transport:
 
     def close(self):
         os.close(self.eventfd)
+        os.close(self._wake_w)
 
 
 def _ev(evt_type, stream_id, cnx_ptr, session_ptr, flag=False):
