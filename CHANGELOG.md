@@ -15,7 +15,7 @@
   `ConnectionError` instead of `RuntimeError("WT session not yet open")`.
 - Fix: a single write larger than the stream's TX ring raises `ValueError`
   on raw QUIC and WebTransport; it parked the writer forever.
-- Fix: the WebTransport CONNECT's `:protocol` is always `webtransport`.
+- Compatibility (to be removed): the WebTransport CONNECT's `:protocol` is always `webtransport`.
   picowt followed draft-ietf-webtrans-http3-16 and sent `webtransport-h3` to
   servers advertising SETTINGS_WT_ENABLED; browsers still send `webtransport`,
   and proxygen advertises that setting yet refuses the new token with 400, so

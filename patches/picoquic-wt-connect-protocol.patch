@@ -1,17 +1,18 @@
 diff --git a/picohttp/webtransport.c b/picohttp/webtransport.c
-index fb49cd6d..1014aa9f 100644
+index fb49cd6d..a37d085e 100644
 --- a/picohttp/webtransport.c
 +++ b/picohttp/webtransport.c
-@@ -345,8 +345,12 @@ const char* picowt_get_authority(h3zero_stream_ctx_t* stream_ctx)
+@@ -345,8 +345,13 @@ const char* picowt_get_authority(h3zero_stream_ctx_t* stream_ctx)
  
  static const char* picowt_connect_protocol_from_settings(const h3zero_settings_t* settings)
  {
 -    return (settings != NULL && settings->webtransport_enabled > 0) ?
 -        H3ZERO_WEBTRANSPORT_H3_PROTOCOL : H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD;
-+    /* draft-ietf-webtrans-http3-16 (since -15) wants "webtransport-h3"
-+     * once the server advertises SETTINGS_WT_ENABLED. Browsers still send "webtransport",
-+     * and proxygen advertises the setting yet answers the new token with
-+     * 400, so send the old token until the ecosystem moves. */
++    /* COMPATIBILITY PATCH, remove when proxygen and browsers accept
++     * "webtransport-h3". draft-ietf-webtrans-http3-16 (since -15) wants that
++     * token once the server advertises SETTINGS_WT_ENABLED; browsers still
++     * send "webtransport", and proxygen advertises the setting yet answers
++     * the new token with 400. */
 +    (void)settings;
 +    return H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD;
  }
