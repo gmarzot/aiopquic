@@ -480,6 +480,12 @@ cdef class StreamChain:
                     else:
                         value_len_obj = self.pull_uint_var()
                         value_len = <Py_ssize_t>value_len_obj
+                        if value_len > exts_end - self._pos or value_len > 0xFFFF:
+                            # Checked before the pull: waiting for bytes the
+                            # block cannot hold would stall the stream.
+                            raise OverflowError(
+                                f"KVP value length {value_len} exceeds its "
+                                f"block at type 0x{ext_id:x}")
                         ext_value = self.pull_bytes(value_len)
                     if self._pos > exts_end:
                         # §1.4.3 bounds the sequence by the block's
@@ -556,6 +562,12 @@ cdef class StreamChain:
                     else:
                         value_len_obj = self.pull_uint_vi64()
                         value_len = <Py_ssize_t>value_len_obj
+                        if value_len > exts_end - self._pos or value_len > 0xFFFF:
+                            # Checked before the pull: waiting for bytes the
+                            # block cannot hold would stall the stream.
+                            raise OverflowError(
+                                f"KVP value length {value_len} exceeds its "
+                                f"block at type 0x{ext_id:x}")
                         ext_value = self.pull_bytes(value_len)
                     if self._pos > exts_end:
                         # §1.4.3 bounds the sequence by the block's
