@@ -40,6 +40,9 @@ from aiopquic.asyncio.webtransport import (
     WT_SESSION_GONE, connect_webtransport, serve_webtransport,
 )
 from aiopquic.quic.configuration import QuicConfiguration
+SNI = "test.example.com"  # the test certificate's name
+CA_FILE = None            # set from the cert path in main()
+
 from aiopquic.quic.events import (
     WebTransportNewStream, WebTransportStreamDataReceived,
 )
@@ -84,7 +87,7 @@ async def _receive_some(wt):
 
 
 async def _close_while_receiving(port):
-    async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+    async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
         await _receive_some(wt)
         # Block the loop so data events queue undrained, close, and keep
         # blocking while the worker runs the session cleanup. The
@@ -118,7 +121,7 @@ async def unsent(port, cert, key):
         handler=handler, cert_file=cert, key_file=key)
     try:
         before = _queued_tx_bytes()
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             sid = await wt.create_stream(bidir=False)
             chunk = b"q" * 65536
             for _ in range(4096):
@@ -177,11 +180,11 @@ async def starve(port, cert, key):
         handler=handler, cert_file=cert, key_file=key)
     try:
         transport_a = TransportContext()
-        transport_a.start(is_client=True, alpn="h3",
+        transport_a.start(is_client=True, alpn="h3", ca_file=CA_FILE,
                           max_datagram_frame_size=64 * 1024)
         try:
             async with connect_webtransport(
-                    "127.0.0.1", port, "/wt", transport=transport_a):
+                    "127.0.0.1", port, "/wt", sni=SNI, transport=transport_a):
                 await asyncio.wait_for(a_streams.wait(), timeout=5.0)
                 transport_a.stop()
                 a_gone.set()
@@ -191,7 +194,7 @@ async def starve(port, cert, key):
         if _queued_tx_bytes() <= cap:
             sys.exit(f"precondition: only {_queued_tx_bytes()} bytes queued")
 
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             try:
                 await asyncio.wait_for(_receive_new_stream(wt), timeout=3.0)
             except asyncio.TimeoutError:
@@ -289,7 +292,7 @@ async def directions(port, cert, key):
                 srv.clear()
                 seen, sids = set(), {}
                 async with connect_webtransport(
-                        "127.0.0.1", port, "/wt",
+                        "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
                         configuration=QuicConfiguration(qlog_dir=cdir)) as wt:
                     asyncio.create_task(_count_data(wt, seen))
                     await _hold_streams(wt, sids)
@@ -343,5 +346,6 @@ async def directions(port, cert, key):
 
 if __name__ == "__main__":
     mode, port, cert, key = sys.argv[1:5]
+    CA_FILE = os.path.join(os.path.dirname(cert), "test-ca.crt")
     asyncio.run({"receive": receive, "unsent": unsent, "starve": starve,
                  "directions": directions}[mode](int(port), cert, key))

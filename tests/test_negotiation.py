@@ -29,6 +29,8 @@ CERTS_DIR = os.path.join(
 )
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 
 pytestmark = pytest.mark.skipif(
     not (os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE)),
@@ -48,7 +50,8 @@ def _server_cfg(alpn_protocols):
 
 
 def _client_cfg(alpn_protocols):
-    return QuicConfiguration(is_client=True, alpn_protocols=alpn_protocols)
+    return QuicConfiguration(is_client=True, alpn_protocols=alpn_protocols,
+                             server_name=SNI, cafile=CA_FILE)
 
 
 # ===================================================================
@@ -174,7 +177,7 @@ async def test_wt_protocol_match_both_ends():
         wt_supported_protocols=["moqt-16", "moqt-14"])
     try:
         async with connect_webtransport(
-                "127.0.0.1", port, "/wt",
+                "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
                 wt_available_protocols=["moqt-18", "moqt-16"]) as wt:
             assert wt.session_ready
             assert wt.negotiated_protocol == "moqt-16"
@@ -201,7 +204,7 @@ async def test_wt_protocol_no_match_session_still_opens():
         wt_supported_protocols=["moqt-16"])
     try:
         async with connect_webtransport(
-                "127.0.0.1", port, "/wt",
+                "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
                 wt_available_protocols=["moqt-18"]) as wt:
             assert wt.session_ready
             assert wt.negotiated_protocol is None
@@ -225,7 +228,7 @@ async def test_wt_no_allowlist_no_negotiation():
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
         async with connect_webtransport(
-                "127.0.0.1", port, "/wt",
+                "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
                 wt_available_protocols=["moqt-18", "moqt-16"]) as wt:
             assert wt.session_ready
             assert wt.negotiated_protocol is None

@@ -24,6 +24,8 @@ CERTS_DIR = os.path.join(
 )
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 
 try:
     from ._ports import next_port
@@ -70,7 +72,7 @@ async def test_wt_session_open_close():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             assert wt.session_ready
             await asyncio.wait_for(accepted.wait(), timeout=2.0)
         # connect_webtransport closes on exit
@@ -99,7 +101,7 @@ async def test_wt_bidi_client_to_server():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             sid = await wt.create_stream(bidir=True)
             wt.send_stream_data(sid, b"hello", end_stream=False)
             data = await asyncio.wait_for(server_got, timeout=5.0)
@@ -136,7 +138,7 @@ async def test_wt_bidi_server_replies_on_peer_stream():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             sid = await wt.create_stream(bidir=True)
             wt.send_stream_data(sid, b"ping", end_stream=False)
             data = await _drain_stream(wt, sid, want=len(b"reply:ping"),
@@ -167,7 +169,7 @@ async def test_wt_uni_client_to_server():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             sid = await wt.create_stream(bidir=False)
             wt.send_stream_data(sid, b"unidata", end_stream=True)
             data = await asyncio.wait_for(got, timeout=5.0)
@@ -210,7 +212,7 @@ async def test_wt_stream_tx_ctxs_drains_on_stream_close():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             for _ in range(n_streams):
                 sid = await wt.create_stream(bidir=False)
                 wt.send_stream_data(sid, b"x", end_stream=True)
@@ -264,7 +266,7 @@ async def test_wt_sender_side_sc_returns_to_baseline_across_streams():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             # Process-wide count, read after session setup. Collect earlier
             # tests' garbage first: chunks and stopped transports hold sc refs.
             gc.collect()
@@ -311,7 +313,7 @@ async def test_wt_datagram_client_to_server():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             assert wt.send_datagram_frame(b"hello-datagram") == 14
             payload = await asyncio.wait_for(got.get(), timeout=5.0)
             assert payload == b"hello-datagram"
@@ -332,7 +334,7 @@ async def test_wt_datagram_oversize_is_refused():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             with pytest.raises(ValueError):
                 wt.send_datagram_frame(b"x" * 4096)
     finally:
@@ -368,7 +370,7 @@ async def test_wt_set_stream_priority_reaches_picoquic():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             sid = await wt.create_stream(bidir=True)
             wt.send_stream_data(sid, b"hello", end_stream=False)
             tx = wt._transport
@@ -404,7 +406,7 @@ async def test_wt_set_stream_priority_on_closed_session_raises():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             sid = await wt.create_stream(bidir=True)
             assert wt.set_stream_priority(sid, 2) == 0
             wt._session_closed.set()
@@ -436,7 +438,7 @@ async def test_registry_does_not_leak_entries_across_sessions():
             "127.0.0.1", port, "/wt",
             handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
         try:
-            async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+            async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
                 assert wt.session_ready
         finally:
             server.close()
@@ -481,7 +483,7 @@ async def test_wt_close_resets_streams_with_session_gone():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             sid = await wt.create_stream(bidir=True)
             wt.send_stream_data(sid, b"hello", end_stream=False)
             await asyncio.wait_for(saw_stream, timeout=5.0)
@@ -592,7 +594,7 @@ async def test_wt_stop_sending_on_own_uni_is_dropped():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             uni = await wt.create_stream(bidir=False)
             wt.send_stream_data(uni, b"x" * 100)
             bidi = await wt.create_stream(bidir=True)
@@ -654,7 +656,7 @@ async def test_wt_reset_stream_by_direction():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             async def _watch():
                 async for ev in wt.events():
                     if (isinstance(ev, WebTransportNewStream)
@@ -701,7 +703,7 @@ async def test_wt_reset_releases_queued_bytes():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             sid = await wt.create_stream(bidir=False)
             wt.send_stream_data(sid, b"y" * 1000)
             await asyncio.sleep(0.2)

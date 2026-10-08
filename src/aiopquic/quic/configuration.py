@@ -1,5 +1,6 @@
 """QUIC configuration — matches qh3.quic.configuration API."""
 
+import ssl
 from dataclasses import dataclass, field
 
 
@@ -68,7 +69,11 @@ class QuicConfiguration:
     server_name: str | None = None
     certificate_file: str | None = None
     private_key_file: str | None = None
+    # Client: None or ssl.CERT_REQUIRED verifies the server's chain and
+    # name; ssl.CERT_NONE accepts any certificate.
     verify_mode: int | None = None
+    # Client: PEM bundle of trusted roots; None uses certifi's bundle.
+    cafile: str | None = None
     # NSS Key Log Format file (Wireshark-compatible). When set, picoquic
     # writes TLS secrets per connection so packet captures can be
     # decrypted offline. Honors the SSLKEYLOGFILE env var as a default.
@@ -141,8 +146,20 @@ class QuicConfiguration:
         if keyfile is not None:
             self.private_key_file = keyfile
 
+    @property
+    def verify_peer(self) -> bool:
+        """Whether a client verifies the server's certificate."""
+        return self.verify_mode != ssl.CERT_NONE
+
     def load_verify_locations(self, cafile: str | None = None,
                               capath: str | None = None,
                               cadata: bytes | None = None) -> None:
-        """Load CA certificates for peer verification."""
-        pass  # picoquic uses system CA store by default
+        """Trust the roots in `cafile`, a PEM bundle, for verifying servers.
+
+        picoquic loads a single PEM file, so `capath` and `cadata` are
+        not supported.
+        """
+        if capath is not None or cadata is not None:
+            raise NotImplementedError(
+                "only cafile is supported: picoquic loads one PEM file")
+        self.cafile = cafile

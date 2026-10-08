@@ -221,6 +221,8 @@ class QuicConnection:
                        if cfg.alpn_protocols and len(cfg.alpn_protocols) > 1
                        else None),
             is_client=cfg.is_client,
+            verify_peer=getattr(cfg, 'verify_peer', True),
+            ca_file=getattr(cfg, 'cafile', None),
             idle_timeout_ms=int(cfg.idle_timeout * 1000),
             max_datagram_frame_size=(cfg.max_datagram_frame_size or 0),
             keylog_filename=keylog,
@@ -1163,6 +1165,8 @@ class QuicEngine:
                        if cfg.alpn_protocols and len(cfg.alpn_protocols) > 1
                        else None),
             is_client=cfg.is_client,
+            verify_peer=getattr(cfg, 'verify_peer', True),
+            ca_file=getattr(cfg, 'cafile', None),
             idle_timeout_ms=int(cfg.idle_timeout * 1000),
             max_datagram_frame_size=(cfg.max_datagram_frame_size or 0),
             keylog_filename=keylog,

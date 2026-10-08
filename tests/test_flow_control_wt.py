@@ -44,6 +44,8 @@ CERTS_DIR = os.path.join(
 )
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 
 try:
     from ._ports import next_port
@@ -78,7 +80,7 @@ async def test_buffer_error_under_sustained_push():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             sid = await wt.create_stream(bidir=False)
             event = wt.get_tx_data_drain_event(sid)
 
@@ -142,7 +144,7 @@ async def test_drained_helper_absorbs_backpressure():
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             sid = await wt.create_stream(bidir=False)
 
             pushed = 0

@@ -2542,7 +2542,9 @@ cdef class TransportContext:
               qlog_dir=None,
               wt_supported_protocols=None,
               alpn_list=None,
-              bint dual=False):
+              bint dual=False,
+              bint verify_peer=True,
+              ca_file=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -2551,7 +2553,13 @@ cdef class TransportContext:
             cert_file: Path to TLS certificate (server mode).
             key_file: Path to TLS private key (server mode).
             alpn: Default ALPN string (e.g. "h3", "moq-chat").
-            is_client: If True, skip cert verification.
+            is_client: Client mode; servers do not verify peers.
+            verify_peer: Client mode: verify the server's certificate chain
+                and its name against the SNI. False accepts any
+                certificate.
+            ca_file: Client mode: PEM bundle of trusted roots. Default:
+                certifi's bundle. A file with no loadable certificate
+                raises rather than leaving verification off.
             idle_timeout_ms: Idle timeout in milliseconds.
             max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
             wt_path: Server-mode WebTransport path (e.g. "/moq").
@@ -2577,7 +2585,21 @@ cdef class TransportContext:
         cdef const char* c_cert = NULL
         cdef const char* c_key = NULL
         cdef const char* c_alpn = NULL
-        cdef bytes b_cert, b_key, b_alpn, b_alpn_csv
+        cdef const char* c_cert_root = NULL
+        cdef bytes b_cert, b_key, b_alpn, b_alpn_csv, b_cert_root
+
+        if is_client and verify_peer:
+            if ca_file is None:
+                import certifi
+                ca_file = certifi.where()
+            # picoquic silently falls back to no verification when its
+            # root store comes up empty, so prove the bundle loads first.
+            import ssl
+            ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(
+                cafile=ca_file)
+            b_cert_root = (ca_file.encode() if isinstance(ca_file, str)
+                           else ca_file)
+            c_cert_root = b_cert_root
 
         if cert_file is not None:
             b_cert = cert_file.encode() if isinstance(cert_file, str) else cert_file
@@ -2653,7 +2675,7 @@ cdef class TransportContext:
         self._quic = picoquic_create(
             256,            # max connections
             c_cert, c_key,
-            NULL,           # cert root (use default)
+            c_cert_root,    # trusted roots; NULL unless a verifying client
             c_alpn,
             default_cb_fn,
             default_cb_ctx,
@@ -2731,7 +2753,7 @@ cdef class TransportContext:
                        else _qlog_dir)
             picoquic_set_qlog(self._quic, _b_qlog)
 
-        if is_client:
+        if is_client and not verify_peer:
             picoquic_set_null_verifier(self._quic)
 
         if wt_path is not None and not is_client:

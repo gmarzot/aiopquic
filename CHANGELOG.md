@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fix: clients verify the server's certificate chain and name (RFC 9114 §3.1);
+  every release so far accepted any certificate. `connect_webtransport(verify_peer=False)`
+  or `QuicConfiguration(verify_mode=ssl.CERT_NONE)` opts out; `ca_file` /
+  `QuicConfiguration.cafile` (or `load_verify_locations`) sets the trusted roots,
+  certifi's bundle by default. A root file with no loadable certificate raises.
 - Fix: the WebTransport CONNECT's `:protocol` is always `webtransport`
   (draft-ietf-webtrans-http3 §3.2). picowt sent `webtransport-h3` to a server
   advertising picoquic's old wt_enabled setting, which moxygen refuses with

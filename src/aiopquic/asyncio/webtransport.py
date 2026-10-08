@@ -1095,6 +1095,8 @@ async def connect_webtransport(
         transport: TransportContext | None = None,
         timeout: float = 10.0,
         configuration: QuicConfiguration | None = None,
+        verify_peer: bool | None = None,
+        ca_file: str | None = None,
 ) -> AsyncGenerator[WebTransportClient, None]:
     """Open a WebTransport session.
 
@@ -1107,6 +1109,11 @@ async def connect_webtransport(
     `transport` defaults to a fresh TransportContext started in client
     mode (alpn='h3', max_datagram_frame_size=64KB); pass an existing
     one to share rings/threading across multiple sessions.
+
+    The server's certificate is verified unless `verify_peer` is False
+    (else `configuration.verify_mode` decides); `ca_file` (else
+    `configuration.cafile`, else certifi's bundle) holds the trusted
+    roots. Both apply only to a transport created here.
 
     Empty path "" is normalized to "/" — HTTP/3 root request semantics
     (RFC 9114 §4.3.1). Picoquic's path-match is exact, so registering
@@ -1124,8 +1131,14 @@ async def connect_webtransport(
                 ring_capacity=configuration.event_ring_capacity)
         else:
             transport = TransportContext()
+        if verify_peer is None:
+            verify_peer = (configuration.verify_peer
+                           if configuration is not None else True)
+        if ca_file is None and configuration is not None:
+            ca_file = configuration.cafile
         start_kwargs = dict(
             is_client=True, alpn="h3",
+            verify_peer=verify_peer, ca_file=ca_file,
             max_datagram_frame_size=(
                 configuration.max_datagram_frame_size or 64 * 1024
                 if configuration is not None else 64 * 1024))

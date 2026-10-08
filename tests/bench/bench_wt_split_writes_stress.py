@@ -45,6 +45,8 @@ CERTS_DIR = os.path.join(
 )
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 
 
 pytestmark = pytest.mark.skipif(
@@ -126,7 +128,7 @@ async def _run_split_writes_wt(n_streams: int, objs_per_stream: int,
     t_send_done = 0.0
 
     try:
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             t_start = time.monotonic()
             for stream_idx in range(n_streams):
                 sid = await wt.create_stream(bidir=False)
@@ -441,7 +443,7 @@ async def _run_split_writes_wt_mp(n_streams: int, objs_per_stream: int,
         t_start = 0.0
         t_send_done = 0.0
 
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             t_start = time.monotonic()
             for stream_idx in range(n_streams):
                 sid = await wt.create_stream(bidir=False)
@@ -707,7 +709,7 @@ async def _run_split_writes_wt_mp_concurrent(
         t_start = 0.0
         t_send_done = 0.0
 
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
 
             async def _writer(writer_idx: int, n_for_writer: int):
                 local_full_waits = 0
@@ -1016,7 +1018,7 @@ async def _run_split_writes_wt_mp_sustained(
         if not ready_event.is_set():
             raise RuntimeError("server subproc never signaled ready")
 
-        async with connect_webtransport("127.0.0.1", port, "/wt") as wt:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
 
             obj_period = num_writers / target_obj_per_sec
             stream_period = obj_period * objs_per_stream

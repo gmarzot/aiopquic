@@ -23,6 +23,7 @@ def bench_duration(request):
     return request.config.getoption("--duration")
 
 from _helpers import (  # noqa: E402
+    CA_FILE, SNI,
     ALPN, CERT_FILE, KEY_FILE,
     next_port, wait_for_ready,
     start_server, connect_client, wait_for_server_cnx,
@@ -87,12 +88,12 @@ def big_ring_pair():
     assert wait_for_ready(server)
     try:
         client = TransportContext(ring_capacity=65536)
-        client.start(port=0, alpn=ALPN, is_client=True,
+        client.start(port=0, alpn=ALPN, is_client=True, ca_file=CA_FILE,
                      rx_data_ring_cap=1 << 20)
         assert wait_for_ready(client)
         try:
             client.create_client_connection(
-                "127.0.0.1", port, sni="localhost", alpn=ALPN,
+                "127.0.0.1", port, sni=SNI, alpn=ALPN,
             )
             from _helpers import drain_until, SPSC_EVT_ALMOST_READY, get_cnx_ptr
             evs = drain_until(client, SPSC_EVT_ALMOST_READY, timeout=5.0)

@@ -43,6 +43,8 @@ CERTS_DIR = os.path.join(
 )
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 ALPN = "hq-interop"
 
 HEADER_FMT = "<QII"          # u64 seq, u32 payload_len, u32 crc32
@@ -86,7 +88,7 @@ def _server_config(max_data: int = 1 << 28,
 def _client_config(max_data: int = 1 << 28,
                    max_stream_data: int = 1 << 27) -> QuicConfiguration:
     return QuicConfiguration(
-        is_client=True, alpn_protocols=[ALPN],
+        is_client=True, alpn_protocols=[ALPN], server_name=SNI, cafile=CA_FILE,
         max_data=max_data, max_stream_data=max_stream_data,
     )
 

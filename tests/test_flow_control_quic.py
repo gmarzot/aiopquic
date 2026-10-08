@@ -44,6 +44,8 @@ CERTS_DIR = os.path.join(
 )
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 
 try:
     from ._ports import next_port
@@ -58,7 +60,8 @@ def _server_cfg(_port):
 
 
 def _client_cfg():
-    return QuicConfiguration(is_client=True, alpn_protocols=["hq-interop"])
+    return QuicConfiguration(is_client=True, alpn_protocols=["hq-interop"],
+                             server_name=SNI, cafile=CA_FILE)
 
 
 pytestmark = pytest.mark.skipif(

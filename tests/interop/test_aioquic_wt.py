@@ -18,7 +18,9 @@ from aiopquic.asyncio.webtransport import WT_SESSION_GONE, connect_webtransport
 from aiopquic.quic.configuration import QuicConfiguration
 
 from ..wt_close_scenarios import _frames_sent
-from .conftest import CERT_FILE, KEY_FILE, _free_port
+from .conftest import CA_FILE, CERT_FILE, KEY_FILE, _free_port
+
+SNI = "test.example.com"  # the test certificate's name
 
 
 PEER = os.path.join(os.path.dirname(__file__), "peers", "aioquic_wt.py")
@@ -132,7 +134,8 @@ async def test_wt_close_keeps_strict_peer_connection():
     peer = await _start_peer()
     try:
         async with connect_webtransport(
-                "127.0.0.1", peer.port, "/wt", timeout=5.0) as wt:
+                "127.0.0.1", peer.port, "/wt", timeout=5.0,
+                sni=SNI, ca_file=CA_FILE) as wt:
             uni = await wt.create_stream(bidir=False)
             wt.send_stream_data(uni, b"c" * 1000)
             bidi = await wt.create_stream(bidir=True)
@@ -163,6 +166,7 @@ async def test_wt_reset_reaches_peer_without_reset_stream_at(tmp_path):
     try:
         async with connect_webtransport(
                 "127.0.0.1", peer.port, "/wt", timeout=5.0,
+                sni=SNI, ca_file=CA_FILE,
                 configuration=QuicConfiguration(
                     qlog_dir=str(tmp_path))) as wt:
             uni = await wt.create_stream(bidir=False)
@@ -190,7 +194,8 @@ async def test_wt_late_peer_stream_after_close_is_stopped():
     peer = await _start_peer("--late-uni", "500")
     try:
         async with connect_webtransport(
-                "127.0.0.1", peer.port, "/wt", timeout=5.0) as wt:
+                "127.0.0.1", peer.port, "/wt", timeout=5.0,
+                sni=SNI, ca_file=CA_FILE) as wt:
             wt.close()
 
             late = await peer.wait_for(lambda e: e["event"] == "late_uni", 5.0)
@@ -217,7 +222,8 @@ async def test_wt_connect_protocol_token_is_webtransport():
     peer = await _start_peer("--wt-enabled-setting", "--strict-protocol")
     try:
         async with connect_webtransport(
-                "127.0.0.1", peer.port, "/wt", timeout=5.0) as wt:
+                "127.0.0.1", peer.port, "/wt", timeout=5.0,
+                sni=SNI, ca_file=CA_FILE) as wt:
             assert wt.session_ready
         ev = await peer.wait_for(lambda e: e["event"] == "connect", 5.0)
         assert ev is not None and ev["protocol"] == "webtransport", peer.events
