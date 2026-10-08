@@ -1,12 +1,16 @@
 # Changelog
 
-## Unreleased
+## v0.5.0a1
 
 - Fix: clients verify the server's certificate chain and name (RFC 9114 §3.1);
   every release so far accepted any certificate. `connect_webtransport(verify_peer=False)`
   or `QuicConfiguration(verify_mode=ssl.CERT_NONE)` opts out; `ca_file` /
   `QuicConfiguration.cafile` (or `load_verify_locations`) sets the trusted roots,
   certifi's bundle by default. A root file with no loadable certificate raises.
+- Fix: an exception from one event's handler no longer drops the rest of the
+  drained batch (WebTransport, dual-stack and raw-QUIC server dispatch, and the
+  raw-QUIC client loop); it is logged and the batch continues.
+- Fix: `aiopquic.versions` ignores a caller's `GIT_DIR` / `GIT_WORK_TREE`.
 - Fix: writing to a WebTransport session the peer tore down raises
   `ConnectionError` instead of `RuntimeError("WT session not yet open")`.
 - Fix: a single write larger than the stream's TX ring raises `ValueError`

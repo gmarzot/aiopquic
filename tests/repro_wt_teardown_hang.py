@@ -51,9 +51,13 @@ PHASES = [
 
 
 def rss_kb() -> int:
-    for line in open("/proc/self/status"):
-        if line.startswith("VmRSS"):
-            return int(line.split()[1])
+    try:
+        with open("/proc/self/status") as status:
+            for line in status:
+                if line.startswith("VmRSS"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
     return 0
 
 

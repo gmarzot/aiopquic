@@ -177,7 +177,9 @@ def _git(root: str, *args: str) -> str | None:
     """One `git -C root` invocation, or None on any failure."""
     try:
         out = subprocess.run(("git", "-C", root, *args),
-                             capture_output=True, text=True, timeout=2.0)
+                             capture_output=True, text=True, timeout=2.0,
+                             env={k: v for k, v in os.environ.items()
+                                  if not k.startswith("GIT_")})
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:

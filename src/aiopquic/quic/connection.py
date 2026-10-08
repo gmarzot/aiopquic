@@ -13,6 +13,17 @@ from enum import IntEnum
 
 logger = logging.getLogger(__name__)
 
+
+def route_batch(events, route) -> None:
+    """Route one drained batch. An exception from one event's handler is
+    logged and the rest of the batch still arrives; the batch is already
+    off the ring, so nothing would replay it."""
+    for ev in events:
+        try:
+            route(ev)
+        except Exception:
+            logger.exception("event type %s dropped by its handler", ev[0])
+
 from .configuration import QuicConfiguration
 from .events import (
     QuicEvent, HandshakeCompleted, ConnectionTerminated,
@@ -1201,8 +1212,7 @@ class QuicEngine:
         """
         if self._transport is None:
             return
-        for ev in self._transport.drain_rx():
-            self.route_event(ev)
+        route_batch(self._transport.drain_rx(), self.route_event)
 
     def route_event(self, ev) -> None:
         """Route one already-drained event (also the entry point for an

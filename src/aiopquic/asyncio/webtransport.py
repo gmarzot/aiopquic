@@ -27,6 +27,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import AsyncGenerator
 
 from aiopquic.quic.configuration import QuicConfiguration
+from aiopquic.quic.connection import route_batch
 from aiopquic._binding._transport import (
     TransportContext, WebTransportSessionState,
     tx_data_bytes_queued,
@@ -950,8 +951,7 @@ class _Dispatcher:
         self._acceptor = acceptor
 
     def _drain(self) -> None:
-        for ev in self._transport.drain_rx():
-            self.route_event(ev)
+        route_batch(self._transport.drain_rx(), self.route_event)
 
     def route_event(self, ev) -> None:
         """Route one already-drained event (also the entry point for an

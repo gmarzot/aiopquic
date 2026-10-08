@@ -5,8 +5,11 @@ thread to the asyncio event loop.
 """
 
 import asyncio
+import logging
 
 from aiopquic.quic.connection import QuicConnection
+logger = logging.getLogger(__name__)
+
 from aiopquic.quic.events import (
     QuicEvent, HandshakeCompleted, ConnectionTerminated,
 )
@@ -83,7 +86,11 @@ class QuicConnectionProtocol:
                             and not self._connected_waiter.done()):
                         self._connected_waiter.set_exception(exc)
 
-            self.quic_event_received(event)
+            try:
+                self.quic_event_received(event)
+            except Exception:
+                logger.exception("event %s dropped by its handler",
+                                 type(event).__name__)
             event = self._quic.next_event()
 
     def quic_event_received(self, event: QuicEvent) -> None:
