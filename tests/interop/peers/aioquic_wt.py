@@ -42,12 +42,24 @@ def emit(**fields):
     sys.stdout.flush()
 
 
+class _H3WithWtEnabled(H3Connection):
+    """Also advertises picoquic's old wt_enabled setting (0x2c7cf000)."""
+
+    def _get_local_settings(self):
+        settings = super()._get_local_settings()
+        settings[0x2C7CF000] = 1
+        return settings
+
+
 class WebTransportPeer(QuicConnectionProtocol):
     def __init__(self, *args, done: asyncio.Event, late_uni_ms: float,
-                 **kwargs):
+                 strict_protocol: bool = False,
+                 wt_enabled_setting: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self._done = done
         self._late_uni_ms = late_uni_ms
+        self._strict_protocol = strict_protocol
+        self._wt_enabled_setting = wt_enabled_setting
         self._h3 = None
         self._seen = set()
 
@@ -60,7 +72,9 @@ class WebTransportPeer(QuicConnectionProtocol):
 
     def quic_event_received(self, event):
         if isinstance(event, ProtocolNegotiated):
-            self._h3 = H3Connection(self._quic, enable_webtransport=True)
+            h3_class = (_H3WithWtEnabled if self._wt_enabled_setting
+                        else H3Connection)
+            self._h3 = h3_class(self._quic, enable_webtransport=True)
         elif isinstance(event, StreamReset):
             emit(event="stream_reset", stream_id=event.stream_id,
                  error_code=event.error_code)
@@ -76,6 +90,16 @@ class WebTransportPeer(QuicConnectionProtocol):
         for ev in self._h3.handle_event(event):
             if isinstance(ev, HeadersReceived):
                 if dict(ev.headers).get(b":method") == b"CONNECT":
+                    token = dict(ev.headers).get(b":protocol", b"")
+                    emit(event="connect",
+                         protocol=token.decode(errors="replace"))
+                    if self._strict_protocol and token != b"webtransport":
+                        # draft-ietf-webtrans-http3 section 3.2
+                        self._h3.send_headers(
+                            ev.stream_id, [(b":status", b"400")],
+                            end_stream=True)
+                        self.transmit()
+                        continue
                     self._h3.send_headers(ev.stream_id, [
                         (b":status", b"200"),
                         (b"sec-webtransport-http3-draft", b"draft02")])
@@ -102,7 +126,9 @@ async def main(args):
     server = await serve(
         "127.0.0.1", args.port, configuration=cfg,
         create_protocol=lambda *a, **kw: WebTransportPeer(
-            *a, done=done, late_uni_ms=args.late_uni, **kw))
+            *a, done=done, late_uni_ms=args.late_uni,
+            strict_protocol=args.strict_protocol,
+            wt_enabled_setting=args.wt_enabled_setting, **kw))
     sys.stderr.write(f"serving on 127.0.0.1:{args.port}\n")
     sys.stderr.flush()
     try:
@@ -120,4 +146,8 @@ if __name__ == "__main__":
     p.add_argument("--key", required=True)
     p.add_argument("--lifetime", type=float, default=10.0)
     p.add_argument("--late-uni", type=float, default=0.0)
+    p.add_argument("--strict-protocol", action="store_true",
+                   help="400 unless :protocol is webtransport")
+    p.add_argument("--wt-enabled-setting", action="store_true",
+                   help="advertise picoquic's old wt_enabled setting")
     asyncio.run(main(p.parse_args()))

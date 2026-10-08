@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix: the WebTransport CONNECT's `:protocol` is always `webtransport`
+  (draft-ietf-webtrans-http3 §3.2). picowt sent `webtransport-h3` to a server
+  advertising picoquic's old wt_enabled setting, which moxygen refuses with
+  400, so no release could open a WebTransport session on moqx-main :4433.
 - Fix: a reset of a WebTransport stream we opened reaches peers that did not
   negotiate reset_stream_at (mvfst/moqx, quinn, aioquic). picowt's
   RESET_STREAM_AT was refused there and nothing was sent; it now falls back to

@@ -207,3 +207,19 @@ async def test_wt_late_peer_stream_after_close_is_stopped():
             assert killed is None, f"peer closed the connection: {killed}"
     finally:
         await peer.stop()
+
+
+async def test_wt_connect_protocol_token_is_webtransport():
+    """The CONNECT's :protocol is "webtransport" whatever the server
+    advertises (draft-ietf-webtrans-http3 section 3.2); moxygen refuses
+    any other token with 400.
+    """
+    peer = await _start_peer("--wt-enabled-setting", "--strict-protocol")
+    try:
+        async with connect_webtransport(
+                "127.0.0.1", peer.port, "/wt", timeout=5.0) as wt:
+            assert wt.session_ready
+        ev = await peer.wait_for(lambda e: e["event"] == "connect", 5.0)
+        assert ev is not None and ev["protocol"] == "webtransport", peer.events
+    finally:
+        await peer.stop()
