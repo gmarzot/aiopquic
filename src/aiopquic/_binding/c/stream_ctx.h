@@ -517,6 +517,7 @@ static inline int aiopquic_stream_ctx_send_data(
         sc->tx = aiopquic_stream_buf_create(capacity);
         if (!sc->tx) return -1;
     }
+    if (len > sc->tx->capacity) return -2;  /* can never fit */
     if (len > 0) {
         /* All-or-nothing: pre-check free_bytes against full request,
          * then call push only when the whole request fits. push is

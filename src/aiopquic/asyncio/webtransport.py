@@ -280,7 +280,11 @@ class WebTransportSession:
         marks the stream active. Picoquic pulls bytes at wire rate via
         prepare_to_send. All-or-nothing on backpressure: BufferError
         means no bytes committed and caller may retry the same buffer.
+        Raises ConnectionError once the session is closed and
+        ValueError for a write larger than the stream's ring.
         """
+        if self.session_closed:
+            raise ConnectionError("WT session closed")
         if not self.session_ready:
             raise WebTransportError("session not open")
         sc_ptr = self._stream_tx_ctxs.get(stream_id, 0)

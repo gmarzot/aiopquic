@@ -2191,6 +2191,10 @@ cdef class TransportContext:
         # internally; rc=0 means ring full, rc<0 alloc fail).
         rc = aiopquic_stream_ctx_send_data(
             sc, data_ptr, data_len, stream_ring_cap, end_stream)
+        if rc == -2:
+            raise ValueError(
+                f"write of {data_len} bytes exceeds the stream ring "
+                f"(stream={stream_id}, cap={stream_ring_cap})")
         if rc == 0:
             self._send_busy_stream_ring += 1
             return 2
@@ -3268,13 +3272,17 @@ cdef class WebTransportSessionState:
           BufferError: TX-event ring or sc->tx is full. Bytes from
               the failed call were NOT committed; caller can retry
               the SAME data buffer without risk of duplicating bytes.
+          ConnectionError: the WT session is closed.
           RuntimeError: WT session not yet open, or sc_ptr is 0.
+          ValueError: data is larger than the stream's ring.
           MemoryError: sc->tx ring allocation failed.
         """
         cdef picoquic_cnx_t* cnx = NULL
         if self._wt is not NULL:
             cnx = <picoquic_cnx_t*>self._wt.cnx
         if cnx is NULL:
+            if self._wt is not NULL and self._wt.session_closing:
+                raise ConnectionError("WT session closed")
             raise RuntimeError("WT session not yet open")
 
         cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>sc_ptr
@@ -3315,6 +3323,10 @@ cdef class WebTransportSessionState:
                 f"WT TX ring full (stream={stream_id}, "
                 f"need={data_len})"
             )
+        if rc == -2:
+            raise ValueError(
+                f"write of {data_len} bytes exceeds the stream ring "
+                f"(stream={stream_id}, cap={stream_ring_cap})")
         if rc < 0:
             raise MemoryError(
                 f"WT sc->tx alloc failed (stream={stream_id})"

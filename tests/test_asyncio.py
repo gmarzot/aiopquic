@@ -296,3 +296,17 @@ class TestAsyncConnect:
                 assert dropped == 1, f"expected 1 dropped request, got {dropped}"
         finally:
             server.close()
+
+
+async def test_write_larger_than_the_stream_ring_raises():
+    port = next_port()
+    server = await serve("127.0.0.1", port, configuration=server_config(port))
+    try:
+        async with connect("127.0.0.1", port,
+                           configuration=client_config()) as client:
+            sid = client._quic.get_next_available_stream_id()
+            with pytest.raises(ValueError):
+                client._quic.send_stream_data(sid, b"x" * (5 << 20))
+            client._quic.send_stream_data(sid, b"y" * 1024, end_stream=True)
+    finally:
+        server.close()

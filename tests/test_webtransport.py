@@ -743,3 +743,47 @@ async def test_wt_reset_releases_queued_bytes():
                 f"{queued - stranded} B")
     finally:
         server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_write_after_peer_teardown_raises_connection_error():
+    port = next_port()
+
+    async def handler(session):
+        pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            sid = await wt.create_stream(bidir=False)
+            server.close()
+            for _ in range(100):
+                if wt.session_closed:
+                    break
+                await asyncio.sleep(0.05)
+            with pytest.raises(ConnectionError):
+                wt.send_stream_data(sid, b"x")
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_write_larger_than_the_stream_ring_raises():
+    port = next_port()
+
+    async def handler(session):
+        pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            sid = await wt.create_stream(bidir=False)
+            with pytest.raises(ValueError):
+                wt.send_stream_data(sid, b"x" * (wt.stream_ring_cap + 1))
+            wt.send_stream_data(sid, b"y" * 1024)
+    finally:
+        server.close()
