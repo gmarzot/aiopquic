@@ -45,7 +45,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Run core tier
-        timeout-minutes: 25
+        timeout-minutes: 15
         run: python -m pytest tests/ -v -m "not interop and not native"
 
   native:
