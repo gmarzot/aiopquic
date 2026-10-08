@@ -43,7 +43,8 @@ def emit(**fields):
 
 
 class _H3WithWtEnabled(H3Connection):
-    """Also advertises picoquic's old wt_enabled setting (0x2c7cf000)."""
+    """Also advertises SETTINGS_WT_ENABLED (0x2c7cf000, draft-15+), which
+    makes a draft-15 client switch to the webtransport-h3 token."""
 
     def _get_local_settings(self):
         settings = super()._get_local_settings()
@@ -94,7 +95,7 @@ class WebTransportPeer(QuicConnectionProtocol):
                     emit(event="connect",
                          protocol=token.decode(errors="replace"))
                     if self._strict_protocol and token != b"webtransport":
-                        # draft-ietf-webtrans-http3 section 3.2
+                        # the token browsers send and proxygen requires
                         self._h3.send_headers(
                             ev.stream_id, [(b":status", b"400")],
                             end_stream=True)
@@ -149,5 +150,5 @@ if __name__ == "__main__":
     p.add_argument("--strict-protocol", action="store_true",
                    help="400 unless :protocol is webtransport")
     p.add_argument("--wt-enabled-setting", action="store_true",
-                   help="advertise picoquic's old wt_enabled setting")
+                   help="advertise SETTINGS_WT_ENABLED (draft-15+)")
     asyncio.run(main(p.parse_args()))

@@ -15,10 +15,11 @@
   `ConnectionError` instead of `RuntimeError("WT session not yet open")`.
 - Fix: a single write larger than the stream's TX ring raises `ValueError`
   on raw QUIC and WebTransport; it parked the writer forever.
-- Fix: the WebTransport CONNECT's `:protocol` is always `webtransport`
-  (draft-ietf-webtrans-http3 §3.2). picowt sent `webtransport-h3` to a server
-  advertising picoquic's old wt_enabled setting, which moxygen refuses with
-  400, so no release could open a WebTransport session on moqx-main :4433.
+- Fix: the WebTransport CONNECT's `:protocol` is always `webtransport`.
+  picowt followed draft-ietf-webtrans-http3-15+ and sent `webtransport-h3` to
+  servers advertising SETTINGS_WT_ENABLED; browsers still send `webtransport`,
+  and proxygen advertises that setting yet refuses the new token with 400, so
+  no release could open a WebTransport session on moqx-main :4433.
 - Fix: a reset of a WebTransport stream we opened reaches peers that did not
   negotiate reset_stream_at (mvfst/moqx, quinn, aioquic). picowt's
   RESET_STREAM_AT was refused there and nothing was sent; it now falls back to
