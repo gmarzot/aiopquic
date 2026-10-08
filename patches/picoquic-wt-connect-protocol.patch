@@ -16,3 +16,16 @@ index fb49cd6d..7cf629ac 100644
  }
  
  static int picowt_webtransport_requirements_met(picoquic_cnx_t* cnx, h3zero_callback_ctx_t* ctx)
+diff --git a/picoquictest/webtransport_test.c b/picoquictest/webtransport_test.c
+index 25dd58bf..b40f0bc3 100644
+--- a/picoquictest/webtransport_test.c
++++ b/picoquictest/webtransport_test.c
+@@ -551,7 +551,7 @@ static int picowt_connect_protocol_test_one(picoquic_cnx_t* cnx,
+ 
+ static int picowt_connect_protocol_test(picoquic_cnx_t* cnx)
+ {
+-    int ret = picowt_connect_protocol_test_one(cnx, 1, H3ZERO_WEBTRANSPORT_H3_PROTOCOL);
++    int ret = picowt_connect_protocol_test_one(cnx, 1, H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD);
+ 
+     if (ret == 0) {
+         ret = picowt_connect_protocol_test_one(cnx, 0, H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD);
