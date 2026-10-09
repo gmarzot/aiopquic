@@ -64,6 +64,8 @@ async def connect(
             await protocol.wait_connected()
         yield protocol
     finally:
-        protocol.close()
-        protocol._stop()
-        quic.stop()
+        try:
+            await protocol.aclose()
+        finally:
+            protocol._stop()
+            quic.stop()
