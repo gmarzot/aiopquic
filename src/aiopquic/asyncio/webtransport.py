@@ -72,8 +72,10 @@ _EVT_WT_CNX_CLOSED = 77
 WT_SESSION_GONE = 0x170d7b68
 
 
-class WebTransportError(Exception):
-    """Raised when a WebTransport session fails."""
+class WebTransportError(ConnectionError):
+    """The session is unusable: closed, not open, refused or timed out.
+    A ConnectionError, so a refused CONNECT is caught like a refused
+    raw QUIC handshake."""
 
 
 def _resolve_host(host: str) -> str:

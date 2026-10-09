@@ -87,7 +87,7 @@ async def test_client_exit_fins_connect_before_closing_the_connection(tmp_path):
 
     server = await _serve(port, handler, qlog_dir=str(tmp_path))
     try:
-        async with _connect(port) as wt:
+        async with _connect(port):
             await asyncio.sleep(0.1)
         await asyncio.sleep(0.3)
     finally:
@@ -200,7 +200,7 @@ async def test_closed_server_sessions_leave_the_dispatcher():
     server = await _serve(port, handler)
     try:
         for _ in range(5):
-            async with _connect(port) as wt:
+            async with _connect(port):
                 await asyncio.sleep(0.05)
         await asyncio.sleep(0.3)
         assert len(server._dispatcher._sessions) == 0
@@ -226,10 +226,11 @@ async def test_aclose_is_bounded_when_the_peer_vanished():
 async def test_a_refused_open_returns_promptly():
     port = next_port()
     t0 = time.monotonic()
-    with pytest.raises(WebTransportError):
+    with pytest.raises(ConnectionError) as refused:
         async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI,
                                         ca_file=CA_FILE, timeout=1.0):
             pass
+    assert isinstance(refused.value, WebTransportError)
     assert time.monotonic() - t0 < 4.0
 
 

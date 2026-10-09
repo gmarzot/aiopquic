@@ -28,6 +28,8 @@
   closes the connection with H3_NO_ERROR after a short grace, or at a one-second
   deadline. `WebTransportSession.aclose()` awaits that; `connect_webtransport` exits
   through it. Before, a WebTransport connection lingered to the idle timeout.
+- `WebTransportError` is a `ConnectionError`: a refused or closed session is caught like
+  a failed raw QUIC connect, with the specific type still available.
 - Fix: a WebTransport client learns that the peer closed the connection; h3zero's
   client branch only set a flag, and an aiomoqt client hung after a relay closed.
 - Fix: a WebTransport server sees its client's close capsule and FIN, closes the
