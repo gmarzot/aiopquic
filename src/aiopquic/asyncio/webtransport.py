@@ -1164,6 +1164,8 @@ async def connect_webtransport(
                 socket_buffer_size=(
                     configuration.socket_buffer_size or 0),
                 qlog_dir=configuration.qlog_dir,
+                key_exchange_groups=getattr(
+                    configuration, 'key_exchange_groups', None),
             )
         transport.start(**start_kwargs)
 
@@ -1283,6 +1285,8 @@ async def serve_webtransport(
                 socket_buffer_size=(
                     configuration.socket_buffer_size or 0),
                 qlog_dir=configuration.qlog_dir,
+                key_exchange_groups=getattr(
+                    configuration, 'key_exchange_groups', None),
             )
         if wt_supported_protocols:
             # Server subprotocol allowlist for WT-Protocol selection,

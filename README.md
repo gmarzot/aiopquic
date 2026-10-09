@@ -116,6 +116,9 @@ roots. A private CA goes in `QuicConfiguration.cafile` (or
 takes the same file. To accept any certificate, such as a self-signed test
 server, set `verify_mode=ssl.CERT_NONE` or pass
 `connect_webtransport(verify_peer=False)`.
+Clients offer a classic key share first; `QuicConfiguration.key_exchange_groups`
+(or `start(key_exchange_groups=...)`) puts `KEX_X25519MLKEM768` first for a
+post-quantum key exchange with servers that support it.
 
 ### WebTransport
 

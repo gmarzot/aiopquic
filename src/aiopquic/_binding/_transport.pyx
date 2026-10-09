@@ -221,6 +221,10 @@ cdef extern from *:
     void picoquic_get_default_path_quality(
         picoquic_cnx_t* cnx, picoquic_path_quality_t* quality)
 
+cdef extern from "tls_api.h":
+    void picoquic_sort_key_exchange_algorithms(
+        uint16_t* ordered_key_exchange, size_t nb_ordered_key_exchange)
+
 cdef extern from "picoquic_packet_loop.h":
     ctypedef struct picoquic_packet_loop_param_t:
         unsigned short local_port
@@ -856,6 +860,21 @@ cdef class RingBuffer:
 # contexts aren't kept alive by the registry.
 import weakref as _weakref
 _TRANSPORT_REGISTRY = _weakref.WeakSet()
+
+# TLS key-exchange group ids (IANA), for start(key_exchange_groups=...).
+KEX_X25519 = 29
+KEX_SECP256R1 = 23
+KEX_X25519MLKEM768 = 4588
+KEX_SECP256R1MLKEM768 = 4587
+KEX_MLKEM1024 = 514
+# Classic groups first: picotls sends one key share, for the first
+# group, and a server without the hybrid and without HelloRetryRequest
+# (aioquic, qh3) cannot complete a handshake whose only share is
+# post-quantum.
+DEFAULT_KEY_EXCHANGE_GROUPS = (KEX_X25519, KEX_SECP256R1,
+                               KEX_X25519MLKEM768, KEX_SECP256R1MLKEM768,
+                               KEX_MLKEM1024)
+_applied_key_exchange_groups = None
 
 
 def dump_all_counters(file=None):
@@ -2548,7 +2567,8 @@ cdef class TransportContext:
               alpn_list=None,
               bint dual=False,
               bint verify_peer=True,
-              ca_file=None):
+              ca_file=None,
+              key_exchange_groups=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -2564,6 +2584,11 @@ cdef class TransportContext:
             ca_file: Client mode: PEM bundle of trusted roots. Default:
                 certifi's bundle. A file with no loadable certificate
                 raises rather than leaving verification off.
+            key_exchange_groups: TLS key-exchange groups in preference
+                order, IANA ids (KEX_X25519MLKEM768 first gives a
+                post-quantum key share). Default: classic first,
+                DEFAULT_KEY_EXCHANGE_GROUPS. picoquic keeps one order
+                per process, so the last start() wins.
             idle_timeout_ms: Idle timeout in milliseconds.
             max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
             wt_path: Server-mode WebTransport path (e.g. "/moq").
@@ -2591,6 +2616,9 @@ cdef class TransportContext:
         cdef const char* c_alpn = NULL
         cdef const char* c_cert_root = NULL
         cdef bytes b_cert, b_key, b_alpn, b_alpn_csv, b_cert_root
+        cdef uint16_t* c_groups = NULL
+        cdef size_t n_groups = 0
+        cdef size_t gi
 
         if is_client and verify_peer:
             if ca_file is None:
@@ -2756,6 +2784,25 @@ cdef class TransportContext:
                        if isinstance(_qlog_dir, str)
                        else _qlog_dir)
             picoquic_set_qlog(self._quic, _b_qlog)
+
+        # picoquic sorts its key exchanges once per process, on the
+        # first context; a different order here re-sorts for every
+        # context, so the last start() wins.
+        global _applied_key_exchange_groups
+        groups = (DEFAULT_KEY_EXCHANGE_GROUPS if key_exchange_groups is None
+                  else tuple(int(g) for g in key_exchange_groups))
+        if groups and groups != _applied_key_exchange_groups:
+            n_groups = len(groups)
+            c_groups = <uint16_t*>malloc(n_groups * sizeof(uint16_t))
+            if c_groups is NULL:
+                raise MemoryError()
+            try:
+                for gi in range(n_groups):
+                    c_groups[gi] = <uint16_t>groups[gi]
+                picoquic_sort_key_exchange_algorithms(c_groups, n_groups)
+            finally:
+                free(c_groups)
+            _applied_key_exchange_groups = groups
 
         if is_client and not verify_peer:
             picoquic_set_null_verifier(self._quic)

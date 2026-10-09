@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.5.0a2
+
+- picoquic pin advanced to 1.1.53.0 (`c9088724`, 2026-10-08), picotls to `f06553b`:
+  upstream's September security fixes (integer overflows in frame and length
+  parsing, SACK eviction, datagram length wrap, QPACK length check), the receive-
+  and send-path work, the newreno cwnd-blocked and Prague CE fixes, and the
+  network-thread wake-up fix that retires our wake-on-delete patch. The CONNECT
+  token patch is regenerated unchanged.
+- TLS key exchange: clients offer a classic key share first (X25519, then
+  SECP256R1) with the ML-KEM hybrids still advertised. picoquic now leads with
+  X25519MLKEM768 and picotls sends one share, which no server without the hybrid
+  and without HelloRetryRequest, aioquic and qh3 among them, can complete.
+  `QuicConfiguration.key_exchange_groups` / `start(key_exchange_groups=...)`
+  set the order; the hybrid first gives a post-quantum share.
+- Native smoke: the picoquic self-tests run with `AIOPQUIC_WT_STRICT_CONNECT=1`,
+  so they check upstream's CONNECT gate rather than our lenient one; the four
+  QMUX tests are excluded, their TLS records fail with fusion AES-GCM.
+
 ## v0.5.0a1
 
 - Fix: clients verify the server's certificate chain and name (RFC 9114 §3.1);
