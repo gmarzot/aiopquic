@@ -19,6 +19,7 @@ from aiopquic._binding._transport import (
 from aiopquic.asyncio.client import connect
 from aiopquic.asyncio.server import serve
 from aiopquic.quic.configuration import QuicConfiguration
+from aiopquic.versions import _openssl_info
 
 CERTS_DIR = os.path.join(
     os.path.dirname(__file__), "..", "third_party", "picoquic", "certs")
@@ -77,6 +78,15 @@ async def _handshake(qlog_dir, **client_kw) -> tuple[bool, int]:
     return connected, _first_flight_crypto_bytes(qlog_dir)
 
 
+def _mlkem_available() -> bool:
+    """ML-KEM groups need OpenSSL 3.5 in the libcrypto the binding links."""
+    info = _openssl_info()
+    if not info:
+        return False
+    digits = info[0].split()[1].split(".")[:2]
+    return tuple(int(d) for d in digits) >= (3, 5)
+
+
 def _restore_default_order() -> None:
     ctx = TransportContext()
     ctx.start(port=0, alpn=ALPN, is_client=True, key_exchange_groups=None)
@@ -89,6 +99,8 @@ async def test_default_sends_a_classic_key_share(tmp_path):
     assert crypto_bytes < 600, crypto_bytes
 
 
+@pytest.mark.skipif(not _mlkem_available(),
+                    reason="ML-KEM needs OpenSSL 3.5")
 async def test_hybrid_first_sends_the_post_quantum_share(tmp_path):
     try:
         connected, crypto_bytes = await _handshake(
