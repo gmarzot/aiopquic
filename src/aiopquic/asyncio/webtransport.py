@@ -21,6 +21,7 @@ the wt_session pointer.
 from __future__ import annotations
 
 import asyncio
+import logging
 import socket
 from collections import deque
 from contextlib import asynccontextmanager, suppress
@@ -44,6 +45,8 @@ from aiopquic.quic.events import (
 # Must match spsc_ring.h SPSC_EVT_STREAM_TX_DRAINED — shared with
 # the raw-QUIC path. Fired by the picoquic worker when sc->tx drains
 # after a Python writer was blocked, edge-trigger via tx_drain_pending.
+logger = logging.getLogger(__name__)
+
 _EVT_STREAM_TX_DRAINED = 15
 _EVT_STREAM_DESTROY = 17
 _EVT_WT_STREAM_DESTROY = 18
@@ -62,6 +65,7 @@ _EVT_WT_DATAGRAM = 72
 _EVT_WT_NEW_STREAM = 73
 _EVT_WT_STREAM_CREATED = 74
 _EVT_WT_NEW_SESSION = 75
+_EVT_WT_CNX_CLOSED = 77
 
 # Application-error code surfaced on RESET_STREAM for WT data streams when
 # the WT session itself terminates. Per draft-ietf-webtrans-http3 §6, §9.5.
@@ -106,6 +110,8 @@ class WebTransportSession:
         # Session-level signals
         self._session_ready: asyncio.Future | None = None
         self._session_closed = asyncio.Event()
+        self._cnx_closed = asyncio.Event()
+        self._fin_sent = False
         self._session_close_event: WebTransportSessionClosed | None = None
         self._draining = False
         # Stream creation: FIFO of pending futures. Each create_stream()
@@ -607,10 +613,7 @@ class WebTransportSession:
         # One worker-thread walk (TX_WT_SESSION_CLEANUP) sends the §6
         # resets and stop-sendings and releases the session's wt_link
         # sc's; the release does not wait on the wire. O(1) ring cost.
-        try:
-            self._state.push_session_cleanup()
-        except (BufferError, ConnectionError):
-            pass
+        self._push_or_retry(self._state.push_session_cleanup, "cleanup")
         self._stream_tx_ctxs.clear()
         # Wake any producer parked in send_stream_data_drained awaiting a
         # per-stream sc_event or the connection-global ring_event. After
@@ -627,21 +630,57 @@ class WebTransportSession:
         # Inbox queues are only popped on per-stream STREAM_DESTROY, so
         # without this every stream that arrived leaks its asyncio.Queue
         # and any undrained payload keeps a Cython chunk alive.
-        for q in self._stream_inbox.values():
+        for sid, q in self._stream_inbox.items():
             while True:
                 try:
                     q.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+            # §6: the session's streams end with WT_SESSION_GONE; a
+            # reader parked on the queue returns on it.
+            q.put_nowait(WebTransportStreamReset(
+                stream_id=sid, error_code=WT_SESSION_GONE))
         self._stream_inbox.clear()
+
+    def _push_or_retry(self, push, what: str) -> None:
+        """Queue a session command. A full TX ring reschedules it once
+        the ring drains, so a close, a cleanup or a FIN is never lost
+        to backpressure and never raises out of a close path."""
+        try:
+            push()
+        except BufferError:
+            loop = self._loop or asyncio.get_event_loop()
+            loop.create_task(self._retry_push(push, what))
+        except ConnectionError as exc:
+            logger.debug("WT %s not queued: %s", what, exc)
+
+    async def _retry_push(self, push, what: str) -> None:
+        ring_ev = self._transport.tx_event_ring_drain_event
+        for _ in range(3):
+            ring_ev.clear()
+            self._transport.arm_tx_event_ring_drain_pending()
+            try:
+                await asyncio.wait_for(ring_ev.wait(), 1.0)
+            except asyncio.TimeoutError:
+                pass
+            try:
+                push()
+                return
+            except BufferError:
+                continue
+            except ConnectionError:
+                return
+        logger.warning("WT %s dropped: TX ring stayed full", what)
 
     def close(self, error_code: int = 0, reason: bytes = b"") -> None:
         if not self.session_closed:
-            self._state.push_close(error_code, reason)
-            # Terminated the moment the capsule is sent, per §6, so the
+            # Terminated the moment the capsule is queued, per §6, so the
             # state and the reclaim both happen here — an inbound
             # SESSION_CLOSED may never arrive for a close we initiated.
             self._session_closed.set()
+            self._fin_sent = True
+            self._push_or_retry(
+                lambda: self._state.push_close(error_code, reason), "close")
             self._release_session_resources()
 
     def drain(self) -> None:
@@ -654,6 +693,21 @@ class WebTransportSession:
         else:
             await asyncio.wait_for(self._session_closed.wait(),
                                      timeout=timeout)
+
+    async def aclose(self, error_code: int = 0, reason: bytes = b"",
+                     *, timeout: float = 2.0) -> None:
+        """Close the session and wait for the close to leave. A client
+        waits for its connection to go, bounded by `timeout`; a server
+        returns once the close is queued, the connection is the
+        client's. A session that never opened returns at once."""
+        if not self.session_closed:
+            self.close(error_code, reason)
+        if self._role == "server" or not self.session_ready:
+            return
+        try:
+            await asyncio.wait_for(self._cnx_closed.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
 
     # --- event fan-out ------------------------------------------------
 
@@ -680,6 +734,34 @@ class WebTransportSession:
             ev.set()
         self._stream_tx_ctxs.pop(sid, None)
         self._stream_tx_drain_events.pop(sid, None)
+
+    def _on_session_closed(self, error_code, data) -> None:
+        reason = data if data is not None else memoryview(b"")
+        ev = WebTransportSessionClosed(error_code=error_code, reason=reason)
+        self._session_close_event = ev
+        self._session_closed.set()
+        self._release_session_resources()
+        if (self._session_ready
+                and not self._session_ready.done()):
+            self._session_ready.set_exception(WebTransportError(
+                "WT session closed before READY"))
+        # Fail any pending create_stream() callers; the session
+        # is gone, no point making them wait for the timeout.
+        while self._pending_creates:
+            fut = self._pending_creates.popleft()
+            if not fut.done():
+                fut.set_exception(WebTransportError(
+                    "WT session closed"))
+        self._event_queue.put_nowait(ev)
+        # §6: answer an inbound close with our FIN on CONNECT.
+        if not self._fin_sent:
+            self._fin_sent = True
+            self._push_or_retry(self._state.push_fin, "FIN")
+        if self._role == "server":
+            # A closed server session leaves the dispatcher's table;
+            # the dispatcher stays for the next CONNECT.
+            _get_dispatcher_registry().release(
+                self._loop, self._transport, self)
 
     def _on_event(self, ev_tuple) -> None:
         """Called by the dispatcher for every drained event whose
@@ -728,23 +810,11 @@ class WebTransportSession:
                     f"WT CONNECT refused (code={error_code})"))
             self._event_queue.put_nowait(err)
         elif evt_type == _EVT_WT_SESSION_CLOSED:
-            reason = data if data is not None else memoryview(b"")
-            ev = WebTransportSessionClosed(error_code=error_code, reason=reason)
-            self._session_close_event = ev
-            self._session_closed.set()
-            self._release_session_resources()
-            if (self._session_ready
-                    and not self._session_ready.done()):
-                self._session_ready.set_exception(WebTransportError(
-                    "WT session closed before READY"))
-            # Fail any pending create_stream() callers; the session
-            # is gone, no point making them wait for the timeout.
-            while self._pending_creates:
-                fut = self._pending_creates.popleft()
-                if not fut.done():
-                    fut.set_exception(WebTransportError(
-                        "WT session closed"))
-            self._event_queue.put_nowait(ev)
+            self._on_session_closed(error_code, data)
+        elif evt_type == _EVT_WT_CNX_CLOSED:
+            if not self.session_closed:
+                self._on_session_closed(error_code, None)
+            self._cnx_closed.set()
         elif evt_type == _EVT_WT_SESSION_DRAINING:
             self._draining = True
             self._event_queue.put_nowait(WebTransportSessionDraining())
@@ -809,10 +879,8 @@ class WebTransportSession:
                 # The cleanup walk is idempotent: it ends the late stream
                 # in its own direction and releases its link.
                 if sc_ptr and sid:
-                    try:
-                        self._state.push_session_cleanup()
-                    except BufferError:
-                        pass
+                    self._push_or_retry(self._state.push_session_cleanup,
+                                        "cleanup")
                 return
             # Peer opened a new stream — for bidi we may want to reply,
             # so stash the sc pointer here too.
@@ -1064,6 +1132,14 @@ class _DispatcherRegistry:
         d = self._dispatchers.get((id(loop), id(transport)))
         return d.cancel_tasks() if d is not None else []
 
+    def release(self, loop: asyncio.AbstractEventLoop,
+                transport: TransportContext,
+                session: WebTransportSession) -> None:
+        """Drop one session from its dispatcher; the dispatcher stays."""
+        d = self._dispatchers.get((id(loop), id(transport)))
+        if d is not None:
+            d.remove_session(session)
+
     def detach(self, loop: asyncio.AbstractEventLoop,
                 transport: TransportContext,
                 session: WebTransportSession) -> None:
@@ -1179,12 +1255,10 @@ async def connect_webtransport(
         yield client
     finally:
         loop = asyncio.get_event_loop()
-        if not client.session_closed:
-            client.close(0, b"")
-            try:
-                await asyncio.wait_for(client.wait_closed(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
+        try:
+            await client.aclose(0, b"")
+        except Exception:
+            pass
         # Reap anything the dispatcher started before the engine goes
         # away: a pending acceptor coroutine still holds this session and
         # transport, and stop() would free them underneath it.
@@ -1213,6 +1287,14 @@ class WebTransportServer:
         self._transport = transport
         self._dispatcher = dispatcher
         self._own_transport = own_transport
+
+    async def aclose(self) -> None:
+        """Close every live session, then the server."""
+        for session in list(self._dispatcher._sessions.values()):
+            if not session.session_closed:
+                session.close(0, b"")
+        await asyncio.sleep(0)
+        self.close()
 
     def close(self) -> None:
         try:

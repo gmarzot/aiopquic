@@ -43,7 +43,7 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_CLOSE,
     SPSC_EVT_TX_MARK_ACTIVE, SPSC_EVT_TX_CONNECT,
     SPSC_EVT_TX_WT_OPEN, SPSC_EVT_TX_WT_CREATE_STREAM,
-    SPSC_EVT_TX_WT_CLOSE, SPSC_EVT_TX_WT_DRAIN,
+    SPSC_EVT_TX_WT_CLOSE, SPSC_EVT_TX_WT_DRAIN, SPSC_EVT_TX_WT_FIN,
     SPSC_EVT_TX_WT_RESET_STREAM, SPSC_EVT_TX_WT_DEREGISTER,
     SPSC_EVT_TX_WT_STOP_SENDING,
     SPSC_EVT_TX_OPEN_FLOW_CONTROL,
@@ -603,6 +603,11 @@ cdef extern from "c/h3wt_callback.h":
         int event,
         h3zero_stream_ctx_t* stream_ctx, void* path_app_ctx)
     int aiopquic_dispatch_cb(
+        picoquic_cnx_t* cnx, uint64_t stream_id,
+        uint8_t* bytes, size_t length,
+        int event,
+        void* callback_ctx, void* v_stream_ctx)
+    int aiopquic_wt_server_bootstrap_cb(
         picoquic_cnx_t* cnx, uint64_t stream_id,
         uint8_t* bytes, size_t length,
         int event,
@@ -2702,7 +2707,7 @@ cdef class TransportContext:
                 self._ctx.dual_wt_params = <void*>&self._wt_params
                 default_cb_fn = aiopquic_dispatch_cb
             else:
-                default_cb_fn = h3zero_callback
+                default_cb_fn = aiopquic_wt_server_bootstrap_cb
                 default_cb_ctx = <void*>&self._wt_params
             # Server WT subprotocol allowlist (CSV, e.g. "moqt-18, moqt-16").
             # Held as bytes on self so the borrowed pointer the bridge reads
@@ -3305,6 +3310,20 @@ cdef class WebTransportSessionState:
             self._transport._ctx.tx_event_ring, &entry, NULL, 0)
         if ret != 0:
             raise BufferError("TX ring full (WT_DRAIN)")
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
+        self._transport.wake_up()
+
+    def push_fin(self):
+        """FIN our side of the CONNECT stream, answering a peer close."""
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_WT_FIN
+        entry.cnx = <void*>self._wt
+        entry.stream_ctx = <void*>self._wt
+        cdef int ret = spsc_ring_push(
+            self._transport._ctx.tx_event_ring, &entry, NULL, 0)
+        if ret != 0:
+            raise BufferError("TX ring full (WT_FIN)")
         self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 

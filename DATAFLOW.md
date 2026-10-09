@@ -106,6 +106,19 @@ Key contracts:
 - Close/destroy paths set every parked Event so waiters exit cleanly
   (`_handle_raw_event` close/destroy branches, `connection.py`).
 
+### Session close (WebTransport)
+
+`close()` queues the CLOSE_WEBTRANSPORT_SESSION capsule with FIN on CONNECT and the
+session cleanup, one worker walk that resets and stops every stream of the session
+with WT_SESSION_GONE. The peer's FIN or reset on CONNECT, or its capsule, marks
+`peer_fin`; the peer's close is answered with our FIN. A client closes the connection
+with H3_NO_ERROR once its FIN and cleanup are queued and the peer's FIN is in, after
+`AIOPQUIC_WT_CLOSE_GRACE_US` so the queued resets leave first (a disconnecting cnx
+sends nothing else), or after `AIOPQUIC_WT_CLOSE_DEADLINE_US` without the peer's FIN;
+both ride picoquic's app wake timer. `WT_CNX_CLOSED` completes `aclose()`. A server
+never closes the shared connection. Connection-level events reach the sessions
+through `aiopquic_wt_cnx_cb`, installed on every cnx that carries sessions.
+
 ### TX backpressure layers
 
 Layered from coarsest to finest; whichever binds first governs.

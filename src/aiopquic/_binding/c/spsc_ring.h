@@ -187,6 +187,7 @@ typedef enum {
      * a wt_session pointer in entry.cnx instead of a picoquic_cnx_t. */
     SPSC_EVT_TX_SET_STREAM_PRIORITY = 149,
     SPSC_EVT_TX_WT_SET_STREAM_PRIORITY = 150,
+    SPSC_EVT_TX_WT_FIN = 151,           /* FIN the CONNECT stream, answering a peer close */
 
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
@@ -222,6 +223,8 @@ typedef enum {
                                               calls aiopquic_wt_stream_link_destroy.
                                               data_buf = link*; not exposed
                                               to Python. */
+    SPSC_EVT_WT_CNX_CLOSED = 77,           /* WT client cnx gone: close, application close or
+                                              stateless reset; error_code = the peer's code */
 } spsc_event_type_t;
 
 typedef struct {

@@ -23,6 +23,29 @@
   could leave the engine routing a new connection into a dead protocol, and a lost
   drained wake parked a writer for good. `rx_overflow_pushed` and
   `rx_overflow_max_depth` count it; `rx_event_drops` now means out of memory.
+- Fix: a WebTransport close reaches the wire (draft-ietf-webtrans-http3 §6). The closing
+  end sends the capsule and FINs CONNECT; a client then waits for the peer's FIN and
+  closes the connection with H3_NO_ERROR after a short grace, or at a one-second
+  deadline. `WebTransportSession.aclose()` awaits that; `connect_webtransport` exits
+  through it. Before, a WebTransport connection lingered to the idle timeout.
+- Fix: a WebTransport client learns that the peer closed the connection; h3zero's
+  client branch only set a flag, and an aiomoqt client hung after a relay closed.
+- Fix: a WebTransport server sees its client's close capsule and FIN, closes the
+  session and answers with its own FIN; h3zero routed those frames through the path
+  entry, which ignored them, so sessions lingered to the idle timeout.
+- Fix: the peer's close code and reason survive a capsule that arrives with its FIN;
+  the session saw (0, None).
+- Fix: a peer-initiated close is answered with our FIN on CONNECT (§6 MUST), and
+  readers of a terminated session's streams return with WT_SESSION_GONE instead of
+  waiting forever.
+- Fix: a closed server session leaves the dispatcher's table while the server runs;
+  it was held until the server stopped.
+- Fix: `WebTransportSession.close()` on a full TX ring no longer raises before the
+  session is marked closed; close, cleanup and FIN are rescheduled on the ring's
+  drain instead. `WebTransportServer.aclose()` closes live sessions first.
+- Fix: raw-QUIC `connect()` exits through `QuicConnectionProtocol.aclose()`, which
+  awaits the close, so `stop()` can no longer discard it; one exit in five to twenty
+  lost the close before.
 
 ## v0.5.0a1
 

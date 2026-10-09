@@ -1351,7 +1351,8 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                      entry->event_type <= SPSC_EVT_TX_WT_STOP_SENDING) ||
                     entry->event_type == SPSC_EVT_TX_WT_SESSION_CLEANUP ||
                     entry->event_type == SPSC_EVT_TX_MARK_WT_DATAGRAM_READY ||
-                    entry->event_type == SPSC_EVT_TX_WT_SET_STREAM_PRIORITY) {
+                    entry->event_type == SPSC_EVT_TX_WT_SET_STREAM_PRIORITY ||
+                    entry->event_type == SPSC_EVT_TX_WT_FIN) {
                     (void)aiopquic_wt_handle_tx(quic, ctx, entry);
                     ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                     aiopquic_maybe_fire_tx_event_ring_drained(ctx);
