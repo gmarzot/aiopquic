@@ -2,6 +2,7 @@
 
 import ssl
 from dataclasses import dataclass, field
+from collections.abc import Sequence
 
 
 @dataclass
@@ -74,6 +75,9 @@ class QuicConfiguration:
     verify_mode: int | None = None
     # Client: PEM bundle of trusted roots; None uses certifi's bundle.
     cafile: str | None = None
+    # TLS key-exchange groups in preference order, IANA ids. None is
+    # classic first; KEX_X25519MLKEM768 first gives a post-quantum share.
+    key_exchange_groups: Sequence[int] | None = None
     # NSS Key Log Format file (Wireshark-compatible). When set, picoquic
     # writes TLS secrets per connection so packet captures can be
     # decrypted offline. Honors the SSLKEYLOGFILE env var as a default.

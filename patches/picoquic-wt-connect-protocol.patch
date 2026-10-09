@@ -1,5 +1,5 @@
 diff --git a/picohttp/webtransport.c b/picohttp/webtransport.c
-index fb49cd6d..a37d085e 100644
+index cb15e6e1..78a3a66f 100644
 --- a/picohttp/webtransport.c
 +++ b/picohttp/webtransport.c
 @@ -345,8 +345,13 @@ const char* picowt_get_authority(h3zero_stream_ctx_t* stream_ctx)
@@ -17,12 +17,12 @@ index fb49cd6d..a37d085e 100644
 +    return H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD;
  }
  
- static int picowt_webtransport_requirements_met(picoquic_cnx_t* cnx, h3zero_callback_ctx_t* ctx)
+ /* Not declared static because used in tests. */
 diff --git a/picoquictest/webtransport_test.c b/picoquictest/webtransport_test.c
-index 25dd58bf..b40f0bc3 100644
+index 8dc0aee1..1a2e6223 100644
 --- a/picoquictest/webtransport_test.c
 +++ b/picoquictest/webtransport_test.c
-@@ -551,7 +551,7 @@ static int picowt_connect_protocol_test_one(picoquic_cnx_t* cnx,
+@@ -688,7 +688,7 @@ static int picowt_connect_protocol_test_one(picoquic_cnx_t* cnx,
  
  static int picowt_connect_protocol_test(picoquic_cnx_t* cnx)
  {

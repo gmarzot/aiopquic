@@ -83,7 +83,7 @@ sequenceDiagram
 
     Note over WK,App: backpressure return path
     alt stream queue was full (BufferError raised to caller)
-        WK-->>API: STREAM_TX_DRAINED (CAS-armed, once per fill-drain cycle,<br/>re-armed if rx_event_ring full)
+        WK-->>API: STREAM_TX_DRAINED (CAS-armed, once per fill-drain cycle,<br/>spills to the overflow if rx_event_ring is full)
         API->>API: asyncio.wait FIRST_COMPLETED on per-stream + ring events,<br/>then retry the same buffer
     end
     alt tx_event_ring drains to the 50% low-water after being full
@@ -105,6 +105,19 @@ Key contracts:
   a wake is delayed, never lost.
 - Close/destroy paths set every parked Event so waiters exit cleanly
   (`_handle_raw_event` close/destroy branches, `connection.py`).
+
+### Session close (WebTransport)
+
+`close()` queues the CLOSE_WEBTRANSPORT_SESSION capsule with FIN on CONNECT and the
+session cleanup, one worker walk that resets and stops every stream of the session
+with WT_SESSION_GONE. The peer's FIN or reset on CONNECT, or its capsule, marks
+`peer_fin`; the peer's close is answered with our FIN. A client closes the connection
+with H3_NO_ERROR once its FIN and cleanup are queued and the peer's FIN is in, after
+`AIOPQUIC_WT_CLOSE_GRACE_US` so the queued resets leave first (a disconnecting cnx
+sends nothing else), or after `AIOPQUIC_WT_CLOSE_DEADLINE_US` without the peer's FIN;
+both ride picoquic's app wake timer. `WT_CNX_CLOSED` completes `aclose()`. A server
+never closes the shared connection. Connection-level events reach the sessions
+through `aiopquic_wt_cnx_cb`, installed on every cnx that carries sessions.
 
 ### TX backpressure layers
 
@@ -283,9 +296,8 @@ Quick triage, in order:
 ```
 sc drain_arms > drain_fires + drain_dropped        → per-stream wake lost (bug)
 tx_event_ring_arms > fires + fire_dropped          → ring wake lost (bug)
-rx_event_drops growing                             → event ring overflow; data events
-                                                     are coalescing-protected, but
-                                                     lifecycle events may be delayed
+rx_overflow_max_depth growing                      → consumer lags the worker; events arrive late, never lost
+rx_event_drops > 0                                 → out of memory on an event push (bug)
 sc_alive_total growing without bound               → stream teardown starving
                                                      (drain not getting CPU) or leak
 chunks_alive_total growing without bound           → consumer pipeline retaining

@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.5.0a2
+
+- picoquic pin advanced to 1.1.53.0 (`c9088724`, 2026-10-08), picotls to `f06553b`:
+  upstream's September security fixes (integer overflows in frame and length
+  parsing, SACK eviction, datagram length wrap, QPACK length check), the receive-
+  and send-path work, the newreno cwnd-blocked and Prague CE fixes, and the
+  network-thread wake-up fix that retires our wake-on-delete patch. The CONNECT
+  token patch is regenerated unchanged.
+- TLS key exchange: clients offer a classic key share first (X25519, then
+  SECP256R1) with the ML-KEM hybrids still advertised. picoquic now leads with
+  X25519MLKEM768 and picotls sends one share, which no server without the hybrid
+  and without HelloRetryRequest, aioquic and qh3 among them, can complete.
+  `QuicConfiguration.key_exchange_groups` / `start(key_exchange_groups=...)`
+  set the order; the hybrid first gives a post-quantum share.
+- Native smoke: the picoquic self-tests run with `AIOPQUIC_WT_STRICT_CONNECT=1`,
+  so they check upstream's CONNECT gate rather than our lenient one; the four
+  QMUX tests are excluded, their TLS records fail with fusion AES-GCM.
+- Fix: a full RX event ring no longer drops lifecycle or wake events (STREAM_DESTROY,
+  FIN, RESET, STOP_SENDING, CLOSE, SESSION_CLOSED, link release, drained wakes). They
+  spill to an order-preserving overflow and arrive late instead of never; a lost CLOSE
+  could leave the engine routing a new connection into a dead protocol, and a lost
+  drained wake parked a writer for good. `rx_overflow_pushed` and
+  `rx_overflow_max_depth` count it; `rx_event_drops` now means out of memory.
+- Fix: a WebTransport close reaches the wire (draft-ietf-webtrans-http3 §6). The closing
+  end sends the capsule and FINs CONNECT; a client then waits for the peer's FIN and
+  closes the connection with H3_NO_ERROR after a short grace, or at a one-second
+  deadline. `WebTransportSession.aclose()` awaits that; `connect_webtransport` exits
+  through it. Before, a WebTransport connection lingered to the idle timeout.
+- `WebTransportError` is a `ConnectionError`: a refused or closed session is caught like
+  a failed raw QUIC connect, with the specific type still available.
+- Fix: a WebTransport client learns that the peer closed the connection; h3zero's
+  client branch only set a flag, and an aiomoqt client hung after a relay closed.
+- Fix: a WebTransport server sees its client's close capsule and FIN, closes the
+  session and answers with its own FIN; h3zero routed those frames through the path
+  entry, which ignored them, so sessions lingered to the idle timeout.
+- Fix: the peer's close code and reason survive a capsule that arrives with its FIN;
+  the session saw (0, None).
+- Fix: a peer-initiated close is answered with our FIN on CONNECT (§6 MUST), and
+  readers of a terminated session's streams return with WT_SESSION_GONE instead of
+  waiting forever.
+- Fix: a closed server session leaves the dispatcher's table while the server runs;
+  it was held until the server stopped.
+- Fix: `WebTransportSession.close()` on a full TX ring no longer raises before the
+  session is marked closed; close, cleanup and FIN are rescheduled on the ring's
+  drain instead. `WebTransportServer.aclose()` closes live sessions first.
+- Fix: raw-QUIC `connect()` exits through `QuicConnectionProtocol.aclose()`, which
+  awaits the close, so `stop()` can no longer discard it; one exit in five to twenty
+  lost the close before.
+
 ## v0.5.0a1
 
 - Fix: clients verify the server's certificate chain and name (RFC 9114 §3.1);

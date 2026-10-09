@@ -23,6 +23,7 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -186,6 +187,7 @@ typedef enum {
      * a wt_session pointer in entry.cnx instead of a picoquic_cnx_t. */
     SPSC_EVT_TX_SET_STREAM_PRIORITY = 149,
     SPSC_EVT_TX_WT_SET_STREAM_PRIORITY = 150,
+    SPSC_EVT_TX_WT_FIN = 151,           /* FIN the CONNECT stream, answering a peer close */
 
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
@@ -221,6 +223,8 @@ typedef enum {
                                               calls aiopquic_wt_stream_link_destroy.
                                               data_buf = link*; not exposed
                                               to Python. */
+    SPSC_EVT_WT_CNX_CLOSED = 77,           /* WT client cnx gone: close, application close or
+                                              stateless reset; error_code = the peer's code */
 } spsc_event_type_t;
 
 typedef struct {
@@ -477,6 +481,137 @@ static inline int spsc_ring_push_stream_data(spsc_ring_t* ring,
     entry.cnx = cnx;
     entry.stream_ctx = stream_ctx;
     return spsc_ring_push(ring, &entry, data, length);
+}
+
+
+/*
+ * Overflow for a full ring, order-preserving. The producer uses the ring
+ * only while the overflow is empty; the consumer moves overflow entries
+ * back into the ring and lets the producer in again only after the last
+ * one, so the ring keeps its single producer during a refill. Entries
+ * keep the ring's ownership rules: an owned payload is copied into the
+ * node and handed to the ring on refill, a borrowed pointer travels
+ * as-is with data_length 0.
+ */
+typedef struct spsc_overflow_node {
+    spsc_entry_t entry;
+    struct spsc_overflow_node* next;
+} spsc_overflow_node_t;
+
+typedef struct {
+    pthread_mutex_t lock;              /* guards the list links only */
+    spsc_overflow_node_t* head;
+    spsc_overflow_node_t* tail;
+    _Atomic(uint64_t) depth;           /* nonzero: producer stays off the ring */
+    uint64_t pushed;                   /* producer-side counters */
+    uint64_t max_depth;
+} spsc_overflow_t;
+
+static inline void spsc_overflow_init(spsc_overflow_t* ovf) {
+    memset(ovf, 0, sizeof(*ovf));
+    pthread_mutex_init(&ovf->lock, NULL);
+}
+
+static inline void spsc_overflow_destroy(spsc_overflow_t* ovf) {
+    spsc_overflow_node_t* n = ovf->head;
+    while (n) {
+        spsc_overflow_node_t* next = n->next;
+        if (n->entry.data_buf && n->entry.data_length > 0) {
+            free(n->entry.data_buf);
+        }
+        free(n);
+        n = next;
+    }
+    ovf->head = NULL;
+    ovf->tail = NULL;
+    atomic_store_explicit(&ovf->depth, 0, memory_order_relaxed);
+    pthread_mutex_destroy(&ovf->lock);
+}
+
+/* Producer. 0: pushed to the ring; 1: queued in the overflow; -2: out of
+ * memory. data/data_len copy an owned payload; with data NULL the entry's
+ * data_buf travels as a borrowed pointer. */
+static inline int spsc_ring_push_or_overflow(spsc_ring_t* ring,
+                                             spsc_overflow_t* ovf,
+                                             const spsc_entry_t* entry,
+                                             const uint8_t* data,
+                                             uint32_t data_len) {
+    if (atomic_load_explicit(&ovf->depth, memory_order_acquire) == 0) {
+        int rc = (data != NULL && data_len > 0)
+            ? spsc_ring_push(ring, entry, data, data_len)
+            : spsc_ring_push_borrowed(ring, entry);
+        if (rc == 0 || rc == -2) {
+            return rc;
+        }
+    }
+    spsc_overflow_node_t* node =
+        (spsc_overflow_node_t*)malloc(sizeof(*node));
+    if (!node) {
+        return -2;
+    }
+    node->entry = *entry;
+    node->next = NULL;
+    if (data != NULL && data_len > 0) {
+        node->entry.data_buf = malloc(data_len);
+        if (!node->entry.data_buf) {
+            free(node);
+            return -2;
+        }
+        memcpy(node->entry.data_buf, data, data_len);
+        node->entry.data_length = data_len;
+    } else {
+        node->entry.data_length = 0;
+    }
+    pthread_mutex_lock(&ovf->lock);
+    if (ovf->tail) {
+        ovf->tail->next = node;
+    } else {
+        ovf->head = node;
+    }
+    ovf->tail = node;
+    pthread_mutex_unlock(&ovf->lock);
+    uint64_t depth = atomic_fetch_add_explicit(&ovf->depth, 1,
+                                               memory_order_release) + 1;
+    ovf->pushed++;
+    if (depth > ovf->max_depth) {
+        ovf->max_depth = depth;
+    }
+    return 1;
+}
+
+/* Consumer. Moves overflow entries into the ring while there is room and
+ * returns how many moved. Writing the ring here is safe: the producer
+ * stays off it while depth is nonzero, and the last decrement is a
+ * release that publishes the new tail. */
+static inline uint32_t spsc_ring_refill_from_overflow(spsc_ring_t* ring,
+                                                      spsc_overflow_t* ovf) {
+    uint32_t moved = 0;
+    while (atomic_load_explicit(&ovf->depth, memory_order_acquire) > 0) {
+        uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+        uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
+        if (tail - head >= ring->capacity) {
+            break;
+        }
+        pthread_mutex_lock(&ovf->lock);
+        spsc_overflow_node_t* node = ovf->head;
+        ovf->head = node->next;
+        if (ovf->head == NULL) {
+            ovf->tail = NULL;
+        }
+        pthread_mutex_unlock(&ovf->lock);
+        spsc_entry_t* e = &ring->entries[(uint32_t)(tail & ring->mask)];
+        *e = node->entry;
+        if (e->data_length > 0) {
+            atomic_fetch_add_explicit(&ring->bytes_pending,
+                                      (uint64_t)e->data_length,
+                                      memory_order_relaxed);
+        }
+        free(node);
+        atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
+        atomic_fetch_sub_explicit(&ovf->depth, 1, memory_order_release);
+        moved++;
+    }
+    return moved;
 }
 
 #ifdef __cplusplus

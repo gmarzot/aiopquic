@@ -35,6 +35,13 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* A client that closed its session waits this long for the peer's CONNECT
+ * FIN before closing the connection anyway, and this long after both FINs
+ * are in so the queued stream resets leave before the CONNECTION_CLOSE:
+ * a disconnecting picoquic cnx sends nothing else. */
+#define AIOPQUIC_WT_CLOSE_DEADLINE_US 1000000
+#define AIOPQUIC_WT_CLOSE_GRACE_US 20000
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -110,6 +117,10 @@ struct st_aiopquic_wt_session_t {
     picowt_capsule_t              capsule;         /* incremental capsule accumulator */
     int                           session_ready;   /* CONNECT accepted */
     int                           session_closing; /* close/drain seen or initiated */
+    int                           fin_sent;        /* our CONNECT FIN is sent */
+    int                           peer_fin;        /* peer FIN or reset on CONNECT seen */
+    uint64_t                      close_deadline;  /* quic time to close the cnx, 0 = none */
+    int                           cleanup_done;    /* the session's stream resets are queued */
     char*                         wt_protocol;     /* negotiated WT subprotocol (owned copy), NULL if none */
     /* Pull-model datagram TX for this session. The producer commits
      * records from Python; h3zero pulls them in provide_datagram and
@@ -321,24 +332,11 @@ static inline void aiopquic_wt_push_event_with_sc(
     entry.data_buf = sc;      /* borrowed; freed by link_destroy */
     entry.data_length = 0;    /* sentinel: do not free on pop */
     entry.is_fin = is_fin;
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
-    if (ret == 0) {
-        aiopquic_notify_rx(s->bridge);
-    } else {
-        s->bridge->worker_rx_event_drops++;
-        if (event_type == SPSC_EVT_WT_STREAM_DATA) {
-            s->bridge->worker_rx_event_drops_stream_data++;
-            /* Clear rx_event_pending so the next arrival retries. */
-            aiopquic_stream_ctx_rx_event_pending_clear(sc);
-        }
-        if (aiopquic_rx_log_enabled()
-                && s->bridge->worker_rx_event_drops <= 100) {
-            fprintf(stderr,
-                "[aiopquic_rx] WT EVENT RING FULL (sc): drop "
-                "stream=%llu evt=%u (rx_event_ring entries=%u)\n",
-                (unsigned long long)stream_id, event_type,
-                spsc_ring_count(s->bridge->rx_event_ring));
-        }
+    if (aiopquic_rx_push(s->bridge, &entry, NULL, 0) != 0
+            && event_type == SPSC_EVT_WT_STREAM_DATA) {
+        s->bridge->worker_rx_event_drops_stream_data++;
+        /* Clear rx_event_pending so the next arrival retries. */
+        aiopquic_stream_ctx_rx_event_pending_clear(sc);
     }
 }
 
@@ -359,22 +357,9 @@ static inline void aiopquic_wt_push_event(
     entry.error_code = error_code;
     entry.cnx = s->cnx;
     entry.stream_ctx = s;       /* session ptr for demux */
-    int ret = spsc_ring_push(s->bridge->rx_event_ring, &entry, data, data_len);
-    if (ret == 0) {
-        aiopquic_notify_rx(s->bridge);
-    } else {
-        s->bridge->worker_rx_event_drops++;
-        if (event_type == SPSC_EVT_WT_STREAM_DATA) {
-            s->bridge->worker_rx_event_drops_stream_data++;
-        }
-        if (aiopquic_rx_log_enabled()
-                && s->bridge->worker_rx_event_drops <= 100) {
-            fprintf(stderr,
-                "[aiopquic_rx] WT EVENT RING FULL: drop "
-                "stream=%llu evt=%u (rx_event_ring entries=%u)\n",
-                (unsigned long long)stream_id, event_type,
-                spsc_ring_count(s->bridge->rx_event_ring));
-        }
+    if (aiopquic_rx_push(s->bridge, &entry, data, data_len) != 0
+            && event_type == SPSC_EVT_WT_STREAM_DATA) {
+        s->bridge->worker_rx_event_drops_stream_data++;
     }
 }
 
@@ -394,12 +379,7 @@ static inline void aiopquic_wt_push_new_stream(
     entry.stream_ctx = s;
     entry.data_buf = sc;     /* BORROWED */
     entry.data_length = 0;   /* sentinel: do not free on pop */
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
-    if (ret == 0) {
-        aiopquic_notify_rx(s->bridge);
-    } else {
-        s->bridge->worker_rx_event_drops++;
-    }
+    (void)aiopquic_rx_push(s->bridge, &entry, NULL, 0);
 }
 
 /*
@@ -429,20 +409,10 @@ static inline int aiopquic_wt_push_stream_destroy(
     entry.stream_id = stream_id;
     entry.cnx = s->cnx;
     entry.stream_ctx = s;  /* session ptr for asyncio routing */
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
-    if (ret == 0) {
-        aiopquic_notify_rx(s->bridge);
-    } else {
-        /* RX ring full. The Python dict retains a stale entry for
-         * this stream until session close clears it. The CALLER
-         * must skip the paired link_release when this fails —
-         * freeing the sc while Python's dict still maps the sid
-         * would leave a dangling pointer for any sid-keyed access.
-         * Bounded by per-cnx stream count; surfaced via the drop
-         * counter so sustained drops are visible. */
-        s->bridge->worker_rx_event_drops++;
-    }
-    return ret;
+    /* Out of memory is the only failure; the caller then skips the
+     * paired link_release, since Python's dict would still map the
+     * sid to the freed sc. */
+    return aiopquic_rx_push(s->bridge, &entry, NULL, 0);
 }
 
 static inline void aiopquic_wt_push_link_release(
@@ -456,25 +426,9 @@ static inline void aiopquic_wt_push_link_release(
     entry.stream_ctx = s;
     entry.data_buf = link;
     entry.data_length = 0;
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
-    if (ret == 0) {
-        aiopquic_notify_rx(s->bridge);
-    } else {
-        /* RX ring full when worker tries to push LINK_RELEASE. We
-         * cannot retry from here (picoquic owns the calling thread)
-         * and we cannot synchronously destroy (Python may have
-         * STREAM_DATA/FIN for this stream still in the ring → UAF).
-         * Best path: leak the link. Surface via the existing drop
-         * counter so sustained drops are visible. */
-        s->bridge->worker_rx_event_drops++;
-        if (aiopquic_rx_log_enabled()
-                && s->bridge->worker_rx_event_drops <= 100) {
-            fprintf(stderr,
-                "[aiopquic_rx] LINK_RELEASE drop on full rx_event_ring: "
-                "leaking link for stream=%llu\n",
-                (unsigned long long)stream_id);
-        }
-    }
+    /* Out of memory leaks the link: it cannot be freed here while
+     * Python may still hold events for the stream. */
+    (void)aiopquic_rx_push(s->bridge, &entry, NULL, 0);
 }
 
 /*
@@ -495,12 +449,126 @@ static inline void aiopquic_wt_push_stream_created(
     entry.stream_ctx = s;
     entry.data_buf = sc;     /* BORROWED, NULL on error */
     entry.data_length = 0;
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
-    if (ret == 0) {
-        aiopquic_notify_rx(s->bridge);
-    } else {
-        s->bridge->worker_rx_event_drops++;
+    (void)aiopquic_rx_push(s->bridge, &entry, NULL, 0);
+}
+
+/* A client closes the connection once its FIN and its stream resets are
+ * queued and the peer's FIN is in, or at the deadline, carried by the
+ * app wake timer. A server leaves the shared connection to the client. */
+static void aiopquic_wt_maybe_close_cnx(aiopquic_wt_session_t* s,
+                                        picoquic_cnx_t* cnx) {
+    if (aiopquic_wt_diag_enabled()) {
+        fprintf(stderr, "[wt-diag] maybe_close cnx=%p client=%d fin_sent=%d cleanup=%d peer_fin=%d deadline=%llu\n",
+            (void*)cnx, cnx ? picoquic_is_client(cnx) : -1, s->fin_sent, s->cleanup_done, s->peer_fin,
+            (unsigned long long)s->close_deadline);
+        fflush(stderr);
     }
+    if (cnx == NULL || !picoquic_is_client(cnx)
+            || !s->fin_sent || !s->cleanup_done) {
+        return;
+    }
+    uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
+    uint64_t at = now + (s->peer_fin ? AIOPQUIC_WT_CLOSE_GRACE_US
+                                     : AIOPQUIC_WT_CLOSE_DEADLINE_US);
+    if (s->close_deadline == 0 || at < s->close_deadline) {
+        s->close_deadline = at;
+        picoquic_set_app_wake_time(cnx, at);
+    }
+}
+
+/* The peer ended its side of CONNECT. */
+static void aiopquic_wt_peer_fin(aiopquic_wt_session_t* s, picoquic_cnx_t* cnx) {
+    s->peer_fin = 1;
+    aiopquic_wt_maybe_close_cnx(s, cnx);
+}
+
+/* Our side of CONNECT is done. */
+static void aiopquic_wt_fin_sent(aiopquic_wt_session_t* s, picoquic_cnx_t* cnx) {
+    s->fin_sent = 1;
+    s->session_closing = 1;
+    aiopquic_wt_maybe_close_cnx(s, cnx);
+}
+
+static int aiopquic_wt_path_callback(picoquic_cnx_t* cnx, uint8_t* bytes,
+                                     size_t length,
+                                     picohttp_call_back_event_t event,
+                                     h3zero_stream_ctx_t* stream_ctx,
+                                     void* path_app_ctx);
+
+/* The session behind a client cnx: the one stream prefix we declared. */
+static aiopquic_wt_session_t* aiopquic_wt_client_session(
+        h3zero_callback_ctx_t* h3) {
+    for (h3zero_stream_prefix_t* p = h3->stream_prefixes.first; p != NULL;
+            p = p->next) {
+        if (p->function_call == aiopquic_wt_path_callback) {
+            return (aiopquic_wt_session_t*)p->function_ctx;
+        }
+    }
+    return NULL;
+}
+
+/* Connection callback of a cnx that carries WT sessions, both roles. The
+ * callback context stays h3zero's, which its helpers read back from the
+ * cnx; everything is handed on to h3zero afterwards. A client learns of a
+ * connection close here, h3zero's client branch only flags it, and the
+ * close deadline rides the app wake timer. On a server h3zero frees its
+ * context on a close, so every session's cached pointers die here first. */
+static int aiopquic_wt_cnx_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
+                              uint8_t* bytes, size_t length,
+                              picoquic_call_back_event_t event,
+                              void* callback_ctx, void* v_stream_ctx) {
+    h3zero_callback_ctx_t* h3 = (h3zero_callback_ctx_t*)callback_ctx;
+    int client = picoquic_is_client(cnx);
+    switch (event) {
+    case picoquic_callback_app_wakeup: {
+        aiopquic_wt_session_t* s = client ? aiopquic_wt_client_session(h3) : NULL;
+        if (aiopquic_wt_diag_enabled()) {
+            fprintf(stderr, "[wt-diag] app_wakeup deadline=%llu peer_fin=%d\n",
+                s ? (unsigned long long)s->close_deadline : 0ULL, s ? s->peer_fin : -1);
+            fflush(stderr);
+        }
+        if (s != NULL && s->close_deadline != 0) {
+            s->close_deadline = 0;
+            picoquic_close(cnx, H3ZERO_NO_ERROR);
+        }
+        break;
+    }
+    case picoquic_callback_close:
+    case picoquic_callback_application_close:
+    case picoquic_callback_stateless_reset: {
+        uint64_t code = 0;
+        if (event == picoquic_callback_application_close) {
+            code = picoquic_get_application_error(cnx);
+        } else if (event == picoquic_callback_close) {
+            code = picoquic_get_remote_error(cnx);
+        }
+        for (h3zero_stream_prefix_t* p = h3->stream_prefixes.first; p != NULL;
+                p = p->next) {
+            if (p->function_call != aiopquic_wt_path_callback) {
+                continue;
+            }
+            aiopquic_wt_session_t* s = (aiopquic_wt_session_t*)p->function_ctx;
+            if (!s->session_closing) {
+                aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_CLOSED,
+                                        s->control_stream_id, code, NULL, 0);
+                s->session_closing = 1;
+            }
+            if (client) {
+                aiopquic_wt_push_event(s, SPSC_EVT_WT_CNX_CLOSED,
+                                        s->control_stream_id, code, NULL, 0);
+            } else {
+                s->cnx = NULL;
+                s->h3_ctx = NULL;
+                s->control_stream = NULL;
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    return h3zero_callback(cnx, stream_id, bytes, length, event,
+                           callback_ctx, v_stream_ctx);
 }
 
 /*
@@ -590,9 +658,11 @@ static int aiopquic_wt_path_callback(
             if (rc == 0 && s->capsule.h3_capsule.is_stored) {
                 uint64_t ctype = s->capsule.h3_capsule.capsule_type;
                 if (ctype == picowt_capsule_close_webtransport_session) {
-                    aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_CLOSED,
-                        s->control_stream_id, s->capsule.error_code,
-                        s->capsule.error_msg, (uint32_t)s->capsule.error_msg_len);
+                    if (!s->session_closing) {
+                        aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_CLOSED,
+                            s->control_stream_id, s->capsule.error_code,
+                            s->capsule.error_msg, (uint32_t)s->capsule.error_msg_len);
+                    }
                     s->session_closing = 1;
                 } else if (ctype == picowt_capsule_drain_webtransport_session) {
                     aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_DRAINING,
@@ -668,14 +738,30 @@ static int aiopquic_wt_path_callback(
 
     case picohttp_callback_post_fin:
         if (is_control) {
-            if (length > 0) {
-                int rc = picowt_receive_capsule(cnx, bytes,
-                                                  bytes + length, &s->capsule);
-                (void)rc;
+            uint64_t code = 0;
+            const uint8_t* reason = NULL;
+            uint32_t reason_len = 0;
+            if (length > 0
+                    && picowt_receive_capsule(cnx, bytes, bytes + length,
+                                              &s->capsule) == 0
+                    && s->capsule.h3_capsule.is_stored
+                    && s->capsule.h3_capsule.capsule_type
+                        == picowt_capsule_close_webtransport_session) {
+                code = s->capsule.error_code;
+                reason = s->capsule.error_msg;
+                reason_len = (uint32_t)s->capsule.error_msg_len;
             }
-            aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_CLOSED,
-                                    s->control_stream_id, 0, NULL, 0);
+            if (!s->session_closing) {
+                aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_CLOSED,
+                                        s->control_stream_id, code,
+                                        reason, reason_len);
+            }
             s->session_closing = 1;
+            if (aiopquic_wt_diag_enabled()) {
+                fprintf(stderr, "[wt-diag] control post_fin len=%zu code=%llu\n", length, (unsigned long long)code);
+                fflush(stderr);
+            }
+            aiopquic_wt_peer_fin(s, cnx);
         } else {
             int first_touch = 0;
             link = aiopquic_wt_ensure_link(s, link, stream_ctx, sid,
@@ -782,11 +868,9 @@ static int aiopquic_wt_path_callback(
                 drain_entry.stream_id = sid;
                 drain_entry.cnx = s->cnx;
                 drain_entry.stream_ctx = s;
-                if (spsc_ring_push(s->bridge->rx_event_ring,
-                                   &drain_entry, NULL, 0) == 0) {
+                if (aiopquic_rx_push(s->bridge, &drain_entry, NULL, 0) == 0) {
                     sc->cnt_drain_fires++;
                     sc->last_drain_fire_ns = aiopquic_now_ns();
-                    aiopquic_notify_rx(s->bridge);
                 } else {
                     sc->cnt_drain_dropped++;
                     atomic_store_explicit(
@@ -844,10 +928,7 @@ static int aiopquic_wt_path_callback(
                 drain_entry.event_type = SPSC_EVT_DATAGRAM_TX_DRAINED;
                 drain_entry.cnx = cnx;
                 drain_entry.stream_ctx = s;  /* session ptr for routing */
-                if (spsc_ring_push(s->bridge->rx_event_ring,
-                                   &drain_entry, NULL, 0) == 0) {
-                    aiopquic_notify_rx(s->bridge);
-                } else {
+                if (aiopquic_rx_push(s->bridge, &drain_entry, NULL, 0) != 0) {
                     atomic_store_explicit(&db->drain_pending, 1,
                                           memory_order_release);
                 }
@@ -867,11 +948,14 @@ static int aiopquic_wt_path_callback(
             fflush(stderr);
         }
         if (is_control) {
-            aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_CLOSED,
-                                    s->control_stream_id,
-                                    picoquic_get_remote_stream_error(cnx, sid),
-                                    NULL, 0);
+            if (!s->session_closing) {
+                aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_CLOSED,
+                                        s->control_stream_id,
+                                        picoquic_get_remote_stream_error(cnx, sid),
+                                        NULL, 0);
+            }
             s->session_closing = 1;
+            aiopquic_wt_peer_fin(s, cnx);
         } else {
             aiopquic_wt_push_event(s, SPSC_EVT_WT_STREAM_RESET,
                                     sid,
@@ -1004,14 +1088,20 @@ static int aiopquic_wt_server_path_callback(
         void* path_app_ctx) {
     aiopquic_ctx_t* bridge = (aiopquic_ctx_t*)path_app_ctx;
     if (!bridge || !stream_ctx) return -1;
-
-    if (event != picohttp_callback_connect) {
-        return 0;
-    }
-
     h3zero_callback_ctx_t* h3_ctx =
         (h3zero_callback_ctx_t*)picoquic_get_callback_context(cnx);
     if (!h3_ctx) return -1;
+    if (event != picohttp_callback_connect) {
+        /* h3zero routes the CONNECT stream's later frames, the capsules
+         * and the FIN, through the path entry; the session owns them. */
+        h3zero_stream_prefix_t* prefix =
+            h3zero_find_stream_prefix(h3_ctx, stream_ctx->stream_id);
+        if (prefix != NULL && prefix->function_call == aiopquic_wt_path_callback) {
+            return aiopquic_wt_path_callback(cnx, path_bytes, path_len, event,
+                                             stream_ctx, prefix->function_ctx);
+        }
+        return 0;
+    }
 
     aiopquic_wt_session_t* s = aiopquic_wt_session_create(bridge);
     if (!s) return -1;
@@ -1060,9 +1150,7 @@ static int aiopquic_wt_server_path_callback(
     entry.stream_id = s->control_stream_id;
     entry.cnx = cnx;
     entry.stream_ctx = s;
-    int rc = spsc_ring_push(bridge->rx_event_ring, &entry,
-                             path_bytes, (uint32_t)path_len);
-    if (rc == 0) aiopquic_notify_rx(bridge);
+    (void)aiopquic_rx_push(bridge, &entry, path_bytes, (uint32_t)path_len);
     return 0;
 }
 
@@ -1165,6 +1253,7 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         s->h3_ctx = h3_ctx;
         s->control_stream = control_stream;
         s->control_stream_id = control_stream->stream_id;
+        picoquic_set_callback(cnx, aiopquic_wt_cnx_cb, h3_ctx);
         /* Suppress h3zero's stdout banner on client-side cnx close
          * ("Received a connection close request"). h3zero_common.c
          * gates on !ctx->no_print; raw-QUIC has no equivalent print
@@ -1215,19 +1304,41 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (!s || !s->cnx || !s->control_stream) return 1;
         const char* msg = (const char*)entry->data_buf;
         char buf[256];
+        int rc;
         if (msg && entry->data_length > 0 &&
             entry->data_length < sizeof(buf)) {
             memcpy(buf, msg, entry->data_length);
             buf[entry->data_length] = '\0';
-            picowt_send_close_session_message(
+            rc = picowt_send_close_session_message(
                 s->cnx, s->control_stream,
                 (uint32_t)entry->error_code, buf);
         } else {
-            picowt_send_close_session_message(
+            rc = picowt_send_close_session_message(
                 s->cnx, s->control_stream,
                 (uint32_t)entry->error_code, "");
         }
         s->session_closing = 1;
+        if (rc == 0) {
+            aiopquic_wt_fin_sent(s, s->cnx);
+        }
+        return 1;
+    }
+    case SPSC_EVT_TX_WT_FIN: {
+        if (aiopquic_wt_diag_enabled()) {
+            fprintf(stderr, "[wt-diag] TX_WT_FIN s=%p cnx=%p control=%p fin_sent=%d\n",
+                (void*)s, s ? (void*)s->cnx : NULL, s ? (void*)s->control_stream : NULL, s ? s->fin_sent : -1);
+            fflush(stderr);
+        }
+        if (!s || !s->cnx || !s->control_stream) return 1;
+        if (!s->fin_sent && !s->control_stream->ps.stream_state.is_fin_sent) {
+            int fin_rc = picoquic_add_to_stream(s->cnx, s->control_stream_id,
+                                                NULL, 0, 1);
+            if (aiopquic_wt_diag_enabled()) {
+                fprintf(stderr, "[wt-diag] control FIN add_to_stream rc=%d\n", fin_rc);
+                fflush(stderr);
+            }
+        }
+        aiopquic_wt_fin_sent(s, s->cnx);
         return 1;
     }
 
@@ -1371,6 +1482,10 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                 node = next;
             }
         }
+        if (s) {
+            s->cleanup_done = 1;
+            aiopquic_wt_maybe_close_cnx(s, s->cnx);
+        }
         return 1;
     }
 
@@ -1433,6 +1548,18 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                 /* Step 3: now safe to deregister + free. */
                 picowt_deregister(s->cnx, s->h3_ctx, s->control_stream);
             }
+            if (s->cnx && s->h3_ctx && aiopquic_cnx_is_alive(quic, s->cnx)) {
+                if (picoquic_is_client(s->cnx)) {
+                    if (s->fin_sent) {
+                        picoquic_close(s->cnx, H3ZERO_NO_ERROR);
+                    }
+                    picoquic_set_callback(s->cnx, h3zero_callback, s->h3_ctx);
+                }
+                /* The stream prefix names this session; h3zero would hand
+                 * it a deregister at context deletion, after the free. */
+                h3zero_delete_stream_prefix(s->cnx, s->h3_ctx,
+                                            s->control_stream_id);
+            }
             aiopquic_wt_session_destroy(s);
         }
         return 1;
@@ -1467,12 +1594,29 @@ static void aiopquic_dispatch_announce(aiopquic_ctx_t* bridge,
     entry.event_type = SPSC_EVT_CNX_STACK;
     entry.cnx = cnx;
     entry.is_fin = (uint8_t)(is_h3 ? 1 : 0);
-    if (spsc_ring_push(bridge->rx_event_ring, &entry,
-                       (const uint8_t*)&snap, sizeof(snap)) == 0) {
-        aiopquic_notify_rx(bridge);
-    } else {
-        bridge->worker_rx_event_drops++;
+    (void)aiopquic_rx_push(bridge, &entry, (const uint8_t*)&snap, sizeof(snap));
+}
+
+/* Default callback of a WebTransport-only server: like h3zero's own
+ * first-contact path, create the per-cnx H3 context, but install our
+ * wrapper so connection-level events reach the sessions. */
+static int aiopquic_wt_server_bootstrap_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
+    uint8_t* bytes, size_t length, picoquic_call_back_event_t event,
+    void* callback_ctx, void* v_stream_ctx)
+{
+    h3zero_callback_ctx_t* hctx = h3zero_callback_create_context(
+        (picohttp_server_parameters_t*)callback_ctx);
+    if (hctx == NULL) {
+        picoquic_close(cnx, PICOQUIC_ERROR_MEMORY);
+        return -1;
     }
+    picoquic_set_callback(cnx, aiopquic_wt_cnx_cb, hctx);
+    int ret = h3zero_protocol_init_safe(cnx, hctx);
+    if (ret != 0) {
+        return ret;
+    }
+    return aiopquic_wt_cnx_cb(cnx, stream_id, bytes, length,
+                              event, hctx, v_stream_ctx);
 }
 
 static int aiopquic_dispatch_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
@@ -1491,13 +1635,13 @@ static int aiopquic_dispatch_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
             picoquic_close(cnx, PICOQUIC_ERROR_MEMORY);
             return -1;
         }
-        picoquic_set_callback(cnx, h3zero_callback, hctx);
+        picoquic_set_callback(cnx, aiopquic_wt_cnx_cb, hctx);
         int ret = h3zero_protocol_init_safe(cnx, hctx);
         if (ret != 0) {
             return ret;
         }
         aiopquic_dispatch_announce(bridge, cnx, 1);
-        return h3zero_callback(cnx, stream_id, bytes, length,
+        return aiopquic_wt_cnx_cb(cnx, stream_id, bytes, length,
                                event, hctx, v_stream_ctx);
     }
     picoquic_set_callback(cnx, aiopquic_stream_cb, bridge);

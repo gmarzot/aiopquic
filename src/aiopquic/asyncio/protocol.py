@@ -108,6 +108,21 @@ class QuicConnectionProtocol:
         """Close the QUIC connection."""
         self._quic.close()
 
+    async def aclose(self, error_code: int = 0, *,
+                     timeout: float = 2.0) -> None:
+        """Close the connection and wait, bounded by `timeout`, for the
+        close to complete, so it reaches the wire before the transport
+        stops. Returns at once when no handshake ever completed."""
+        if self._closed.is_set():
+            return
+        self._quic.close(error_code)
+        if not self._quic._connected:
+            return
+        try:
+            await asyncio.wait_for(self._closed.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+
     async def wait_connected(self) -> None:
         """Wait for TLS handshake to complete.
 

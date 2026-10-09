@@ -38,6 +38,7 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_TX_OPEN_FLOW_CONTROL
         SPSC_EVT_TX_SET_APP_FLOW_CONTROL
         SPSC_EVT_TX_WT_SESSION_CLEANUP
+        SPSC_EVT_TX_WT_FIN
         SPSC_EVT_TX_MARK_DATAGRAM_READY
         SPSC_EVT_TX_MARK_WT_DATAGRAM_READY
         SPSC_EVT_TX_SET_STREAM_PRIORITY
@@ -57,6 +58,7 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_WT_NEW_STREAM
         SPSC_EVT_WT_STREAM_CREATED
         SPSC_EVT_WT_STREAM_LINK_RELEASE
+        SPSC_EVT_WT_CNX_CLOSED
 
     ctypedef struct spsc_entry_t:
         uint64_t    stream_id
