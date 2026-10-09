@@ -83,7 +83,7 @@ sequenceDiagram
 
     Note over WK,App: backpressure return path
     alt stream queue was full (BufferError raised to caller)
-        WK-->>API: STREAM_TX_DRAINED (CAS-armed, once per fill-drain cycle,<br/>re-armed if rx_event_ring full)
+        WK-->>API: STREAM_TX_DRAINED (CAS-armed, once per fill-drain cycle,<br/>spills to the overflow if rx_event_ring is full)
         API->>API: asyncio.wait FIRST_COMPLETED on per-stream + ring events,<br/>then retry the same buffer
     end
     alt tx_event_ring drains to the 50% low-water after being full
@@ -283,9 +283,8 @@ Quick triage, in order:
 ```
 sc drain_arms > drain_fires + drain_dropped        → per-stream wake lost (bug)
 tx_event_ring_arms > fires + fire_dropped          → ring wake lost (bug)
-rx_event_drops growing                             → event ring overflow; data events
-                                                     are coalescing-protected, but
-                                                     lifecycle events may be delayed
+rx_overflow_max_depth growing                      → consumer lags the worker; events arrive late, never lost
+rx_event_drops > 0                                 → out of memory on an event push (bug)
 sc_alive_total growing without bound               → stream teardown starving
                                                      (drain not getting CPU) or leak
 chunks_alive_total growing without bound           → consumer pipeline retaining

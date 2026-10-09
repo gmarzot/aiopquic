@@ -17,6 +17,12 @@
 - Native smoke: the picoquic self-tests run with `AIOPQUIC_WT_STRICT_CONNECT=1`,
   so they check upstream's CONNECT gate rather than our lenient one; the four
   QMUX tests are excluded, their TLS records fail with fusion AES-GCM.
+- Fix: a full RX event ring no longer drops lifecycle or wake events (STREAM_DESTROY,
+  FIN, RESET, STOP_SENDING, CLOSE, SESSION_CLOSED, link release, drained wakes). They
+  spill to an order-preserving overflow and arrive late instead of never; a lost CLOSE
+  could leave the engine routing a new connection into a dead protocol, and a lost
+  drained wake parked a writer for good. `rx_overflow_pushed` and
+  `rx_overflow_max_depth` count it; `rx_event_drops` now means out of memory.
 
 ## v0.5.0a1
 

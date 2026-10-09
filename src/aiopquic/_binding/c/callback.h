@@ -197,6 +197,7 @@ extern "C" {
 typedef struct {
     spsc_ring_t*    rx_event_ring;
     spsc_ring_t*    tx_event_ring;
+    spsc_overflow_t rx_overflow;    /* order-preserving spill for a full RX ring */
     int             eventfd;        /* readable fd asyncio watches (eventfd
                                        on Linux, pipe read end elsewhere) */
     int             wake_write_fd;  /* fd the network thread writes to
@@ -228,11 +229,8 @@ typedef struct {
     uint64_t        worker_mark_active_processed;
     uint64_t        worker_prepare_to_send_calls;
     uint64_t        worker_prepare_to_send_pulled_bytes;
-    /* RX-side: count of spsc_ring_push failures on rx_event_ring (event
-     * ring full). On stream_data callbacks the BYTES were already
-     * pushed to sc->rx; the dropped EVENT means asyncio is not told
-     * those bytes arrived → small streams whose only events drop
-     * are silently lost. THIS WAS THE STREAM-LOSS BUG ROOT CAUSE. */
+    /* RX-side: events lost for want of memory. A full rx_event_ring
+     * spills to rx_overflow instead, order kept. */
     uint64_t        worker_rx_event_drops;
     uint64_t        worker_rx_event_drops_stream_data;
     uint64_t        cnt_rx_data_event_coalesced;     /* data events skipped: notification already in flight */
@@ -400,6 +398,7 @@ static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
 
     ctx->rx_event_ring = spsc_ring_create(rx_cap);
     ctx->tx_event_ring = spsc_ring_create(tx_cap);
+    spsc_overflow_init(&ctx->rx_overflow);
     if (!ctx->rx_event_ring || !ctx->tx_event_ring) {
         spsc_ring_destroy(ctx->rx_event_ring);
         spsc_ring_destroy(ctx->tx_event_ring);
@@ -462,6 +461,7 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
         if (ctx->wake_write_fd >= 0 && ctx->wake_write_fd != ctx->eventfd) {
             close(ctx->wake_write_fd);
         }
+        spsc_overflow_destroy(&ctx->rx_overflow);
         spsc_ring_destroy(ctx->rx_event_ring);
         spsc_ring_destroy(ctx->tx_event_ring);
         aiopquic_dgram_table_destroy(&ctx->dgram_table);
@@ -562,6 +562,22 @@ static inline int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx) {
  * SPSC_EVT_TX_EVENT_RING_DRAINED into rx_event_ring and calls aiopquic_notify_rx
  * which is defined further down in this header. */
 static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx);
+
+/* RX event push that never drops an event: the ring while it has room,
+ * else the order-preserving overflow. Wakes asyncio either way. Returns
+ * 0, or -2 when out of memory, the one case still counted as a drop. */
+static inline int aiopquic_rx_push(aiopquic_ctx_t* ctx,
+                                   const spsc_entry_t* entry,
+                                   const uint8_t* data, uint32_t data_len) {
+    int rc = spsc_ring_push_or_overflow(ctx->rx_event_ring, &ctx->rx_overflow,
+                                        entry, data, data_len);
+    if (rc < 0) {
+        ctx->worker_rx_event_drops++;
+        return rc;
+    }
+    aiopquic_notify_rx(ctx);
+    return 0;
+}
 
 /* Python-side helpers for the TX ring drain wakeup protocol. The
  * producer (asyncio thread) calls arm() before awaiting the event,
@@ -669,18 +685,11 @@ static inline void aiopquic_maybe_fire_tx_event_ring_drained(aiopquic_ctx_t* ctx
     }
     spsc_entry_t entry = {0};
     entry.event_type = SPSC_EVT_TX_EVENT_RING_DRAINED;
-    if (spsc_ring_push(ctx->rx_event_ring, &entry, NULL, 0) == 0) {
+    if (aiopquic_rx_push(ctx, &entry, NULL, 0) == 0) {
         ctx->cnt_tx_event_ring_fires++;
         ctx->last_tx_event_ring_fire_ns = aiopquic_now_ns();
-        aiopquic_notify_rx(ctx);
     } else {
-        /* rx_event_ring full — re-arm tx_event_ring_drain_pending so the next pop
-         * (or post-drain re-check in the wake_up handler) retries
-         * once Python catches up. Mirrors the STREAM_TX_DRAINED
-         * handling at callback.h:496-507 and the WT analog at
-         * h3wt_callback.h:649-664. Without this re-arm the wake is
-         * lost (CAS-clear is already committed) and the producer
-         * awaiting ring_event deadlocks. */
+        /* Out of memory: re-arm so the next pop fires again. */
         ctx->cnt_tx_event_ring_fire_dropped++;
         __atomic_store_n(&ctx->tx_event_ring_drain_pending, 1,
                           __ATOMIC_RELEASE);
@@ -722,6 +731,9 @@ static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
  *      thus skipping its own wake write — without re-arm those
  *      stranded entries would never wake asyncio again. */
 static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
+    /* Overflow left behind must keep the wake armed: the re-arm below
+     * looks at the ring only. */
+    spsc_ring_refill_from_overflow(ctx->rx_event_ring, &ctx->rx_overflow);
     __atomic_store_n(&ctx->rx_notify_pending, 0, __ATOMIC_RELEASE);
 #ifdef __linux__
     uint64_t val;
@@ -962,16 +974,11 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                 drain_entry.stream_id = stream_id;
                 drain_entry.cnx = cnx;
                 drain_entry.stream_ctx = sc;
-                if (spsc_ring_push(ctx->rx_event_ring,
-                                   &drain_entry, NULL, 0) == 0) {
+                if (aiopquic_rx_push(ctx, &drain_entry, NULL, 0) == 0) {
                     sc->cnt_drain_fires++;
                     sc->last_drain_fire_ns = aiopquic_now_ns();
-                    aiopquic_notify_rx(ctx);
                 } else {
-                    /* RX ring full — re-arm so Python re-attempts
-                     * once it drains; the worker will retry next
-                     * prepare_to_send. Better than losing the
-                     * wakeup. */
+                    /* Out of memory: re-arm so the next pull fires again. */
                     sc->cnt_drain_dropped++;
                     atomic_store_explicit(
                         &sc->tx_drain_pending, 1,
@@ -1004,12 +1011,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             destroy_entry.stream_id = stream_id;
             destroy_entry.cnx = cnx;
             destroy_entry.stream_ctx = stream_ctx;
-            if (spsc_ring_push(ctx->rx_event_ring, &destroy_entry,
-                               NULL, 0) == 0) {
-                aiopquic_notify_rx(ctx);
-            } else {
-                ctx->worker_rx_event_drops++;
-            }
+            (void)aiopquic_rx_push(ctx, &destroy_entry, NULL, 0);
         }
         return 0;
     }
@@ -1061,14 +1063,10 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                     spsc_entry_t drain_entry = {0};
                     drain_entry.event_type = SPSC_EVT_DATAGRAM_TX_DRAINED;
                     drain_entry.cnx = cnx;
-                    if (spsc_ring_push(ctx->rx_event_ring,
-                                       &drain_entry, NULL, 0) == 0) {
-                        aiopquic_notify_rx(ctx);
-                    } else {
-                        /* Ring full: re-arm so a later pop retries. */
+                    if (aiopquic_rx_push(ctx, &drain_entry, NULL, 0) != 0) {
+                        /* Out of memory: re-arm so a later pop fires again. */
                         atomic_store_explicit(&db->drain_pending, 1,
                                               memory_order_release);
-                        ctx->worker_rx_event_drops++;
                     }
                 }
             }
@@ -1217,7 +1215,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             }
             coalesce_sc = sc;
         }
-        ret = spsc_ring_push(ctx->rx_event_ring, &entry, NULL, 0);
+        ret = aiopquic_rx_push(ctx, &entry, NULL, 0);
     } else if (entry.event_type == SPSC_EVT_DATAGRAM_ACKED ||
                entry.event_type == SPSC_EVT_DATAGRAM_LOST) {
         /* Delivery signals, not data: picoquic hands us the ORIGINAL
@@ -1225,52 +1223,31 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
          * memcpy per event for payloads no consumer read. Surface the
          * event with its length only. */
         entry.data_length = (uint32_t)length;
-        ret = spsc_ring_push(ctx->rx_event_ring, &entry, NULL, 0);
+        ret = aiopquic_rx_push(ctx, &entry, NULL, 0);
     } else if (fin_or_event == picoquic_callback_ready) {
         /* The handshake-time state asyncio needs rides with READY. */
         aiopquic_cnx_snapshot_t snap;
         aiopquic_cnx_snapshot_fill(cnx, &snap);
-        ret = spsc_ring_push(ctx->rx_event_ring, &entry,
-                             (const uint8_t*)&snap, sizeof(snap));
+        ret = aiopquic_rx_push(ctx, &entry,
+                               (const uint8_t*)&snap, sizeof(snap));
     } else {
-        ret = spsc_ring_push(ctx->rx_event_ring, &entry, bytes, (uint32_t)length);
+        ret = aiopquic_rx_push(ctx, &entry, bytes, (uint32_t)length);
     }
-    if (ret == 0) {
-        aiopquic_notify_rx(ctx);
-        /* Note: the pure-receiver STREAM_DESTROY emit that used to
-         * live here is removed in 0.3.6. The new
-         * picoquic_callback_stream_released path (handled near the
-         * top of this function) is universal — it covers pure
-         * receivers AND senders AND bidi at the right moment
-         * (immediately for pure receivers, after FIN+ACK for
-         * senders). */
-    } else {
-        /* RX EVENT RING FULL — the data is already in sc->rx (for
-         * stream_data) but the notification event is gone. asyncio
-         * will only learn about the bytes if a LATER event for the
-         * same stream pushes successfully (drain_rx pops avail bytes
-         * from sc->rx then). Short streams whose only events drop
-         * are silently lost. Counter is exposed via Cython so callers
-         * can detect the condition; opt-in stderr via AIOPQUIC_RX_LOG=1. */
-        ctx->worker_rx_event_drops++;
+    if (ret != 0) {
+        /* Out of memory: the notification is gone. Stream bytes wait
+         * in sc->rx and the next arrival re-arms. */
         if (has_payload) {
             ctx->worker_rx_event_drops_stream_data++;
         }
         if (coalesce_sc != NULL) {
-            /* Notification push failed after arming: clear so the next
-             * arrival re-arms and retries; bytes wait in sc->rx
-             * meanwhile (same exposure as the pre-coalescing drop
-             * path, now vastly rarer since data events can no
-             * longer flood the ring). */
             aiopquic_stream_ctx_rx_event_pending_clear(coalesce_sc);
         }
         if (aiopquic_rx_log_enabled()
                 && ctx->worker_rx_event_drops <= 100) {
             fprintf(stderr,
-                "[aiopquic_rx] EVENT RING FULL: drop "
-                "stream=%llu evt=%u (rx_event_ring entries=%u)\n",
-                (unsigned long long)stream_id, entry.event_type,
-                spsc_ring_count(ctx->rx_event_ring));
+                "[aiopquic_rx] EVENT DROP (no memory): "
+                "stream=%llu evt=%u\n",
+                (unsigned long long)stream_id, entry.event_type);
         }
     }
 
@@ -1289,8 +1266,11 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
     switch (cb_mode) {
         case picoquic_packet_loop_ready:
             ctx->quic = quic;
-            spsc_ring_push_event(ctx->rx_event_ring, SPSC_EVT_READY, 0, NULL, 0);
-            aiopquic_notify_rx(ctx);
+            {
+                spsc_entry_t ready = {0};
+                ready.event_type = SPSC_EVT_READY;
+                (void)aiopquic_rx_push(ctx, &ready, NULL, 0);
+            }
             break;
 
         case picoquic_packet_loop_wake_up:
@@ -1350,8 +1330,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                             spsc_entry_t resp = {0};
                             resp.event_type = SPSC_EVT_ALMOST_READY;
                             resp.cnx = new_cnx;
-                            spsc_ring_push(ctx->rx_event_ring, &resp, NULL, 0);
-                            aiopquic_notify_rx(ctx);
+                            (void)aiopquic_rx_push(ctx, &resp, NULL, 0);
                         }
                     }
                     ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
@@ -1455,13 +1434,8 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         spsc_entry_t out = {0};
                         out.event_type = SPSC_EVT_CNX_SNAPSHOT;
                         out.cnx = cnx;
-                        if (spsc_ring_push(ctx->rx_event_ring, &out,
-                                           (const uint8_t*)&snap,
-                                           sizeof(snap)) == 0) {
-                            aiopquic_notify_rx(ctx);
-                        } else {
-                            ctx->worker_rx_event_drops++;
-                        }
+                        (void)aiopquic_rx_push(ctx, &out, (const uint8_t*)&snap,
+                                               sizeof(snap));
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;

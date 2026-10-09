@@ -321,24 +321,11 @@ static inline void aiopquic_wt_push_event_with_sc(
     entry.data_buf = sc;      /* borrowed; freed by link_destroy */
     entry.data_length = 0;    /* sentinel: do not free on pop */
     entry.is_fin = is_fin;
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
-    if (ret == 0) {
-        aiopquic_notify_rx(s->bridge);
-    } else {
-        s->bridge->worker_rx_event_drops++;
-        if (event_type == SPSC_EVT_WT_STREAM_DATA) {
-            s->bridge->worker_rx_event_drops_stream_data++;
-            /* Clear rx_event_pending so the next arrival retries. */
-            aiopquic_stream_ctx_rx_event_pending_clear(sc);
-        }
-        if (aiopquic_rx_log_enabled()
-                && s->bridge->worker_rx_event_drops <= 100) {
-            fprintf(stderr,
-                "[aiopquic_rx] WT EVENT RING FULL (sc): drop "
-                "stream=%llu evt=%u (rx_event_ring entries=%u)\n",
-                (unsigned long long)stream_id, event_type,
-                spsc_ring_count(s->bridge->rx_event_ring));
-        }
+    if (aiopquic_rx_push(s->bridge, &entry, NULL, 0) != 0
+            && event_type == SPSC_EVT_WT_STREAM_DATA) {
+        s->bridge->worker_rx_event_drops_stream_data++;
+        /* Clear rx_event_pending so the next arrival retries. */
+        aiopquic_stream_ctx_rx_event_pending_clear(sc);
     }
 }
 
@@ -359,22 +346,9 @@ static inline void aiopquic_wt_push_event(
     entry.error_code = error_code;
     entry.cnx = s->cnx;
     entry.stream_ctx = s;       /* session ptr for demux */
-    int ret = spsc_ring_push(s->bridge->rx_event_ring, &entry, data, data_len);
-    if (ret == 0) {
-        aiopquic_notify_rx(s->bridge);
-    } else {
-        s->bridge->worker_rx_event_drops++;
-        if (event_type == SPSC_EVT_WT_STREAM_DATA) {
-            s->bridge->worker_rx_event_drops_stream_data++;
-        }
-        if (aiopquic_rx_log_enabled()
-                && s->bridge->worker_rx_event_drops <= 100) {
-            fprintf(stderr,
-                "[aiopquic_rx] WT EVENT RING FULL: drop "
-                "stream=%llu evt=%u (rx_event_ring entries=%u)\n",
-                (unsigned long long)stream_id, event_type,
-                spsc_ring_count(s->bridge->rx_event_ring));
-        }
+    if (aiopquic_rx_push(s->bridge, &entry, data, data_len) != 0
+            && event_type == SPSC_EVT_WT_STREAM_DATA) {
+        s->bridge->worker_rx_event_drops_stream_data++;
     }
 }
 
@@ -394,12 +368,7 @@ static inline void aiopquic_wt_push_new_stream(
     entry.stream_ctx = s;
     entry.data_buf = sc;     /* BORROWED */
     entry.data_length = 0;   /* sentinel: do not free on pop */
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
-    if (ret == 0) {
-        aiopquic_notify_rx(s->bridge);
-    } else {
-        s->bridge->worker_rx_event_drops++;
-    }
+    (void)aiopquic_rx_push(s->bridge, &entry, NULL, 0);
 }
 
 /*
@@ -429,20 +398,10 @@ static inline int aiopquic_wt_push_stream_destroy(
     entry.stream_id = stream_id;
     entry.cnx = s->cnx;
     entry.stream_ctx = s;  /* session ptr for asyncio routing */
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
-    if (ret == 0) {
-        aiopquic_notify_rx(s->bridge);
-    } else {
-        /* RX ring full. The Python dict retains a stale entry for
-         * this stream until session close clears it. The CALLER
-         * must skip the paired link_release when this fails —
-         * freeing the sc while Python's dict still maps the sid
-         * would leave a dangling pointer for any sid-keyed access.
-         * Bounded by per-cnx stream count; surfaced via the drop
-         * counter so sustained drops are visible. */
-        s->bridge->worker_rx_event_drops++;
-    }
-    return ret;
+    /* Out of memory is the only failure; the caller then skips the
+     * paired link_release, since Python's dict would still map the
+     * sid to the freed sc. */
+    return aiopquic_rx_push(s->bridge, &entry, NULL, 0);
 }
 
 static inline void aiopquic_wt_push_link_release(
@@ -456,25 +415,9 @@ static inline void aiopquic_wt_push_link_release(
     entry.stream_ctx = s;
     entry.data_buf = link;
     entry.data_length = 0;
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
-    if (ret == 0) {
-        aiopquic_notify_rx(s->bridge);
-    } else {
-        /* RX ring full when worker tries to push LINK_RELEASE. We
-         * cannot retry from here (picoquic owns the calling thread)
-         * and we cannot synchronously destroy (Python may have
-         * STREAM_DATA/FIN for this stream still in the ring → UAF).
-         * Best path: leak the link. Surface via the existing drop
-         * counter so sustained drops are visible. */
-        s->bridge->worker_rx_event_drops++;
-        if (aiopquic_rx_log_enabled()
-                && s->bridge->worker_rx_event_drops <= 100) {
-            fprintf(stderr,
-                "[aiopquic_rx] LINK_RELEASE drop on full rx_event_ring: "
-                "leaking link for stream=%llu\n",
-                (unsigned long long)stream_id);
-        }
-    }
+    /* Out of memory leaks the link: it cannot be freed here while
+     * Python may still hold events for the stream. */
+    (void)aiopquic_rx_push(s->bridge, &entry, NULL, 0);
 }
 
 /*
@@ -495,12 +438,7 @@ static inline void aiopquic_wt_push_stream_created(
     entry.stream_ctx = s;
     entry.data_buf = sc;     /* BORROWED, NULL on error */
     entry.data_length = 0;
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
-    if (ret == 0) {
-        aiopquic_notify_rx(s->bridge);
-    } else {
-        s->bridge->worker_rx_event_drops++;
-    }
+    (void)aiopquic_rx_push(s->bridge, &entry, NULL, 0);
 }
 
 /*
@@ -782,11 +720,9 @@ static int aiopquic_wt_path_callback(
                 drain_entry.stream_id = sid;
                 drain_entry.cnx = s->cnx;
                 drain_entry.stream_ctx = s;
-                if (spsc_ring_push(s->bridge->rx_event_ring,
-                                   &drain_entry, NULL, 0) == 0) {
+                if (aiopquic_rx_push(s->bridge, &drain_entry, NULL, 0) == 0) {
                     sc->cnt_drain_fires++;
                     sc->last_drain_fire_ns = aiopquic_now_ns();
-                    aiopquic_notify_rx(s->bridge);
                 } else {
                     sc->cnt_drain_dropped++;
                     atomic_store_explicit(
@@ -844,10 +780,7 @@ static int aiopquic_wt_path_callback(
                 drain_entry.event_type = SPSC_EVT_DATAGRAM_TX_DRAINED;
                 drain_entry.cnx = cnx;
                 drain_entry.stream_ctx = s;  /* session ptr for routing */
-                if (spsc_ring_push(s->bridge->rx_event_ring,
-                                   &drain_entry, NULL, 0) == 0) {
-                    aiopquic_notify_rx(s->bridge);
-                } else {
+                if (aiopquic_rx_push(s->bridge, &drain_entry, NULL, 0) != 0) {
                     atomic_store_explicit(&db->drain_pending, 1,
                                           memory_order_release);
                 }
@@ -1060,9 +993,7 @@ static int aiopquic_wt_server_path_callback(
     entry.stream_id = s->control_stream_id;
     entry.cnx = cnx;
     entry.stream_ctx = s;
-    int rc = spsc_ring_push(bridge->rx_event_ring, &entry,
-                             path_bytes, (uint32_t)path_len);
-    if (rc == 0) aiopquic_notify_rx(bridge);
+    (void)aiopquic_rx_push(bridge, &entry, path_bytes, (uint32_t)path_len);
     return 0;
 }
 
@@ -1467,12 +1398,7 @@ static void aiopquic_dispatch_announce(aiopquic_ctx_t* bridge,
     entry.event_type = SPSC_EVT_CNX_STACK;
     entry.cnx = cnx;
     entry.is_fin = (uint8_t)(is_h3 ? 1 : 0);
-    if (spsc_ring_push(bridge->rx_event_ring, &entry,
-                       (const uint8_t*)&snap, sizeof(snap)) == 0) {
-        aiopquic_notify_rx(bridge);
-    } else {
-        bridge->worker_rx_event_drops++;
-    }
+    (void)aiopquic_rx_push(bridge, &entry, (const uint8_t*)&snap, sizeof(snap));
 }
 
 static int aiopquic_dispatch_cb(picoquic_cnx_t* cnx, uint64_t stream_id,

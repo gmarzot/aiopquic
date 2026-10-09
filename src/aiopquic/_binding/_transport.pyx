@@ -260,6 +260,14 @@ cdef extern from "picoquic_packet_loop.h":
     void picoquic_delete_network_thread(picoquic_network_thread_ctx_t* thread_ctx)
 
 # C callback declarations
+cdef extern from "c/spsc_ring.h":
+    ctypedef struct spsc_overflow_t:
+        uint64_t depth
+        uint64_t pushed
+        uint64_t max_depth
+    uint32_t spsc_ring_refill_from_overflow(spsc_ring_t* ring,
+                                            spsc_overflow_t* ovf)
+
 cdef extern from "c/callback.h":
     # Resource defaults — single source of truth in callback.h.
     enum:
@@ -273,6 +281,7 @@ cdef extern from "c/callback.h":
     ctypedef struct aiopquic_ctx_t:
         spsc_ring_t* rx_event_ring
         spsc_ring_t* tx_event_ring
+        spsc_overflow_t rx_overflow
         int eventfd
         picoquic_quic_t* quic
         picoquic_network_thread_ctx_t* thread_ctx
@@ -1050,7 +1059,10 @@ cdef class TransportContext:
         while True:
             entry = spsc_ring_peek(self._ctx.rx_event_ring)
             if entry is NULL:
-                break
+                if spsc_ring_refill_from_overflow(
+                        self._ctx.rx_event_ring, &self._ctx.rx_overflow) == 0:
+                    break
+                continue
             if (entry.event_type == SPSC_EVT_WT_STREAM_LINK_RELEASE
                     and entry.data_buf is not NULL):
                 aiopquic_wt_stream_link_destroy(
@@ -1133,6 +1145,8 @@ cdef class TransportContext:
             'tx_wrong_direction_dropped': self._ctx.cnt_tx_wrong_direction_dropped,
             'rx_event_drops': self._ctx.worker_rx_event_drops,
             'rx_event_drops_stream_data': self._ctx.worker_rx_event_drops_stream_data,
+            'rx_overflow_pushed': self._ctx.rx_overflow.pushed,
+            'rx_overflow_max_depth': self._ctx.rx_overflow.max_depth,
             'rx_data_event_coalesced': self._ctx.cnt_rx_data_event_coalesced,
             'rx_byte_ring_overflow': self._ctx.worker_rx_byte_ring_overflow,
             'last_tx_event_ring_arm_ns': self._ctx.last_tx_event_ring_arm_ns,
@@ -1676,10 +1690,15 @@ cdef class TransportContext:
         # / hysteresis_bytes) instead of per-chunk.
         cdef dict pending_fc = {}
         self._begin_drain_cycle()
+        spsc_ring_refill_from_overflow(self._ctx.rx_event_ring,
+                                       &self._ctx.rx_overflow)
         for i in range(max_events):
             entry = spsc_ring_peek(self._ctx.rx_event_ring)
             if entry is NULL:
-                break
+                if spsc_ring_refill_from_overflow(
+                        self._ctx.rx_event_ring, &self._ctx.rx_overflow) == 0:
+                    break
+                continue
 
             # LINK_RELEASE is internal: free the link, never emit.
             if entry.event_type == SPSC_EVT_WT_STREAM_LINK_RELEASE:
@@ -1953,10 +1972,15 @@ cdef class TransportContext:
         cdef uint32_t avail
         cdef dict pending_fc = {}
         self._begin_drain_cycle()
+        spsc_ring_refill_from_overflow(self._ctx.rx_event_ring,
+                                       &self._ctx.rx_overflow)
         for i in range(max_events):
             entry = spsc_ring_peek(self._ctx.rx_event_ring)
             if entry is NULL:
-                break
+                if spsc_ring_refill_from_overflow(
+                        self._ctx.rx_event_ring, &self._ctx.rx_overflow) == 0:
+                    break
+                continue
 
             if entry.event_type == SPSC_EVT_WT_STREAM_LINK_RELEASE:
                 if entry.data_buf is not NULL:
