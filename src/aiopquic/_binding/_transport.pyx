@@ -278,6 +278,9 @@ cdef extern from "c/callback.h":
         AIOPQUIC_RX_EVENT_RING_CAP_DEFAULT
         AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT
 
+    ctypedef struct aiopquic_dgram_table_t:
+        uint32_t live
+
     ctypedef struct aiopquic_ctx_t:
         spsc_ring_t* rx_event_ring
         spsc_ring_t* tx_event_ring
@@ -298,6 +301,9 @@ cdef extern from "c/callback.h":
         uint64_t worker_dgram_prepare_calls
         uint64_t worker_dgram_records_sent
         uint64_t worker_dgram_bytes_sent
+        aiopquic_dgram_table_t dgram_table
+        uint32_t dgram_release_owed_n
+        uint64_t worker_dgram_ring_release_processed
         uint64_t cnt_rx_data_event_coalesced
         uint64_t worker_rx_byte_ring_overflow
         uint32_t rx_notify_pending
@@ -423,6 +429,13 @@ cdef extern from "c/datagram_buf.h":
         aiopquic_dgram_buf_t* db, const uint8_t* data, uint32_t length)
     uint32_t aiopquic_dgram_buf_used(aiopquic_dgram_buf_t* db)
     void aiopquic_dgram_buf_arm_drain(aiopquic_dgram_buf_t* db)
+    int64_t aiopquic_dgram_rings_alive_load()
+
+cdef extern from "c/callback.h":
+    void aiopquic_dgram_ring_release(aiopquic_ctx_t* ctx, void* cnx,
+                                     aiopquic_dgram_buf_t* db)
+    void aiopquic_dgram_ring_release_flush(aiopquic_ctx_t* ctx)
+    void aiopquic_dgram_ring_release_undrained(aiopquic_ctx_t* ctx)
 
 
 # Per-stream wrapper holding both TX and RX byte rings + flow-control
@@ -1083,6 +1096,8 @@ cdef class TransportContext:
                 self._ctx.thread_ctx = NULL
             picoquic_delete_network_thread(self._thread_ctx)
             self._thread_ctx = NULL
+        if self._ctx is not NULL:
+            aiopquic_dgram_ring_release_undrained(self._ctx)
         if self._quic is not NULL:
             picoquic_free(self._quic)
             self._quic = NULL
@@ -1203,6 +1218,12 @@ cdef class TransportContext:
             'tx_data_bytes_discarded_total':
                 aiopquic_tx_data_bytes_discarded_load(),
             'tx_data_bytes_queued': aiopquic_tx_data_bytes_queued(),
+            # Datagram ring lifecycle: releases the worker processed, rings
+            # its cnx table holds, and live rings process-wide.
+            'dgram_ring_release_processed':
+                self._ctx.worker_dgram_ring_release_processed,
+            'dgram_table_live': self._ctx.dgram_table.live,
+            'dgram_rings_alive_total': aiopquic_dgram_rings_alive_load(),
         }
 
 
@@ -1435,8 +1456,11 @@ cdef class TransportContext:
             self._snapshot_drops.append((cnx_ptr, snap))
 
     cdef object _begin_drain_cycle(self):
-        """Apply snapshot drops deferred from the last drain and reopen
-        refreshes for every cnx."""
+        """Apply snapshot drops deferred from the last drain, reopen
+        refreshes for every cnx and post ring releases a full TX ring
+        refused."""
+        if self._ctx.dgram_release_owed_n:
+            aiopquic_dgram_ring_release_flush(self._ctx)
         if self._refresh_posted:
             self._refresh_posted.clear()
         if not self._snapshot_drops:
@@ -2363,10 +2387,15 @@ cdef class TransportContext:
             raise MemoryError("aiopquic_dgram_buf_create failed")
         return <uintptr_t>db
 
-    def dgram_ring_release(self, uintptr_t db_ptr):
-        """Drop the caller's reference (worker table may still hold one;
-        the last reference frees)."""
-        aiopquic_dgram_buf_unref(<aiopquic_dgram_buf_t*>db_ptr)
+    def dgram_ring_release(self, uintptr_t db_ptr, uintptr_t cnx_ptr=0):
+        """Drop the caller's reference; the last reference frees.
+
+        With the worker running, the worker drops it after every MARK
+        queued before this call, together with cnx_ptr's table entry
+        while that still holds this ring. Otherwise it is dropped now.
+        """
+        aiopquic_dgram_ring_release(self._ctx, <void*>cnx_ptr,
+                                    <aiopquic_dgram_buf_t*>db_ptr)
 
     def dgram_mark_ready(self, uintptr_t cnx_ptr, uintptr_t db_ptr):
         """Post (or re-post) the MARK_DATAGRAM_READY event for a ring
