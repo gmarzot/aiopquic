@@ -1378,7 +1378,8 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
     case SPSC_EVT_TX_MARK_WT_DATAGRAM_READY: {
         /* WT twin of MARK_DATAGRAM_READY: the ring hangs off the
          * session — h3zero pulls from it in provide_datagram — and the
-         * scheduler is armed per control stream, not per connection. */
+         * scheduler is armed per control stream, not per connection.
+         * db is alive: Python's release queues behind this event. */
         aiopquic_dgram_buf_t* db =
             (aiopquic_dgram_buf_t*)(uintptr_t)entry->error_code;
         if (!s || !s->cnx || !db) return 1;

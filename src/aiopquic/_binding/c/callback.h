@@ -194,6 +194,12 @@ typedef struct {
 extern "C" {
 #endif
 
+/* A datagram ring release a full TX event ring refused. */
+typedef struct {
+    void*                 cnx;
+    aiopquic_dgram_buf_t* db;
+} aiopquic_dgram_release_t;
+
 typedef struct {
     spsc_ring_t*    rx_event_ring;
     spsc_ring_t*    tx_event_ring;
@@ -350,8 +356,9 @@ typedef struct {
     void*           dual_wt_params;
     /* Pull-model datagram TX: worker-owned cnx→record-ring table
      * (insert on MARK_DATAGRAM_READY, lookup on prepare_datagram,
-     * remove on cnx close, sweep at destroy). Per-ring counters live
-     * on the aiopquic_dgram_buf_t; these aggregate across the ctx. */
+     * remove on cnx close or ring release, sweep at destroy). Per-ring
+     * counters live on the aiopquic_dgram_buf_t; these aggregate across
+     * the ctx. */
     aiopquic_dgram_table_t dgram_table;
     uint64_t        worker_dgram_mark_ready_processed;
     uint64_t        worker_dgram_prepare_calls;
@@ -374,6 +381,12 @@ typedef struct {
      * stream has no such direction (aiopquic_stream_can_send /
      * aiopquic_stream_can_receive). */
     uint64_t        cnt_tx_wrong_direction_dropped;
+    /* Datagram ring releases a full TX event ring refused, posted again
+     * at the next drain (asyncio thread only). */
+    aiopquic_dgram_release_t* dgram_release_owed;
+    uint32_t        dgram_release_owed_n;
+    uint32_t        dgram_release_owed_cap;
+    uint64_t        worker_dgram_ring_release_processed;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -465,6 +478,10 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
         spsc_ring_destroy(ctx->rx_event_ring);
         spsc_ring_destroy(ctx->tx_event_ring);
         aiopquic_dgram_table_destroy(&ctx->dgram_table);
+        for (uint32_t i = 0; i < ctx->dgram_release_owed_n; i++) {
+            aiopquic_dgram_buf_unref(ctx->dgram_release_owed[i].db);
+        }
+        free(ctx->dgram_release_owed);
         if (ctx->alpn_list) {
             for (size_t i = 0; i < ctx->alpn_list_count; i++)
                 free(ctx->alpn_list[i]);
@@ -648,6 +665,102 @@ static inline void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx,
         ctx->cnt_sc_destroy_fc_credit_pushfail++;
         aiopquic_stream_ctx_destroy(sc);
     }
+}
+
+/* Drop a released ring's reference, with cnx's table entry while that
+ * still holds this ring. Worker thread, or the asyncio thread once no
+ * worker runs. */
+static inline void aiopquic_dgram_ring_drop(aiopquic_ctx_t* ctx, void* cnx,
+                                            aiopquic_dgram_buf_t* db) {
+    aiopquic_dgram_table_remove_ring(&ctx->dgram_table, cnx, db);
+    aiopquic_dgram_buf_unref(db);
+}
+
+static inline int aiopquic_dgram_ring_release_post(aiopquic_ctx_t* ctx,
+                                                   void* cnx,
+                                                   aiopquic_dgram_buf_t* db) {
+    spsc_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.event_type = SPSC_EVT_TX_DGRAM_RING_RELEASE;
+    entry.cnx = cnx;
+    entry.stream_ctx = db;
+    if (spsc_ring_push(ctx->tx_event_ring, &entry, NULL, 0) != 0) {
+        return -1;
+    }
+    ctx->cnt_tx_event_ring_pushes++;
+    if (aiopquic_tx_wake_set_pending(ctx) == 0) {
+        picoquic_wake_up_network_thread(ctx->thread_ctx);
+    }
+    return 0;
+}
+
+/* Asyncio thread: give up the caller's ring reference. A running worker
+ * drops it behind every MARK queued before it, which carries the ring
+ * without a reference; with none running it is dropped here. A full TX
+ * ring owes the release to aiopquic_dgram_ring_release_flush. */
+static inline void aiopquic_dgram_ring_release(aiopquic_ctx_t* ctx, void* cnx,
+                                               aiopquic_dgram_buf_t* db) {
+    if (db == NULL) return;
+    if (ctx->thread_ctx == NULL) {
+        aiopquic_dgram_buf_unref(db);
+        return;
+    }
+    if (aiopquic_dgram_ring_release_post(ctx, cnx, db) == 0) return;
+    if (ctx->dgram_release_owed_n == ctx->dgram_release_owed_cap) {
+        uint32_t cap = ctx->dgram_release_owed_cap
+                     ? 2 * ctx->dgram_release_owed_cap : 8;
+        aiopquic_dgram_release_t* grown = (aiopquic_dgram_release_t*)realloc(
+            ctx->dgram_release_owed, cap * sizeof(*grown));
+        if (grown == NULL) return;  /* out of memory: the ring leaks */
+        ctx->dgram_release_owed = grown;
+        ctx->dgram_release_owed_cap = cap;
+    }
+    ctx->dgram_release_owed[ctx->dgram_release_owed_n].cnx = cnx;
+    ctx->dgram_release_owed[ctx->dgram_release_owed_n].db = db;
+    ctx->dgram_release_owed_n++;
+    aiopquic_arm_tx_event_ring_drain_pending(ctx);
+}
+
+/* Asyncio thread: post owed releases while the TX ring has room. */
+static inline void aiopquic_dgram_ring_release_flush(aiopquic_ctx_t* ctx) {
+    uint32_t n = ctx->dgram_release_owed_n;
+    uint32_t i = 0;
+    if (n == 0 || ctx->thread_ctx == NULL) return;
+    while (i < n && aiopquic_dgram_ring_release_post(
+               ctx, ctx->dgram_release_owed[i].cnx,
+               ctx->dgram_release_owed[i].db) == 0) {
+        i++;
+    }
+    if (i > 0) {
+        memmove(ctx->dgram_release_owed, ctx->dgram_release_owed + i,
+                (n - i) * sizeof(*ctx->dgram_release_owed));
+    }
+    ctx->dgram_release_owed_n = n - i;
+    if (n - i > 0) {
+        aiopquic_arm_tx_event_ring_drain_pending(ctx);
+    }
+}
+
+/* Asyncio thread, the worker stopped: drop what queued and owed releases
+ * still hold. A queued entry is cleared, so a second sweep is a no-op. */
+static inline void aiopquic_dgram_ring_release_undrained(aiopquic_ctx_t* ctx) {
+    spsc_ring_t* r = ctx->tx_event_ring;
+    uint64_t head = atomic_load_explicit(&r->head, memory_order_acquire);
+    uint64_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
+    for (uint64_t i = head; i < tail; i++) {
+        spsc_entry_t* e = &r->entries[i & r->mask];
+        if (e->event_type == SPSC_EVT_TX_DGRAM_RING_RELEASE
+                && e->stream_ctx != NULL) {
+            aiopquic_dgram_ring_drop(ctx, e->cnx,
+                                     (aiopquic_dgram_buf_t*)e->stream_ctx);
+            e->stream_ctx = NULL;
+        }
+    }
+    for (uint32_t i = 0; i < ctx->dgram_release_owed_n; i++) {
+        aiopquic_dgram_ring_drop(ctx, ctx->dgram_release_owed[i].cnx,
+                                 ctx->dgram_release_owed[i].db);
+    }
+    ctx->dgram_release_owed_n = 0;
 }
 
 /* Worker-side: if a Python writer armed tx_event_ring_drain_pending and the
@@ -1338,6 +1451,20 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     continue;
                 }
 
+                /* Ahead of the stale-cnx guard: the ring is released
+                 * whether or not its cnx lives; cnx is only a table key. */
+                if (entry->event_type == SPSC_EVT_TX_DGRAM_RING_RELEASE) {
+                    if (entry->stream_ctx != NULL) {
+                        aiopquic_dgram_ring_drop(
+                            ctx, entry->cnx,
+                            (aiopquic_dgram_buf_t*)entry->stream_ctx);
+                    }
+                    ctx->worker_dgram_ring_release_processed++;
+                    ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
+                    aiopquic_maybe_fire_tx_event_ring_drained(ctx);
+                    continue;
+                }
+
                 /* WT events route through aiopquic_wt_handle_tx, which
                  * interprets entry->cnx as aiopquic_wt_session_t* — NOT a
                  * picoquic_cnx_t*. TX_WT_OPEN in particular CREATES the
@@ -1399,7 +1526,8 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         /* Producer already committed the record(s) to the
                          * per-cnx ring; register the ring (idempotent,
                          * takes a worker-side ref on first sight) and
-                         * arm picoquic's datagram scheduler. */
+                         * arm picoquic's datagram scheduler. The ring is
+                         * alive: Python's release queues behind this. */
                         aiopquic_dgram_buf_t* db =
                             (aiopquic_dgram_buf_t*)entry->stream_ctx;
                         if (db) {

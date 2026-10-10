@@ -189,6 +189,15 @@ typedef enum {
     SPSC_EVT_TX_WT_SET_STREAM_PRIORITY = 150,
     SPSC_EVT_TX_WT_FIN = 151,           /* FIN the CONNECT stream, answering a peer close */
 
+    /* Python's reference to a datagram record ring (asyncio → picoquic
+     * worker). A MARK carries the ring without a reference, so the
+     * release rides behind every MARK queued before it. entry.stream_ctx
+     * carries the aiopquic_dgram_buf_t*; entry.cnx the raw cnx whose
+     * table entry goes with it while it still holds this ring, NULL for
+     * a WebTransport session's ring. Handled ahead of the stale-cnx
+     * guard; cnx is only a table key. */
+    SPSC_EVT_TX_DGRAM_RING_RELEASE = 152,
+
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
      * WT control stream for session events, or the WT stream for

@@ -22,7 +22,9 @@
  *
  * Lifetime: refcounted. The Python connection object holds one ref;
  * the worker's cnx->ring table holds one from insert until the cnx
- * close callback (or ctx destroy sweep). Last unref frees.
+ * close callback (or ctx destroy sweep). Last unref frees. Python's ref
+ * is dropped on the worker, behind every MARK naming the ring
+ * (SPSC_EVT_TX_DGRAM_RING_RELEASE): a MARK carries no reference.
  */
 #pragma once
 
@@ -57,6 +59,14 @@ typedef struct {
     uint64_t head_deferred;     /* worker: head didn't fit this packet */
 } aiopquic_dgram_buf_t;
 
+/* Rings allocated and not yet freed, process-wide. */
+static _Atomic(int64_t) aiopquic_cnt_dgram_rings_alive = 0;
+
+static inline int64_t aiopquic_dgram_rings_alive_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_dgram_rings_alive,
+                                memory_order_relaxed);
+}
+
 static inline aiopquic_dgram_buf_t* aiopquic_dgram_buf_create(
         uint32_t capacity, uint32_t max_record) {
     capacity = aiopquic_ceil_pow2_u32(capacity);
@@ -79,6 +89,8 @@ static inline aiopquic_dgram_buf_t* aiopquic_dgram_buf_create(
     atomic_store_explicit(&db->tail, 0, memory_order_relaxed);
     atomic_store_explicit(&db->refcnt, 1, memory_order_relaxed);
     atomic_store_explicit(&db->drain_pending, 0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&aiopquic_cnt_dgram_rings_alive, 1,
+                              memory_order_relaxed);
     return db;
 }
 
@@ -90,6 +102,8 @@ static inline void aiopquic_dgram_buf_unref(aiopquic_dgram_buf_t* db) {
     if (!db) return;
     if (atomic_fetch_sub_explicit(&db->refcnt, 1,
                                   memory_order_acq_rel) == 1) {
+        atomic_fetch_sub_explicit(&aiopquic_cnt_dgram_rings_alive, 1,
+                                  memory_order_relaxed);
         free(db->buf);
         free(db);
     }
@@ -182,9 +196,9 @@ static inline void aiopquic_dgram_buf_arm_drain(aiopquic_dgram_buf_t* db) {
 
 /* ---------------------------------------------------------------------
  * cnx -> ring table. WORKER-THREAD-ONLY access (insert on
- * MARK_DATAGRAM_READY, lookup on prepare_datagram, remove on cnx close,
- * sweep on ctx destroy) — no locking needed. Open addressing with
- * tombstones; grows by rehash at ~70% load.
+ * MARK_DATAGRAM_READY, lookup on prepare_datagram, remove on cnx close
+ * and on DGRAM_RING_RELEASE, sweep on ctx destroy) — no locking needed.
+ * Open addressing with tombstones; grows by rehash at ~70% load.
  * ------------------------------------------------------------------- */
 
 #define AIOPQUIC_DGRAM_SLOT_TOMBSTONE ((void*)(uintptr_t)1)
@@ -273,14 +287,17 @@ static inline aiopquic_dgram_buf_t* aiopquic_dgram_table_get(
     }
 }
 
-/* Remove + drop the worker-side ref. Safe to call for absent cnx. */
-static inline void aiopquic_dgram_table_remove(
-        aiopquic_dgram_table_t* t, void* cnx) {
-    if (t->cap == 0) return;
+/* Remove + drop the worker-side ref. Safe to call for absent cnx. A
+ * non-NULL db removes the entry only while it holds that ring: a reused
+ * cnx address may hold a newer connection's ring. */
+static inline void aiopquic_dgram_table_remove_ring(
+        aiopquic_dgram_table_t* t, void* cnx, aiopquic_dgram_buf_t* db) {
+    if (t->cap == 0 || cnx == NULL) return;
     uint32_t i = aiopquic_dgram_hash_ptr(cnx) & t->mask;
     for (;;) {
         void* c = t->slots[i].cnx;
         if (c == cnx) {
+            if (db != NULL && t->slots[i].db != db) return;
             aiopquic_dgram_buf_unref(t->slots[i].db);
             t->slots[i].cnx = AIOPQUIC_DGRAM_SLOT_TOMBSTONE;
             t->slots[i].db = NULL;
@@ -290,6 +307,11 @@ static inline void aiopquic_dgram_table_remove(
         if (c == NULL) return;
         i = (i + 1) & t->mask;
     }
+}
+
+static inline void aiopquic_dgram_table_remove(
+        aiopquic_dgram_table_t* t, void* cnx) {
+    aiopquic_dgram_table_remove_ring(t, cnx, NULL);
 }
 
 /* Drop every worker-side ref and free the slot array (ctx destroy). */

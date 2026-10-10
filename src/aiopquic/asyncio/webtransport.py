@@ -609,7 +609,8 @@ class WebTransportSession:
         self._dgram_tx_drain_event.set()
         if self._dgram_ring:
             # The worker's session holds its own reference until the
-            # session struct is freed.
+            # session struct is freed; ours is dropped behind any queued
+            # MARK naming the ring.
             self._transport.dgram_ring_release(self._dgram_ring)
             self._dgram_ring = 0
         # One worker-thread walk (TX_WT_SESSION_CLEANUP) sends the §6
