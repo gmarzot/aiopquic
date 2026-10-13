@@ -9,6 +9,8 @@
   event dispatcher, which held the transport and its wake fd for good;
   `connect_webtransport` exits through it. A shared transport's other sessions keep
   their dispatcher and acceptor tasks.
+- `QuicConnection.tx_sent_bytes(stream_id)` and `WebTransportSession.tx_sent_bytes(stream_id)`:
+  bytes picoquic has taken from the stream's TX ring into packets.
 
 ## v0.5.0a2
 

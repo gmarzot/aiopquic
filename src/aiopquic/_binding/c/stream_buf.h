@@ -184,6 +184,12 @@ static inline uint64_t aiopquic_stream_buf_popped(aiopquic_stream_buf_t* sb) {
     return atomic_load_explicit(&sb->head, memory_order_acquire);
 }
 
+/* Bytes the consumer has taken from the ring, read from any thread:
+ * monotonic, so a relaxed load suffices. */
+static inline uint64_t aiopquic_stream_buf_sent(aiopquic_stream_buf_t* sb) {
+    return atomic_load_explicit(&sb->head, memory_order_relaxed);
+}
+
 /* Diagnostic hashes. Both AIOPQUIC_FNV1A_INIT when hash_enabled=0 or
  * no bytes have moved through. */
 static inline uint32_t aiopquic_stream_buf_push_hash(

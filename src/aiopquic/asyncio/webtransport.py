@@ -348,6 +348,16 @@ class WebTransportSession:
             return 0
         return self._transport.tx_data_ring_used(sc_ptr)
 
+    def tx_sent_bytes(self, stream_id: int) -> int:
+        """Cumulative bytes of this WT stream picoquic has taken from its TX
+        ring into packets; the stream header h3zero writes is not counted.
+        Monotonic: a stream offset has left the ring once this exceeds it.
+        0 for a stream with no TX ring yet, or one reset or retired."""
+        sc_ptr = self._stream_tx_ctxs.get(stream_id, 0)
+        if not sc_ptr:
+            return 0
+        return self._transport.tx_data_ring_sent(sc_ptr)
+
     def _tx_backlog(self) -> int:
         """Bytes queued in this session's stream rings, not yet pulled."""
         return sum(self._transport.tx_data_ring_used(sc_ptr)

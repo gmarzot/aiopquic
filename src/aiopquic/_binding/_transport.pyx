@@ -402,6 +402,7 @@ cdef extern from "c/stream_buf.h":
     int aiopquic_stream_buf_fin_pending(aiopquic_stream_buf_t* sb)
     uint64_t aiopquic_stream_buf_pushed(aiopquic_stream_buf_t* sb)
     uint64_t aiopquic_stream_buf_popped(aiopquic_stream_buf_t* sb)
+    uint64_t aiopquic_stream_buf_sent(aiopquic_stream_buf_t* sb)
     uint32_t aiopquic_stream_buf_push_hash(aiopquic_stream_buf_t* sb)
     uint32_t aiopquic_stream_buf_pop_hash(aiopquic_stream_buf_t* sb)
 
@@ -1408,6 +1409,16 @@ cdef class TransportContext:
         if sc.tx is NULL:
             return 0
         return aiopquic_stream_buf_used(sc.tx)
+
+    def tx_data_ring_sent(self, uintptr_t sc_ptr):
+        """Cumulative bytes picoquic has taken from a stream's sc->tx ring
+        into packets; monotonic. 0 for NULL or a stream without sc->tx."""
+        if sc_ptr == 0:
+            return 0
+        cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*><void*>sc_ptr
+        if sc.tx is NULL:
+            return 0
+        return aiopquic_stream_buf_sent(sc.tx)
 
     def set_tx_data_drain_pending(self, uintptr_t sc_ptr):
         """Arm the per-stream sc->tx drain signal so the next worker

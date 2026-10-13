@@ -531,6 +531,16 @@ class QuicConnection:
             return 0
         return self._transport.tx_data_ring_used(sc_ptr)
 
+    def tx_sent_bytes(self, stream_id: int) -> int:
+        """Cumulative bytes of this stream picoquic has taken from its TX
+        ring into packets. Monotonic: a stream offset has left the ring
+        once this exceeds it. 0 for a stream with no TX ring yet, or one
+        already retired."""
+        sc_ptr = self._stream_ctxs.get(stream_id, 0)
+        if not sc_ptr or self._transport is None:
+            return 0
+        return self._transport.tx_data_ring_sent(sc_ptr)
+
     def set_tx_data_drain_pending(self, stream_id: int) -> None:
         """Arm the per-stream sc->tx_drain_pending flag so the next
         worker drain of this stream's sc->tx fires
