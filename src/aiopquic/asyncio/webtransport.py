@@ -348,6 +348,16 @@ class WebTransportSession:
             return 0
         return self._transport.tx_data_ring_used(sc_ptr)
 
+    def tx_sent_bytes(self, stream_id: int) -> int:
+        """Cumulative bytes of this WT stream picoquic has taken from its TX
+        ring into packets; the stream header h3zero writes is not counted.
+        Monotonic: a stream offset has left the ring once this exceeds it.
+        0 for a stream with no TX ring yet, or one reset or retired."""
+        sc_ptr = self._stream_tx_ctxs.get(stream_id, 0)
+        if not sc_ptr:
+            return 0
+        return self._transport.tx_data_ring_sent(sc_ptr)
+
     def _tx_backlog(self) -> int:
         """Bytes queued in this session's stream rings, not yet pulled."""
         return sum(self._transport.tx_data_ring_used(sc_ptr)
@@ -609,7 +619,8 @@ class WebTransportSession:
         self._dgram_tx_drain_event.set()
         if self._dgram_ring:
             # The worker's session holds its own reference until the
-            # session struct is freed.
+            # session struct is freed; ours is dropped behind any queued
+            # MARK naming the ring.
             self._transport.dgram_ring_release(self._dgram_ring)
             self._dgram_ring = 0
         # One worker-thread walk (TX_WT_SESSION_CLEANUP) sends the §6
@@ -710,6 +721,23 @@ class WebTransportSession:
             await asyncio.wait_for(self._cnx_closed.wait(), timeout)
         except asyncio.TimeoutError:
             pass
+
+    async def detach(self) -> None:
+        """Release what this session holds in its transport's event
+        dispatcher, which keeps the session, the transport and its wake fd
+        alive until then. connect_webtransport does this on exit; a caller
+        that builds the session itself calls it after aclose() and before
+        stopping the transport.
+
+        A dispatcher left with no session and no acceptor is retired: its
+        acceptor tasks are cancelled and awaited and its reader removed.
+        Other sessions and an acceptor on a shared transport keep theirs.
+        Idempotent; a no-op for a session that never opened."""
+        if not self._dispatcher_attached:
+            return
+        self._dispatcher_attached = False
+        await _get_dispatcher_registry().detach_session(
+            self._loop, self._transport, self)
 
     # --- event fan-out ------------------------------------------------
 
@@ -1062,10 +1090,12 @@ class _Dispatcher:
             task.add_done_callback(self._tasks.discard)
 
     def cancel_tasks(self) -> list:
-        """Cancel the acceptor coroutines this dispatcher started and
-        return them, so a caller on the loop can await the cancellation
-        before the transport is freed."""
-        pending = [t for t in self._tasks if not t.done()]
+        """Cancel the acceptor coroutines this dispatcher started, except
+        the caller's own, and return them, so a caller on the loop can
+        await the cancellation before the transport is freed."""
+        current = asyncio.current_task(self._loop)
+        pending = [t for t in self._tasks
+                   if not t.done() and t is not current]
         for t in pending:
             t.cancel()
         return pending
@@ -1128,12 +1158,6 @@ class _DispatcherRegistry:
             d.detach()
             del self._dispatchers[key]
 
-    def cancel_tasks(self, loop: asyncio.AbstractEventLoop,
-                      transport: TransportContext) -> list:
-        """Cancel the acceptor coroutines for this (loop, transport)."""
-        d = self._dispatchers.get((id(loop), id(transport)))
-        return d.cancel_tasks() if d is not None else []
-
     def release(self, loop: asyncio.AbstractEventLoop,
                 transport: TransportContext,
                 session: WebTransportSession) -> None:
@@ -1142,15 +1166,25 @@ class _DispatcherRegistry:
         if d is not None:
             d.remove_session(session)
 
-    def detach(self, loop: asyncio.AbstractEventLoop,
-                transport: TransportContext,
-                session: WebTransportSession) -> None:
+    async def detach_session(self, loop: asyncio.AbstractEventLoop,
+                             transport: TransportContext,
+                             session: WebTransportSession) -> None:
+        """Drop one session. A dispatcher left with no session and no
+        acceptor is retired: its tasks cancelled and awaited, then its
+        reader removed."""
         key = (id(loop), id(transport))
         d = self._dispatchers.get(key)
         if d is None:
             return
         d.remove_session(session)
-        if not d._sessions:
+        if d._sessions or d._acceptor is not None:
+            return
+        pending = d.cancel_tasks()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        # A session or an acceptor may have attached during the await.
+        if (self._dispatchers.get(key) is d and not d._sessions
+                and d._acceptor is None):
             d.detach()
             del self._dispatchers[key]
 
@@ -1256,19 +1290,11 @@ async def connect_webtransport(
         await client.open(timeout=timeout)
         yield client
     finally:
-        loop = asyncio.get_event_loop()
         try:
             await client.aclose(0, b"")
         except Exception:
             pass
-        # Reap anything the dispatcher started before the engine goes
-        # away: a pending acceptor coroutine still holds this session and
-        # transport, and stop() would free them underneath it.
-        reg = _get_dispatcher_registry()
-        pending = reg.cancel_tasks(loop, transport)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        reg.detach(loop, transport, client)
+        await client.detach()
         if own_transport:
             try:
                 transport.stop()

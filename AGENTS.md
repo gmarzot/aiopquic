@@ -1,0 +1,1 @@
+src/aiopquic/AGENTS.md

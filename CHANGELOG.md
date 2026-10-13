@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.0a3
+
+- Fix: a datagram ring is released on the worker behind every MARK queued for
+  it; freed ahead of one, it was registered again and freed twice at `stop()`.
+  Counters `dgram_ring_release_processed`, `dgram_table_live`, `dgram_rings_alive_total`.
+- `WebTransportSession.detach()`: a session the caller built releases its transport's
+  event dispatcher, which held the transport and its wake fd for good;
+  `connect_webtransport` exits through it. A shared transport's other sessions keep
+  their dispatcher and acceptor tasks.
+- `QuicConnection.tx_sent_bytes(stream_id)` and `WebTransportSession.tx_sent_bytes(stream_id)`:
+  bytes picoquic has taken from the stream's TX ring into packets.
+
 ## v0.5.0a2
 
 - picoquic pin advanced to 1.1.53.0 (`c9088724`, 2026-10-08), picotls to `f06553b`:

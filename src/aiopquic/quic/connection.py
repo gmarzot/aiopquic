@@ -423,10 +423,8 @@ class QuicConnection:
             # free per-stream wrappers; without this they'd leak until
             # process exit.
             self._destroy_stream_ctxs()
-            # Datagram ring: worker already dropped its table ref in the
-            # close callback (before this event was queued), so this
-            # release is the last one. Wake any parked datagram writer
-            # first so it observes _closed instead of deadlocking.
+            # Wake any parked datagram writer first so it observes
+            # _closed instead of deadlocking.
             self._dgram_tx_drain_event.set()
             self._release_dgram_ring()
             # picoquic may already have freed the cnx_t. The accessors
@@ -532,6 +530,16 @@ class QuicConnection:
         if not sc_ptr or self._transport is None:
             return 0
         return self._transport.tx_data_ring_used(sc_ptr)
+
+    def tx_sent_bytes(self, stream_id: int) -> int:
+        """Cumulative bytes of this stream picoquic has taken from its TX
+        ring into packets. Monotonic: a stream offset has left the ring
+        once this exceeds it. 0 for a stream with no TX ring yet, or one
+        already retired."""
+        sc_ptr = self._stream_ctxs.get(stream_id, 0)
+        if not sc_ptr or self._transport is None:
+            return 0
+        return self._transport.tx_data_ring_sent(sc_ptr)
 
     def set_tx_data_drain_pending(self, stream_id: int) -> None:
         """Arm the per-stream sc->tx_drain_pending flag so the next
@@ -1001,7 +1009,8 @@ class QuicConnection:
 
     def _release_dgram_ring(self) -> None:
         if self._dgram_ring:
-            self._transport.dgram_ring_release(self._dgram_ring)
+            self._transport.dgram_ring_release(self._dgram_ring,
+                                               self._cnx_ptr)
             self._dgram_ring = 0
 
     def get_stream_buf_stats(self, stream_id: int):
