@@ -387,6 +387,8 @@ typedef struct {
     uint32_t        dgram_release_owed_n;
     uint32_t        dgram_release_owed_cap;
     uint64_t        worker_dgram_ring_release_processed;
+    /* OPEN_FLOW_CONTROL sc references released by the stale-cnx guard. */
+    uint64_t        cnt_sc_destroy_fc_credit_dead_cnx;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -1492,6 +1494,13 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                  * aiopquic_cnx_is_alive() comment for cost notes. */
                 if (!cnx || !aiopquic_cnx_is_alive(quic, cnx)) {
                     ctx->cnt_tx_event_dropped_dead_cnx++;
+                    /* The event owns an sc reference; release it. */
+                    if (entry->event_type == SPSC_EVT_TX_OPEN_FLOW_CONTROL &&
+                        entry->stream_ctx != NULL) {
+                        ctx->cnt_sc_destroy_fc_credit_dead_cnx++;
+                        aiopquic_stream_ctx_destroy(
+                            (aiopquic_stream_ctx_t*)entry->stream_ctx);
+                    }
                     ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                     aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                     continue;

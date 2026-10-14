@@ -338,6 +338,7 @@ cdef extern from "c/callback.h":
         uint64_t cnt_sc_destroy_wt_link_close_walker
         uint64_t cnt_sc_destroy_fc_credit_pushfail
         uint64_t cnt_sc_destroy_fc_credit_worker
+        uint64_t cnt_sc_destroy_fc_credit_dead_cnx
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
                                           uint32_t rx_cap,
@@ -1193,6 +1194,8 @@ cdef class TransportContext:
             'sc_destroy_wt_link_close_walker': self._ctx.cnt_sc_destroy_wt_link_close_walker,
             'sc_destroy_fc_credit_pushfail': self._ctx.cnt_sc_destroy_fc_credit_pushfail,
             'sc_destroy_fc_credit_worker': self._ctx.cnt_sc_destroy_fc_credit_worker,
+            'sc_destroy_fc_credit_dead_cnx':
+                self._ctx.cnt_sc_destroy_fc_credit_dead_cnx,
             'sc_ref_chunk_wrap_total': aiopquic_cnt_sc_ref_chunk_wrap_load(),
             'sc_destroy_chunk_dealloc_total': aiopquic_cnt_sc_destroy_chunk_dealloc_load(),
             'sc_destroy_rx_event_total': aiopquic_cnt_sc_destroy_rx_event_load(),
