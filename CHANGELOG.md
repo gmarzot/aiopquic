@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.0a4
+
+- Fix: a WebTransport session struct is freed only once picoquic cannot reach it; the GC
+  clearing a session's state freed it under a live server connection, which `stop()` then
+  touched (segfault/abort at server close). A session released after `stop()` is now freed
+  instead of leaked.
+
 ## v0.5.0a3
 
 - Fix: a datagram ring is released on the worker behind every MARK queued for
