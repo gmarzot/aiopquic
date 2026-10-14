@@ -339,6 +339,7 @@ cdef extern from "c/callback.h":
         uint64_t cnt_sc_destroy_fc_credit_pushfail
         uint64_t cnt_sc_destroy_fc_credit_worker
         uint64_t cnt_sc_destroy_fc_credit_dead_cnx
+        uint64_t cnt_wt_control_released
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
                                           uint32_t rx_cap,
@@ -1185,6 +1186,7 @@ cdef class TransportContext:
             # WT sc/link leak diagnostic (added 2026-06-06).
             # Growth rate ~ sc leak rate per cnx.
             'wt_callback_free_skipped': self._ctx.cnt_wt_callback_free_skipped,
+            'wt_control_released': self._ctx.cnt_wt_control_released,
             # Per-site sc create/ref/destroy counters (added 2026-06-06).
             # See stream_ctx.h block comment for the balance invariant.
             'sc_create_raw_quic': self._ctx.cnt_sc_create_raw_quic,

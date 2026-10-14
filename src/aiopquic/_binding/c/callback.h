@@ -389,6 +389,8 @@ typedef struct {
     uint64_t        worker_dgram_ring_release_processed;
     /* OPEN_FLOW_CONTROL sc references released by the stale-cnx guard. */
     uint64_t        cnt_sc_destroy_fc_credit_dead_cnx;
+    /* WT CONNECT streams h3zero freed while their session lived. */
+    uint64_t        cnt_wt_control_released;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */

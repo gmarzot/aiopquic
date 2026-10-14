@@ -1021,6 +1021,12 @@ static int aiopquic_wt_path_callback(
                 s->session_closing);
             fflush(stderr);
         }
+        /* h3zero frees CONNECT once both FINs are done, possibly while
+         * the session lives; the cached pointer must not outlive it. */
+        if (is_control && stream_ctx == s->control_stream) {
+            s->control_stream = NULL;
+            s->bridge->cnt_wt_control_released++;
+        }
         if (link && stream_ctx
                 && stream_ctx->path_callback_ctx == link) {
             stream_ctx->path_callback_ctx = NULL;
@@ -1516,7 +1522,7 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
          * Done at session-destroy time only (once per session). No
          * per-stream tracking overhead during active operation. */
         if (s) {
-            if (s->cnx && s->h3_ctx && s->control_stream) {
+            if (s->cnx && s->h3_ctx && aiopquic_cnx_is_alive(quic, s->cnx)) {
                 /* Step 1: free this session's per-stream links. */
                 picosplay_node_t* node =
                     picosplay_first(&s->h3_ctx->h3_stream_tree);
@@ -1541,15 +1547,16 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                     }
                     node = next;
                 }
-                /* Step 2: detach the control stream's callback so the
+                /* Steps 2 and 3 need CONNECT, which h3zero may have
+                 * freed already. Step 2: detach its callback so the
                  * eventual picohttp_callback_free at cnx-close doesn't
                  * dispatch into a freed session pointer. */
-                s->control_stream->path_callback = NULL;
-                s->control_stream->path_callback_ctx = NULL;
-                /* Step 3: now safe to deregister + free. */
-                picowt_deregister(s->cnx, s->h3_ctx, s->control_stream);
-            }
-            if (s->cnx && s->h3_ctx && aiopquic_cnx_is_alive(quic, s->cnx)) {
+                if (s->control_stream) {
+                    s->control_stream->path_callback = NULL;
+                    s->control_stream->path_callback_ctx = NULL;
+                    /* Step 3: now safe to deregister + free. */
+                    picowt_deregister(s->cnx, s->h3_ctx, s->control_stream);
+                }
                 if (picoquic_is_client(s->cnx)) {
                     if (s->fin_sent) {
                         picoquic_close(s->cnx, H3ZERO_NO_ERROR);
