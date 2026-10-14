@@ -150,3 +150,45 @@ class TestTransportLifecycle:
         t0 = time.monotonic()
         ctx.stop(drain_timeout=5.0)
         assert time.monotonic() - t0 < 0.5, "waited despite having no worker"
+
+
+SPSC_EVT_TX_OPEN_FLOW_CONTROL = 143
+# Never dereferenced: the liveness guard compares it against picoquic's list.
+BOGUS_CNX = 0xDEADBEEF
+
+
+def _wait_counter(ctx, key, target, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if ctx.counters[key] >= target:
+            break
+        time.sleep(0.01)
+    return ctx.counters[key]
+
+
+class TestDeadCnxDrop:
+
+    def test_open_flow_control_on_dead_cnx_releases_sc_ref(self):
+        """OPEN_FLOW_CONTROL holds an sc reference; dropping it on a dead cnx
+        must release that reference."""
+        import gc
+        from aiopquic._binding._transport import stream_ctx_create
+
+        ctx = TransportContext()
+        ctx.start(alpn="h3")
+        gc.collect()
+        gc.disable()
+        try:
+            dropped = ctx.counters['tx_event_dropped_dead_cnx']
+            destroyed = ctx.counters['sc_destroyed_total']
+            sc = stream_ctx_create()
+            ctx.push_tx_event(SPSC_EVT_TX_OPEN_FLOW_CONTROL, 0,
+                              cnx_ptr=BOGUS_CNX, stream_ctx=sc)
+            ctx.wake_up()
+            assert _wait_counter(ctx, 'tx_event_dropped_dead_cnx',
+                                 dropped + 1) == dropped + 1
+            assert ctx.counters['sc_destroyed_total'] == destroyed + 1
+            assert ctx.counters['sc_destroy_fc_credit_dead_cnx'] == 1
+        finally:
+            gc.enable()
+            ctx.stop()

@@ -217,8 +217,9 @@ static inline int64_t aiopquic_cnt_chunks_alive_load(void) {
  *   (cnt_sc_create_raw_quic + cnt_sc_create_wt_link + cnt_sc_create_python_helper
  *    + cnt_sc_ref_fc_credit + cnt_sc_ref_chunk_wrap)
  *   == (cnt_sc_destroy_wt_link + cnt_sc_destroy_fc_credit_pushfail
- *       + cnt_sc_destroy_fc_credit_worker + cnt_sc_destroy_chunk_dealloc
- *       + cnt_sc_destroy_rx_event + cnt_sc_destroy_python_helper) */
+ *       + cnt_sc_destroy_fc_credit_worker + cnt_sc_destroy_fc_credit_dead_cnx
+ *       + cnt_sc_destroy_chunk_dealloc + cnt_sc_destroy_rx_event
+ *       + cnt_sc_destroy_python_helper) */
 static _Atomic(uint64_t) aiopquic_cnt_sc_ref_chunk_wrap = 0;
 static _Atomic(uint64_t) aiopquic_cnt_sc_destroy_chunk_dealloc = 0;
 static _Atomic(uint64_t) aiopquic_cnt_sc_destroy_rx_event = 0;

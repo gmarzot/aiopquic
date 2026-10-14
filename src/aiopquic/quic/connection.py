@@ -1132,6 +1132,10 @@ class QuicConnection:
         if self._transport is not None:
             self._transport.stop()
             self._transport = None
+        # The worker is joined: a close event it never delivered (aclose()
+        # timed out) cannot free these any more.
+        self._closed = True
+        self._destroy_stream_ctxs()
 
 
 class QuicEngine:
@@ -1287,6 +1291,9 @@ class QuicEngine:
         if self._transport is not None:
             self._transport.stop()
             self._transport = None
+        # CLOSE events still queued are never routed; release their rings.
+        for conn in self._connections.values():
+            conn._release_dgram_ring()
         # Now safe to drop Python state; picoquic is fully torn down.
         self._connections.clear()
         self._protocols.clear()

@@ -24,10 +24,8 @@ inputs:
     default: 'dev'
   with-native-tests:
     description: >
-      If "true", also runs build_picoquic_tests.sh after the main build
-      (for the native test-driver tier). Uses a separate cache key so
-      a tests-included build doesn't poison the cache for jobs that
-      don't need them.
+      If "true", use a separate picoquic build cache for the native
+      test-driver tier (./build.sh builds the drivers).
     required: false
     default: 'false'
 
@@ -67,7 +65,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: third_party/picoquic/build
-        key: picoquic-build${{ inputs.with-native-tests == 'true' && '-native' || '' }}-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build.sh', 'patches/*.patch', 'build_picoquic_tests.sh') }}
+        key: picoquic-build${{ inputs.with-native-tests == 'true' && '-native' || '' }}-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build.sh', 'patches/*.patch') }}
     - name: Build picoquic
       if: steps.picoquic-cache.outputs.cache-hit != 'true'
       shell: bash
@@ -79,13 +77,6 @@ runs:
         AIOPQUIC_WHEEL_BUILD: "1"
       run: |
         ./build.sh --native
-        if [ "${{ inputs.with-native-tests }}" = "true" ]; then
-          if [ -x ./build_picoquic_tests.sh ]; then
-            ./build_picoquic_tests.sh
-          else
-            echo "::warning::build_picoquic_tests.sh not present; skipping native test driver build"
-          fi
-        fi
     - name: Install aiopquic (editable)
       shell: bash
       run: |

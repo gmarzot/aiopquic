@@ -1114,26 +1114,42 @@ class _DispatcherRegistry:
     def __init__(self):
         self._dispatchers: dict[tuple[int, int], _Dispatcher] = {}
 
-    def attach(self, loop: asyncio.AbstractEventLoop,
-                transport: TransportContext,
-                session: WebTransportSession) -> None:
+    def _lookup(self, loop: asyncio.AbstractEventLoop,
+                transport: TransportContext) -> "_Dispatcher | None":
+        """The dispatcher of exactly this (loop, transport); an entry
+        filed under the same ids for other objects is not it."""
+        d = self._dispatchers.get((id(loop), id(transport)))
+        if d is not None and d._loop is loop and d._transport is transport:
+            return d
+        return None
+
+    def _get_or_create(self, loop: asyncio.AbstractEventLoop,
+                       transport: TransportContext) -> "_Dispatcher":
         key = (id(loop), id(transport))
         d = self._dispatchers.get(key)
+        if d is not None and (d._loop is not loop
+                              or d._transport is not transport):
+            # Retired before the new reader is added: the stale wake fd
+            # may share its number with this transport's.
+            d.detach()
+            del self._dispatchers[key]
+            d = None
         if d is None:
             d = _Dispatcher(loop, transport)
             self._dispatchers[key] = d
-        d.add_session(session)
+        return d
+
+    def attach(self, loop: asyncio.AbstractEventLoop,
+                transport: TransportContext,
+                session: WebTransportSession) -> None:
+        self._get_or_create(loop, transport).add_session(session)
 
     def attach_acceptor(self, loop: asyncio.AbstractEventLoop,
                          transport: TransportContext,
                          acceptor) -> "_Dispatcher":
         """Bind a server-side accept handler to (loop, transport).
         Returns the underlying dispatcher so callers can detach."""
-        key = (id(loop), id(transport))
-        d = self._dispatchers.get(key)
-        if d is None:
-            d = _Dispatcher(loop, transport)
-            self._dispatchers[key] = d
+        d = self._get_or_create(loop, transport)
         d.set_acceptor(acceptor)
         return d
 
@@ -1147,7 +1163,7 @@ class _DispatcherRegistry:
         objects, so a retained entry keeps a dead pair addressable.
         """
         key = (id(loop), id(transport))
-        d = self._dispatchers.get(key)
+        d = self._lookup(loop, transport)
         if d is None:
             return
         d.set_acceptor(None)
@@ -1162,7 +1178,7 @@ class _DispatcherRegistry:
                 transport: TransportContext,
                 session: WebTransportSession) -> None:
         """Drop one session from its dispatcher; the dispatcher stays."""
-        d = self._dispatchers.get((id(loop), id(transport)))
+        d = self._lookup(loop, transport)
         if d is not None:
             d.remove_session(session)
 
@@ -1173,7 +1189,7 @@ class _DispatcherRegistry:
         acceptor is retired: its tasks cancelled and awaited, then its
         reader removed."""
         key = (id(loop), id(transport))
-        d = self._dispatchers.get(key)
+        d = self._lookup(loop, transport)
         if d is None:
             return
         d.remove_session(session)

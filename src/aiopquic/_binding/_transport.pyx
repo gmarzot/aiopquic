@@ -114,6 +114,7 @@ cdef extern from "picoquic.h":
         picoquic_quic_t* quic, const char* alg_name)
 
     void picoquic_register_all_congestion_control_algorithms()
+    const void* picoquic_get_congestion_algorithm(const char* alg_name)
 
     void picoquic_free(picoquic_quic_t* quic)
     uint64_t picoquic_current_time()
@@ -338,6 +339,8 @@ cdef extern from "c/callback.h":
         uint64_t cnt_sc_destroy_wt_link_close_walker
         uint64_t cnt_sc_destroy_fc_credit_pushfail
         uint64_t cnt_sc_destroy_fc_credit_worker
+        uint64_t cnt_sc_destroy_fc_credit_dead_cnx
+        uint64_t cnt_wt_control_released
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
                                           uint32_t rx_cap,
@@ -639,6 +642,30 @@ cdef extern from "c/h3wt_callback.h":
 
 # Default ring sizing
 DEF DEFAULT_RING_CAPACITY = 262144
+
+
+_CC_NAMES = ("newreno", "reno", "cubic", "dcubic", "fast", "bbr", "bbr1",
+             "prague", "c4")
+
+
+def check_congestion_control_algorithm(name):
+    """Raise ValueError unless picoquic has an algorithm registered under
+    exactly `name` (str or bytes). None, picoquic's default, passes."""
+    if name is None:
+        return
+    cdef bytes b_name
+    if isinstance(name, str):
+        b_name = name.encode()
+    elif isinstance(name, bytes):
+        b_name = name
+    else:
+        raise ValueError(
+            f"congestion_control_algorithm must be a str, not {type(name).__name__}")
+    picoquic_register_all_congestion_control_algorithms()
+    if b"\0" in b_name or picoquic_get_congestion_algorithm(b_name) is NULL:
+        raise ValueError(
+            f"unknown congestion_control_algorithm {name!r}; "
+            f"expected one of {', '.join(_CC_NAMES)}")
 
 
 def tx_data_bytes_queued():
@@ -982,6 +1009,16 @@ cdef class TransportContext:
 
     This is the core bridge between the C picoquic library and Python.
     It owns the SPSC rings and the eventfd used for async notification.
+
+    Constructor arguments size the two event rings, in entries, rounded up
+    to a power of two; 0 takes the default:
+        tx_ring_cap: TX event ring, asyncio to worker (default 2048).
+        rx_data_ring_cap: RX event ring, worker to asyncio (default 16384).
+            Not a byte ring: start(rx_data_ring_cap=) sizes each stream's
+            RX bytes.
+        ring_capacity: both, where the specific argument is 0.
+        tx_event_ring_low_water_pct: TX ring fill, in percent, below which a
+            parked writer is woken (default 50).
     """
     # Make cdef class weakref-able so the SIGUSR2 counter-dump registry
     # (_TRANSPORT_REGISTRY at module level above) can hold WeakRef
@@ -1184,6 +1221,7 @@ cdef class TransportContext:
             # WT sc/link leak diagnostic (added 2026-06-06).
             # Growth rate ~ sc leak rate per cnx.
             'wt_callback_free_skipped': self._ctx.cnt_wt_callback_free_skipped,
+            'wt_control_released': self._ctx.cnt_wt_control_released,
             # Per-site sc create/ref/destroy counters (added 2026-06-06).
             # See stream_ctx.h block comment for the balance invariant.
             'sc_create_raw_quic': self._ctx.cnt_sc_create_raw_quic,
@@ -1193,6 +1231,8 @@ cdef class TransportContext:
             'sc_destroy_wt_link_close_walker': self._ctx.cnt_sc_destroy_wt_link_close_walker,
             'sc_destroy_fc_credit_pushfail': self._ctx.cnt_sc_destroy_fc_credit_pushfail,
             'sc_destroy_fc_credit_worker': self._ctx.cnt_sc_destroy_fc_credit_worker,
+            'sc_destroy_fc_credit_dead_cnx':
+                self._ctx.cnt_sc_destroy_fc_credit_dead_cnx,
             'sc_ref_chunk_wrap_total': aiopquic_cnt_sc_ref_chunk_wrap_load(),
             'sc_destroy_chunk_dealloc_total': aiopquic_cnt_sc_destroy_chunk_dealloc_load(),
             'sc_destroy_rx_event_total': aiopquic_cnt_sc_destroy_rx_event_load(),
@@ -2660,6 +2700,12 @@ cdef class TransportContext:
                 DEFAULT_KEY_EXCHANGE_GROUPS. picoquic keeps one order
                 per process, so the last start() wins.
             idle_timeout_ms: Idle timeout in milliseconds.
+            rx_data_ring_cap: Per-stream RX byte ring, in bytes, and the
+                advertised stream window. 0: a 4 MiB ring and picoquic's
+                default window.
+            congestion_control_algorithm: picoquic algorithm name, matched
+                exactly; an unknown name raises ValueError. None keeps
+                picoquic's default (newreno).
             max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
             wt_path: Server-mode WebTransport path (e.g. "/moq").
                 When set, uses h3zero_callback as picoquic's default
@@ -2672,6 +2718,7 @@ cdef class TransportContext:
         """
         if self._started:
             raise RuntimeError("Transport already started")
+        check_congestion_control_algorithm(congestion_control_algorithm)
 
         # Stash per-stream RX ring capacity on the C ctx so the
         # stream_data callback sizes per-stream byte rings to match the
@@ -2799,9 +2846,8 @@ cdef class TransportContext:
         if alpn_list and not is_client:
             picoquic_set_alpn_select_fn_v2(self._quic, aiopquic_alpn_select_cb)
 
-        # Optional congestion-control selection. None defers to picoquic's
-        # compile-time default (newreno). Unknown names fall back the
-        # same way (picoquic logs a warning and keeps the default).
+        # Congestion control, checked above. None keeps picoquic's
+        # compile-time default (newreno).
         cdef bytes _b_cc
         cdef const char* _c_cc
         if congestion_control_algorithm is not None:

@@ -47,7 +47,7 @@ CA: `QuicConfiguration.cafile` or `connect_webtransport(ca_file=)`. Accept anyth
 
 **Congestion control.** Default `"bbr1"`; `None` is picoquic's `newreno`. Names, matched exactly:
 `newreno` (alias `reno`), `cubic`, `dcubic`, `fast`, `bbr` (v3), `bbr1`, `prague`, `c4`. An unknown
-name is not rejected; see Known traps.
+name (`"BBR1"` among them) raises `ValueError` from `QuicConfiguration` and at transport start.
 
 **Datagrams** are on by default. `send_datagram_frame(data)` returns `len(data)`, or 0 when the
 record ring is full: wait on `get_datagram_tx_drain_event()` and resend the same payload.
@@ -97,11 +97,12 @@ has left the ring once it is exceeded.
 
 ## Tests
 
-    python -m pytest tests -m "not interop and not native"   # CI core tier
+    python -m pytest tests                                   # CI core tier
     python -m pytest tests -m native                         # picoquic's own suites
     python -m pytest tests/bench                             # opt-in benchmarks
 
-- A bare `pytest tests` includes `interop` (public endpoints) and `native`; pass `-m`.
+- `interop` (public endpoints) and `native` are deselected by default; `-m native` or
+  `-m interop` selects them.
 - Ports come from `tests/_ports.next_port()`. `tests/interop/` peers need
   `pip install aioquic 'qh3<2'`.
 - `tests/wt_close_scenarios.py` and `tests/dgram_release_scenarios.py` are not collected: their
@@ -170,11 +171,10 @@ applies nor reverse-applies stops the build: drop or regenerate it.
 | `picoquic-wt-connect-lenient` | A client sends CONNECT once the server's SETTINGS arrive, dropping vetoes deployed relays fail; `AIOPQUIC_WT_STRICT_CONNECT=1` restores the gate | Local |
 | `picoquic-alpn-null-guard` | negotiated-ALPN lookup tolerates a NULL cnx | Upstream candidate |
 | `picoquic-h3zero-null-file-guard` | h3zero's client skips `fwrite` on a NULL `FILE*` | Upstream candidate |
+| `picoquic-stop-sending-error-getter` | `picoquic_get_remote_stop_sending_error()` returns the code of a received STOP_SENDING | Local |
 
 ## Known traps
 
-- An unknown `congestion_control_algorithm` is not rejected: picoquic stores a NULL algorithm and
-  connections run without congestion control. `"BBR1"` is unknown.
 - picoquic's `bbr` (v3) freezes cwnd below ~128 µs RTT: loopback, the one place not to use it.
   `newreno` or `cubic` give clean loopback timing; loss-based CCs collapse on the GIL-induced loss
   blips of a loaded host.
@@ -187,6 +187,6 @@ applies nor reverse-applies stops the build: drop or regenerate it.
 - `max_stream_data` (16 MiB) is both the advertised window and the per-stream RX ring.
 - A stalled consumer back-pressures the peer to silence and the connection idles out; set
   `keep_alive_interval`. On a closed raw connection `send_stream_data()` silently does nothing;
-  check `quic.closed`. STOP_SENDING error codes arrive as 0.
+  check `quic.closed`.
 - qlog roughly halves multi-Gbps throughput.
 - macOS: no GSO; `AIOPQUIC_SEND_LENGTH_MAX` above `net.inet.udp.maxdgram` fails with EMSGSIZE.

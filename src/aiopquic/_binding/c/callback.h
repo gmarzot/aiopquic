@@ -387,6 +387,10 @@ typedef struct {
     uint32_t        dgram_release_owed_n;
     uint32_t        dgram_release_owed_cap;
     uint64_t        worker_dgram_ring_release_processed;
+    /* OPEN_FLOW_CONTROL sc references released by the stale-cnx guard. */
+    uint64_t        cnt_sc_destroy_fc_credit_dead_cnx;
+    /* WT CONNECT streams h3zero freed while their session lived. */
+    uint64_t        cnt_wt_control_released;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -1110,8 +1114,8 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         return 0;
     }
 
-    /* Local picoquic patch (patches/0003-...): fires once per stream
-     * when picoquic considers it fully retired (pure receivers on
+    /* picoquic fires this once per stream
+     * when it considers the stream fully retired (pure receivers on
      * FIN/RESET; senders/bidi when all sent data ACKed). Universal
      * sc-destroy signal; covers cases the old pure-receiver-only
      * STREAM_DESTROY emit (further down) didn't. picoquic won't call
@@ -1202,14 +1206,11 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     entry.cnx = cnx;
     entry.stream_ctx = stream_ctx;
 
-    if (fin_or_event == picoquic_callback_stream_reset ||
-        fin_or_event == picoquic_callback_stop_sending) {
-        /* picoquic_get_remote_stream_error returns the RESET_STREAM
-         * code; STOP_SENDING is stored in stream->remote_stop_error
-         * (private to picoquic_internal.h, no public getter), so
-         * STOP_SENDING events surface error_code=0 today. TODO: add
-         * a small C helper that includes internal.h to recover it. */
+    if (fin_or_event == picoquic_callback_stream_reset) {
         entry.error_code = picoquic_get_remote_stream_error(cnx, stream_id);
+    } else if (fin_or_event == picoquic_callback_stop_sending) {
+        entry.error_code =
+            picoquic_get_remote_stop_sending_error(cnx, stream_id);
     } else if (fin_or_event == picoquic_callback_application_close) {
         entry.error_code = picoquic_get_application_error(cnx);
         aiopquic_dgram_table_remove(&ctx->dgram_table, cnx);
@@ -1492,6 +1493,13 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                  * aiopquic_cnx_is_alive() comment for cost notes. */
                 if (!cnx || !aiopquic_cnx_is_alive(quic, cnx)) {
                     ctx->cnt_tx_event_dropped_dead_cnx++;
+                    /* The event owns an sc reference; release it. */
+                    if (entry->event_type == SPSC_EVT_TX_OPEN_FLOW_CONTROL &&
+                        entry->stream_ctx != NULL) {
+                        ctx->cnt_sc_destroy_fc_credit_dead_cnx++;
+                        aiopquic_stream_ctx_destroy(
+                            (aiopquic_stream_ctx_t*)entry->stream_ctx);
+                    }
                     ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                     aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                     continue;

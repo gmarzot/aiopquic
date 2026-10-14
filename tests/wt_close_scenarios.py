@@ -25,6 +25,13 @@ at zero, and a fault kills only the child.
         reset_stream_at) and STOP_SENDING on those it receives on, and no
         end sent STOP_SENDING on a stream it only sends on or a reset on one
         it only receives on. Exits 0 when both hold.
+
+    python tests/wt_close_scenarios.py ctl PORT CERT KEY
+        The client sends the close capsule and FIN on CONNECT but keeps the
+        session, the server answers with its FIN, and h3zero frees the
+        client's CONNECT stream while the session lives. Then close, FIN, drain and deregister run on that
+        session. Run with MALLOC_PERTURB_. Exits 0 when the release is
+        counted every cycle and nothing faults.
 """
 import asyncio
 import glob
@@ -344,8 +351,34 @@ async def directions(port, cert, key):
         sys.exit("\n".join(errors))
 
 
+async def ctl(port, cert, key):
+    async def handler(session):
+        pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=cert, key_file=key)
+    try:
+        for cycle in range(10):
+            async with connect_webtransport(
+                    "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+                counters = wt._transport.counters
+                released = counters.get('wt_control_released', 0)
+                # Capsule and FIN, leaving the session and connection up.
+                wt._state.push_close(0, b"")
+                await _until(
+                    lambda: wt._transport.counters.get(
+                        'wt_control_released', 0) > released,
+                    f"the CONNECT stream release (cycle {cycle})")
+                wt._state.push_fin()
+                wt.drain()
+                wt.close()
+    finally:
+        server.close()
+
+
 if __name__ == "__main__":
     mode, port, cert, key = sys.argv[1:5]
     CA_FILE = os.path.join(os.path.dirname(cert), "test-ca.crt")
     asyncio.run({"receive": receive, "unsent": unsent, "starve": starve,
-                 "directions": directions}[mode](int(port), cert, key))
+                 "directions": directions, "ctl": ctl}[mode](int(port), cert, key))
