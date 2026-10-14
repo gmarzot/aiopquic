@@ -114,6 +114,7 @@ cdef extern from "picoquic.h":
         picoquic_quic_t* quic, const char* alg_name)
 
     void picoquic_register_all_congestion_control_algorithms()
+    const void* picoquic_get_congestion_algorithm(const char* alg_name)
 
     void picoquic_free(picoquic_quic_t* quic)
     uint64_t picoquic_current_time()
@@ -641,6 +642,30 @@ cdef extern from "c/h3wt_callback.h":
 
 # Default ring sizing
 DEF DEFAULT_RING_CAPACITY = 262144
+
+
+_CC_NAMES = ("newreno", "reno", "cubic", "dcubic", "fast", "bbr", "bbr1",
+             "prague", "c4")
+
+
+def check_congestion_control_algorithm(name):
+    """Raise ValueError unless picoquic has an algorithm registered under
+    exactly `name` (str or bytes). None, picoquic's default, passes."""
+    if name is None:
+        return
+    cdef bytes b_name
+    if isinstance(name, str):
+        b_name = name.encode()
+    elif isinstance(name, bytes):
+        b_name = name
+    else:
+        raise ValueError(
+            f"congestion_control_algorithm must be a str, not {type(name).__name__}")
+    picoquic_register_all_congestion_control_algorithms()
+    if b"\0" in b_name or picoquic_get_congestion_algorithm(b_name) is NULL:
+        raise ValueError(
+            f"unknown congestion_control_algorithm {name!r}; "
+            f"expected one of {', '.join(_CC_NAMES)}")
 
 
 def tx_data_bytes_queued():
@@ -2677,6 +2702,7 @@ cdef class TransportContext:
         """
         if self._started:
             raise RuntimeError("Transport already started")
+        check_congestion_control_algorithm(congestion_control_algorithm)
 
         # Stash per-stream RX ring capacity on the C ctx so the
         # stream_data callback sizes per-stream byte rings to match the
@@ -2804,9 +2830,8 @@ cdef class TransportContext:
         if alpn_list and not is_client:
             picoquic_set_alpn_select_fn_v2(self._quic, aiopquic_alpn_select_cb)
 
-        # Optional congestion-control selection. None defers to picoquic's
-        # compile-time default (newreno). Unknown names fall back the
-        # same way (picoquic logs a warning and keeps the default).
+        # Congestion control, checked above. None keeps picoquic's
+        # compile-time default (newreno).
         cdef bytes _b_cc
         cdef const char* _c_cc
         if congestion_control_algorithm is not None:
