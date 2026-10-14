@@ -25,6 +25,11 @@ must reach the worker behind every MARK queued before it.
         A client sends datagrams until the server closes the session, then
         sends its first datagram on a fresh session and closes it at once,
         20 times each. Exits 0 when every cycle ends and no ring is left.
+
+    python tests/dgram_release_scenarios.py raw-engine-close PORT CERT KEY
+        The server echoes a datagram, so it holds a ring for the
+        connection, then closes while the connection is up: its CLOSE
+        event is never routed. Exits 0 when no ring is left.
 """
 import asyncio
 import gc
@@ -227,6 +232,37 @@ async def raw_peer_close(port, cert, key):
         _fail(f"{left} rings alive after {CYCLES} cycles")
 
 
+async def raw_engine_close(port, cert, key):
+    class _Echo(QuicConnectionProtocol):
+        def quic_event_received(self, event):
+            if isinstance(event, DatagramFrameReceived):
+                self._quic.send_datagram_frame(bytes(event.data))
+
+    echoed = asyncio.Event()
+
+    class _Client(QuicConnectionProtocol):
+        def quic_event_received(self, event):
+            if isinstance(event, DatagramFrameReceived):
+                echoed.set()
+
+    scfg = _datagram_cfg(is_client=False)
+    scfg.load_cert_chain(cert, key)
+    server = await serve("127.0.0.1", port, configuration=scfg,
+                         create_protocol=_Echo)
+    base = TransportContext().counters["dgram_rings_alive_total"]
+    ccfg = _datagram_cfg(is_client=True, server_name=SNI, cafile=CA_FILE)
+    async with connect("127.0.0.1", port, configuration=ccfg,
+                       create_protocol=_Client) as client:
+        client._quic.send_datagram_frame(PAYLOAD)
+        await asyncio.wait_for(echoed.wait(), timeout=5.0)
+        server.close()
+        await asyncio.wait_for(client.wait_closed(), timeout=5.0)
+    gc.collect()
+    left = TransportContext().counters["dgram_rings_alive_total"] - base
+    if left:
+        _fail(f"{left} rings alive after the server closed")
+
+
 async def wt_peer_close(port, cert, key):
     async def handler(session):
         async for _ in session.events():
@@ -277,5 +313,6 @@ if __name__ == "__main__":
         raw_queued(int(port), cert, key)
     else:
         asyncio.run({"wt-queued": wt_queued, "raw-peer-close": raw_peer_close,
-                     "wt-peer-close": wt_peer_close}[mode](
+                     "wt-peer-close": wt_peer_close,
+                     "raw-engine-close": raw_engine_close}[mode](
                          int(port), cert, key))
