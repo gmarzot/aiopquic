@@ -1114,8 +1114,8 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         return 0;
     }
 
-    /* Local picoquic patch (patches/0003-...): fires once per stream
-     * when picoquic considers it fully retired (pure receivers on
+    /* picoquic fires this once per stream
+     * when it considers the stream fully retired (pure receivers on
      * FIN/RESET; senders/bidi when all sent data ACKed). Universal
      * sc-destroy signal; covers cases the old pure-receiver-only
      * STREAM_DESTROY emit (further down) didn't. picoquic won't call

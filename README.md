@@ -21,7 +21,7 @@
 - QUIC client and server: `connect`, `serve`, `QuicConnectionProtocol`
 - Stream data send/receive with FIN signaling, stream reset, stop_sending
 - WebTransport client + server: `serve_webtransport`, `WebTransportSession`
-- QUIC datagram TX + RX (note: WebTransport datagram TX not yet wired)
+- QUIC and WebTransport datagram TX + RX
 - Connection migration / 0-RTT (inherited from picoquic)
 - Connection management: create, close, idle timeout, application close codes
 - Per-cnx multiplexing on the server side via `QuicEngine`
@@ -144,14 +144,11 @@ Test-suite coverage, benchmark methodology, performance builds (`AIOPQUIC_PERF=1
 ## Known Limitations
 
 - **Free-threaded Python (3.14t) not yet supported** -- the TX-ring producer side, `TransportContext` lifecycle, and the WebTransport engine state currently rely on the GIL for serialization. FT support deferred until a per-context locking audit lands.
-- **STOP_SENDING error codes** surface as 0 today: picoquic's public stream-error getter only returns the RESET_STREAM code. STOP_SENDING's code lives in `stream->remote_stop_error` in `picoquic_internal.h` (no public getter). A small helper that pulls the field is straightforward future work — see TODO in `src/aiopquic/_binding/c/callback.h`.
 
 ## TODO
 
 - Windows support (eventfd alternative — IOCP / WSAEventSelect on the wake-fd path)
 - Free-threaded Python (3.14t) support after producer-side locking audit
-- STOP_SENDING error-code surfacing helper (read `remote_stop_error` from picoquic_internal.h)
-- WebTransport datagram TX path through the C bridge
 - Datagram benches: latency percentiles, payload-size sweep, loss / jitter under load (today's `bench_datagram` is fire-and-count throughput only)
 - Pure stream open/close microbench (lifecycle rate without payload, separate from `bench_stream_churn_highlevel` which bundles writes + FIN)
 - Submit aiopquic to the [QUIC interop runner](https://interop.seemann.io/) for cross-implementation coverage

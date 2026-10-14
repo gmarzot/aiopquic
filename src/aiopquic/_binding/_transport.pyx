@@ -1009,6 +1009,16 @@ cdef class TransportContext:
 
     This is the core bridge between the C picoquic library and Python.
     It owns the SPSC rings and the eventfd used for async notification.
+
+    Constructor arguments size the two event rings, in entries, rounded up
+    to a power of two; 0 takes the default:
+        tx_ring_cap: TX event ring, asyncio to worker (default 2048).
+        rx_data_ring_cap: RX event ring, worker to asyncio (default 16384).
+            Not a byte ring: start(rx_data_ring_cap=) sizes each stream's
+            RX bytes.
+        ring_capacity: both, where the specific argument is 0.
+        tx_event_ring_low_water_pct: TX ring fill, in percent, below which a
+            parked writer is woken (default 50).
     """
     # Make cdef class weakref-able so the SIGUSR2 counter-dump registry
     # (_TRANSPORT_REGISTRY at module level above) can hold WeakRef
@@ -2690,6 +2700,12 @@ cdef class TransportContext:
                 DEFAULT_KEY_EXCHANGE_GROUPS. picoquic keeps one order
                 per process, so the last start() wins.
             idle_timeout_ms: Idle timeout in milliseconds.
+            rx_data_ring_cap: Per-stream RX byte ring, in bytes, and the
+                advertised stream window. 0: a 4 MiB ring and picoquic's
+                default window.
+            congestion_control_algorithm: picoquic algorithm name, matched
+                exactly; an unknown name raises ValueError. None keeps
+                picoquic's default (newreno).
             max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
             wt_path: Server-mode WebTransport path (e.g. "/moq").
                 When set, uses h3zero_callback as picoquic's default
