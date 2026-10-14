@@ -1,0 +1,35 @@
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+index dee1f980..96b636f1 100644
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -1796,6 +1796,8 @@ uint64_t picoquic_get_application_error(picoquic_cnx_t* cnx);
+ 
+ /* Returns the remote error for the given stream. */
+ uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t* cnx, uint64_t stream_id);
++/* Returns the error code of the peer's STOP_SENDING for the given stream. */
++uint64_t picoquic_get_remote_stop_sending_error(picoquic_cnx_t* cnx, uint64_t stream_id);
+ 
+ uint64_t picoquic_get_data_sent(picoquic_cnx_t * cnx);
+ 
+diff --git a/picoquic/quicctx.c b/picoquic/quicctx.c
+index 66ef22c3..932fd559 100644
+--- a/picoquic/quicctx.c
++++ b/picoquic/quicctx.c
+@@ -5282,6 +5282,17 @@ uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t* cnx, uint64_t stream_i
+     return remote_error;
+ }
+ 
++uint64_t picoquic_get_remote_stop_sending_error(picoquic_cnx_t* cnx, uint64_t stream_id)
++{
++    uint64_t remote_stop_error = 0;
++    picoquic_stream_head_t* stream;
++    PICOQUIC_THREAD_CHECK(cnx->quic);
++    if ((stream = picoquic_find_stream(cnx, stream_id)) != NULL) {
++        remote_stop_error = stream->remote_stop_error;
++    }
++    return remote_stop_error;
++}
++
+ uint64_t picoquic_get_data_sent(picoquic_cnx_t* cnx)
+ {
+     PICOQUIC_THREAD_CHECK(cnx->quic);

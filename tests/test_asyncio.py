@@ -192,7 +192,7 @@ class TestAsyncConnect:
                 if isinstance(event, StreamDataReceived) and event.data:
                     received.set()
                 elif isinstance(event, StopSendingReceived):
-                    stops.append(event.stream_id)
+                    stops.append((event.stream_id, event.error_code))
 
         class ClientProtocol(QuicConnectionProtocol):
             def quic_event_received(self, event):
@@ -230,8 +230,9 @@ class TestAsyncConnect:
                 dropped = quic._transport.counters.get(
                     'tx_wrong_direction_dropped', 0) - before
                 assert dropped == 1, f"expected 1 dropped request, got {dropped}"
-                assert stops == [bidi], (
-                    f"peer saw STOP_SENDING on {stops}, expected only {bidi}")
+                assert stops == [(bidi, 0x10)], (
+                    f"peer saw STOP_SENDING {stops}, expected only "
+                    f"({bidi}, 0x10)")
         finally:
             server.close()
 

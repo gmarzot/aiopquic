@@ -170,6 +170,7 @@ applies nor reverse-applies stops the build: drop or regenerate it.
 | `picoquic-wt-connect-lenient` | A client sends CONNECT once the server's SETTINGS arrive, dropping vetoes deployed relays fail; `AIOPQUIC_WT_STRICT_CONNECT=1` restores the gate | Local |
 | `picoquic-alpn-null-guard` | negotiated-ALPN lookup tolerates a NULL cnx | Upstream candidate |
 | `picoquic-h3zero-null-file-guard` | h3zero's client skips `fwrite` on a NULL `FILE*` | Upstream candidate |
+| `picoquic-stop-sending-error-getter` | `picoquic_get_remote_stop_sending_error()` returns the code of a received STOP_SENDING | Local |
 
 ## Known traps
 

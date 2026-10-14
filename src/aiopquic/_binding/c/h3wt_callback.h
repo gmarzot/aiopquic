@@ -971,12 +971,13 @@ static int aiopquic_wt_path_callback(
                 "[wt-diag] picohttp_callback_stop_sending sid=%llu "
                 "remote_err=%llu\n",
                 (unsigned long long)sid,
-                (unsigned long long)picoquic_get_remote_stream_error(cnx, sid));
+                (unsigned long long)picoquic_get_remote_stop_sending_error(
+                    cnx, sid));
             fflush(stderr);
         }
         aiopquic_wt_push_event(s, SPSC_EVT_WT_STOP_SENDING,
                                 sid,
-                                picoquic_get_remote_stream_error(cnx, sid),
+                                picoquic_get_remote_stop_sending_error(cnx, sid),
                                 NULL, 0);
         /* link is freed at picohttp_callback_free below. */
         break;

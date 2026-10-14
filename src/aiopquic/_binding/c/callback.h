@@ -1206,14 +1206,11 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     entry.cnx = cnx;
     entry.stream_ctx = stream_ctx;
 
-    if (fin_or_event == picoquic_callback_stream_reset ||
-        fin_or_event == picoquic_callback_stop_sending) {
-        /* picoquic_get_remote_stream_error returns the RESET_STREAM
-         * code; STOP_SENDING is stored in stream->remote_stop_error
-         * (private to picoquic_internal.h, no public getter), so
-         * STOP_SENDING events surface error_code=0 today. TODO: add
-         * a small C helper that includes internal.h to recover it. */
+    if (fin_or_event == picoquic_callback_stream_reset) {
         entry.error_code = picoquic_get_remote_stream_error(cnx, stream_id);
+    } else if (fin_or_event == picoquic_callback_stop_sending) {
+        entry.error_code =
+            picoquic_get_remote_stop_sending_error(cnx, stream_id);
     } else if (fin_or_event == picoquic_callback_application_close) {
         entry.error_code = picoquic_get_application_error(cnx);
         aiopquic_dgram_table_remove(&ctx->dgram_table, cnx);

@@ -627,10 +627,9 @@ async def test_wt_stop_sending_on_own_uni_is_dropped():
             dropped = wt._transport.counters.get(
                 'tx_wrong_direction_dropped', 0) - before
             assert dropped == 1, f"expected 1 dropped request, got {dropped}"
-            # Ids only: a received STOP_SENDING's code is not exposed by
-            # picoquic's public API, so it surfaces as 0.
-            assert [sid for sid, _ in stops] == [bidi], (
-                f"peer saw STOP_SENDING {stops}, expected only bidi {bidi}")
+            assert stops == [(bidi, 0x10)], (
+                f"peer saw STOP_SENDING {stops}, expected only "
+                f"({bidi}, 0x10)")
     finally:
         server.close()
 
