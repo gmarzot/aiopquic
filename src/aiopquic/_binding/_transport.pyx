@@ -16,6 +16,7 @@ covers TX entry points and the WT TX dispatch path.
 import os
 import sys
 
+cimport cython
 from cpython.buffer cimport PyBuffer_FillInfo
 from cpython.bytes cimport PyBytes_AsString, PyBytes_FromStringAndSize
 from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t, int64_t, uintptr_t
@@ -3148,6 +3149,9 @@ cdef extern from "c/h3wt_callback.h":
         uint16_t protocols_len
 
 
+# tp_clear would drop _transport, which __dealloc__ needs to tell whether
+# picoquic still holds the session.
+@cython.no_gc_clear
 cdef class WebTransportSessionState:
     """C-side state for one WebTransport client session.
 
@@ -3174,29 +3178,27 @@ cdef class WebTransportSessionState:
                 raise MemoryError("Failed to create WT session")
 
     def __dealloc__(self):
-        """If we ever pushed TX_WT_OPEN, picoquic is holding our
-        session as path_app_ctx. Push TX_WT_DEREGISTER and let the
-        picoquic thread call picowt_deregister + free. Don't free
-        here; doing so would race with any in-flight path callback.
+        """Free the session struct once picoquic cannot reach it.
 
-        If never opened, free directly (picoquic has no reference)."""
+        An opened session is named by picoquic (stream prefix, control
+        stream, links) until TX_WT_DEREGISTER: a running worker frees it
+        there. Once the worker is joined and picoquic freed, it is ours.
+        Never opened, picoquic has no reference."""
         cdef spsc_entry_t entry
-        cdef TransportContext tp
+        cdef TransportContext tp = self._transport
         if self._wt is NULL:
             return
-        # _transport is a typed cdef reference, so attribute access on it
-        # is not None-checked. tp_clear drops it to None before
-        # __dealloc__ whenever GC breaks a cycle or the interpreter is
-        # shutting down, and TransportContext.__dealloc__ nulls _ctx once
-        # the context is destroyed. Either way there is no ring left to
-        # post to, and reaching for one is an unchecked NULL dereference.
-        tp = self._transport
-        if self._opened and tp is not None and tp._ctx is not NULL:
-            # Push deregister; the picoquic thread will free wt.
+        if not self._opened:
+            aiopquic_wt_session_destroy(self._wt)
+        elif tp is None:
+            # No way to tell whether picoquic still names it: leak.
+            pass
+        elif tp._thread_ctx is not NULL:
             memset(&entry, 0, sizeof(entry))
             entry.event_type = SPSC_EVT_TX_WT_DEREGISTER
             entry.cnx = <void*>self._wt
             entry.stream_ctx = <void*>self._wt
+            # A full ring leaks the session rather than freeing it live.
             if spsc_ring_push(tp._ctx.tx_event_ring, &entry,
                               NULL, 0) == 0:
                 tp._ctx.cnt_tx_event_ring_pushes += 1
@@ -3204,13 +3206,9 @@ cdef class WebTransportSessionState:
                 tp.wake_up()
             except Exception:
                 pass
-            self._wt = NULL
-        else:
-            # No worker to race: the context is gone, so the session
-            # struct is ours to free.
+        elif tp._quic is NULL:
             aiopquic_wt_session_destroy(self._wt)
-            self._wt = NULL
-            self._wt = NULL
+        self._wt = NULL
 
     @property
     def session_ptr(self):
