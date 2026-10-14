@@ -13,8 +13,8 @@ import pytest
 
 from aiopquic._binding._transport import TransportContext
 from aiopquic.asyncio.webtransport import (
-    WebTransportClient, WebTransportSession, _get_dispatcher_registry,
-    serve_webtransport,
+    WebTransportClient, WebTransportSession, _Dispatcher,
+    _get_dispatcher_registry, serve_webtransport,
 )
 
 CERTS_DIR = os.path.join(
@@ -135,3 +135,36 @@ async def test_detach_keeps_a_dispatcher_others_still_use():
         loop.remove_reader(tr.eventfd)
         reg._dispatchers.pop(key, None)
         tr.close()
+
+
+@pytest.mark.parametrize("via", ["attach", "attach_acceptor"])
+async def test_attach_replaces_a_stale_dispatcher(via):
+    """A dispatcher filed under (id(loop), id(transport)) for another
+    transport, as after id reuse, is retired and replaced, not reused."""
+    loop = asyncio.get_running_loop()
+    reg = _get_dispatcher_registry()
+    old, new = _Transport(), _Transport()
+    key = (id(loop), id(new))
+    stale = _Dispatcher(loop, old)
+    handler = loop.create_task(asyncio.sleep(3600))
+    stale._tasks.add(handler)
+    reg._dispatchers[key] = stale
+    try:
+        if via == "attach":
+            _session(new, 1)
+        else:
+            reg.attach_acceptor(loop, new, lambda session: None)
+        d = reg._dispatchers[key]
+        assert d is not stale and d._transport is new
+        if via == "attach":
+            assert 1 in d._sessions and 1 not in stale._sessions
+        else:
+            assert stale._acceptor is None
+        await asyncio.sleep(0)
+        assert handler.cancelled()
+    finally:
+        handler.cancel()
+        for tr in (old, new):
+            loop.remove_reader(tr.eventfd)
+            tr.close()
+        reg._dispatchers.pop(key, None)
