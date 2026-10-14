@@ -175,6 +175,42 @@ class TestAsyncConnect:
             srv_quic.stop()
 
     @pytest.mark.asyncio
+    async def test_stop_after_vanished_peer_releases_queued_tx(self):
+        """stop() after an aclose() that timed out on a vanished peer frees
+        the remaining stream contexts: the process-wide queued TX total
+        returns to where it started."""
+        import gc
+        from aiopquic._binding._transport import tx_data_bytes_queued
+
+        port = next_port()
+        server = await serve("127.0.0.1", port,
+                             configuration=server_config(port))
+        gc.collect()
+        gc.disable()
+        try:
+            baseline = tx_data_bytes_queued()
+            quic = QuicConnection(configuration=client_config())
+            quic._start_transport()
+            protocol = QuicConnectionProtocol(quic)
+            protocol._start(asyncio.get_event_loop())
+            protocol.connect(("127.0.0.1", port))
+            await asyncio.wait_for(protocol.wait_connected(), timeout=5.0)
+            # The server goes without a word: nothing is ACKed again.
+            server._engine._transport.stop()
+            sid = quic.get_next_available_stream_id()
+            quic.send_stream_data(sid, b"z" * (2 << 20))
+            assert tx_data_bytes_queued() > baseline
+            # Times out before picoquic gives up on the vanished peer.
+            await protocol.aclose(timeout=0.001)
+            assert not protocol._closed.is_set(), "precondition: close completed"
+            protocol._stop()
+            quic.stop()
+            assert tx_data_bytes_queued() == baseline
+        finally:
+            gc.enable()
+            server.close()
+
+    @pytest.mark.asyncio
     async def test_stop_sending_on_own_uni_is_dropped(self):
         """An app STOP_SENDING on our own uni stream is dropped and counted.
 

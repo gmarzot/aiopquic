@@ -1132,6 +1132,10 @@ class QuicConnection:
         if self._transport is not None:
             self._transport.stop()
             self._transport = None
+        # The worker is joined: a close event it never delivered (aclose()
+        # timed out) cannot free these any more.
+        self._closed = True
+        self._destroy_stream_ctxs()
 
 
 class QuicEngine:
