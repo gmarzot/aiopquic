@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Fix: an OPEN_FLOW_CONTROL dropped on a dead connection releases its stream-context
+  reference (counter `sc_destroy_fc_credit_dead_cnx`).
+- Fix: a WebTransport session no longer touches its CONNECT stream after h3zero frees it
+  (both FINs done); close, FIN, drain and deregister skip it (counter `wt_control_released`).
+- STOP_SENDING events carry the peer's error code (raw QUIC and WebTransport), via a local
+  picoquic patch.
+- Fix: `QuicConnection.stop()` frees stream contexts left by an `aclose()` that timed out.
+- Fix: `QuicEngine.close()` releases the datagram rings of connections whose close it never
+  routed.
+- Fix: the WebTransport dispatcher registry replaces a dispatcher filed for another
+  transport instead of reusing it.
+- An unknown `congestion_control_algorithm` raises `ValueError` from `QuicConfiguration`,
+  `TransportContext.start()` and the WebTransport entry points; it used to run with no
+  congestion control.
+- pytest deselects `interop` and `native` by default.
+
 ## v0.5.0a4
 
 - Fix: a WebTransport session struct is freed only once picoquic cannot reach it; the GC
