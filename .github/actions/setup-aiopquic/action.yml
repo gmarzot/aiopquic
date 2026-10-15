@@ -77,6 +77,12 @@ runs:
         AIOPQUIC_WHEEL_BUILD: "1"
       run: |
         ./build.sh --native
+    # The cache holds the built libraries, not a patched checkout; the
+    # extension still compiles against the patched picoquic headers.
+    - name: Apply picoquic patches
+      if: steps.picoquic-cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: ./build.sh --patches
     - name: Install aiopquic (editable)
       shell: bash
       run: |

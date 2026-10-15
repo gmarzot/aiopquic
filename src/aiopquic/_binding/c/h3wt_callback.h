@@ -1565,7 +1565,10 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                     picoquic_set_callback(s->cnx, h3zero_callback, s->h3_ctx);
                 }
                 /* The stream prefix names this session; h3zero would hand
-                 * it a deregister at context deletion, after the free. */
+                 * it a deregister at context deletion, after the free.
+                 * Deleting it re-enters our deregister case: no
+                 * SESSION_CLOSED for a session Python has released. */
+                s->session_closing = 1;
                 h3zero_delete_stream_prefix(s->cnx, s->h3_ctx,
                                             s->control_stream_id);
             }

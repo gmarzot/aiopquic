@@ -17,6 +17,8 @@
   `TransportContext.start()` and the WebTransport entry points; it used to run with no
   congestion control.
 - pytest deselects `interop` and `native` by default.
+- Fix: releasing a WebTransport session that never closed no longer queues a SESSION_CLOSED
+  for it, which dropped its live connection's snapshot.
 
 ## v0.5.0a4
 

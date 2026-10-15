@@ -19,6 +19,9 @@
 #                         cibuildwheel, and update_submodules.sh use this.
 #   ./build.sh --install  only relink the extension + verify.
 #   ./build.sh --verify   only check imported == this source tree + Fusion.
+#   ./build.sh --patches  only apply patches/*.patch to picoquic. CI runs it
+#                         when a cached native build skips --native: the
+#                         extension compiles against the patched headers.
 #
 # Flavor is driven by the same env as before, passed through to --native:
 #   AIOPQUIC_PERF=0         opt out of host-tuned flags (debug builds)
@@ -254,6 +257,32 @@ sys.exit(0 if ok else 4)
 PY
 }
 
+# --- Local picoquic patches (PRs not merged upstream yet) ---------------
+# Applies patches/*.patch to the vendored submodule. Idempotent: a patch
+# that reverse-applies is already in and is skipped. AIOPQUIC_SKIP_PATCHES=1
+# skips them all.
+apply_patches() {
+    if [ "${AIOPQUIC_SKIP_PATCHES:-0}" = "1" ]; then
+        echo -e "${COLOR_GREEN}AIOPQUIC_SKIP_PATCHES=1: skipping patch application${COLOR_OFF}"
+        return 0
+    fi
+    [ -d "${PATCH_DIR}" ] || return 0
+    shopt -s nullglob
+    for patch in "${PATCH_DIR}"/*.patch; do
+        name="$(basename "${patch}")"
+        if git -C "${PICOQUIC_DIR}" apply --check "${patch}" >/dev/null 2>&1; then
+            echo -e "${COLOR_GREEN}applying ${name}${COLOR_OFF}"
+            git -C "${PICOQUIC_DIR}" apply "${patch}"
+        elif git -C "${PICOQUIC_DIR}" apply --check --reverse "${patch}" >/dev/null 2>&1; then
+            echo -e "${COLOR_GREEN}${name}: already applied (skipping)${COLOR_OFF}"
+        else
+            echo -e "${COLOR_RED}${name}: cannot apply cleanly AND not already applied — likely upstream-merged or conflicts; remove the patch if so${COLOR_OFF}" >&2
+            exit 1
+        fi
+    done
+    shopt -u nullglob
+}
+
 # --- Native build (picotls + picoquic) ----------------------------------
 # Compile picotls + picoquic (+ native test drivers) only. CI, cibuildwheel,
 # update_submodules.sh, and sim_link invoke this via `build.sh --native`.
@@ -270,29 +299,7 @@ build_native() {
         exit 1
     fi
 
-    # --- Apply local picoquic patches (PRs not merged upstream yet) ---
-    # Patches live in patches/picoquic-*.patch and are applied to the
-    # vendored submodule before cmake. Skipped when AIOPQUIC_SKIP_PATCHES=1.
-    # Idempotent: `git apply --check` is used to detect already-applied
-    # patches and skip them, so re-running this script is safe.
-    if [ "${AIOPQUIC_SKIP_PATCHES:-0}" = "1" ]; then
-        echo -e "${COLOR_GREEN}AIOPQUIC_SKIP_PATCHES=1: skipping patch application${COLOR_OFF}"
-    elif [ -d "${PATCH_DIR}" ]; then
-        shopt -s nullglob
-        for patch in "${PATCH_DIR}"/*.patch; do
-            name="$(basename "${patch}")"
-            if git -C "${PICOQUIC_DIR}" apply --check "${patch}" >/dev/null 2>&1; then
-                echo -e "${COLOR_GREEN}applying ${name}${COLOR_OFF}"
-                git -C "${PICOQUIC_DIR}" apply "${patch}"
-            elif git -C "${PICOQUIC_DIR}" apply --check --reverse "${patch}" >/dev/null 2>&1; then
-                echo -e "${COLOR_GREEN}${name}: already applied (skipping)${COLOR_OFF}"
-            else
-                echo -e "${COLOR_RED}${name}: cannot apply cleanly AND not already applied — likely upstream-merged or conflicts; remove the patch if so${COLOR_OFF}" >&2
-                exit 1
-            fi
-        done
-        shopt -u nullglob
-    fi
+    apply_patches
 
     # --- Locate OpenSSL (Homebrew on macOS, system on Linux) ---
     CMAKE_OPENSSL_ARGS=()
@@ -590,6 +597,7 @@ while [ $# -gt 0 ]; do
         --native)  MODE=native ;;
         --install) MODE=install ;;
         --verify)  MODE=verify ;;
+        --patches) MODE=patches ;;
         --force)   FORCE=1 ;;
         -h|--help|-\?) usage 0 ;;
         *) die "unknown option: $1 (try --help)" ;;
@@ -602,5 +610,6 @@ case "${MODE}" in
     native)  build_native; write_stamp ;;
     install) install_extension; verify_imported ;;
     verify)  verify_imported ;;
+    patches) apply_patches ;;
     full)    do_full ;;
 esac
