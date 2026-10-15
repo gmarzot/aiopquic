@@ -210,6 +210,10 @@ static const char* aiopquic_wt_list_next(const char* p, const char* end,
     return p;
 }
 
+/* Defined in picohttp/webtransport.c; no header declares it. */
+int picowt_set_wt_protocol(h3zero_stream_ctx_t* stream_ctx,
+                           const char* selected_protocol);
+
 /* Select the WT-Protocol by the server's order: the first entry of
  * `supported` (CSV, most preferred first) that the client offered.
  * Sets stream_state.wt_protocol on a match. */
