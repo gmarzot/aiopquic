@@ -182,6 +182,76 @@ static inline char* aiopquic_wt_strdup(const char* src) {
     return d;
 }
 
+/* Status refusing a CONNECT whose WT-Available-Protocols has no match. */
+#define AIOPQUIC_WT_NO_PROTOCOL_STATUS 400
+
+#define AIOPQUIC_WT_PROTO_NO_MATCH     (-1)
+#define AIOPQUIC_WT_PROTO_NONE_OFFERED 0
+#define AIOPQUIC_WT_PROTO_SELECTED     1
+
+/* Next item of a comma-separated list in [p, end): whitespace, one pair
+ * of quotes and ";parameters" stripped. Returns the position after the
+ * item, NULL when none is left. */
+static const char* aiopquic_wt_list_next(const char* p, const char* end,
+                                         const char** item, size_t* len) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) p++;
+    if (p >= end) return NULL;
+    const char* start = p;
+    while (p < end && *p != ',') p++;
+    const char* stop = start;
+    while (stop < p && *stop != ';') stop++;
+    while (stop > start && (stop[-1] == ' ' || stop[-1] == '\t')) stop--;
+    if (stop - start >= 2 && *start == '"' && stop[-1] == '"') {
+        start++;
+        stop--;
+    }
+    *item = start;
+    *len = (size_t)(stop - start);
+    return p;
+}
+
+/* Select the WT-Protocol by the server's order: the first entry of
+ * `supported` (CSV, most preferred first) that the client offered.
+ * Sets stream_state.wt_protocol on a match. */
+static int aiopquic_wt_select_protocol(h3zero_stream_ctx_t* st,
+                                       const char* supported) {
+    const char* offer =
+        (const char*)st->ps.stream_state.header.wt_available_protocols;
+    if (offer == NULL) return AIOPQUIC_WT_PROTO_NONE_OFFERED;
+    const char* offer_end =
+        offer + st->ps.stream_state.header.wt_available_protocols_length;
+    const char* sup_end = supported + strlen(supported);
+    const char *o, *sv;
+    size_t olen, slen;
+    int offered = 0;
+
+    for (const char* q = offer;
+         (q = aiopquic_wt_list_next(q, offer_end, &o, &olen)) != NULL;) {
+        if (olen > 0) {
+            offered = 1;
+            break;
+        }
+    }
+    if (!offered) return AIOPQUIC_WT_PROTO_NONE_OFFERED;
+
+    for (const char* p = supported;
+         (p = aiopquic_wt_list_next(p, sup_end, &sv, &slen)) != NULL;) {
+        if (slen == 0) continue;
+        for (const char* q = offer;
+             (q = aiopquic_wt_list_next(q, offer_end, &o, &olen)) != NULL;) {
+            if (olen == slen && memcmp(o, sv, slen) == 0) {
+                char sel[256];
+                if (slen >= sizeof(sel)) break;
+                memcpy(sel, sv, slen);
+                sel[slen] = 0;
+                return picowt_set_wt_protocol(st, sel) == 0
+                    ? AIOPQUIC_WT_PROTO_SELECTED : AIOPQUIC_WT_PROTO_NO_MATCH;
+            }
+        }
+    }
+    return AIOPQUIC_WT_PROTO_NO_MATCH;
+}
+
 static inline aiopquic_wt_session_t* aiopquic_wt_session_create(
         aiopquic_ctx_t* bridge) {
     aiopquic_wt_session_t* s =
@@ -639,8 +709,13 @@ static int aiopquic_wt_path_callback(
         break;
 
     case picohttp_callback_connect_refused:
+        /* error_code carries the response status. */
         aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_REFUSED,
-                                s->control_stream_id, 0, NULL, 0);
+                                s->control_stream_id,
+                                stream_ctx != NULL
+                                    ? (uint64_t)stream_ctx->ps.stream_state.header.status
+                                    : 0,
+                                NULL, 0);
         break;
 
     case picohttp_callback_drain:
@@ -1110,6 +1185,18 @@ static int aiopquic_wt_server_path_callback(
         return 0;
     }
 
+    /* WT-Protocol: the server's most preferred mutual protocol. An offer
+     * with no match is refused (h3zero sends the returned status); a
+     * client that offered nothing gets a session with no protocol. */
+    int proto_sel = AIOPQUIC_WT_PROTO_NONE_OFFERED;
+    if (bridge->wt_supported_protocols != NULL) {
+        proto_sel = aiopquic_wt_select_protocol(
+            stream_ctx, bridge->wt_supported_protocols);
+        if (proto_sel == AIOPQUIC_WT_PROTO_NO_MATCH) {
+            return AIOPQUIC_WT_NO_PROTOCOL_STATUS;
+        }
+    }
+
     aiopquic_wt_session_t* s = aiopquic_wt_session_create(bridge);
     if (!s) return -1;
     s->cnx = cnx;
@@ -1123,23 +1210,9 @@ static int aiopquic_wt_server_path_callback(
     }
     aiopquic_wt_log_cnxid("server-cnx-accept", cnx, stream_ctx->stream_id);
 
-    /* WT subprotocol selection: pick the highest mutual from the
-     * client's WT-Available-Protocols against our configured allowlist.
-     * picowt_select_wt_protocol reads the client offer off stream_ctx
-     * and, on a match, sets stream_state.wt_protocol — which h3zero then
-     * emits as the WT-Protocol response header. We copy it onto the
-     * session so Python can read the negotiated value. No allowlist or
-     * no match → no WT-Protocol header sent (s->wt_protocol stays NULL).
-     *
-     * Deliberately PERMISSIVE: unlike raw-QUIC ALPN (mandatory in TLS, a
-     * mismatch hard-fails the handshake), WT-Protocol is OPTIONAL, so the
-     * CONNECT still succeeds with no subprotocol when there is no overlap
-     * (or the client offered none — picowt can't tell those apart). The
-     * version-mismatch policy belongs to the application layer (aiomoqt),
-     * which sees negotiated_protocol == None and decides whether to close. */
-    if (bridge->wt_supported_protocols != NULL &&
-        picowt_select_wt_protocol(
-            stream_ctx, bridge->wt_supported_protocols) == 0 &&
+    /* h3zero emits stream_state.wt_protocol as the WT-Protocol response
+     * header; the session keeps a copy for negotiated_protocol. */
+    if (proto_sel == AIOPQUIC_WT_PROTO_SELECTED &&
         stream_ctx->ps.stream_state.wt_protocol != NULL) {
         s->wt_protocol =
             aiopquic_wt_strdup(stream_ctx->ps.stream_state.wt_protocol);

@@ -3282,8 +3282,8 @@ cdef class WebTransportSessionState:
     @property
     def negotiated_wt_protocol(self):
         """The WebTransport subprotocol negotiated for this session, or
-        None. Server side: what picowt_select_wt_protocol chose from the
-        client's WT-Available-Protocols against the configured allowlist.
+        None. Server side: the first allowlist entry the client offered in
+        WT-Available-Protocols.
         Client side: the WT-Protocol the server selected, read from the
         CONNECT response. Both are captured (copied) on the picoquic
         thread when the session is established, so this is safe to read

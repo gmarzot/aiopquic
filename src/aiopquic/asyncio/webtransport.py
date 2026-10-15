@@ -836,8 +836,11 @@ class WebTransportSession:
         elif evt_type == _EVT_WT_SESSION_REFUSED:
             err = WebTransportSessionRefused(error_code=error_code)
             if self._session_ready and not self._session_ready.done():
+                # >= 100 is the server's HTTP status; below, a local failure.
+                reason = (f"HTTP {error_code}" if error_code >= 100
+                          else f"code={error_code}")
                 self._session_ready.set_exception(WebTransportError(
-                    f"WT CONNECT refused (code={error_code})"))
+                    f"WT CONNECT refused ({reason})"))
             self._event_queue.put_nowait(err)
         elif evt_type == _EVT_WT_SESSION_CLOSED:
             self._on_session_closed(error_code, data)
@@ -942,6 +945,12 @@ class WebTransportSession:
 # Initiator-side: subclass adds open().
 # =====================================================================
 
+def _sf_string_list(items: list[str]) -> str:
+    """WT-Available-Protocols value: a Structured Field List of Strings
+    (RFC 9651). picoquic sends it verbatim; "" sends no header."""
+    return ", ".join(f'"{p}"' for p in items)
+
+
 class WebTransportClient(WebTransportSession):
     """Initiator-side WT session. Adds open() to drive the
     CONNECT handshake."""
@@ -970,17 +979,8 @@ class WebTransportClient(WebTransportSession):
         self._session_ready = self._loop.create_future()
 
         addr = _resolve_host(self._host)
-        # WT-Available-Protocols is an HTTP Structured Field list of
-        # strings (RFC 9651); each value is double-quoted, comma-joined.
-        # picoquic puts the value into the QPACK literal verbatim — no
-        # SF formatting on its side — so we have to produce the
-        # canonical form here.
-        if self._wt_protocols:
-            protocols_str = ", ".join(f'"{p}"' for p in self._wt_protocols)
-        else:
-            protocols_str = ""
         self._state.push_open(addr, self._port, self._path, self._sni,
-                              protocols_str)
+                              _sf_string_list(self._wt_protocols))
 
         try:
             await asyncio.wait_for(self._session_ready, timeout=timeout)
@@ -1415,9 +1415,9 @@ async def serve_webtransport(
                     configuration, 'key_exchange_groups', None),
             )
         if wt_supported_protocols:
-            # Server subprotocol allowlist for WT-Protocol selection,
-            # newest-preferred. picowt matches the client's offered
-            # WT-Available-Protocols against this unquoted CSV.
+            # WT-Protocol allowlist, most preferred first: the server picks
+            # its first entry the client offered and refuses (400) an offer
+            # with no match.
             start_kwargs["wt_supported_protocols"] = ", ".join(
                 wt_supported_protocols)
         transport.start(**start_kwargs)
