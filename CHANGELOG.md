@@ -27,6 +27,10 @@
 - pytest deselects `interop` and `native` by default.
 - Fix: releasing a WebTransport session that never closed no longer queues a SESSION_CLOSED
   for it, which dropped its live connection's snapshot.
+- Fix: lost wakes between the asyncio and network threads: the RX notify, TX wake and
+  per-stream RX event flags clear by exchange; stream, datagram and TX event ring drain arms
+  re-check after arming, so a writer no longer parks after the worker already drained.
+- `arm_tx_event_ring_drain_pending()` returns whether the caller may wait.
 
 ## v0.5.0a4
 

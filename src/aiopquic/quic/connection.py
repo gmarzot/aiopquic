@@ -886,9 +886,8 @@ class QuicConnection:
             # armed when sc->tx fills).
             if self.tx_event_ring_fill() > hard_wait_at:
                 ring_event.clear()
-                self._transport.arm_tx_event_ring_drain_pending()
-                if self.tx_event_ring_fill() <= hard_wait_at:
-                    self._transport.clear_tx_event_ring_drain_pending()
+                if (not self._transport.arm_tx_event_ring_drain_pending()
+                        or self.tx_event_ring_fill() <= hard_wait_at):
                     continue
                 await ring_event.wait()
                 continue

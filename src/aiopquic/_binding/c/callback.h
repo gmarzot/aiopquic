@@ -579,6 +579,13 @@ static inline int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx) {
     return (int)prev;
 }
 
+/* Worker: clear tx_wake_pending before draining the TX ring. An
+ * exchange, not a store: the store could pass the ring peek that follows
+ * while the producer's exchange still read 1, losing the wake. */
+static inline void aiopquic_tx_wake_clear(aiopquic_ctx_t* ctx) {
+    (void)__atomic_exchange_n(&ctx->tx_wake_pending, 0, __ATOMIC_ACQ_REL);
+}
+
 /* Forward decl: aiopquic_maybe_fire_tx_event_ring_drained pushes
  * SPSC_EVT_TX_EVENT_RING_DRAINED into rx_event_ring and calls aiopquic_notify_rx
  * which is defined further down in this header. */
@@ -604,11 +611,17 @@ static inline int aiopquic_rx_push(aiopquic_ctx_t* ctx,
  * producer (asyncio thread) calls arm() before awaiting the event,
  * and clear() if it raced with a worker drain. Worker side does
  * the CAS-clear+fire inside aiopquic_maybe_fire_tx_event_ring_drained. */
-static inline void aiopquic_arm_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx) {
+/* Returns 1 when the caller may wait: the worker fires once the ring is
+ * at or below low water. Returns 0 when it already is: the caller
+ * retries instead (the arm stays; another waiter may own it). The fence
+ * pairs with aiopquic_tx_event_ring_drained_final. */
+static inline int aiopquic_arm_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx) {
     ctx->cnt_tx_event_ring_arms++;
     ctx->last_tx_event_ring_arm_ns = aiopquic_now_ns();
     __atomic_store_n(&ctx->tx_event_ring_drain_pending, 1,
-                      __ATOMIC_RELEASE);
+                      __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return spsc_ring_count(ctx->tx_event_ring) > ctx->tx_event_ring_low_water;
 }
 
 static inline void aiopquic_clear_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx) {
@@ -698,6 +711,8 @@ static inline int aiopquic_dgram_ring_release_post(aiopquic_ctx_t* ctx,
     return 0;
 }
 
+static inline void aiopquic_dgram_ring_release_flush(aiopquic_ctx_t* ctx);
+
 /* Asyncio thread: give up the caller's ring reference. A running worker
  * drops it behind every MARK queued before it, which carries the ring
  * without a reference; with none running it is dropped here. A full TX
@@ -722,26 +737,29 @@ static inline void aiopquic_dgram_ring_release(aiopquic_ctx_t* ctx, void* cnx,
     ctx->dgram_release_owed[ctx->dgram_release_owed_n].cnx = cnx;
     ctx->dgram_release_owed[ctx->dgram_release_owed_n].db = db;
     ctx->dgram_release_owed_n++;
-    aiopquic_arm_tx_event_ring_drain_pending(ctx);
+    aiopquic_dgram_ring_release_flush(ctx);
 }
 
-/* Asyncio thread: post owed releases while the TX ring has room. */
+/* Asyncio thread: post owed releases while the TX ring has room; what
+ * stays owed is posted on the drain cycle the ring-drained event starts. */
 static inline void aiopquic_dgram_ring_release_flush(aiopquic_ctx_t* ctx) {
-    uint32_t n = ctx->dgram_release_owed_n;
-    uint32_t i = 0;
-    if (n == 0 || ctx->thread_ctx == NULL) return;
-    while (i < n && aiopquic_dgram_ring_release_post(
-               ctx, ctx->dgram_release_owed[i].cnx,
-               ctx->dgram_release_owed[i].db) == 0) {
-        i++;
-    }
-    if (i > 0) {
-        memmove(ctx->dgram_release_owed, ctx->dgram_release_owed + i,
-                (n - i) * sizeof(*ctx->dgram_release_owed));
-    }
-    ctx->dgram_release_owed_n = n - i;
-    if (n - i > 0) {
-        aiopquic_arm_tx_event_ring_drain_pending(ctx);
+    if (ctx->thread_ctx == NULL) return;
+    for (;;) {
+        uint32_t n = ctx->dgram_release_owed_n;
+        uint32_t i = 0;
+        while (i < n && aiopquic_dgram_ring_release_post(
+                   ctx, ctx->dgram_release_owed[i].cnx,
+                   ctx->dgram_release_owed[i].db) == 0) {
+            i++;
+        }
+        if (i > 0) {
+            memmove(ctx->dgram_release_owed, ctx->dgram_release_owed + i,
+                    (n - i) * sizeof(*ctx->dgram_release_owed));
+        }
+        ctx->dgram_release_owed_n = n - i;
+        if (n - i == 0 || aiopquic_arm_tx_event_ring_drain_pending(ctx)) {
+            return;
+        }
     }
 }
 
@@ -813,6 +831,13 @@ static inline void aiopquic_maybe_fire_tx_event_ring_drained(aiopquic_ctx_t* ctx
     }
 }
 
+/* Worker, after the drain loop emptied the TX ring: an arm whose
+ * re-check read the ring before the last pops is seen here. */
+static inline void aiopquic_tx_event_ring_drained_final(aiopquic_ctx_t* ctx) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    aiopquic_maybe_fire_tx_event_ring_drained(ctx);
+}
+
 /* Signal asyncio that there are RX events.
  * Coalesced: write the wake fd only on the 0→1 transition of
  * rx_notify_pending. The consumer (aiopquic_clear_rx) restores the
@@ -851,7 +876,9 @@ static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
     /* Overflow left behind must keep the wake armed: the re-arm below
      * looks at the ring only. */
     spsc_ring_refill_from_overflow(ctx->rx_event_ring, &ctx->rx_overflow);
-    __atomic_store_n(&ctx->rx_notify_pending, 0, __ATOMIC_RELEASE);
+    /* Exchange, so the re-check below cannot read the ring before the
+     * clear is visible to aiopquic_notify_rx's exchange. */
+    (void)__atomic_exchange_n(&ctx->rx_notify_pending, 0, __ATOMIC_ACQ_REL);
 #ifdef __linux__
     uint64_t val;
     (void)read(ctx->eventfd, &val, sizeof(val));
@@ -1082,10 +1109,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
              * after the LAST drain emptied sc->tx — pending stayed
              * at 1 forever, sc_event never fired. Mirrors the WT
              * fix at h3wt_callback.h. */
-            uint32_t expected = 1;
-            if (atomic_compare_exchange_strong_explicit(
-                    &sc->tx_drain_pending, &expected, 0,
-                    memory_order_acq_rel, memory_order_relaxed)) {
+            if (aiopquic_stream_ctx_tx_drain_take(sc)) {
                 spsc_entry_t drain_entry = {0};
                 drain_entry.event_type = SPSC_EVT_STREAM_TX_DRAINED;
                 drain_entry.stream_id = stream_id;
@@ -1173,10 +1197,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                 /* Edge-trigger producer wakeup, mirroring the stream
                  * sc->tx_drain_pending contract: only the CAS winner
                  * emits the event. */
-                uint32_t expected = 1;
-                if (atomic_compare_exchange_strong_explicit(
-                        &db->drain_pending, &expected, 0,
-                        memory_order_acq_rel, memory_order_relaxed)) {
+                if (aiopquic_dgram_buf_drain_take(db)) {
                     spsc_entry_t drain_entry = {0};
                     drain_entry.event_type = SPSC_EVT_DATAGRAM_TX_DRAINED;
                     drain_entry.cnx = cnx;
@@ -1398,8 +1419,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
              *   their exchange could see 1 (stale) and skip — that's
              *   why we clear FIRST. Producer always sees 0 when the
              *   ring was actually drained. */
-            __atomic_store_n(&ctx->tx_wake_pending, 0,
-                              __ATOMIC_RELEASE);
+            aiopquic_tx_wake_clear(ctx);
             while (1) {
                 spsc_entry_t* entry = spsc_ring_peek(ctx->tx_event_ring);
                 if (!entry) break;
@@ -1682,6 +1702,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                 }
             }
+            aiopquic_tx_event_ring_drained_final(ctx);
             break;
 
         default:

@@ -349,7 +349,7 @@ cdef extern from "c/callback.h":
     void aiopquic_clear_rx(aiopquic_ctx_t* ctx)
     void aiopquic_notify_rx(aiopquic_ctx_t* ctx)
     int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx)
-    void aiopquic_arm_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx)
+    int aiopquic_arm_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx)
     void aiopquic_clear_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx)
     void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx, void* cnx,
                                   uint64_t stream_id,
@@ -433,7 +433,6 @@ cdef extern from "c/datagram_buf.h":
     int aiopquic_dgram_buf_push_record(
         aiopquic_dgram_buf_t* db, const uint8_t* data, uint32_t length)
     uint32_t aiopquic_dgram_buf_used(aiopquic_dgram_buf_t* db)
-    void aiopquic_dgram_buf_arm_drain(aiopquic_dgram_buf_t* db)
     int64_t aiopquic_dgram_rings_alive_load()
 
 cdef extern from "c/callback.h":
@@ -1697,26 +1696,21 @@ cdef class TransportContext:
         return self._tx_event_ring_drain_event
 
     def arm_tx_event_ring_drain_pending(self):
-        """Atomically set tx_event_ring_drain_pending = 1. The worker's
-        post-pop check (aiopquic_maybe_fire_tx_event_ring_drained in
-        callback.h) CAS-clears this and fires SPSC_EVT_TX_EVENT_RING_DRAINED
-        when ring count drops to/below tx_event_ring_low_water.
+        """Arm SPSC_EVT_TX_EVENT_RING_DRAINED, fired once the TX event ring
+        is at or below tx_event_ring_low_water. Returns True when the caller
+        may await tx_event_ring_drain_event, False when the ring is already
+        there (retry instead; the arm stays and may wake later).
 
-        Use pattern (caller side):
             event = tx.tx_event_ring_drain_event
             event.clear()
-            tx.arm_tx_event_ring_drain_pending()
-            if tx_event_ring_fill > wait_threshold:
-                await event.wait()       # safe: worker will fire
-            else:
-                tx.clear_tx_event_ring_drain_pending()  # raced, clear arm
+            if tx.arm_tx_event_ring_drain_pending():
+                await event.wait()
         """
-        aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
+        return aiopquic_arm_tx_event_ring_drain_pending(self._ctx) != 0
 
     def clear_tx_event_ring_drain_pending(self):
-        """Clear the arm without waiting. Use when the producer
-        re-checks pressure after arming and finds it has already
-        dropped below the wait threshold (raced with worker drain)."""
+        """Clear the arm without waiting. Unsafe while another waiter
+        relies on the same arm."""
         aiopquic_clear_tx_event_ring_drain_pending(self._ctx)
 
     def drain_rx(self, int max_events=256):
@@ -2302,12 +2296,11 @@ cdef class TransportContext:
         # MARK_ACTIVE event we'll push after committing bytes.
         # Without this, retry semantics duplicate bytes on the wire.
         # Single-producer (asyncio thread) ⇒ no TOCTOU window.
-        if spsc_ring_count(self._ctx.tx_event_ring) >= self._ctx.tx_event_ring.capacity:
-            # Arm the connection-global drain wakeup BEFORE returning
-            # rc=1 so the caller can await tx_event_ring_drain_event without
-            # losing the wakeup. Worker fires SPSC_EVT_TX_EVENT_RING_DRAINED
-            # when the ring drops to/below low_water.
-            aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
+        if (spsc_ring_count(self._ctx.tx_event_ring) >= self._ctx.tx_event_ring.capacity
+                and aiopquic_arm_tx_event_ring_drain_pending(self._ctx)):
+            # Armed before returning rc=1, so the caller can await
+            # tx_event_ring_drain_event without losing the wakeup. An arm
+            # that finds the ring already drained falls through.
             self._send_busy_event_ring += 1
             return 1
 
@@ -2458,9 +2451,9 @@ cdef class TransportContext:
         entry.event_type = SPSC_EVT_TX_MARK_DATAGRAM_READY
         entry.cnx = <void*>cnx_ptr
         entry.stream_ctx = <void*>db_ptr
-        if spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
-            aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
-            return 1
+        while spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            if aiopquic_arm_tx_event_ring_drain_pending(self._ctx):
+                return 1
         self._ctx.cnt_tx_event_ring_pushes += 1
         if self._thread_ctx is not NULL:
             if aiopquic_tx_wake_set_pending(self._ctx) == 0:
@@ -2484,7 +2477,6 @@ cdef class TransportContext:
         cdef uint32_t n = <uint32_t>len(data)
         cdef int rc = aiopquic_dgram_buf_push_record(db, buf, n)
         if rc == 0:
-            aiopquic_dgram_buf_arm_drain(db)
             return 0
         if rc < 0:
             return -1
@@ -2503,9 +2495,9 @@ cdef class TransportContext:
         entry.cnx = <void*>cnx_ptr
         entry.stream_id = stream_id
         entry.error_code = priority
-        if spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
-            aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
-            return 1
+        while spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            if aiopquic_arm_tx_event_ring_drain_pending(self._ctx):
+                return 1
         self._ctx.cnt_tx_event_ring_pushes += 1
         if self._thread_ctx is not NULL:
             if aiopquic_tx_wake_set_pending(self._ctx) == 0:
@@ -2531,7 +2523,6 @@ cdef class TransportContext:
         cdef uint32_t n = <uint32_t>len(data)
         cdef int rc = aiopquic_dgram_buf_push_record(db, buf, n)
         if rc == 0:
-            aiopquic_dgram_buf_arm_drain(db)
             return 0
         if rc < 0:
             return -1
@@ -3476,12 +3467,12 @@ cdef class WebTransportSessionState:
         # Without this, retry semantics could duplicate bytes.
         # Single-producer (asyncio thread) ⇒ no TOCTOU window.
         if (spsc_ring_count(self._transport._ctx.tx_event_ring) >=
-                self._transport._ctx.tx_event_ring.capacity):
-            # Arm the connection-global drain wakeup BEFORE raising so
-            # the caller can await tx_event_ring_drain_event without losing
-            # the wakeup. Worker fires SPSC_EVT_TX_EVENT_RING_DRAINED when
-            # the ring drops to/below low_water.
-            aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx)
+                self._transport._ctx.tx_event_ring.capacity
+                and aiopquic_arm_tx_event_ring_drain_pending(
+                    self._transport._ctx)):
+            # Armed before raising, so the caller can await
+            # tx_event_ring_drain_event without losing the wakeup. An arm
+            # that finds the ring already drained falls through.
             raise BufferError(
                 f"TX event ring full (WT stream={stream_id})"
             )
@@ -3588,10 +3579,10 @@ cdef class WebTransportSessionState:
         entry.cnx = <void*>self._wt
         entry.stream_ctx = <void*>self._wt
         entry.error_code = <uint64_t>db_ptr
-        if spsc_ring_push(
+        while spsc_ring_push(
                 self._transport._ctx.tx_event_ring, &entry, NULL, 0) != 0:
-            aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx)
-            return 1
+            if aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx):
+                return 1
         self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
         return 0
@@ -3607,13 +3598,12 @@ cdef class WebTransportSessionState:
         entry.stream_ctx = <void*>self._wt
         entry.stream_id = stream_id
         entry.error_code = priority
-        if spsc_ring_push(
+        while spsc_ring_push(
                 self._transport._ctx.tx_event_ring, &entry, NULL, 0) != 0:
-            # Arm before reporting full, as the raw twin does: a caller
-            # that awaits tx_event_ring_drain_event on a 1 never wakes
-            # otherwise.
-            aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx)
-            return 1
+            # Armed before reporting full: a caller that awaits
+            # tx_event_ring_drain_event on a 1 never wakes otherwise.
+            if aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx):
+                return 1
         self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
         return 0
@@ -3655,6 +3645,27 @@ cdef class WebTransportSessionState:
 #   ... wait for ring to drain ...
 #   stream_buf_destroy(sb)
 # ---------------------------------------------------------------------------
+
+cdef extern from "c/litmus.h":
+    int64_t aiopquic_litmus_run(int kind, uint64_t rounds) nogil
+
+_LITMUS_KINDS = {
+    'rx_notify': 0, 'tx_wake': 1, 'rx_event': 2,
+    'tx_drain': 3, 'tx_ring': 4, 'dgram': 5,
+}
+
+
+def _litmus(str kind, uint64_t n):
+    """Race one wake protocol's two sides on two threads for n rounds.
+    Returns the number of lost wakes (test only)."""
+    cdef int k = _LITMUS_KINDS[kind]
+    cdef int64_t lost
+    with nogil:
+        lost = aiopquic_litmus_run(k, n)
+    if lost < 0:
+        raise MemoryError("litmus setup failed")
+    return lost
+
 
 def stream_buf_create(uint32_t capacity):
     """Allocate a per-stream send buffer of `capacity` bytes (power of 2).

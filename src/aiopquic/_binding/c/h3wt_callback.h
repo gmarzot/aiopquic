@@ -938,10 +938,7 @@ static int aiopquic_wt_path_callback(
          * picoquic window-math edge cases). Single-shot per arm —
          * only the CAS winner pushes. */
         {
-            uint32_t expected = 1;
-            if (atomic_compare_exchange_strong_explicit(
-                    &sc->tx_drain_pending, &expected, 0,
-                    memory_order_acq_rel, memory_order_relaxed)) {
+            if (aiopquic_stream_ctx_tx_drain_take(sc)) {
                 spsc_entry_t drain_entry = {0};
                 drain_entry.event_type = SPSC_EVT_STREAM_TX_DRAINED;
                 drain_entry.stream_id = sid;
@@ -999,10 +996,7 @@ static int aiopquic_wt_path_callback(
             s->bridge->worker_dgram_records_sent++;
             s->bridge->worker_dgram_bytes_sent += rec;
             /* Edge-triggered producer wakeup, as on the raw path. */
-            uint32_t expected = 1;
-            if (atomic_compare_exchange_strong_explicit(
-                    &db->drain_pending, &expected, 0,
-                    memory_order_acq_rel, memory_order_relaxed)) {
+            if (aiopquic_dgram_buf_drain_take(db)) {
                 spsc_entry_t drain_entry = {0};
                 drain_entry.event_type = SPSC_EVT_DATAGRAM_TX_DRAINED;
                 drain_entry.cnx = cnx;
