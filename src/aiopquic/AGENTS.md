@@ -27,7 +27,8 @@ the `KEX_*` ids and `counters`; everything else there, and raw pointers, are tes
   `serve_webtransport(host, port, path, handler=h, cert_file=..., key_file=..., configuration=cfg)`
   calls `h(session)` per CONNECT. `WebTransportError` is a `ConnectionError`.
 - `serve_dispatch(...)` serves both on one UDP port by ALPN (`h3` is added to `alpn_protocols`).
-  WebTransport subprotocols: `wt_available_protocols=` / `wt_supported_protocols=`.
+  WebTransport subprotocols: `wt_available_protocols=` / `wt_supported_protocols=`. The server
+  picks by its own order; an offer with no match is refused with HTTP 400.
 
 **Lifecycle.** `TransportContext.start()` creates picoquic and its thread, once. `stop()` drains
 the TX ring to picoquic (up to 50 ms) and joins the thread; it does not wait for the wire, so

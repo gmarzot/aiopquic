@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- WebTransport servers select the WT-Protocol by `wt_supported_protocols` order, not the
+  client's offer order.
+- A WebTransport CONNECT whose WT-Available-Protocols matches nothing in
+  `wt_supported_protocols` is refused with HTTP 400; a client offering none still connects.
+- Fix: WT-Available-Protocols items carrying Structured Field parameters match; picowt's
+  parser kept the parameters in the item.
+- A refused WebTransport CONNECT reports the server's HTTP status in its error.
+- A WebTransport path callback can choose the CONNECT error status, via a local picoquic patch.
 - Fix: an OPEN_FLOW_CONTROL dropped on a dead connection releases its stream-context
   reference (counter `sc_destroy_fc_credit_dead_cnx`).
 - Fix: a WebTransport session no longer touches its CONNECT stream after h3zero frees it

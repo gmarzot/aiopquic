@@ -6,8 +6,9 @@ a multi-ALPN server selects the highest mutual; no overlap fails the
 handshake promptly (not a 30s idle hang).
 
 WebTransport: a client offers WT-Available-Protocols, the server picks
-one into the WT-Protocol response; both ends read it back. No overlap
-still establishes the session, with negotiated_protocol == None.
+its most preferred mutual protocol into the WT-Protocol response; both
+ends read it back. An offer with no overlap is refused with HTTP 400; a
+client that offers nothing still opens a session with no protocol.
 """
 import asyncio
 import os
@@ -19,8 +20,9 @@ from aiopquic.quic.events import HandshakeCompleted
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
 from aiopquic.asyncio.client import connect
 from aiopquic.asyncio.server import serve
+from aiopquic.asyncio.dispatch import serve_dispatch
 from aiopquic.asyncio.webtransport import (
-    connect_webtransport, serve_webtransport,
+    WebTransportError, connect_webtransport, serve_webtransport,
 )
 
 CERTS_DIR = os.path.join(
@@ -188,10 +190,9 @@ async def test_wt_protocol_match_both_ends():
 
 
 @pytest.mark.asyncio
-async def test_wt_protocol_no_match_session_still_opens():
-    """No overlap (server [16], client offers [18]): the CONNECT still
-    succeeds (WT-Protocol is optional), with negotiated_protocol None on
-    both ends."""
+async def test_wt_protocol_server_order_wins():
+    """The server's order decides: server prefers [22,18,16], client offers
+    ascending [14,16,18,22] -> moqt-22, not the client's first match."""
     port = next_port()
     seen = {}
 
@@ -201,15 +202,123 @@ async def test_wt_protocol_no_match_session_still_opens():
     server = await serve_webtransport(
         "127.0.0.1", port, "/wt",
         handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE,
-        wt_supported_protocols=["moqt-16"])
+        wt_supported_protocols=["moqt-22", "moqt-18", "moqt-16"])
     try:
         async with connect_webtransport(
                 "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
-                wt_available_protocols=["moqt-18"]) as wt:
+                wt_available_protocols=["moqt-14", "moqt-16", "moqt-18",
+                                        "moqt-22"]) as wt:
+            assert wt.negotiated_protocol == "moqt-22"
+            await asyncio.sleep(0.15)
+        assert seen.get("server") == "moqt-22"
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_protocol_no_match_refused():
+    """No overlap (server [18,16], client offers [22]): the CONNECT is
+    refused with 400 and the server handler never runs."""
+    port = next_port()
+    seen = []
+
+    async def handler(session):
+        seen.append(session)
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE,
+        wt_supported_protocols=["moqt-18", "moqt-16"])
+    try:
+        with pytest.raises(WebTransportError, match="400"):
+            async with connect_webtransport(
+                    "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
+                    wt_available_protocols=["moqt-22"], timeout=5.0):
+                pass
+        assert seen == []
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_protocol_no_offer_still_opens():
+    """A client offering no WT-Available-Protocols still opens a session
+    against a server with an allowlist, with no protocol selected."""
+    port = next_port()
+    seen = {}
+
+    async def handler(session):
+        seen["server"] = session.negotiated_protocol
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE,
+        wt_supported_protocols=["moqt-18", "moqt-16"])
+    try:
+        async with connect_webtransport(
+                "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             assert wt.session_ready
             assert wt.negotiated_protocol is None
             await asyncio.sleep(0.15)
-        assert seen.get("server") is None
+        assert "server" in seen and seen["server"] is None
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_wt_server_order_and_refusal():
+    """serve_dispatch applies the same policy on its WT side."""
+    port = next_port()
+
+    async def handler(session):
+        pass
+
+    server = await serve_dispatch(
+        "127.0.0.1", port, configuration=_server_cfg(["moqt-18"]),
+        wt_path="/wt", wt_handler=handler,
+        wt_supported_protocols=["moqt-18", "moqt-16"])
+    try:
+        async with connect_webtransport(
+                "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
+                wt_available_protocols=["moqt-16", "moqt-18"]) as wt:
+            assert wt.negotiated_protocol == "moqt-18"
+        with pytest.raises(WebTransportError, match="400"):
+            async with connect_webtransport(
+                    "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
+                    wt_available_protocols=["moqt-22"], timeout=5.0):
+                pass
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("offer", [
+    '"moqt-22", "moqt-18", "moqt-16"',
+    '"moqt-22","moqt-18","moqt-16"',
+    '"moqt-18"',
+    'moqt-18',
+    '"moqt-22";v=1, "moqt-18";q=0.5',
+    '"moqt-22",\t"moqt-18" ,  "moqt-16"',
+], ids=["canonical", "no-space", "single", "token", "params", "whitespace"])
+async def test_wt_protocol_offer_formats(monkeypatch, offer):
+    """WT-Available-Protocols spelled as other stacks send it (SF list:
+    quoting, spacing, parameters, one item) selects moqt-18."""
+    import aiopquic.asyncio.webtransport as wtmod
+    monkeypatch.setattr(wtmod, "_sf_string_list", lambda items: offer)
+    port = next_port()
+
+    async def handler(session):
+        pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE,
+        wt_supported_protocols=["moqt-18", "moqt-16"])
+    try:
+        async with connect_webtransport(
+                "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
+                wt_available_protocols=["unused"]) as wt:
+            assert wt.negotiated_protocol == "moqt-18"
     finally:
         server.close()
 

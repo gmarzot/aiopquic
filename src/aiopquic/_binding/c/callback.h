@@ -329,9 +329,9 @@ typedef struct {
      * subscriber whose flow control has back-pressured the sender to
      * silence). Set once at start(); read by the worker. */
     uint64_t        keep_alive_us;
-    /* Server-mode WebTransport subprotocol allowlist: a comma-separated
-     * CSV (e.g. "moqt-18, moqt-16") the server offers when selecting a
-     * WT-Protocol against the client's WT-Available-Protocols. Borrowed
+    /* Server-mode WebTransport subprotocol allowlist: a CSV in server
+     * preference order (e.g. "moqt-18, moqt-16") from which the WT-Protocol
+     * is selected against the client's WT-Available-Protocols. Borrowed
      * pointer owned by the Cython TransportContext (kept alive there);
      * NULL = no subprotocol negotiation. Read by the worker thread in
      * the WT server path callback. */
