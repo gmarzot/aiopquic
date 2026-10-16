@@ -515,6 +515,19 @@ static inline uint32_t aiopquic_datagram_payload_ceiling(picoquic_cnx_t* cnx) {
     return cap;
 }
 
+/* Receive window our transport parameters granted this stream at the
+ * handshake (RFC 9000 §18.2). Bit 1 of the id: unidirectional; bit 0:
+ * server-initiated. Worker thread only. */
+static inline uint64_t aiopquic_initial_rx_window(picoquic_cnx_t* cnx,
+                                                  uint64_t stream_id) {
+    const picoquic_tp_t* tp = picoquic_get_transport_parameters(cnx, 1);
+    if (!tp) return 0;
+    if (stream_id & 2) return tp->initial_max_stream_data_uni;
+    int local = (int)(stream_id & 1) == (picoquic_is_client(cnx) ? 0 : 1);
+    return local ? tp->initial_max_stream_data_bidi_local
+                 : tp->initial_max_stream_data_bidi_remote;
+}
+
 /* A copy of a connection's picoquic state, taken on the worker thread and
  * delivered to asyncio as an event payload. asyncio reads the copy and
  * never touches picoquic memory, which the worker owns and frees. Sent
@@ -1274,7 +1287,6 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             : AIOPQUIC_RX_DATA_RING_CAP_DEFAULT;
         uint32_t physical_cap = advertise_cap;
         aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)stream_ctx;
-        int rx_first_touch = 0;
         if (!sc) {
             sc = aiopquic_stream_ctx_create();
             if (!sc) {
@@ -1283,13 +1295,12 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             ctx->cnt_sc_create_raw_quic++;
             picoquic_set_app_stream_ctx(cnx, stream_id, sc);
             entry.stream_ctx = sc;
-            /* Opt into application-driven flow control on this stream.
-             * The MAX_STREAM_DATA grant itself is issued via
-             * picoquic_open_flow_control AFTER we push the just-
-             * delivered bytes so the grant reflects actual free space —
-             * see the FC block below. */
+        }
+        /* First RX on this stream, including a local bidi whose sc the
+         * TX path created: switch it to application-driven flow control. */
+        int rx_first_touch = (sc->rx == NULL);
+        if (rx_first_touch) {
             (void)picoquic_set_app_flow_control(cnx, stream_id, 1);
-            rx_first_touch = 1;
         }
         if (aiopquic_stream_ctx_ensure_rx(sc, physical_cap) != 0) {
             return -1;
@@ -1322,16 +1333,16 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         if (fin_or_event == picoquic_callback_stream_fin) {
             aiopquic_stream_buf_set_fin(sc->rx);
         }
-        /* FC management: first-touch grants initial buffer capacity to
-         * peer via open_flow_control(buf_free post-push). Subsequent
-         * replenishment is consumer-driven — Python's drain pushes
-         * SPSC_EVT_TX_OPEN_FLOW_CONTROL with the popped byte count as
-         * an incremental credit, mirroring picoquic's own
-         * flow_control_test pattern. Worker-side extension inside
-         * post_data can't unblock an FC-stalled peer. */
+        /* First touch extends the handshake window to the ring only when
+         * the window is smaller, and never once FIN arrived (RFC 9000
+         * §3.3); replenishment is consumer-driven
+         * (SPSC_EVT_TX_OPEN_FLOW_CONTROL from drain_rx). */
         if (rx_first_touch) {
-            uint32_t buf_free = aiopquic_stream_buf_free(sc->rx);
-            (void)picoquic_open_flow_control(cnx, stream_id, buf_free);
+            if (fin_or_event != picoquic_callback_stream_fin &&
+                aiopquic_initial_rx_window(cnx, stream_id) < advertise_cap) {
+                uint32_t buf_free = aiopquic_stream_buf_free(sc->rx);
+                (void)picoquic_open_flow_control(cnx, stream_id, buf_free);
+            }
             aiopquic_stream_ctx_rx_credit_store(sc, advertise_cap);
         }
         /* RX data-event coalescing: at most ONE outstanding STREAM_DATA
@@ -1672,7 +1683,9 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         ctx->cnt_fc_credit_handled++;
                         aiopquic_stream_ctx_t* sc =
                             (aiopquic_stream_ctx_t*)entry->stream_ctx;
-                        if (sc != NULL && sc->rx != NULL) {
+                        /* No credit once FIN arrived (RFC 9000 §3.3). */
+                        if (sc != NULL && sc->rx != NULL &&
+                                !aiopquic_stream_buf_fin_pending(sc->rx)) {
                             uint32_t buf_free =
                                 aiopquic_stream_buf_free(sc->rx);
                             uint32_t grant;

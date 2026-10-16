@@ -793,18 +793,14 @@ static int aiopquic_wt_path_callback(
                 }
                 return -1;
             }
-            /* FC management: at first-touch we grant the initial buffer
-             * capacity to peer (buf_free post-push = capacity - length).
-             * From then on, peer's credit is REPLENISHED by Python's
-             * drain side via SPSC_EVT_TX_OPEN_FLOW_CONTROL — see
-             * _transport.pyx drain_rx. The worker doing extension here
-             * inside post_data can't unblock a peer that's FC-stalled
-             * (no inbound bytes → no callback → no extension), so we
-             * rely on the consumer-driven model from picoquic's own
-             * flow_control_test pattern. */
+            /* First touch extends the handshake window to the ring only
+             * when the window is smaller; replenishment is consumer-driven
+             * (SPSC_EVT_TX_OPEN_FLOW_CONTROL from drain_rx). */
             if (rx_first) {
-                uint32_t buf_free = aiopquic_stream_buf_free(sc->rx);
-                (void)picoquic_open_flow_control(cnx, sid, buf_free);
+                if (aiopquic_initial_rx_window(cnx, sid) < advertise_cap) {
+                    uint32_t buf_free = aiopquic_stream_buf_free(sc->rx);
+                    (void)picoquic_open_flow_control(cnx, sid, buf_free);
+                }
                 aiopquic_stream_ctx_rx_credit_store(sc, advertise_cap);
             }
             if (first_touch) {
@@ -872,14 +868,8 @@ static int aiopquic_wt_path_callback(
             }
             aiopquic_stream_buf_set_fin(sc->rx);
 
-            /* On FIN we still need to issue a MAX_STREAM_DATA grant on
-             * first-touch so picoquic's accounting matches our buffer
-             * state; subsequent extensions are unnecessary since the
-             * stream is over. See post_data above for the rationale on
-             * passing buf_free. */
+            /* All data has arrived: no grant (RFC 9000 §3.3). */
             if (rx_first) {
-                uint32_t buf_free = aiopquic_stream_buf_free(sc->rx);
-                (void)picoquic_open_flow_control(cnx, sid, buf_free);
                 aiopquic_stream_ctx_rx_credit_store(
                     sc, aiopquic_stream_ctx_rx_consumed_load(sc) + advertise_cap);
             }

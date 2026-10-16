@@ -36,6 +36,10 @@
   a WebTransport reset relies on a local picoquic patch retiring the stream when the
   RESET_STREAM_AT is acked.
 - WebTransport stream data, FIN and reset events arriving after the session closed are dropped.
+- Fix: a raw QUIC bidi stream we open takes application flow control on its first byte received;
+  picoquic's own window could run past the RX ring and overflow it.
+- Fix: no MAX_STREAM_DATA once a stream's FIN arrived; the first-touch grant goes out only when
+  the handshake window is smaller than the RX ring (WebTransport sent one per stream).
 
 ## v0.5.0a4
 
