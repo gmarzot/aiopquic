@@ -40,6 +40,8 @@
   picoquic's own window could run past the RX ring and overflow it.
 - Fix: no MAX_STREAM_DATA once a stream's FIN arrived; the first-touch grant goes out only when
   the handshake window is smaller than the RX ring (WebTransport sent one per stream).
+- Fix: WebTransport stream reset and STOP_SENDING codes travel in the WT_APPLICATION_ERROR range
+  and are mapped back on receipt (draft-ietf-webtrans-http3 §4.4); they went out raw.
 
 ## v0.5.0a4
 
