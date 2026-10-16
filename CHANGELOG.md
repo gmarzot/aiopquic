@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.0rc1
 
 - WebTransport servers select the WT-Protocol by `wt_supported_protocols` order, not the
   client's offer order.
