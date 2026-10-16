@@ -172,6 +172,11 @@ async def _wt_churn(stop):
 
 
 @pytest.mark.asyncio
+async def test_wt_reset_churn_releases_streams():
+    await _wt_churn(stop=False)
+
+
+@pytest.mark.asyncio
 async def test_wt_stop_sending_releases_streams():
     await _wt_churn(stop=True)
 
