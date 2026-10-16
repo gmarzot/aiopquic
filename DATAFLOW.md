@@ -51,7 +51,7 @@ sequenceDiagram
     participant NIC as UDP / NIC
 
     Note over App,API: NEW STREAM only — gates before creation
-    alt aggregate queued exceeds tx_max_queued_bytes (8 MiB)
+    alt aggregate queued exceeds tx_max_queued_bytes (4 MiB)
         API->>API: park, 2 ms poll, resume below cap/2<br/>raw: send_stream_data_drained new-stream branch<br/>WT: create_stream calls _await_tx_data_capacity
     end
     opt raw QUIC, every new stream
@@ -65,7 +65,7 @@ sequenceDiagram
 
     Note over App,SCTX: per write
     App->>API: stream_write_drain(sid, bytes)
-    alt this stream's queue exceeds tx_max_inflight_bytes (2 MiB, aiomoqt)
+    alt this stream's queue exceeds tx_max_inflight_bytes (1 MiB, aiomoqt)
         API->>API: park on per-stream drain event, resume below cap/2<br/>(clear, arm, recheck, wait)
     end
     API->>CY: send_stream_data

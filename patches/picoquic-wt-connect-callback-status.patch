@@ -1,0 +1,29 @@
+diff --git a/picohttp/h3zero_common.c b/picohttp/h3zero_common.c
+--- a/picohttp/h3zero_common.c
++++ b/picohttp/h3zero_common.c
+@@ -1253,14 +1253,20 @@
+ 					o_bytes = h3zero_create_error_frame(o_bytes, o_bytes_max, error_code, H3ZERO_USER_AGENT_STRING);
+ 				}
+ 				else {
++					int connect_ret;
+ 					stream_ctx->path_callback = item->path_callback;
+ 					stream_ctx->path_callback_ctx = item->path_app_ctx;
+-					if (stream_ctx->path_callback(cnx, (uint8_t*)stream_ctx->ps.stream_state.header.path, stream_ctx->ps.stream_state.header.path_length, picohttp_callback_connect,
+-						stream_ctx, item->path_app_ctx) != 0) {
+-						/* This callback is not supported */
+-						picoquic_log_app_message(cnx, "Unsupported callback on stream: %"PRIu64 ", path:%s", stream_ctx->stream_id, item->path);
++					connect_ret = stream_ctx->path_callback(cnx, (uint8_t*)stream_ctx->ps.stream_state.header.path, stream_ctx->ps.stream_state.header.path_length, picohttp_callback_connect,
++						stream_ctx, item->path_app_ctx);
++					if (connect_ret != 0) {
++						/* A return of 400..599 is the response status; anything else is 501. */
++						char connect_status[4] = "501";
++						if (connect_ret >= 400 && connect_ret <= 599) {
++							(void)snprintf(connect_status, sizeof(connect_status), "%03d", connect_ret);
++						}
++						picoquic_log_app_message(cnx, "CONNECT rejected (%s) on stream: %"PRIu64 ", path:%s", connect_status, stream_ctx->stream_id, item->path);
+ 						stream_ctx->path_callback = NULL;
+-						o_bytes = h3zero_create_error_frame(o_bytes, o_bytes_max, "501", H3ZERO_USER_AGENT_STRING);
++						o_bytes = h3zero_create_error_frame(o_bytes, o_bytes_max, connect_status, H3ZERO_USER_AGENT_STRING);
+ 					}
+ 					else {
+ 						/* Create a connect accept frame */

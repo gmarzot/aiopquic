@@ -1,0 +1,15 @@
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index 1d2f9422..72fc4b88 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -538,9 +538,7 @@ int picoquic_process_ack_of_reset_stream_at_frame(picoquic_cnx_t* cnx, const uin
+             /* mark reset as acked by peer */
+             stream->reset_acked = 1;
+             /* Delete stream if closed. */
+-            if (stream->consumed_offset >= stream->reliable_size) {
+-                (void)picoquic_delete_stream_if_closed(cnx, stream);
+-            }
++            (void)picoquic_delete_stream_if_closed(cnx, stream);
+         }
+     }
+     return ret;

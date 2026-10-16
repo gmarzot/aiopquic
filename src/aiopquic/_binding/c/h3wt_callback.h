@@ -60,6 +60,29 @@ typedef enum {
  * a peer needs to tell session teardown from an ordinary stream reset. */
 #define AIOPQUIC_WT_SESSION_GONE 0x170d7b68u
 
+/* WT_APPLICATION_ERROR (draft-ietf-webtrans-http3 §4.4): a 32-bit stream
+ * application code travels as an HTTP/3 code in this range, skipping the
+ * reserved 0x1f * N + 0x21 codepoints. Codes above 32 bits are HTTP/3 codes
+ * already (WT_SESSION_GONE) and pass through both ways. */
+#define AIOPQUIC_WT_APP_ERROR_FIRST 0x52e4a40fa8dbull
+#define AIOPQUIC_WT_APP_ERROR_LAST  0x52e5ac983162ull
+
+static inline uint64_t aiopquic_wt_code_to_h3(uint64_t code) {
+    if (code > 0xffffffffull) return code;
+    return AIOPQUIC_WT_APP_ERROR_FIRST + code + code / 0x1e;
+}
+
+/* A code outside the range, or a reserved codepoint in it, carries no
+ * application code and is delivered as received. */
+static inline uint64_t aiopquic_wt_code_from_h3(uint64_t h) {
+    if (h < AIOPQUIC_WT_APP_ERROR_FIRST || h > AIOPQUIC_WT_APP_ERROR_LAST
+            || (h - 0x21) % 0x1f == 0) {
+        return h;
+    }
+    uint64_t shifted = h - AIOPQUIC_WT_APP_ERROR_FIRST;
+    return shifted - shifted / 0x1f;
+}
+
 /*
  * Packed payload for SPSC_EVT_TX_WT_OPEN. Stored as data_buf:
  *   header + sni + path + protocols.
@@ -180,6 +203,80 @@ static inline char* aiopquic_wt_strdup(const char* src) {
     char* d = (char*)malloc(n + 1);
     if (d != NULL) memcpy(d, src, n + 1);
     return d;
+}
+
+/* Status refusing a CONNECT whose WT-Available-Protocols has no match. */
+#define AIOPQUIC_WT_NO_PROTOCOL_STATUS 400
+
+#define AIOPQUIC_WT_PROTO_NO_MATCH     (-1)
+#define AIOPQUIC_WT_PROTO_NONE_OFFERED 0
+#define AIOPQUIC_WT_PROTO_SELECTED     1
+
+/* Next item of a comma-separated list in [p, end): whitespace, one pair
+ * of quotes and ";parameters" stripped. Returns the position after the
+ * item, NULL when none is left. */
+static const char* aiopquic_wt_list_next(const char* p, const char* end,
+                                         const char** item, size_t* len) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) p++;
+    if (p >= end) return NULL;
+    const char* start = p;
+    while (p < end && *p != ',') p++;
+    const char* stop = start;
+    while (stop < p && *stop != ';') stop++;
+    while (stop > start && (stop[-1] == ' ' || stop[-1] == '\t')) stop--;
+    if (stop - start >= 2 && *start == '"' && stop[-1] == '"') {
+        start++;
+        stop--;
+    }
+    *item = start;
+    *len = (size_t)(stop - start);
+    return p;
+}
+
+/* Defined in picohttp/webtransport.c; no header declares it. */
+int picowt_set_wt_protocol(h3zero_stream_ctx_t* stream_ctx,
+                           const char* selected_protocol);
+
+/* Select the WT-Protocol by the server's order: the first entry of
+ * `supported` (CSV, most preferred first) that the client offered.
+ * Sets stream_state.wt_protocol on a match. */
+static int aiopquic_wt_select_protocol(h3zero_stream_ctx_t* st,
+                                       const char* supported) {
+    const char* offer =
+        (const char*)st->ps.stream_state.header.wt_available_protocols;
+    if (offer == NULL) return AIOPQUIC_WT_PROTO_NONE_OFFERED;
+    const char* offer_end =
+        offer + st->ps.stream_state.header.wt_available_protocols_length;
+    const char* sup_end = supported + strlen(supported);
+    const char *o, *sv;
+    size_t olen, slen;
+    int offered = 0;
+
+    for (const char* q = offer;
+         (q = aiopquic_wt_list_next(q, offer_end, &o, &olen)) != NULL;) {
+        if (olen > 0) {
+            offered = 1;
+            break;
+        }
+    }
+    if (!offered) return AIOPQUIC_WT_PROTO_NONE_OFFERED;
+
+    for (const char* p = supported;
+         (p = aiopquic_wt_list_next(p, sup_end, &sv, &slen)) != NULL;) {
+        if (slen == 0) continue;
+        for (const char* q = offer;
+             (q = aiopquic_wt_list_next(q, offer_end, &o, &olen)) != NULL;) {
+            if (olen == slen && memcmp(o, sv, slen) == 0) {
+                char sel[256];
+                if (slen >= sizeof(sel)) break;
+                memcpy(sel, sv, slen);
+                sel[slen] = 0;
+                return picowt_set_wt_protocol(st, sel) == 0
+                    ? AIOPQUIC_WT_PROTO_SELECTED : AIOPQUIC_WT_PROTO_NO_MATCH;
+            }
+        }
+    }
+    return AIOPQUIC_WT_PROTO_NO_MATCH;
 }
 
 static inline aiopquic_wt_session_t* aiopquic_wt_session_create(
@@ -639,8 +736,13 @@ static int aiopquic_wt_path_callback(
         break;
 
     case picohttp_callback_connect_refused:
+        /* error_code carries the response status. */
         aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_REFUSED,
-                                s->control_stream_id, 0, NULL, 0);
+                                s->control_stream_id,
+                                stream_ctx != NULL
+                                    ? (uint64_t)stream_ctx->ps.stream_state.header.status
+                                    : 0,
+                                NULL, 0);
         break;
 
     case picohttp_callback_drain:
@@ -714,18 +816,14 @@ static int aiopquic_wt_path_callback(
                 }
                 return -1;
             }
-            /* FC management: at first-touch we grant the initial buffer
-             * capacity to peer (buf_free post-push = capacity - length).
-             * From then on, peer's credit is REPLENISHED by Python's
-             * drain side via SPSC_EVT_TX_OPEN_FLOW_CONTROL — see
-             * _transport.pyx drain_rx. The worker doing extension here
-             * inside post_data can't unblock a peer that's FC-stalled
-             * (no inbound bytes → no callback → no extension), so we
-             * rely on the consumer-driven model from picoquic's own
-             * flow_control_test pattern. */
+            /* First touch extends the handshake window to the ring only
+             * when the window is smaller; replenishment is consumer-driven
+             * (SPSC_EVT_TX_OPEN_FLOW_CONTROL from drain_rx). */
             if (rx_first) {
-                uint32_t buf_free = aiopquic_stream_buf_free(sc->rx);
-                (void)picoquic_open_flow_control(cnx, sid, buf_free);
+                if (aiopquic_initial_rx_window(cnx, sid) < advertise_cap) {
+                    uint32_t buf_free = aiopquic_stream_buf_free(sc->rx);
+                    (void)picoquic_open_flow_control(cnx, sid, buf_free);
+                }
                 aiopquic_stream_ctx_rx_credit_store(sc, advertise_cap);
             }
             if (first_touch) {
@@ -793,14 +891,8 @@ static int aiopquic_wt_path_callback(
             }
             aiopquic_stream_buf_set_fin(sc->rx);
 
-            /* On FIN we still need to issue a MAX_STREAM_DATA grant on
-             * first-touch so picoquic's accounting matches our buffer
-             * state; subsequent extensions are unnecessary since the
-             * stream is over. See post_data above for the rationale on
-             * passing buf_free. */
+            /* All data has arrived: no grant (RFC 9000 §3.3). */
             if (rx_first) {
-                uint32_t buf_free = aiopquic_stream_buf_free(sc->rx);
-                (void)picoquic_open_flow_control(cnx, sid, buf_free);
                 aiopquic_stream_ctx_rx_credit_store(
                     sc, aiopquic_stream_ctx_rx_consumed_load(sc) + advertise_cap);
             }
@@ -859,10 +951,7 @@ static int aiopquic_wt_path_callback(
          * picoquic window-math edge cases). Single-shot per arm —
          * only the CAS winner pushes. */
         {
-            uint32_t expected = 1;
-            if (atomic_compare_exchange_strong_explicit(
-                    &sc->tx_drain_pending, &expected, 0,
-                    memory_order_acq_rel, memory_order_relaxed)) {
+            if (aiopquic_stream_ctx_tx_drain_take(sc)) {
                 spsc_entry_t drain_entry = {0};
                 drain_entry.event_type = SPSC_EVT_STREAM_TX_DRAINED;
                 drain_entry.stream_id = sid;
@@ -920,10 +1009,7 @@ static int aiopquic_wt_path_callback(
             s->bridge->worker_dgram_records_sent++;
             s->bridge->worker_dgram_bytes_sent += rec;
             /* Edge-triggered producer wakeup, as on the raw path. */
-            uint32_t expected = 1;
-            if (atomic_compare_exchange_strong_explicit(
-                    &db->drain_pending, &expected, 0,
-                    memory_order_acq_rel, memory_order_relaxed)) {
+            if (aiopquic_dgram_buf_drain_take(db)) {
                 spsc_entry_t drain_entry = {0};
                 drain_entry.event_type = SPSC_EVT_DATAGRAM_TX_DRAINED;
                 drain_entry.cnx = cnx;
@@ -959,7 +1045,8 @@ static int aiopquic_wt_path_callback(
         } else {
             aiopquic_wt_push_event(s, SPSC_EVT_WT_STREAM_RESET,
                                     sid,
-                                    picoquic_get_remote_stream_error(cnx, sid),
+                                    aiopquic_wt_code_from_h3(
+                                        picoquic_get_remote_stream_error(cnx, sid)),
                                     NULL, 0);
             /* link is freed at picohttp_callback_free below. */
         }
@@ -971,12 +1058,14 @@ static int aiopquic_wt_path_callback(
                 "[wt-diag] picohttp_callback_stop_sending sid=%llu "
                 "remote_err=%llu\n",
                 (unsigned long long)sid,
-                (unsigned long long)picoquic_get_remote_stream_error(cnx, sid));
+                (unsigned long long)picoquic_get_remote_stop_sending_error(
+                    cnx, sid));
             fflush(stderr);
         }
         aiopquic_wt_push_event(s, SPSC_EVT_WT_STOP_SENDING,
                                 sid,
-                                picoquic_get_remote_stream_error(cnx, sid),
+                                aiopquic_wt_code_from_h3(
+                                    picoquic_get_remote_stop_sending_error(cnx, sid)),
                                 NULL, 0);
         /* link is freed at picohttp_callback_free below. */
         break;
@@ -1020,6 +1109,12 @@ static int aiopquic_wt_path_callback(
                 is_control ? 1 : 0,
                 s->session_closing);
             fflush(stderr);
+        }
+        /* h3zero frees CONNECT once both FINs are done, possibly while
+         * the session lives; the cached pointer must not outlive it. */
+        if (is_control && stream_ctx == s->control_stream) {
+            s->control_stream = NULL;
+            s->bridge->cnt_wt_control_released++;
         }
         if (link && stream_ctx
                 && stream_ctx->path_callback_ctx == link) {
@@ -1103,6 +1198,18 @@ static int aiopquic_wt_server_path_callback(
         return 0;
     }
 
+    /* WT-Protocol: the server's most preferred mutual protocol. An offer
+     * with no match is refused (h3zero sends the returned status); a
+     * client that offered nothing gets a session with no protocol. */
+    int proto_sel = AIOPQUIC_WT_PROTO_NONE_OFFERED;
+    if (bridge->wt_supported_protocols != NULL) {
+        proto_sel = aiopquic_wt_select_protocol(
+            stream_ctx, bridge->wt_supported_protocols);
+        if (proto_sel == AIOPQUIC_WT_PROTO_NO_MATCH) {
+            return AIOPQUIC_WT_NO_PROTOCOL_STATUS;
+        }
+    }
+
     aiopquic_wt_session_t* s = aiopquic_wt_session_create(bridge);
     if (!s) return -1;
     s->cnx = cnx;
@@ -1116,23 +1223,9 @@ static int aiopquic_wt_server_path_callback(
     }
     aiopquic_wt_log_cnxid("server-cnx-accept", cnx, stream_ctx->stream_id);
 
-    /* WT subprotocol selection: pick the highest mutual from the
-     * client's WT-Available-Protocols against our configured allowlist.
-     * picowt_select_wt_protocol reads the client offer off stream_ctx
-     * and, on a match, sets stream_state.wt_protocol — which h3zero then
-     * emits as the WT-Protocol response header. We copy it onto the
-     * session so Python can read the negotiated value. No allowlist or
-     * no match → no WT-Protocol header sent (s->wt_protocol stays NULL).
-     *
-     * Deliberately PERMISSIVE: unlike raw-QUIC ALPN (mandatory in TLS, a
-     * mismatch hard-fails the handshake), WT-Protocol is OPTIONAL, so the
-     * CONNECT still succeeds with no subprotocol when there is no overlap
-     * (or the client offered none — picowt can't tell those apart). The
-     * version-mismatch policy belongs to the application layer (aiomoqt),
-     * which sees negotiated_protocol == None and decides whether to close. */
-    if (bridge->wt_supported_protocols != NULL &&
-        picowt_select_wt_protocol(
-            stream_ctx, bridge->wt_supported_protocols) == 0 &&
+    /* h3zero emits stream_state.wt_protocol as the WT-Protocol response
+     * header; the session keeps a copy for negotiated_protocol. */
+    if (proto_sel == AIOPQUIC_WT_PROTO_SELECTED &&
         stream_ctx->ps.stream_state.wt_protocol != NULL) {
         s->wt_protocol =
             aiopquic_wt_strdup(stream_ctx->ps.stream_state.wt_protocol);
@@ -1166,6 +1259,15 @@ static int aiopquic_wt_reset_stream(picoquic_cnx_t* cnx,
         return 0;
     }
     return picoquic_reset_stream(cnx, st->stream_id, code);
+}
+
+/* picoquic_reset_stream and picoquic_stop_sending detach h3zero's stream
+ * ctx, so the stream would never be released and h3zero would keep it,
+ * its link and its sc until the session ends: put it back. A stream
+ * picoquic already deleted is left alone (set fails on it). */
+static void aiopquic_wt_stream_reattach(picoquic_cnx_t* cnx,
+                                        h3zero_stream_ctx_t* st) {
+    (void)picoquic_set_app_stream_ctx(cnx, st->stream_id, st);
 }
 
 /* picoquic sends nothing more on a reset stream: release what is still
@@ -1369,9 +1471,11 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
             ctx->cnt_tx_wrong_direction_dropped++;
             return 1;
         }
-        if (aiopquic_wt_reset_stream(s->cnx, st, entry->error_code) == 0) {
+        if (aiopquic_wt_reset_stream(s->cnx, st,
+                aiopquic_wt_code_to_h3(entry->error_code)) == 0) {
             aiopquic_wt_abandon_stream_tx(s, st);
         }
+        aiopquic_wt_stream_reattach(s->cnx, st);
         return 1;
     }
 
@@ -1419,7 +1523,12 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (!s || !s->cnx) return 1;
         if (aiopquic_stream_can_receive(s->cnx, entry->stream_id)) {
             picoquic_stop_sending(s->cnx, entry->stream_id,
-                                   entry->error_code);
+                                   aiopquic_wt_code_to_h3(entry->error_code));
+            h3zero_callback_ctx_t* h3_ctx =
+                (h3zero_callback_ctx_t*)picoquic_get_callback_context(s->cnx);
+            h3zero_stream_ctx_t* st =
+                h3_ctx ? h3zero_find_stream(h3_ctx, entry->stream_id) : NULL;
+            if (st) aiopquic_wt_stream_reattach(s->cnx, st);
         } else {
             ctx->cnt_tx_wrong_direction_dropped++;
         }
@@ -1473,6 +1582,7 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                                 picoquic_stop_sending(s->cnx, st->stream_id,
                                                       AIOPQUIC_WT_SESSION_GONE);
                             }
+                            aiopquic_wt_stream_reattach(s->cnx, st);
                             st->path_callback = NULL;
                             st->path_callback_ctx = NULL;
                             aiopquic_stream_ctx_tx_abandon(lk->sc);
@@ -1516,7 +1626,7 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
          * Done at session-destroy time only (once per session). No
          * per-stream tracking overhead during active operation. */
         if (s) {
-            if (s->cnx && s->h3_ctx && s->control_stream) {
+            if (s->cnx && s->h3_ctx && aiopquic_cnx_is_alive(quic, s->cnx)) {
                 /* Step 1: free this session's per-stream links. */
                 picosplay_node_t* node =
                     picosplay_first(&s->h3_ctx->h3_stream_tree);
@@ -1541,15 +1651,16 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                     }
                     node = next;
                 }
-                /* Step 2: detach the control stream's callback so the
+                /* Steps 2 and 3 need CONNECT, which h3zero may have
+                 * freed already. Step 2: detach its callback so the
                  * eventual picohttp_callback_free at cnx-close doesn't
                  * dispatch into a freed session pointer. */
-                s->control_stream->path_callback = NULL;
-                s->control_stream->path_callback_ctx = NULL;
-                /* Step 3: now safe to deregister + free. */
-                picowt_deregister(s->cnx, s->h3_ctx, s->control_stream);
-            }
-            if (s->cnx && s->h3_ctx && aiopquic_cnx_is_alive(quic, s->cnx)) {
+                if (s->control_stream) {
+                    s->control_stream->path_callback = NULL;
+                    s->control_stream->path_callback_ctx = NULL;
+                    /* Step 3: now safe to deregister + free. */
+                    picowt_deregister(s->cnx, s->h3_ctx, s->control_stream);
+                }
                 if (picoquic_is_client(s->cnx)) {
                     if (s->fin_sent) {
                         picoquic_close(s->cnx, H3ZERO_NO_ERROR);
@@ -1557,7 +1668,10 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                     picoquic_set_callback(s->cnx, h3zero_callback, s->h3_ctx);
                 }
                 /* The stream prefix names this session; h3zero would hand
-                 * it a deregister at context deletion, after the free. */
+                 * it a deregister at context deletion, after the free.
+                 * Deleting it re-enters our deregister case: no
+                 * SESSION_CLOSED for a session Python has released. */
+                s->session_closing = 1;
                 h3zero_delete_stream_prefix(s->cnx, s->h3_ctx,
                                             s->control_stream_id);
             }

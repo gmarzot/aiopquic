@@ -1,5 +1,9 @@
 # aiopquic — benchmark results
 
+> **Stale:** these numbers are from v0.2.0 and predate the current ring
+> sizes, flow-control defaults and build flags. Re-measure before quoting
+> them; [PERFORMANCE.md](../../PERFORMANCE.md) has current methodology.
+
 Reference numbers for the v0.2.0 pull-model transport. Reproduce with:
 
 ```

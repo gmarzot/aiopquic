@@ -54,3 +54,11 @@ def test_datagram_sender_survives_peer_close(mode):
     proc = _run(mode)
     assert proc.returncode == 0, (
         f"exit {proc.returncode}\n{proc.stderr[-3000:]}")
+
+
+def test_server_close_releases_unrouted_rings():
+    """A server closing with connections up releases their rings, though
+    their CLOSE events are never routed."""
+    proc = _run("raw-engine-close")
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\n{proc.stderr[-3000:]}")

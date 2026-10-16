@@ -463,10 +463,9 @@ class WebTransportSession:
             # armed when sc->tx fills).
             if self.tx_event_ring_fill() > hard_wait_at:
                 ring_event.clear()
-                self._transport.arm_tx_event_ring_drain_pending()
-                if self.tx_event_ring_fill() <= hard_wait_at:
-                    # Raced — worker drained between checks.
-                    self._transport.clear_tx_event_ring_drain_pending()
+                # Re-check after the arm: the worker may have drained since.
+                if (not self._transport.arm_tx_event_ring_drain_pending()
+                        or self.tx_event_ring_fill() <= hard_wait_at):
                     continue
                 await ring_event.wait()
                 continue
@@ -511,14 +510,21 @@ class WebTransportSession:
         sent, else with RESET_STREAM. Unsent bytes stop counting against the
         TX budget, and later or parked writes on the stream raise
         WebTransportError. On a stream we only receive on, the request is
-        dropped and counted in tx_wrong_direction_dropped."""
+        dropped and counted in tx_wrong_direction_dropped.
+
+        error_code is a 32-bit application code, sent in the
+        WT_APPLICATION_ERROR range (draft-ietf-webtrans-http3 §4.4); larger
+        values are HTTP/3 codes (WT_SESSION_GONE) and go out unchanged.
+        Received reset and STOP_SENDING codes are mapped back the same way;
+        a code outside the range is delivered as received."""
         self._state.push_reset_stream(stream_id, error_code)
         self._drop_stream_tx(stream_id)
 
     def stop_stream(self, stream_id: int, error_code: int = 0) -> None:
         """Send STOP_SENDING on a WT stream we receive on (the peer should
         reset it). On our own uni stream, the request is dropped and
-        counted in tx_wrong_direction_dropped."""
+        counted in tx_wrong_direction_dropped. error_code is mapped as in
+        reset_stream()."""
         self._state.push_stop_sending(stream_id, error_code)
 
     def set_stream_priority(self, stream_id: int, priority: int) -> int:
@@ -671,11 +677,11 @@ class WebTransportSession:
         ring_ev = self._transport.tx_event_ring_drain_event
         for _ in range(3):
             ring_ev.clear()
-            self._transport.arm_tx_event_ring_drain_pending()
-            try:
-                await asyncio.wait_for(ring_ev.wait(), 1.0)
-            except asyncio.TimeoutError:
-                pass
+            if self._transport.arm_tx_event_ring_drain_pending():
+                try:
+                    await asyncio.wait_for(ring_ev.wait(), 1.0)
+                except asyncio.TimeoutError:
+                    pass
             try:
                 push()
                 return
@@ -804,6 +810,9 @@ class WebTransportSession:
         # Hot branches first: data, FIN, and TX-drain wakes dominate
         # the event stream; session-lifecycle events are rare.
         if evt_type == _EVT_WT_STREAM_DATA:
+            if self._session_closed.is_set():
+                # Inbox queues are gone; a new one would pin the payload.
+                return
             payload = data if data is not None else memoryview(b"")
             ev = WebTransportStreamDataReceived(
                 stream_id=sid, data=payload, end_stream=False)
@@ -812,6 +821,8 @@ class WebTransportSession:
                 self._stream_inbox[sid] = q = asyncio.Queue()
             q.put_nowait(ev)
         elif evt_type == _EVT_WT_STREAM_FIN:
+            if self._session_closed.is_set():
+                return
             payload = data if data is not None else memoryview(b"")
             ev = WebTransportStreamDataReceived(
                 stream_id=sid, data=payload, end_stream=True)
@@ -836,8 +847,11 @@ class WebTransportSession:
         elif evt_type == _EVT_WT_SESSION_REFUSED:
             err = WebTransportSessionRefused(error_code=error_code)
             if self._session_ready and not self._session_ready.done():
+                # >= 100 is the server's HTTP status; below, a local failure.
+                reason = (f"HTTP {error_code}" if error_code >= 100
+                          else f"code={error_code}")
                 self._session_ready.set_exception(WebTransportError(
-                    f"WT CONNECT refused (code={error_code})"))
+                    f"WT CONNECT refused ({reason})"))
             self._event_queue.put_nowait(err)
         elif evt_type == _EVT_WT_SESSION_CLOSED:
             self._on_session_closed(error_code, data)
@@ -874,6 +888,8 @@ class WebTransportSession:
                     fut.set_result(0 if error_code != 0 else sid)
                     break
         elif evt_type == _EVT_WT_STREAM_RESET:
+            if self._session_closed.is_set():
+                return
             ev = WebTransportStreamReset(stream_id=sid,
                                             error_code=error_code)
             q = self._stream_inbox.get(sid)
@@ -942,6 +958,12 @@ class WebTransportSession:
 # Initiator-side: subclass adds open().
 # =====================================================================
 
+def _sf_string_list(items: list[str]) -> str:
+    """WT-Available-Protocols value: a Structured Field List of Strings
+    (RFC 9651). picoquic sends it verbatim; "" sends no header."""
+    return ", ".join(f'"{p}"' for p in items)
+
+
 class WebTransportClient(WebTransportSession):
     """Initiator-side WT session. Adds open() to drive the
     CONNECT handshake."""
@@ -970,17 +992,8 @@ class WebTransportClient(WebTransportSession):
         self._session_ready = self._loop.create_future()
 
         addr = _resolve_host(self._host)
-        # WT-Available-Protocols is an HTTP Structured Field list of
-        # strings (RFC 9651); each value is double-quoted, comma-joined.
-        # picoquic puts the value into the QPACK literal verbatim — no
-        # SF formatting on its side — so we have to produce the
-        # canonical form here.
-        if self._wt_protocols:
-            protocols_str = ", ".join(f'"{p}"' for p in self._wt_protocols)
-        else:
-            protocols_str = ""
         self._state.push_open(addr, self._port, self._path, self._sni,
-                              protocols_str)
+                              _sf_string_list(self._wt_protocols))
 
         try:
             await asyncio.wait_for(self._session_ready, timeout=timeout)
@@ -1114,26 +1127,42 @@ class _DispatcherRegistry:
     def __init__(self):
         self._dispatchers: dict[tuple[int, int], _Dispatcher] = {}
 
-    def attach(self, loop: asyncio.AbstractEventLoop,
-                transport: TransportContext,
-                session: WebTransportSession) -> None:
+    def _lookup(self, loop: asyncio.AbstractEventLoop,
+                transport: TransportContext) -> "_Dispatcher | None":
+        """The dispatcher of exactly this (loop, transport); an entry
+        filed under the same ids for other objects is not it."""
+        d = self._dispatchers.get((id(loop), id(transport)))
+        if d is not None and d._loop is loop and d._transport is transport:
+            return d
+        return None
+
+    def _get_or_create(self, loop: asyncio.AbstractEventLoop,
+                       transport: TransportContext) -> "_Dispatcher":
         key = (id(loop), id(transport))
         d = self._dispatchers.get(key)
+        if d is not None and (d._loop is not loop
+                              or d._transport is not transport):
+            # Retired before the new reader is added: the stale wake fd
+            # may share its number with this transport's.
+            d.detach()
+            del self._dispatchers[key]
+            d = None
         if d is None:
             d = _Dispatcher(loop, transport)
             self._dispatchers[key] = d
-        d.add_session(session)
+        return d
+
+    def attach(self, loop: asyncio.AbstractEventLoop,
+                transport: TransportContext,
+                session: WebTransportSession) -> None:
+        self._get_or_create(loop, transport).add_session(session)
 
     def attach_acceptor(self, loop: asyncio.AbstractEventLoop,
                          transport: TransportContext,
                          acceptor) -> "_Dispatcher":
         """Bind a server-side accept handler to (loop, transport).
         Returns the underlying dispatcher so callers can detach."""
-        key = (id(loop), id(transport))
-        d = self._dispatchers.get(key)
-        if d is None:
-            d = _Dispatcher(loop, transport)
-            self._dispatchers[key] = d
+        d = self._get_or_create(loop, transport)
         d.set_acceptor(acceptor)
         return d
 
@@ -1147,7 +1176,7 @@ class _DispatcherRegistry:
         objects, so a retained entry keeps a dead pair addressable.
         """
         key = (id(loop), id(transport))
-        d = self._dispatchers.get(key)
+        d = self._lookup(loop, transport)
         if d is None:
             return
         d.set_acceptor(None)
@@ -1162,7 +1191,7 @@ class _DispatcherRegistry:
                 transport: TransportContext,
                 session: WebTransportSession) -> None:
         """Drop one session from its dispatcher; the dispatcher stays."""
-        d = self._dispatchers.get((id(loop), id(transport)))
+        d = self._lookup(loop, transport)
         if d is not None:
             d.remove_session(session)
 
@@ -1173,7 +1202,7 @@ class _DispatcherRegistry:
         acceptor is retired: its tasks cancelled and awaited, then its
         reader removed."""
         key = (id(loop), id(transport))
-        d = self._dispatchers.get(key)
+        d = self._lookup(loop, transport)
         if d is None:
             return
         d.remove_session(session)
@@ -1399,9 +1428,9 @@ async def serve_webtransport(
                     configuration, 'key_exchange_groups', None),
             )
         if wt_supported_protocols:
-            # Server subprotocol allowlist for WT-Protocol selection,
-            # newest-preferred. picowt matches the client's offered
-            # WT-Available-Protocols against this unquoted CSV.
+            # WT-Protocol allowlist, most preferred first: the server picks
+            # its first entry the client offered and refuses (400) an offer
+            # with no match.
             start_kwargs["wt_supported_protocols"] = ", ".join(
                 wt_supported_protocols)
         transport.start(**start_kwargs)

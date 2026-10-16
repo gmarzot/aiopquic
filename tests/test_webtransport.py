@@ -560,6 +560,16 @@ def test_wt_close_resets_and_stops_by_direction():
         f"exit {proc.returncode}\n{proc.stderr[-3000:]}")
 
 
+def test_wt_control_stream_freed_mid_session():
+    """h3zero frees CONNECT once both FINs are done, while the session
+    lives. The release is counted and a later close, FIN, drain or
+    deregister on the session must not touch the freed stream;
+    MALLOC_PERTURB_ poisons it so a read faults."""
+    proc = _run_close_scenario("ctl", MALLOC_PERTURB_="165")
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\n{proc.stderr[-3000:]}")
+
+
 @pytest.mark.asyncio
 async def test_wt_stop_sending_on_own_uni_is_dropped():
     """An app STOP_SENDING on our own uni stream is dropped and counted.
@@ -617,10 +627,9 @@ async def test_wt_stop_sending_on_own_uni_is_dropped():
             dropped = wt._transport.counters.get(
                 'tx_wrong_direction_dropped', 0) - before
             assert dropped == 1, f"expected 1 dropped request, got {dropped}"
-            # Ids only: a received STOP_SENDING's code is not exposed by
-            # picoquic's public API, so it surfaces as 0.
-            assert [sid for sid, _ in stops] == [bidi], (
-                f"peer saw STOP_SENDING {stops}, expected only bidi {bidi}")
+            assert stops == [(bidi, 0x10)], (
+                f"peer saw STOP_SENDING {stops}, expected only "
+                f"({bidi}, 0x10)")
     finally:
         server.close()
 

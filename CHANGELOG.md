@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.5.0rc1
+
+- WebTransport servers select the WT-Protocol by `wt_supported_protocols` order, not the
+  client's offer order.
+- A WebTransport CONNECT whose WT-Available-Protocols matches nothing in
+  `wt_supported_protocols` is refused with HTTP 400; a client offering none still connects.
+- Fix: WT-Available-Protocols items carrying Structured Field parameters match; picowt's
+  parser kept the parameters in the item.
+- A refused WebTransport CONNECT reports the server's HTTP status in its error.
+- A WebTransport path callback can choose the CONNECT error status, via a local picoquic patch.
+- Fix: an OPEN_FLOW_CONTROL dropped on a dead connection releases its stream-context
+  reference (counter `sc_destroy_fc_credit_dead_cnx`).
+- Fix: a WebTransport session no longer touches its CONNECT stream after h3zero frees it
+  (both FINs done); close, FIN, drain and deregister skip it (counter `wt_control_released`).
+- STOP_SENDING events carry the peer's error code (raw QUIC and WebTransport), via a local
+  picoquic patch.
+- Fix: `QuicConnection.stop()` frees stream contexts left by an `aclose()` that timed out.
+- Fix: `QuicEngine.close()` releases the datagram rings of connections whose close it never
+  routed.
+- Fix: the WebTransport dispatcher registry replaces a dispatcher filed for another
+  transport instead of reusing it.
+- An unknown `congestion_control_algorithm` raises `ValueError` from `QuicConfiguration`,
+  `TransportContext.start()` and the WebTransport entry points; it used to run with no
+  congestion control.
+- pytest deselects `interop` and `native` by default.
+- Fix: releasing a WebTransport session that never closed no longer queues a SESSION_CLOSED
+  for it, which dropped its live connection's snapshot.
+- Fix: lost wakes between the asyncio and network threads: the RX notify, TX wake and
+  per-stream RX event flags clear by exchange; stream, datagram and TX event ring drain arms
+  re-check after arming, so a writer no longer parks after the worker already drained.
+- `arm_tx_event_ring_drain_pending()` returns whether the caller may wait.
+- Fix: a stream we reset or stop reading releases its stream context (raw QUIC) or its h3zero
+  stream, link and stream context (WebTransport) once retired, not at connection or session end;
+  a WebTransport reset relies on a local picoquic patch retiring the stream when the
+  RESET_STREAM_AT is acked.
+- WebTransport stream data, FIN and reset events arriving after the session closed are dropped.
+- Fix: a raw QUIC bidi stream we open takes application flow control on its first byte received;
+  picoquic's own window could run past the RX ring and overflow it.
+- Fix: no MAX_STREAM_DATA once a stream's FIN arrived; the first-touch grant goes out only when
+  the handshake window is smaller than the RX ring (WebTransport sent one per stream).
+- Fix: WebTransport stream reset and STOP_SENDING codes travel in the WT_APPLICATION_ERROR range
+  and are mapped back on receipt (draft-ietf-webtrans-http3 §4.4); they went out raw.
+
 ## v0.5.0a4
 
 - Fix: a WebTransport session struct is freed only once picoquic cannot reach it; the GC

@@ -17,6 +17,7 @@ import pytest
 from aiopquic.asyncio.webtransport import WT_SESSION_GONE, connect_webtransport
 from aiopquic.quic.configuration import QuicConfiguration
 
+from ..test_wt_error_codes import to_h3
 from ..wt_close_scenarios import _frames_sent
 from .conftest import CA_FILE, CERT_FILE, KEY_FILE, _free_port
 
@@ -161,7 +162,8 @@ async def test_wt_reset_reaches_peer_without_reset_stream_at(tmp_path):
     """A stream reset reaches a peer that did not negotiate
     reset_stream_at, where RESET_STREAM_AT is not an option. The qlog must
     show the RESET_STREAM fallback frame, so the test fails rather than
-    passing without the fallback if the peer ever negotiates it."""
+    passing without the fallback if the peer ever negotiates it. aioquic
+    does not unmap WebTransport codes, so it reports the §4.4 wire value."""
     peer = await _start_peer()
     try:
         async with connect_webtransport(
@@ -179,12 +181,12 @@ async def test_wt_reset_reaches_peer_without_reset_stream_at(tmp_path):
             reset = await peer.wait_for(_reset_on(uni), 2.0)
             assert reset is not None, (
                 f"reset on stream {uni} never reached the peer: {peer.events}")
-            assert reset["error_code"] == 0x10
+            assert reset["error_code"] == to_h3(0x10)
     finally:
         await peer.stop()
     [qlog] = glob.glob(str(tmp_path / "*.client.qlog"))
-    assert ("reset_stream", uni, 0x10) in _frames_sent(qlog), (
-        f"no RESET_STREAM 0x10 on {uni}: {_frames_sent(qlog)}")
+    assert ("reset_stream", uni, to_h3(0x10)) in _frames_sent(qlog), (
+        f"no RESET_STREAM {to_h3(0x10):#x} on {uni}: {_frames_sent(qlog)}")
 
 
 async def test_wt_late_peer_stream_after_close_is_stopped():

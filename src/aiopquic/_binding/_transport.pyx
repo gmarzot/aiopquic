@@ -114,6 +114,7 @@ cdef extern from "picoquic.h":
         picoquic_quic_t* quic, const char* alg_name)
 
     void picoquic_register_all_congestion_control_algorithms()
+    const void* picoquic_get_congestion_algorithm(const char* alg_name)
 
     void picoquic_free(picoquic_quic_t* quic)
     uint64_t picoquic_current_time()
@@ -338,6 +339,8 @@ cdef extern from "c/callback.h":
         uint64_t cnt_sc_destroy_wt_link_close_walker
         uint64_t cnt_sc_destroy_fc_credit_pushfail
         uint64_t cnt_sc_destroy_fc_credit_worker
+        uint64_t cnt_sc_destroy_fc_credit_dead_cnx
+        uint64_t cnt_wt_control_released
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
                                           uint32_t rx_cap,
@@ -346,7 +349,7 @@ cdef extern from "c/callback.h":
     void aiopquic_clear_rx(aiopquic_ctx_t* ctx)
     void aiopquic_notify_rx(aiopquic_ctx_t* ctx)
     int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx)
-    void aiopquic_arm_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx)
+    int aiopquic_arm_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx)
     void aiopquic_clear_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx)
     void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx, void* cnx,
                                   uint64_t stream_id,
@@ -430,7 +433,6 @@ cdef extern from "c/datagram_buf.h":
     int aiopquic_dgram_buf_push_record(
         aiopquic_dgram_buf_t* db, const uint8_t* data, uint32_t length)
     uint32_t aiopquic_dgram_buf_used(aiopquic_dgram_buf_t* db)
-    void aiopquic_dgram_buf_arm_drain(aiopquic_dgram_buf_t* db)
     int64_t aiopquic_dgram_rings_alive_load()
 
 cdef extern from "c/callback.h":
@@ -639,6 +641,30 @@ cdef extern from "c/h3wt_callback.h":
 
 # Default ring sizing
 DEF DEFAULT_RING_CAPACITY = 262144
+
+
+_CC_NAMES = ("newreno", "reno", "cubic", "dcubic", "fast", "bbr", "bbr1",
+             "prague", "c4")
+
+
+def check_congestion_control_algorithm(name):
+    """Raise ValueError unless picoquic has an algorithm registered under
+    exactly `name` (str or bytes). None, picoquic's default, passes."""
+    if name is None:
+        return
+    cdef bytes b_name
+    if isinstance(name, str):
+        b_name = name.encode()
+    elif isinstance(name, bytes):
+        b_name = name
+    else:
+        raise ValueError(
+            f"congestion_control_algorithm must be a str, not {type(name).__name__}")
+    picoquic_register_all_congestion_control_algorithms()
+    if b"\0" in b_name or picoquic_get_congestion_algorithm(b_name) is NULL:
+        raise ValueError(
+            f"unknown congestion_control_algorithm {name!r}; "
+            f"expected one of {', '.join(_CC_NAMES)}")
 
 
 def tx_data_bytes_queued():
@@ -982,6 +1008,16 @@ cdef class TransportContext:
 
     This is the core bridge between the C picoquic library and Python.
     It owns the SPSC rings and the eventfd used for async notification.
+
+    Constructor arguments size the two event rings, in entries, rounded up
+    to a power of two; 0 takes the default:
+        tx_ring_cap: TX event ring, asyncio to worker (default 2048).
+        rx_data_ring_cap: RX event ring, worker to asyncio (default 16384).
+            Not a byte ring: start(rx_data_ring_cap=) sizes each stream's
+            RX bytes.
+        ring_capacity: both, where the specific argument is 0.
+        tx_event_ring_low_water_pct: TX ring fill, in percent, below which a
+            parked writer is woken (default 50).
     """
     # Make cdef class weakref-able so the SIGUSR2 counter-dump registry
     # (_TRANSPORT_REGISTRY at module level above) can hold WeakRef
@@ -1184,6 +1220,7 @@ cdef class TransportContext:
             # WT sc/link leak diagnostic (added 2026-06-06).
             # Growth rate ~ sc leak rate per cnx.
             'wt_callback_free_skipped': self._ctx.cnt_wt_callback_free_skipped,
+            'wt_control_released': self._ctx.cnt_wt_control_released,
             # Per-site sc create/ref/destroy counters (added 2026-06-06).
             # See stream_ctx.h block comment for the balance invariant.
             'sc_create_raw_quic': self._ctx.cnt_sc_create_raw_quic,
@@ -1193,6 +1230,8 @@ cdef class TransportContext:
             'sc_destroy_wt_link_close_walker': self._ctx.cnt_sc_destroy_wt_link_close_walker,
             'sc_destroy_fc_credit_pushfail': self._ctx.cnt_sc_destroy_fc_credit_pushfail,
             'sc_destroy_fc_credit_worker': self._ctx.cnt_sc_destroy_fc_credit_worker,
+            'sc_destroy_fc_credit_dead_cnx':
+                self._ctx.cnt_sc_destroy_fc_credit_dead_cnx,
             'sc_ref_chunk_wrap_total': aiopquic_cnt_sc_ref_chunk_wrap_load(),
             'sc_destroy_chunk_dealloc_total': aiopquic_cnt_sc_destroy_chunk_dealloc_load(),
             'sc_destroy_rx_event_total': aiopquic_cnt_sc_destroy_rx_event_load(),
@@ -1657,26 +1696,21 @@ cdef class TransportContext:
         return self._tx_event_ring_drain_event
 
     def arm_tx_event_ring_drain_pending(self):
-        """Atomically set tx_event_ring_drain_pending = 1. The worker's
-        post-pop check (aiopquic_maybe_fire_tx_event_ring_drained in
-        callback.h) CAS-clears this and fires SPSC_EVT_TX_EVENT_RING_DRAINED
-        when ring count drops to/below tx_event_ring_low_water.
+        """Arm SPSC_EVT_TX_EVENT_RING_DRAINED, fired once the TX event ring
+        is at or below tx_event_ring_low_water. Returns True when the caller
+        may await tx_event_ring_drain_event, False when the ring is already
+        there (retry instead; the arm stays and may wake later).
 
-        Use pattern (caller side):
             event = tx.tx_event_ring_drain_event
             event.clear()
-            tx.arm_tx_event_ring_drain_pending()
-            if tx_event_ring_fill > wait_threshold:
-                await event.wait()       # safe: worker will fire
-            else:
-                tx.clear_tx_event_ring_drain_pending()  # raced, clear arm
+            if tx.arm_tx_event_ring_drain_pending():
+                await event.wait()
         """
-        aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
+        return aiopquic_arm_tx_event_ring_drain_pending(self._ctx) != 0
 
     def clear_tx_event_ring_drain_pending(self):
-        """Clear the arm without waiting. Use when the producer
-        re-checks pressure after arming and finds it has already
-        dropped below the wait threshold (raced with worker drain)."""
+        """Clear the arm without waiting. Unsafe while another waiter
+        relies on the same arm."""
         aiopquic_clear_tx_event_ring_drain_pending(self._ctx)
 
     def drain_rx(self, int max_events=256):
@@ -2262,12 +2296,11 @@ cdef class TransportContext:
         # MARK_ACTIVE event we'll push after committing bytes.
         # Without this, retry semantics duplicate bytes on the wire.
         # Single-producer (asyncio thread) ⇒ no TOCTOU window.
-        if spsc_ring_count(self._ctx.tx_event_ring) >= self._ctx.tx_event_ring.capacity:
-            # Arm the connection-global drain wakeup BEFORE returning
-            # rc=1 so the caller can await tx_event_ring_drain_event without
-            # losing the wakeup. Worker fires SPSC_EVT_TX_EVENT_RING_DRAINED
-            # when the ring drops to/below low_water.
-            aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
+        if (spsc_ring_count(self._ctx.tx_event_ring) >= self._ctx.tx_event_ring.capacity
+                and aiopquic_arm_tx_event_ring_drain_pending(self._ctx)):
+            # Armed before returning rc=1, so the caller can await
+            # tx_event_ring_drain_event without losing the wakeup. An arm
+            # that finds the ring already drained falls through.
             self._send_busy_event_ring += 1
             return 1
 
@@ -2418,9 +2451,9 @@ cdef class TransportContext:
         entry.event_type = SPSC_EVT_TX_MARK_DATAGRAM_READY
         entry.cnx = <void*>cnx_ptr
         entry.stream_ctx = <void*>db_ptr
-        if spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
-            aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
-            return 1
+        while spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            if aiopquic_arm_tx_event_ring_drain_pending(self._ctx):
+                return 1
         self._ctx.cnt_tx_event_ring_pushes += 1
         if self._thread_ctx is not NULL:
             if aiopquic_tx_wake_set_pending(self._ctx) == 0:
@@ -2444,7 +2477,6 @@ cdef class TransportContext:
         cdef uint32_t n = <uint32_t>len(data)
         cdef int rc = aiopquic_dgram_buf_push_record(db, buf, n)
         if rc == 0:
-            aiopquic_dgram_buf_arm_drain(db)
             return 0
         if rc < 0:
             return -1
@@ -2463,9 +2495,9 @@ cdef class TransportContext:
         entry.cnx = <void*>cnx_ptr
         entry.stream_id = stream_id
         entry.error_code = priority
-        if spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
-            aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
-            return 1
+        while spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            if aiopquic_arm_tx_event_ring_drain_pending(self._ctx):
+                return 1
         self._ctx.cnt_tx_event_ring_pushes += 1
         if self._thread_ctx is not NULL:
             if aiopquic_tx_wake_set_pending(self._ctx) == 0:
@@ -2491,7 +2523,6 @@ cdef class TransportContext:
         cdef uint32_t n = <uint32_t>len(data)
         cdef int rc = aiopquic_dgram_buf_push_record(db, buf, n)
         if rc == 0:
-            aiopquic_dgram_buf_arm_drain(db)
             return 0
         if rc < 0:
             return -1
@@ -2660,6 +2691,12 @@ cdef class TransportContext:
                 DEFAULT_KEY_EXCHANGE_GROUPS. picoquic keeps one order
                 per process, so the last start() wins.
             idle_timeout_ms: Idle timeout in milliseconds.
+            rx_data_ring_cap: Per-stream RX byte ring, in bytes, and the
+                advertised stream window. 0: a 4 MiB ring and picoquic's
+                default window.
+            congestion_control_algorithm: picoquic algorithm name, matched
+                exactly; an unknown name raises ValueError. None keeps
+                picoquic's default (newreno).
             max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
             wt_path: Server-mode WebTransport path (e.g. "/moq").
                 When set, uses h3zero_callback as picoquic's default
@@ -2672,6 +2709,7 @@ cdef class TransportContext:
         """
         if self._started:
             raise RuntimeError("Transport already started")
+        check_congestion_control_algorithm(congestion_control_algorithm)
 
         # Stash per-stream RX ring capacity on the C ctx so the
         # stream_data callback sizes per-stream byte rings to match the
@@ -2799,9 +2837,8 @@ cdef class TransportContext:
         if alpn_list and not is_client:
             picoquic_set_alpn_select_fn_v2(self._quic, aiopquic_alpn_select_cb)
 
-        # Optional congestion-control selection. None defers to picoquic's
-        # compile-time default (newreno). Unknown names fall back the
-        # same way (picoquic logs a warning and keeps the default).
+        # Congestion control, checked above. None keeps picoquic's
+        # compile-time default (newreno).
         cdef bytes _b_cc
         cdef const char* _c_cc
         if congestion_control_algorithm is not None:
@@ -3236,8 +3273,8 @@ cdef class WebTransportSessionState:
     @property
     def negotiated_wt_protocol(self):
         """The WebTransport subprotocol negotiated for this session, or
-        None. Server side: what picowt_select_wt_protocol chose from the
-        client's WT-Available-Protocols against the configured allowlist.
+        None. Server side: the first allowlist entry the client offered in
+        WT-Available-Protocols.
         Client side: the WT-Protocol the server selected, read from the
         CONNECT response. Both are captured (copied) on the picoquic
         thread when the session is established, so this is safe to read
@@ -3430,12 +3467,12 @@ cdef class WebTransportSessionState:
         # Without this, retry semantics could duplicate bytes.
         # Single-producer (asyncio thread) ⇒ no TOCTOU window.
         if (spsc_ring_count(self._transport._ctx.tx_event_ring) >=
-                self._transport._ctx.tx_event_ring.capacity):
-            # Arm the connection-global drain wakeup BEFORE raising so
-            # the caller can await tx_event_ring_drain_event without losing
-            # the wakeup. Worker fires SPSC_EVT_TX_EVENT_RING_DRAINED when
-            # the ring drops to/below low_water.
-            aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx)
+                self._transport._ctx.tx_event_ring.capacity
+                and aiopquic_arm_tx_event_ring_drain_pending(
+                    self._transport._ctx)):
+            # Armed before raising, so the caller can await
+            # tx_event_ring_drain_event without losing the wakeup. An arm
+            # that finds the ring already drained falls through.
             raise BufferError(
                 f"TX event ring full (WT stream={stream_id})"
             )
@@ -3542,10 +3579,10 @@ cdef class WebTransportSessionState:
         entry.cnx = <void*>self._wt
         entry.stream_ctx = <void*>self._wt
         entry.error_code = <uint64_t>db_ptr
-        if spsc_ring_push(
+        while spsc_ring_push(
                 self._transport._ctx.tx_event_ring, &entry, NULL, 0) != 0:
-            aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx)
-            return 1
+            if aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx):
+                return 1
         self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
         return 0
@@ -3561,13 +3598,12 @@ cdef class WebTransportSessionState:
         entry.stream_ctx = <void*>self._wt
         entry.stream_id = stream_id
         entry.error_code = priority
-        if spsc_ring_push(
+        while spsc_ring_push(
                 self._transport._ctx.tx_event_ring, &entry, NULL, 0) != 0:
-            # Arm before reporting full, as the raw twin does: a caller
-            # that awaits tx_event_ring_drain_event on a 1 never wakes
-            # otherwise.
-            aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx)
-            return 1
+            # Armed before reporting full: a caller that awaits
+            # tx_event_ring_drain_event on a 1 never wakes otherwise.
+            if aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx):
+                return 1
         self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
         return 0
@@ -3609,6 +3645,27 @@ cdef class WebTransportSessionState:
 #   ... wait for ring to drain ...
 #   stream_buf_destroy(sb)
 # ---------------------------------------------------------------------------
+
+cdef extern from "c/litmus.h":
+    int64_t aiopquic_litmus_run(int kind, uint64_t rounds) nogil
+
+_LITMUS_KINDS = {
+    'rx_notify': 0, 'tx_wake': 1, 'rx_event': 2,
+    'tx_drain': 3, 'tx_ring': 4, 'dgram': 5,
+}
+
+
+def _litmus(str kind, uint64_t n):
+    """Race one wake protocol's two sides on two threads for n rounds.
+    Returns the number of lost wakes (test only)."""
+    cdef int k = _LITMUS_KINDS[kind]
+    cdef int64_t lost
+    with nogil:
+        lost = aiopquic_litmus_run(k, n)
+    if lost < 0:
+        raise MemoryError("litmus setup failed")
+    return lost
+
 
 def stream_buf_create(uint32_t capacity):
     """Allocate a per-stream send buffer of `capacity` bytes (power of 2).

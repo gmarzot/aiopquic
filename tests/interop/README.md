@@ -9,8 +9,9 @@ Cross-stack tests against independent QUIC implementations.
 | qh3      | Python   | `pip install qh3` (transitive)  | **yes**     | basic byte-conservation smoke (1MB/10MB) |
 | aioquic  | Python   | `pip install aioquic`           | **yes**     | reference asyncio QUIC cross-check; strict WebTransport peer |
 
-CI runs the pure-Python qh3 and aioquic tests by default — they need no extra
-binaries; they're an optional developer-machine harness, not a release gate.
+CI's `peer interop` job installs `aioquic` and `qh3<2` and runs
+`test_aioquic.py`, `test_aioquic_wt.py` and `test_qh3.py`; they need no extra
+binaries. A test whose peer is not installed is skipped.
 
 The package wheel does not ship any of these test peers. They live entirely
 under `tests/interop/` and exist to validate aiopquic's transport against
@@ -19,8 +20,8 @@ genuinely independent QUIC stacks during dev and pre-release.
 ## Run
 
 ```
-# Default (CI shape) — runs qh3 only:
-pytest tests/interop/ -v
+# Needs: pip install aioquic 'qh3<2'
+python -m pytest tests/interop/ -v
 ```
 
 ## qh3

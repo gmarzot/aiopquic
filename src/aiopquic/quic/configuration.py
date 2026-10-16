@@ -92,10 +92,10 @@ class QuicConfiguration:
     # GIL-induced loss blips common on loopback and loaded hosts) and
     # free of the picoquic "bbr" (v3) sub-128µs-RTT cwnd freeze
     # (upstream #2118). Other values: "newreno", "cubic", "bbr",
-    # "prague" (L4S/ECN), "dcubic", "fast". None defers to picoquic's
-    # compile-time default (newreno). The string is passed verbatim to
-    # picoquic_set_default_congestion_algorithm_by_name; an unknown
-    # name falls back to the compile-time default.
+    # "prague" (L4S/ECN), "dcubic", "fast", "c4", "reno" (= newreno).
+    # Matched exactly; an unknown name raises ValueError here and at
+    # transport start. None defers to picoquic's compile-time default
+    # (newreno).
     congestion_control_algorithm: str | None = "bbr1"
     # SPSC TX/RX event ring capacity (entries — must be a power of 2).
     # Each event is an ~64 B notification between the picoquic worker
@@ -142,6 +142,12 @@ class QuicConfiguration:
     # 1 Gbps × 33 ms); raise for high-BDP WAN paths, lower for
     # tighter latency budgets. None or 0 disables.
     tx_max_queued_bytes: int | None = 4 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        from aiopquic._binding._transport import (
+            check_congestion_control_algorithm,
+        )
+        check_congestion_control_algorithm(self.congestion_control_algorithm)
 
     def load_cert_chain(self, certfile: str, keyfile: str | None = None,
                         password: str | None = None) -> None:
