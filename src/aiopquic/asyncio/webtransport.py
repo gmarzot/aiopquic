@@ -510,14 +510,21 @@ class WebTransportSession:
         sent, else with RESET_STREAM. Unsent bytes stop counting against the
         TX budget, and later or parked writes on the stream raise
         WebTransportError. On a stream we only receive on, the request is
-        dropped and counted in tx_wrong_direction_dropped."""
+        dropped and counted in tx_wrong_direction_dropped.
+
+        error_code is a 32-bit application code, sent in the
+        WT_APPLICATION_ERROR range (draft-ietf-webtrans-http3 §4.4); larger
+        values are HTTP/3 codes (WT_SESSION_GONE) and go out unchanged.
+        Received reset and STOP_SENDING codes are mapped back the same way;
+        a code outside the range is delivered as received."""
         self._state.push_reset_stream(stream_id, error_code)
         self._drop_stream_tx(stream_id)
 
     def stop_stream(self, stream_id: int, error_code: int = 0) -> None:
         """Send STOP_SENDING on a WT stream we receive on (the peer should
         reset it). On our own uni stream, the request is dropped and
-        counted in tx_wrong_direction_dropped."""
+        counted in tx_wrong_direction_dropped. error_code is mapped as in
+        reset_stream()."""
         self._state.push_stop_sending(stream_id, error_code)
 
     def set_stream_priority(self, stream_id: int, priority: int) -> int:

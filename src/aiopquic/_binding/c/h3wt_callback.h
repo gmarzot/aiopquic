@@ -60,6 +60,29 @@ typedef enum {
  * a peer needs to tell session teardown from an ordinary stream reset. */
 #define AIOPQUIC_WT_SESSION_GONE 0x170d7b68u
 
+/* WT_APPLICATION_ERROR (draft-ietf-webtrans-http3 §4.4): a 32-bit stream
+ * application code travels as an HTTP/3 code in this range, skipping the
+ * reserved 0x1f * N + 0x21 codepoints. Codes above 32 bits are HTTP/3 codes
+ * already (WT_SESSION_GONE) and pass through both ways. */
+#define AIOPQUIC_WT_APP_ERROR_FIRST 0x52e4a40fa8dbull
+#define AIOPQUIC_WT_APP_ERROR_LAST  0x52e5ac983162ull
+
+static inline uint64_t aiopquic_wt_code_to_h3(uint64_t code) {
+    if (code > 0xffffffffull) return code;
+    return AIOPQUIC_WT_APP_ERROR_FIRST + code + code / 0x1e;
+}
+
+/* A code outside the range, or a reserved codepoint in it, carries no
+ * application code and is delivered as received. */
+static inline uint64_t aiopquic_wt_code_from_h3(uint64_t h) {
+    if (h < AIOPQUIC_WT_APP_ERROR_FIRST || h > AIOPQUIC_WT_APP_ERROR_LAST
+            || (h - 0x21) % 0x1f == 0) {
+        return h;
+    }
+    uint64_t shifted = h - AIOPQUIC_WT_APP_ERROR_FIRST;
+    return shifted - shifted / 0x1f;
+}
+
 /*
  * Packed payload for SPSC_EVT_TX_WT_OPEN. Stored as data_buf:
  *   header + sni + path + protocols.
@@ -793,18 +816,14 @@ static int aiopquic_wt_path_callback(
                 }
                 return -1;
             }
-            /* FC management: at first-touch we grant the initial buffer
-             * capacity to peer (buf_free post-push = capacity - length).
-             * From then on, peer's credit is REPLENISHED by Python's
-             * drain side via SPSC_EVT_TX_OPEN_FLOW_CONTROL — see
-             * _transport.pyx drain_rx. The worker doing extension here
-             * inside post_data can't unblock a peer that's FC-stalled
-             * (no inbound bytes → no callback → no extension), so we
-             * rely on the consumer-driven model from picoquic's own
-             * flow_control_test pattern. */
+            /* First touch extends the handshake window to the ring only
+             * when the window is smaller; replenishment is consumer-driven
+             * (SPSC_EVT_TX_OPEN_FLOW_CONTROL from drain_rx). */
             if (rx_first) {
-                uint32_t buf_free = aiopquic_stream_buf_free(sc->rx);
-                (void)picoquic_open_flow_control(cnx, sid, buf_free);
+                if (aiopquic_initial_rx_window(cnx, sid) < advertise_cap) {
+                    uint32_t buf_free = aiopquic_stream_buf_free(sc->rx);
+                    (void)picoquic_open_flow_control(cnx, sid, buf_free);
+                }
                 aiopquic_stream_ctx_rx_credit_store(sc, advertise_cap);
             }
             if (first_touch) {
@@ -872,14 +891,8 @@ static int aiopquic_wt_path_callback(
             }
             aiopquic_stream_buf_set_fin(sc->rx);
 
-            /* On FIN we still need to issue a MAX_STREAM_DATA grant on
-             * first-touch so picoquic's accounting matches our buffer
-             * state; subsequent extensions are unnecessary since the
-             * stream is over. See post_data above for the rationale on
-             * passing buf_free. */
+            /* All data has arrived: no grant (RFC 9000 §3.3). */
             if (rx_first) {
-                uint32_t buf_free = aiopquic_stream_buf_free(sc->rx);
-                (void)picoquic_open_flow_control(cnx, sid, buf_free);
                 aiopquic_stream_ctx_rx_credit_store(
                     sc, aiopquic_stream_ctx_rx_consumed_load(sc) + advertise_cap);
             }
@@ -1032,7 +1045,8 @@ static int aiopquic_wt_path_callback(
         } else {
             aiopquic_wt_push_event(s, SPSC_EVT_WT_STREAM_RESET,
                                     sid,
-                                    picoquic_get_remote_stream_error(cnx, sid),
+                                    aiopquic_wt_code_from_h3(
+                                        picoquic_get_remote_stream_error(cnx, sid)),
                                     NULL, 0);
             /* link is freed at picohttp_callback_free below. */
         }
@@ -1050,7 +1064,8 @@ static int aiopquic_wt_path_callback(
         }
         aiopquic_wt_push_event(s, SPSC_EVT_WT_STOP_SENDING,
                                 sid,
-                                picoquic_get_remote_stop_sending_error(cnx, sid),
+                                aiopquic_wt_code_from_h3(
+                                    picoquic_get_remote_stop_sending_error(cnx, sid)),
                                 NULL, 0);
         /* link is freed at picohttp_callback_free below. */
         break;
@@ -1456,7 +1471,8 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
             ctx->cnt_tx_wrong_direction_dropped++;
             return 1;
         }
-        if (aiopquic_wt_reset_stream(s->cnx, st, entry->error_code) == 0) {
+        if (aiopquic_wt_reset_stream(s->cnx, st,
+                aiopquic_wt_code_to_h3(entry->error_code)) == 0) {
             aiopquic_wt_abandon_stream_tx(s, st);
         }
         aiopquic_wt_stream_reattach(s->cnx, st);
@@ -1507,7 +1523,7 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (!s || !s->cnx) return 1;
         if (aiopquic_stream_can_receive(s->cnx, entry->stream_id)) {
             picoquic_stop_sending(s->cnx, entry->stream_id,
-                                   entry->error_code);
+                                   aiopquic_wt_code_to_h3(entry->error_code));
             h3zero_callback_ctx_t* h3_ctx =
                 (h3zero_callback_ctx_t*)picoquic_get_callback_context(s->cnx);
             h3zero_stream_ctx_t* st =
