@@ -1389,6 +1389,19 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     return 0;
 }
 
+/* picoquic_reset_stream and picoquic_stop_sending detach the stream's app
+ * ctx, so stream_released, which frees sc, would never fire: put sc back.
+ * sc rides the TX event without a reference; a stream picoquic still has
+ * (rc is not INVALID_STREAM_ID) still holds the stream's reference.
+ * Returns sc when reattached, else NULL. */
+static inline aiopquic_stream_ctx_t* aiopquic_stream_reattach(
+        picoquic_cnx_t* cnx, const spsc_entry_t* entry, int rc) {
+    aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)entry->stream_ctx;
+    if (sc == NULL || rc == PICOQUIC_ERROR_INVALID_STREAM_ID) return NULL;
+    (void)picoquic_set_app_stream_ctx(cnx, entry->stream_id, sc);
+    return sc;
+}
+
 /*
  * Packet loop callback — handles wake-up events to drain the TX ring.
  */
@@ -1607,7 +1620,10 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     }
                     case SPSC_EVT_TX_STREAM_RESET: {
                         if (aiopquic_stream_can_send(cnx, entry->stream_id)) {
-                            picoquic_reset_stream(cnx, entry->stream_id, entry->error_code);
+                            int rr = picoquic_reset_stream(cnx, entry->stream_id,
+                                                           entry->error_code);
+                            aiopquic_stream_ctx_tx_abandon(
+                                aiopquic_stream_reattach(cnx, entry, rr));
                         } else {
                             ctx->cnt_tx_wrong_direction_dropped++;
                         }
@@ -1617,7 +1633,9 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     }
                     case SPSC_EVT_TX_STOP_SENDING: {
                         if (aiopquic_stream_can_receive(cnx, entry->stream_id)) {
-                            picoquic_stop_sending(cnx, entry->stream_id, entry->error_code);
+                            int rr = picoquic_stop_sending(cnx, entry->stream_id,
+                                                           entry->error_code);
+                            (void)aiopquic_stream_reattach(cnx, entry, rr);
                         } else {
                             ctx->cnt_tx_wrong_direction_dropped++;
                         }

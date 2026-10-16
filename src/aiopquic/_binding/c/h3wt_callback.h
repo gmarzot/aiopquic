@@ -1246,6 +1246,15 @@ static int aiopquic_wt_reset_stream(picoquic_cnx_t* cnx,
     return picoquic_reset_stream(cnx, st->stream_id, code);
 }
 
+/* picoquic_reset_stream and picoquic_stop_sending detach h3zero's stream
+ * ctx, so the stream would never be released and h3zero would keep it,
+ * its link and its sc until the session ends: put it back. A stream
+ * picoquic already deleted is left alone (set fails on it). */
+static void aiopquic_wt_stream_reattach(picoquic_cnx_t* cnx,
+                                        h3zero_stream_ctx_t* st) {
+    (void)picoquic_set_app_stream_ctx(cnx, st->stream_id, st);
+}
+
 /* picoquic sends nothing more on a reset stream: release what is still
  * queued in its ring, crediting the TX totals. */
 static void aiopquic_wt_abandon_stream_tx(aiopquic_wt_session_t* s,
@@ -1450,6 +1459,7 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (aiopquic_wt_reset_stream(s->cnx, st, entry->error_code) == 0) {
             aiopquic_wt_abandon_stream_tx(s, st);
         }
+        aiopquic_wt_stream_reattach(s->cnx, st);
         return 1;
     }
 
@@ -1498,6 +1508,11 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (aiopquic_stream_can_receive(s->cnx, entry->stream_id)) {
             picoquic_stop_sending(s->cnx, entry->stream_id,
                                    entry->error_code);
+            h3zero_callback_ctx_t* h3_ctx =
+                (h3zero_callback_ctx_t*)picoquic_get_callback_context(s->cnx);
+            h3zero_stream_ctx_t* st =
+                h3_ctx ? h3zero_find_stream(h3_ctx, entry->stream_id) : NULL;
+            if (st) aiopquic_wt_stream_reattach(s->cnx, st);
         } else {
             ctx->cnt_tx_wrong_direction_dropped++;
         }
@@ -1551,6 +1566,7 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                                 picoquic_stop_sending(s->cnx, st->stream_id,
                                                       AIOPQUIC_WT_SESSION_GONE);
                             }
+                            aiopquic_wt_stream_reattach(s->cnx, st);
                             st->path_callback = NULL;
                             st->path_callback_ctx = NULL;
                             aiopquic_stream_ctx_tx_abandon(lk->sc);

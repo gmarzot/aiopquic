@@ -31,6 +31,10 @@
   per-stream RX event flags clear by exchange; stream, datagram and TX event ring drain arms
   re-check after arming, so a writer no longer parks after the worker already drained.
 - `arm_tx_event_ring_drain_pending()` returns whether the caller may wait.
+- Fix: a raw QUIC stream we reset or stop reading releases its stream context once retired, and
+  a WebTransport stream we stop reading its h3zero stream, link and stream context, not at
+  connection or session end.
+- WebTransport stream data, FIN and reset events arriving after the session closed are dropped.
 
 ## v0.5.0a4
 
