@@ -327,8 +327,8 @@ static inline void aiopquic_set_tx_data_drain_pending(
     if (!sc) return;
     sc->cnt_drain_arms++;
     sc->last_drain_arm_ns = aiopquic_now_ns();
-    atomic_store_explicit(&sc->tx_drain_pending, 1,
-                          memory_order_release);
+    (void)atomic_exchange_explicit(&sc->tx_drain_pending, 1,
+                                   memory_order_acq_rel);
 }
 
 static inline void aiopquic_clear_tx_data_drain_pending(
@@ -336,6 +336,14 @@ static inline void aiopquic_clear_tx_data_drain_pending(
     if (!sc) return;
     atomic_store_explicit(&sc->tx_drain_pending, 0,
                           memory_order_release);
+}
+
+/* Worker, after pulling from sc->tx: 1 if a writer armed the drain
+ * signal and this call took it (the caller emits STREAM_TX_DRAINED).
+ * An exchange, so a writer's arm is ordered against the pull. */
+static inline int aiopquic_stream_ctx_tx_drain_take(aiopquic_stream_ctx_t* sc) {
+    return atomic_exchange_explicit(&sc->tx_drain_pending, 0,
+                                    memory_order_acq_rel) == 1;
 }
 
 static inline int aiopquic_stream_ctx_ensure_tx(aiopquic_stream_ctx_t* sc,
@@ -470,23 +478,22 @@ static inline void aiopquic_stream_ctx_last_fc_push_consumed_store(
                           memory_order_relaxed);
 }
 
-/* rx_event_pending arm/clear. Arm is CAS 0->1: returns 1 iff THIS caller
- * won and must push the notification event; 0 means one is already in
- * flight. Clear is a plain release store, done by the drain side
- * BEFORE it pops sc->rx (so a concurrent post-clear arrival re-arms;
- * worst case one harmless empty notification). */
+/* rx_event_pending arm/clear. Arm returns 1 iff this caller set it and
+ * must push the notification event; 0 means one is already in flight.
+ * The drain side clears BEFORE it pops sc->rx, so an arrival after the
+ * clear re-arms (worst case one empty notification). Both are exchanges:
+ * with a store or a failed CAS, each side's ring access could pass its
+ * flag access and the bytes would sit unnotified. */
 static inline int aiopquic_stream_ctx_rx_event_pending_arm(
         aiopquic_stream_ctx_t* sc) {
-    uint32_t expected = 0;
-    return atomic_compare_exchange_strong_explicit(
-        &sc->rx_event_pending, &expected, 1,
-        memory_order_acq_rel, memory_order_relaxed) ? 1 : 0;
+    return atomic_exchange_explicit(&sc->rx_event_pending, 1,
+                                    memory_order_acq_rel) == 0;
 }
 
 static inline void aiopquic_stream_ctx_rx_event_pending_clear(
         aiopquic_stream_ctx_t* sc) {
-    atomic_store_explicit(&sc->rx_event_pending, 0,
-                          memory_order_release);
+    (void)atomic_exchange_explicit(&sc->rx_event_pending, 0,
+                                   memory_order_acq_rel);
 }
 
 /* Combined send-data fast path. Atomic from Python's perspective:
@@ -532,13 +539,17 @@ static inline int aiopquic_stream_ctx_send_data(
         if (free_bytes < len) {
             /* Arm the edge-trigger so the worker emits one
              * SPSC_EVT_STREAM_TX_DRAINED when it next drains bytes
-             * from sc->tx. Caller awaits on the matching asyncio
-             * Event instead of polling sleep. */
+             * from sc->tx, then re-check: a drain that finished before
+             * the arm took nothing and may not run again. */
             sc->cnt_drain_arms++;
             sc->last_drain_arm_ns = aiopquic_now_ns();
-            atomic_store_explicit(&sc->tx_drain_pending, 1,
-                                  memory_order_release);
-            return 0;
+            (void)atomic_exchange_explicit(&sc->tx_drain_pending, 1,
+                                           memory_order_acq_rel);
+            head = atomic_load_explicit(&sc->tx->head, memory_order_acquire);
+            free_bytes = sc->tx->capacity - (uint32_t)(tail - head);
+            if (free_bytes < len) return 0;
+            /* Room after all: push. The arm stays (another waiter may
+             * own it); the worst case is one spurious wake. */
         }
         uint32_t accepted = aiopquic_stream_buf_push(sc->tx, data, len);
         if (accepted != len) return 0;  /* defensive; shouldn't happen */

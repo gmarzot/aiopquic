@@ -27,6 +27,15 @@
 - pytest deselects `interop` and `native` by default.
 - Fix: releasing a WebTransport session that never closed no longer queues a SESSION_CLOSED
   for it, which dropped its live connection's snapshot.
+- Fix: lost wakes between the asyncio and network threads: the RX notify, TX wake and
+  per-stream RX event flags clear by exchange; stream, datagram and TX event ring drain arms
+  re-check after arming, so a writer no longer parks after the worker already drained.
+- `arm_tx_event_ring_drain_pending()` returns whether the caller may wait.
+- Fix: a stream we reset or stop reading releases its stream context (raw QUIC) or its h3zero
+  stream, link and stream context (WebTransport) once retired, not at connection or session end;
+  a WebTransport reset relies on a local picoquic patch retiring the stream when the
+  RESET_STREAM_AT is acked.
+- WebTransport stream data, FIN and reset events arriving after the session closed are dropped.
 
 ## v0.5.0a4
 

@@ -463,10 +463,9 @@ class WebTransportSession:
             # armed when sc->tx fills).
             if self.tx_event_ring_fill() > hard_wait_at:
                 ring_event.clear()
-                self._transport.arm_tx_event_ring_drain_pending()
-                if self.tx_event_ring_fill() <= hard_wait_at:
-                    # Raced — worker drained between checks.
-                    self._transport.clear_tx_event_ring_drain_pending()
+                # Re-check after the arm: the worker may have drained since.
+                if (not self._transport.arm_tx_event_ring_drain_pending()
+                        or self.tx_event_ring_fill() <= hard_wait_at):
                     continue
                 await ring_event.wait()
                 continue
@@ -671,11 +670,11 @@ class WebTransportSession:
         ring_ev = self._transport.tx_event_ring_drain_event
         for _ in range(3):
             ring_ev.clear()
-            self._transport.arm_tx_event_ring_drain_pending()
-            try:
-                await asyncio.wait_for(ring_ev.wait(), 1.0)
-            except asyncio.TimeoutError:
-                pass
+            if self._transport.arm_tx_event_ring_drain_pending():
+                try:
+                    await asyncio.wait_for(ring_ev.wait(), 1.0)
+                except asyncio.TimeoutError:
+                    pass
             try:
                 push()
                 return
@@ -804,6 +803,9 @@ class WebTransportSession:
         # Hot branches first: data, FIN, and TX-drain wakes dominate
         # the event stream; session-lifecycle events are rare.
         if evt_type == _EVT_WT_STREAM_DATA:
+            if self._session_closed.is_set():
+                # Inbox queues are gone; a new one would pin the payload.
+                return
             payload = data if data is not None else memoryview(b"")
             ev = WebTransportStreamDataReceived(
                 stream_id=sid, data=payload, end_stream=False)
@@ -812,6 +814,8 @@ class WebTransportSession:
                 self._stream_inbox[sid] = q = asyncio.Queue()
             q.put_nowait(ev)
         elif evt_type == _EVT_WT_STREAM_FIN:
+            if self._session_closed.is_set():
+                return
             payload = data if data is not None else memoryview(b"")
             ev = WebTransportStreamDataReceived(
                 stream_id=sid, data=payload, end_stream=True)
@@ -877,6 +881,8 @@ class WebTransportSession:
                     fut.set_result(0 if error_code != 0 else sid)
                     break
         elif evt_type == _EVT_WT_STREAM_RESET:
+            if self._session_closed.is_set():
+                return
             ev = WebTransportStreamReset(stream_id=sid,
                                             error_code=error_code)
             q = self._stream_inbox.get(sid)

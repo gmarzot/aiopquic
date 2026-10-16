@@ -46,9 +46,8 @@ typedef struct {
     _Atomic(uint64_t) head;     /* consumer-advanced; total bytes read */
     _Atomic(uint32_t) refcnt;
     /* Edge-trigger backpressure flag, mirrors sc->tx_drain_pending:
-     * producer sets 1 after a full push; worker CAS-clears after a pop
-     * and emits one SPSC_EVT_DATAGRAM_TX_DRAINED so a blocked writer
-     * can retry. */
+     * a full push sets 1; the worker takes it after a pop and emits one
+     * SPSC_EVT_DATAGRAM_TX_DRAINED so a blocked writer can retry. */
     _Atomic(uint32_t) drain_pending;
     /* Counters, single-writer each (producer / worker). */
     uint64_t records_pushed;    /* producer */
@@ -142,8 +141,17 @@ static inline int aiopquic_dgram_buf_push_record(
     uint64_t head = atomic_load_explicit(&db->head, memory_order_acquire);
     uint32_t free_bytes = db->capacity - (uint32_t)(tail - head);
     if (free_bytes < AIOPQUIC_DGRAM_REC_HDR + len) {
-        db->push_full++;
-        return 0;
+        /* Arm the drain signal, then re-check: a pop that finished
+         * before the arm took nothing and may not run again. */
+        (void)atomic_exchange_explicit(&db->drain_pending, 1,
+                                       memory_order_acq_rel);
+        head = atomic_load_explicit(&db->head, memory_order_acquire);
+        free_bytes = db->capacity - (uint32_t)(tail - head);
+        if (free_bytes < AIOPQUIC_DGRAM_REC_HDR + len) {
+            db->push_full++;
+            return 0;
+        }
+        /* Room after all: push, leaving the arm (one spurious wake). */
     }
     uint8_t hdr[AIOPQUIC_DGRAM_REC_HDR];
     hdr[0] = (uint8_t)(len & 0xff);
@@ -188,10 +196,11 @@ static inline uint32_t aiopquic_dgram_buf_used(aiopquic_dgram_buf_t* db) {
     return (uint32_t)(tail - head);
 }
 
-/* Producer: arm the edge-trigger drain signal after a full push, so the
- * worker's next pop emits SPSC_EVT_DATAGRAM_TX_DRAINED. */
-static inline void aiopquic_dgram_buf_arm_drain(aiopquic_dgram_buf_t* db) {
-    atomic_store_explicit(&db->drain_pending, 1, memory_order_release);
+/* Worker, after a pop: 1 if a writer armed the drain signal and this
+ * call took it (the caller emits SPSC_EVT_DATAGRAM_TX_DRAINED). */
+static inline int aiopquic_dgram_buf_drain_take(aiopquic_dgram_buf_t* db) {
+    return atomic_exchange_explicit(&db->drain_pending, 0,
+                                    memory_order_acq_rel) == 1;
 }
 
 /* ---------------------------------------------------------------------
