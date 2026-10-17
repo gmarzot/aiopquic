@@ -45,9 +45,7 @@ def _assert_same(src, dst, names) -> None:
 
 @pytest.mark.parametrize("testcase,sizes", [
     ("handshake", [1 * KB]),
-    pytest.param("transfer", [2 * MB, 3 * MB, 5 * MB], marks=pytest.mark.xfail(
-        reason="client RX ring overflows under 256 KiB stream windows",
-        strict=False)),
+    ("transfer", [2 * MB, 3 * MB, 5 * MB]),
     ("multiconnect", [1 * KB] * 3),
     # More requests than the server's initial stream limit (512).
     ("transfer", [32] * 1200),
