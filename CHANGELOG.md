@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fix: stream frames behind a peer's CONNECTION_CLOSE in one packet no longer read a freed raw
+  QUIC stream context; every event carrying a stream context holds a reference to it.
+- Fix: stream contexts named by events still queued at `stop()` are released with the transport.
+
 ## v0.5.0rc2
 
 - `peer_address()` and `local_address()` on `QuicConnection` and `WebTransportSession` return

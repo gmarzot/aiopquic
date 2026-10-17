@@ -95,6 +95,7 @@ jobs:
           python -m pytest \
             tests/interop/test_aioquic.py \
             tests/interop/test_aioquic_wt.py \
+            tests/interop/test_aioquic_close.py \
             tests/interop/test_qh3.py \
             -v --tb=short
 
