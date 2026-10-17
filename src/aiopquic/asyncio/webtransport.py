@@ -616,6 +616,11 @@ class WebTransportSession:
         on FIN or reset."""
         q = self._stream_inbox.get(stream_id)
         if q is None:
+            if self._session_closed.is_set():
+                # The inboxes went with the session.
+                yield WebTransportStreamReset(
+                    stream_id=stream_id, error_code=WT_SESSION_GONE)
+                return
             self._stream_inbox[stream_id] = q = asyncio.Queue()
         while True:
             ev = await q.get()
@@ -718,6 +723,9 @@ class WebTransportSession:
             self._push_or_retry(
                 lambda: self._state.push_close(error_code, reason), "close")
             self._release_session_resources()
+            # events() returns once it reads the close.
+            self._event_queue.put_nowait(WebTransportSessionClosed(
+                error_code=error_code, reason=memoryview(bytes(reason))))
 
     def drain(self) -> None:
         self._state.push_drain()
@@ -766,8 +774,8 @@ class WebTransportSession:
 
     async def events(self) -> AsyncGenerator:
         """Yield non-stream events: SessionDraining, NewStream,
-        Datagram, etc. Stream data is delivered via
-        receive_stream_data(stream_id) on demand."""
+        Datagram, etc., ending with the session's close. Stream data is
+        delivered via receive_stream_data(stream_id) on demand."""
         while not self._session_closed.is_set():
             ev = await self._event_queue.get()
             yield ev

@@ -7,6 +7,8 @@
   holds the batch's references until `release_batch()`.
 - Fix: a raw QUIC stream whose context a reset or stop-sending detached no longer leaks the
   second context its later data arrives on; `STREAM_DESTROY` names the context it retires.
+- Fix: a WebTransport `events()` reader ends when its session is closed locally, and
+  `receive_stream_data()` called after the close yields `WT_SESSION_GONE` instead of hanging.
 
 ## v0.5.0rc3
 
