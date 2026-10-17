@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `qns/`: QUIC and WebTransport Interop Runner endpoints; the `Interop` workflow runs them
+  against peer stacks and the public-endpoint handshakes.
+
 ## v0.5.0rc2
 
 - `peer_address()` and `local_address()` on `QuicConnection` and `WebTransportSession` return
