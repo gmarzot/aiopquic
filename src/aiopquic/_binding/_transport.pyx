@@ -326,6 +326,7 @@ cdef extern from "c/callback.h":
         uint64_t worker_set_priority_last_err
         uint64_t cnt_tx_event_dropped_dead_cnx
         uint64_t cnt_tx_wrong_direction_dropped
+        uint64_t cnt_tx_reattach_after_close
         uint64_t last_tx_event_ring_arm_ns
         uint64_t last_tx_event_ring_fire_ns
         uint64_t cnt_fc_credit_pushed
@@ -1201,6 +1202,7 @@ cdef class TransportContext:
             'set_priority_last_err': self._ctx.worker_set_priority_last_err,
             'tx_event_dropped_dead_cnx': self._ctx.cnt_tx_event_dropped_dead_cnx,
             'tx_wrong_direction_dropped': self._ctx.cnt_tx_wrong_direction_dropped,
+            'tx_reattach_after_close': self._ctx.cnt_tx_reattach_after_close,
             'rx_event_drops': self._ctx.worker_rx_event_drops,
             'rx_event_drops_stream_data': self._ctx.worker_rx_event_drops_stream_data,
             'rx_overflow_pushed': self._ctx.rx_overflow.pushed,

@@ -95,6 +95,46 @@ async def test_raw_reset_churn_releases_stream_contexts():
 
 
 @pytest.mark.asyncio
+async def test_raw_reset_after_peer_close_skips_reattach():
+    """STOP_SENDING and CONNECTION_CLOSE in one server drain: the reset the
+    protocol pushes reaches the worker after Python freed the stream
+    contexts, so its sc must not be re-attached."""
+    class Server(QuicConnectionProtocol):
+        def quic_event_received(self, event):
+            if isinstance(event, StopSendingReceived):
+                self._quic.reset_stream(event.stream_id, 0x11)
+
+    async def one():
+        async with connect("127.0.0.1", port,
+                           configuration=_client_config()) as client:
+            quic = client._quic
+            sids = [quic.get_next_available_stream_id() for _ in range(8)]
+            for sid in sids:
+                quic.send_stream_data(sid, b"x")
+            await asyncio.sleep(0)
+            for sid in sids:
+                quic.stop_stream(sid, 0x10)
+            await asyncio.sleep(0)
+            quic.close()
+
+    async def worker(n):
+        for _ in range(n):
+            await asyncio.wait_for(one(), timeout=5.0)
+
+    port = next_port()
+    server = await serve("127.0.0.1", port, configuration=_server_config(),
+                         create_protocol=Server)
+    try:
+        await asyncio.gather(*(worker(25) for _ in range(8)))
+        transport = server._engine._transport
+        assert await _until(
+            lambda: transport.counters["tx_reattach_after_close"] > 0), (
+            transport.counters)
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
 async def test_raw_stop_sending_releases_stream_contexts():
     class Server(QuicConnectionProtocol):
         def quic_event_received(self, event):
