@@ -38,6 +38,7 @@ clear reason.
 | qh3     | 1 stream × 1MB / 10MB transfer      | TX byte-conservation correctness|
 | aioquic | stream transfers, both directions   | byte conservation               |
 | aioquic WebTransport | session close; `reset_stream` | §6 teardown frames in each stream's direction; RESET_STREAM when reset_stream_at is not negotiated |
+| `qns/` endpoints | Interop Runner cases, endpoints against themselves (`test_qns_endpoint.py`) | endpoint contract; the peer matrix runs in `.github/workflows/interop.yml` |
 
 ## Pass criteria
 

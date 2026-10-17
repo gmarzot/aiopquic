@@ -1,0 +1,162 @@
+name: Interop
+
+# QUIC Interop Runner matrix (hq-interop, qns/) against
+# peer stacks, and the public-endpoint handshakes in tests/test_interop.py.
+# Peer results are report-only; a case aiopquic runs failing against itself,
+# or a pair that produced no results, fails the job.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * 1"
+  pull_request:
+    paths:
+      - "qns/**"
+      - ".github/workflows/interop.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  RUNNER_REPO: quic-interop/quic-interop-runner
+  RUNNER_REF: ab039a4a4b43ae2e21bb5704c9fad1f8fe6257d6
+
+jobs:
+  wheel:
+    name: wheel (cp312 manylinux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: pypa/cibuildwheel@v3.1.4
+        env:
+          CIBW_BUILD: cp312-manylinux_x86_64
+          CIBW_ENVIRONMENT_PASS_LINUX: GITHUB_WORKSPACE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-cp312
+          path: wheelhouse/*.whl
+
+  runner:
+    name: ${{ matrix.protocol }} / ${{ matrix.peer }}
+    needs: wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        protocol: [quic]
+        peer: [aiopquic, picoquic, quic-go, aioquic, ngtcp2, quiche]
+    env:
+      PROTOCOL: ${{ matrix.protocol }}
+      PEER: ${{ matrix.peer }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RUNNER_REPO }}
+          ref: ${{ env.RUNNER_REF }}
+          path: runner
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-cp312
+          path: qns/wheelhouse
+      # The runner needs docker engine >= 28.1.
+      - uses: docker/setup-docker-action@v5
+        with:
+          version: version=v28.3.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tshark and runner dependencies
+        run: |
+          sudo modprobe ip6table_filter
+          sudo add-apt-repository -y ppa:wireshark-dev/stable
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tshark
+          pip install -r runner/requirements.txt
+      - name: Build endpoint image
+        run: docker build -t "aiopquic-$PROTOCOL:ci" --target "$PROTOCOL" qns
+      - name: Register aiopquic with the runner
+        working-directory: runner
+        run: |
+          f="implementations_$PROTOCOL.json"
+          jq --arg image "aiopquic-$PROTOCOL:ci" '. + {aiopquic: {image: $image, url: "https://github.com/gmarzot/aiopquic", role: "both"}}' "$f" > "$f.new"
+          mv "$f.new" "$f"
+      - name: Run
+        working-directory: runner
+        env:
+          CRON: "true"
+        run: |
+          mkdir -p ../results ../logs
+          pair() {
+            python run.py -p "$PROTOCOL" -s "$1" -c "$2" -l "../logs/$1_$2" -j "../results/$1_$2.json" 2>&1 | tee "../logs/$1_$2.txt" || true
+          }
+          if [ "$PEER" = aiopquic ]; then
+            pair aiopquic aiopquic
+          else
+            pair aiopquic "$PEER"
+            if [ "$(jq -r --arg p "$PEER" '.[$p].role' "implementations_$PROTOCOL.json")" != client ]; then
+              pair "$PEER" aiopquic
+            fi
+          fi
+      - name: Summarize
+        if: always()
+        run: |
+          python - <<'PY'
+          import glob, json, os, sys
+          mark = {"succeeded": "✓", "failed": "✕", "unsupported": "?", None: "–"}
+          peer, protocol = os.environ["PEER"], os.environ["PROTOCOL"]
+          role = json.load(open(f"runner/implementations_{protocol}.json"))[peer]["role"]
+          expected = (["aiopquic_aiopquic"] if peer == "aiopquic" else
+                      [f"aiopquic_{peer}"] + ([f"{peer}_aiopquic"] if role != "client" else []))
+          found = {os.path.basename(p)[:-5]: json.load(open(p)) for p in sorted(glob.glob("results/*.json"))}
+          errors = [f"{name}: no results" for name in expected if name not in found]
+          lines = [f"### {protocol} / {peer}", ""]
+          for name, r in found.items():
+              server, client = r["servers"][0], r["clients"][0]
+              tests = r["results"][0]
+              lines.append(f"**server {server} · client {client}**: " + " ".join(f"{t['name']} {mark[t['result']]}" for t in tests))
+              for m in (r["measurements"][0] if r["measurements"] else []):
+                  lines.append(f"- {m['name']}: {m['result']} {m['details']}")
+              lines.append("")
+              if server == client == "aiopquic":
+                  failed = [t["name"] for t in tests if t["result"] == "failed"]
+                  if failed:
+                      errors.append(f"{name}: failed against itself: {', '.join(failed)}")
+                  if not any(t["result"] == "succeeded" for t in tests):
+                      errors.append(f"{name}: no case succeeded")
+          lines += [f"- ERROR {e}" for e in errors]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          sys.exit(1 if errors else 0)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: interop-${{ matrix.protocol }}-${{ matrix.peer }}
+          path: |
+            results/
+            logs/
+          retention-days: 7
+
+  public-endpoints:
+    name: public endpoints
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-aiopquic
+        with:
+          python-version: "3.12"
+      - name: Handshake against public QUIC/H3 servers
+        timeout-minutes: 10
+        run: python -m pytest tests/test_interop.py -v -m interop
