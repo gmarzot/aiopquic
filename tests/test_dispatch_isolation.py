@@ -41,6 +41,9 @@ class _Transport:
         batch, self._batch = self._batch, []
         return batch
 
+    def release_batch(self):
+        pass
+
     def close(self):
         os.close(self.eventfd)
         os.close(self._wake_w)
