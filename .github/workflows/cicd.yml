@@ -9,7 +9,8 @@ name: CI
 #   - native: picoquic_ct + picohttp_ct subprocess smoke. Required.
 #   - peer interop: qh3 + aioquic cross-stack transfers; aioquic WebTransport
 #     stream teardown and reset. Required.
-#   - sanitizers: core tier + Python peers on an ASan/UBSan build. Required.
+#   - sanitizers: core tier + Python peers on an ASan/UBSan build, chaos-close
+#     stress at 20 s per transport. Required.
 #   - benchmark: perf floor on shared runners — advisory only
 #     (continue-on-error); perf noise is not a correctness signal.
 
@@ -161,9 +162,11 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          AIOPQUIC_CHAOS_SECONDS: "20"
         # With aioquic and qh3 installed the core tier includes their peer
-        # tests. Only the interpreter is preloaded. The 10 MB and 100 MB
-        # peer transfers outrun their timeouts on a sanitized build.
+        # tests. Only the interpreter is preloaded; the chaos-close children
+        # inherit it. The 10 MB and 100 MB peer transfers outrun their
+        # timeouts on a sanitized build.
         run: |
           LD_PRELOAD="$(gcc -print-file-name=libasan.so)" python -m pytest \
             tests/ -m "not interop and not native" \
