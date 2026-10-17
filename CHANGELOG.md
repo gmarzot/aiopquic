@@ -5,9 +5,15 @@
 - Fix: a server or WebTransport handler that resets, stops or writes a raw QUIC stream retired
   later in the same drained batch no longer touches its freed stream context; `drain_rx()`
   holds the batch's references until `release_batch()`.
+- Fix: a raw QUIC stream whose context a reset or stop-sending detached no longer leaks the
+  second context its later data arrives on; `STREAM_DESTROY` names the context it retires.
+- Fix: a WebTransport `events()` reader ends when its session is closed locally, and
+  `receive_stream_data()` called after the close yields `WT_SESSION_GONE` instead of hanging.
 - Fix: a lost packet at the end of a GSO send batch no longer stalls the connection until the
   idle timeout (local picoquic patch).
 - Fix: every PATH_CHALLENGE is answered, not only the last of a burst (local picoquic patch).
+- Fix: picoquic's process-wide public random state no longer indexes out of bounds when
+  several picoquic threads draw from it at once (local picoquic patch).
 - `reset_stream_at` is advertised and accepted under 0x1d as well as the draft-07 codepoint
   (local picoquic patch).
 - WebTransport servers select the WT-Protocol by the client's offer order.

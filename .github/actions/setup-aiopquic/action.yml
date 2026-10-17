@@ -65,7 +65,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: third_party/picoquic/build
-        key: picoquic-build${{ inputs.with-native-tests == 'true' && '-native' || '' }}-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build.sh', 'patches/*.patch') }}
+        key: picoquic-build${{ inputs.with-native-tests == 'true' && '-native' || '' }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build.sh', 'patches/*.patch') }}
     - name: Build picoquic
       if: steps.picoquic-cache.outputs.cache-hit != 'true'
       shell: bash

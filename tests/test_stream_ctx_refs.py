@@ -45,6 +45,14 @@ def test_stream_events_outlive_the_close(mode):
         f"exit {proc.returncode}\n{proc.stderr[-3000:]}")
 
 
+def test_every_context_a_stream_was_handed_is_released():
+    """A reset or stop-sending detaches picoquic's context, so the stream's
+    next data arrives on a second one; the connection releases both."""
+    proc = _run("second-context")
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\n{proc.stderr[-3000:]}")
+
+
 @pytest.mark.parametrize("mode", ["undrained", "tx-ring-full"])
 def test_undelivered_events_return_their_reference(mode):
     """Events the worker or the drain never consumes, or that never made it

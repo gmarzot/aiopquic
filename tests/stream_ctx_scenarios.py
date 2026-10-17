@@ -16,6 +16,12 @@ reference never frees a context an event still names.
         The same with drain_rx, one event per call, the reference dropped
         between the calls.
 
+    python tests/stream_ctx_scenarios.py second-context PORT CERT KEY
+        A stream handed a second context (picoquic's was detached by a
+        reset or stop-sending), the second retired by STREAM_DESTROY, then
+        the connection closes. Exits 0 when both contexts are released,
+        each once.
+
     python tests/stream_ctx_scenarios.py undrained PORT CERT KEY
         Queue RX STREAM_DATA and TX reset, stop-sending and mark-active
         events that name a context nothing else holds, then free the
@@ -50,7 +56,7 @@ from aiopquic.asyncio.client import connect
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
 from aiopquic.asyncio.server import serve
 from aiopquic.quic.configuration import QuicConfiguration
-from aiopquic.quic.connection import QuicEngine
+from aiopquic.quic.connection import QuicConnection, QuicEngine
 from aiopquic.quic.events import StopSendingReceived, StreamDataReceived
 
 SNI = "test.example.com"  # the test certificate's name
@@ -137,6 +143,20 @@ def close_then_data_split(port, cert, key):
         _fail(f"second batch {second}")
     del first, second, t
     _check_released("after the drains")
+
+
+def second_context(port, cert, key):
+    t = TransportContext()
+    conn = QuicConnection(configuration=QuicConfiguration(is_client=True))
+    first, second = _sc_with_rx(PAYLOAD), _sc_with_rx(PAYLOAD)
+    t._test_push_rx(SPSC_EVT_STREAM_DATA, 0, cnx_ptr=CNX, stream_ctx=first)
+    t._test_push_rx(SPSC_EVT_STREAM_DATA, 0, cnx_ptr=CNX, stream_ctx=second)
+    t._test_push_rx(SPSC_EVT_STREAM_DESTROY, 0, cnx_ptr=CNX, stream_ctx=second)
+    t._test_push_rx(SPSC_EVT_APP_CLOSE, 0, cnx_ptr=CNX)
+    t.drain_rx_callback(conn._handle_raw_event)
+    conn._events.clear()
+    del conn, t
+    _check_released("after the close")
 
 
 def undrained(port, cert, key):
@@ -276,6 +296,7 @@ async def churn(port, cert, key):
 SCENARIOS = {
     "close-then-data": close_then_data,
     "close-then-data-split": close_then_data_split,
+    "second-context": second_context,
     "undrained": undrained,
     "tx-ring-full": tx_ring_full,
     "destroy-in-batch": destroy_in_batch,

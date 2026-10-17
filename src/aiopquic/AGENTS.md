@@ -110,17 +110,18 @@ has left the ring once it is exceeded.
   `-m interop` selects them.
 - Ports come from `tests/_ports.next_port()`. `tests/interop/` peers need
   `pip install aioquic 'qh3<2'`.
-- `tests/wt_close_scenarios.py` and `tests/dgram_release_scenarios.py` are not collected: their
-  tests run each scenario in a fresh process, so process-wide counters start at zero and a native
-  crash takes only the child.
+- `tests/*_scenarios.py` are not collected: their tests run each scenario in a fresh process, so
+  process-wide counters start at zero and a native crash takes only the child.
+- `tests/test_chaos_close.py` drives seeded random stream/close interleavings over raw QUIC and
+  WebTransport; `AIOPQUIC_CHAOS_SECONDS` lengthens it for soaks, `AIOPQUIC_CHAOS_SEED` replays.
 - Every fix needs a test that fails without it: no vacuous passes, no fixed sleeps racing slow
   runners, no process-wide counter reads that earlier tests can skew.
 
 ## CI and releases
 
 - `cicd.yml` runs on pull requests and on push to `main` only: a working branch gets CI once a PR
-  is open from it. Jobs: `core` (ubuntu and macos × 3.12–3.14), `native`, `peer interop`,
-  `benchmark` (continue-on-error).
+  is open from it. Jobs: `core` (ubuntu x86_64 and aarch64, macos × 3.12–3.14), `native`,
+  `peer interop` (both Linux arches), `sanitizers`, `benchmark` (continue-on-error).
 - `release.yml` (`workflow_dispatch`, `version` = `N.N.N[{a,b,rc}N]`) tags the dispatched ref's
   HEAD, tests the tag, builds the sdist and wheels, publishes to TestPyPI then PyPI, and creates
   the GitHub release.

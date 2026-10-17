@@ -450,6 +450,50 @@ async def test_registry_does_not_leak_entries_across_sessions():
 
 
 @pytest.mark.asyncio
+async def test_wt_readers_end_after_a_local_close():
+    """A session closed locally ends an events() reader already parked on
+    it, and receive_stream_data() called after the close yields
+    WT_SESSION_GONE at once instead of waiting on an inbox nothing fills."""
+    from aiopquic.asyncio.webtransport import WT_SESSION_GONE
+
+    port = next_port()
+    saw_stream = asyncio.get_event_loop().create_future()
+    sessions, readers = [], []
+
+    async def handler(session):
+        sessions.append(session)
+
+        async def _events():
+            async for ev in session.events():
+                if (isinstance(ev, WebTransportNewStream)
+                        and not saw_stream.done()):
+                    saw_stream.set_result(ev.stream_id)
+        readers.append(asyncio.create_task(_events()))
+
+    async def _late_read(session, sid):
+        return [ev async for ev in session.receive_stream_data(sid)]
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI,
+                                        ca_file=CA_FILE) as wt:
+            sid = await wt.create_stream(bidir=False)
+            wt.send_stream_data(sid, b"hello")
+            server_sid = await asyncio.wait_for(saw_stream, timeout=5.0)
+            await asyncio.sleep(0.05)  # the reader parks for the next event
+            sessions[0].close(0, b"")
+            await asyncio.wait_for(readers[0], timeout=5.0)
+            late = await asyncio.wait_for(
+                _late_read(sessions[0], server_sid), timeout=5.0)
+            assert [(type(ev), ev.error_code) for ev in late] == [
+                (WebTransportStreamReset, WT_SESSION_GONE)]
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
 async def test_wt_close_resets_streams_with_session_gone():
     """The peer sees WT_SESSION_GONE on this session's streams.
 
