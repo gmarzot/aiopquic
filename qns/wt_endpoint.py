@@ -23,8 +23,10 @@ from aiopquic.quic.events import (
 
 PORT = 443
 CHUNK = 64 * 1024
-# The bottleneck queue holds 25 packets; pace datagram requests below it.
+# The bottleneck queue holds 25 packets; pace datagram requests below it,
+# and responses below the 10 Mbps link rate.
 DATAGRAM_INTERVAL = 0.02
+DATAGRAM_RESPONSE_INTERVAL = 0.0015
 TRANSFER_TIMEOUT = 60.0
 EXIT_UNSUPPORTED = 127
 GET = b"GET "
@@ -79,6 +81,7 @@ class Peer:
         self.downloads = downloads
         self._tasks: set[asyncio.Task] = set()
         self._wanted: dict[str, asyncio.Future] = {}
+        self._response_pacer = asyncio.Lock()
 
     def _spawn(self, coro) -> None:
         task = asyncio.get_running_loop().create_task(coro)
@@ -205,7 +208,9 @@ class Peer:
         found = self._load(data)
         if found is not None:
             name, payload = found
-            await self._send_datagram(PUSH + name.encode() + b"\n" + payload)
+            async with self._response_pacer:
+                await self._send_datagram(PUSH + name.encode() + b"\n" + payload)
+                await asyncio.sleep(DATAGRAM_RESPONSE_INTERVAL)
 
     # --- requester -----------------------------------------------------
 
@@ -279,19 +284,20 @@ async def run_client(testcase: str, urls: list[str], protocols: list[str],
 async def start_server(testcase: str, port: int, www: str, downloads: str,
                        cert_file: str, key_file: str, protocols: list[str],
                        requests: list[str]):
-    """Serve the endpoints under www. Returns (server, done); done
-    resolves when the first session's test case completes."""
+    """Serve the files under www on any session path. Returns (server,
+    done); done resolves when the first session's test case completes."""
     endpoints = sorted(d for d in os.listdir(www)
                        if os.path.isdir(os.path.join(www, d)))
     wanted: dict[str, list[str]] = {}
     for req in requests:
         endpoint, _, name = req.partition("/")
         wanted.setdefault(endpoint, []).append(name)
-    if len(endpoints) == 1:
-        endpoint, path = endpoints[0], "/" + endpoints[0]
+    if len(wanted) == 1:
+        endpoint = next(iter(wanted))
+    elif len(endpoints) == 1:
+        endpoint = endpoints[0]
     else:
-        endpoint = next(iter(wanted)) if len(wanted) == 1 else None
-        path = "*"
+        endpoint = None
     done = asyncio.get_running_loop().create_future()
 
     async def handler(session) -> None:
@@ -313,11 +319,11 @@ async def start_server(testcase: str, port: int, www: str, downloads: str,
             done.set_result(None)
 
     server = await serve_webtransport(
-        "0.0.0.0", port, path, handler=handler,
+        "0.0.0.0", port, "*", handler=handler,
         cert_file=cert_file, key_file=key_file,
         configuration=configuration(is_client=False),
         wt_supported_protocols=protocols or None)
-    log.info("serving %s (path %s) on UDP %d", www, path, port)
+    log.info("serving %s on UDP %d", www, port)
     return server, done
 
 
@@ -328,6 +334,9 @@ async def _serve_once(testcase: str, protocols: list[str],
         "/certs/priv.key", protocols, requests)
     try:
         await done
+        if SERVER_CASES[testcase] is None:
+            # Answer later sessions too; the runner stops the container.
+            await asyncio.Event().wait()
     finally:
         await server.aclose()
 

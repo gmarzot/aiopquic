@@ -6,6 +6,8 @@ import os
 
 import pytest
 
+from aiopquic.asyncio.webtransport import connect_webtransport
+
 from .conftest import _free_port
 
 QNS = os.path.join(os.path.dirname(__file__), "..", "..", "qns")
@@ -47,7 +49,7 @@ def _assert_same(src, dst, names) -> None:
     ("handshake", [1 * KB]),
     ("transfer", [2 * MB, 3 * MB, 5 * MB]),
     ("multiconnect", [1 * KB] * 3),
-    # More requests than the server's initial stream limit (512).
+    # More requests than the server's initial stream limit (100).
     ("transfer", [32] * 1200),
 ])
 async def test_hq(tmp_path, cert_paths, testcase, sizes):
@@ -121,6 +123,29 @@ async def test_wt_handshake(tmp_path, cert_paths):
     client = (cd / "negotiated_protocol.txt").read_text()
     assert client in ("x", "y")
     assert (sd / "negotiated_protocol.txt").read_text() == client
+
+
+async def test_wt_session_on_file_url(tmp_path, cert_paths):
+    """A session opened on a file's own URL is accepted and served."""
+    sw, sd = tmp_path / "sw", tmp_path / "sd"
+    os.makedirs(sd)
+    name = _files(sw / "ep", [64 * KB])[0]
+    port = _free_port()
+    server, _ = await wt.start_server(
+        "transfer", port, str(sw), str(sd), cert_paths["cert"],
+        cert_paths["key"], [], [])
+    try:
+        async with connect_webtransport(
+                "127.0.0.1", port, f"/ep/{name}", verify_peer=False) as session:
+            sid = await session.create_stream(bidir=True)
+            await session.send_stream_data_drained(
+                sid, b"GET " + name.encode(), end_stream=True)
+            body = bytearray()
+            async for ev in session.receive_stream_data(sid):
+                body += ev.data
+    finally:
+        await server.aclose()
+    assert bytes(body) == (sw / "ep" / name).read_bytes()
 
 
 @pytest.mark.parametrize("module,role,testcase", [

@@ -36,8 +36,8 @@ than the windows depend on window updates.
 | `transfer-{unidirectional,bidirectional,datagram}-send` | — | yes |
 
 `PROTOCOLS` sets `wt_available_protocols` on the client and `wt_supported_protocols` on the
-server. One session per QUIC connection. The server registers the one endpoint under `/www`,
-or any path when there are several.
+server. One session per QUIC connection. The server accepts sessions on any path and serves
+files by name from the endpoint directories under `/www`.
 
 ## Running locally
 

@@ -50,6 +50,8 @@ def server_configuration(cert_file: str, key_file: str) -> QuicConfiguration:
                             qlog_dir=_qlog_dir())
     # Requests are one line; the per-stream RX ring is sized to this window.
     cfg.max_stream_data = 64 * 1024
+    # A client opens requests up to the limit at once; keep bursts moderate.
+    cfg.max_streams_bidi = 100
     cfg.load_cert_chain(cert_file, key_file)
     return cfg
 
