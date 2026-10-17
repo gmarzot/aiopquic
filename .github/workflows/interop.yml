@@ -1,6 +1,6 @@
 name: Interop
 
-# QUIC Interop Runner matrix (hq-interop, qns/) against
+# QUIC Interop Runner matrices (hq-interop and WebTransport, qns/) against
 # peer stacks, and the public-endpoint handshakes in tests/test_interop.py.
 # Peer results are report-only; a case aiopquic runs failing against itself,
 # or a pair that produced no results, fails the job.
@@ -51,6 +51,14 @@ jobs:
       matrix:
         protocol: [quic]
         peer: [aiopquic, picoquic, quic-go, aioquic, ngtcp2, quiche]
+        include:
+          - { protocol: webtransport, peer: aiopquic }
+          - { protocol: webtransport, peer: webtransport-go }
+          - { protocol: webtransport, peer: ngtcp2 }
+          - { protocol: webtransport, peer: xquic }
+          - { protocol: webtransport, peer: flupke-webtransport }
+          - { protocol: webtransport, peer: chrome }
+          - { protocol: webtransport, peer: firefox }
     env:
       PROTOCOL: ${{ matrix.protocol }}
       PEER: ${{ matrix.peer }}

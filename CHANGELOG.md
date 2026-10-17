@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- `qns/`: QUIC Interop Runner endpoint; the `Interop` workflow runs it against peer stacks
-  and the public-endpoint handshakes.
+- `qns/`: QUIC and WebTransport Interop Runner endpoints; the `Interop` workflow runs them
+  against peer stacks and the public-endpoint handshakes.
 
 ## v0.5.0rc2
 
