@@ -13,6 +13,7 @@ from aiopquic._binding._transport import tx_data_bytes_queued
 from aiopquic.asyncio.webtransport import (
     WebTransportError, connect_webtransport, serve_webtransport,
 )
+from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.events import (
     WebTransportStreamReset, WebTransportStopSending,
     WebTransportNewStream, WebTransportStreamDataReceived,
@@ -792,6 +793,29 @@ async def test_wt_write_larger_than_the_stream_ring_raises():
             wt.send_stream_data(sid, b"y" * 1024)
     finally:
         server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_writes_tls_key_log(tmp_path):
+    """Both WebTransport ends write TLS secrets to secrets_log_file."""
+    port = next_port()
+    server_log, client_log = tmp_path / "server.keys", tmp_path / "client.keys"
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt", handler=lambda session: None,
+        cert_file=CERT_FILE, key_file=KEY_FILE,
+        configuration=QuicConfiguration(is_client=False,
+                                        secrets_log_file=str(server_log)))
+    try:
+        async with connect_webtransport(
+                "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
+                configuration=QuicConfiguration(
+                    is_client=True, secrets_log_file=str(client_log))) as wt:
+            assert wt.session_ready
+    finally:
+        server.close()
+    for path in (server_log, client_log):
+        assert "CLIENT_TRAFFIC_SECRET_0" in path.read_text(), path
+
 
 @pytest.mark.asyncio
 async def test_wt_advertises_reset_stream_at_both_codepoints(tmp_path,

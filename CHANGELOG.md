@@ -8,6 +8,7 @@
 - `reset_stream_at` is advertised and accepted under 0x1d as well as the draft-07 codepoint
   (local picoquic patch).
 - WebTransport servers select the WT-Protocol by the client's offer order.
+- WebTransport connections write TLS secrets to `secrets_log_file` / `SSLKEYLOGFILE`.
 - `qns/`: QUIC and WebTransport Interop Runner endpoints; the `Interop` workflow runs them
   against peer stacks and the public-endpoint handshakes.
 
