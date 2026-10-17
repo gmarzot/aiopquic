@@ -398,6 +398,23 @@ class WebTransportSession:
             return {}
         return self._transport.path_quality(cnx_ptr)
 
+    def peer_address(self) -> tuple[str, int] | None:
+        """The peer's (host, port) on the underlying connection, or None
+        before it is known or after the session closes. An IPv4-mapped
+        IPv6 address is returned as IPv4."""
+        cnx_ptr = self.cnx_ptr
+        if not cnx_ptr:
+            return None
+        return self._transport.peer_address(cnx_ptr)
+
+    def local_address(self) -> tuple[str, int] | None:
+        """This side's (host, port) on the underlying connection, as
+        peer_address()."""
+        cnx_ptr = self.cnx_ptr
+        if not cnx_ptr:
+            return None
+        return self._transport.local_address(cnx_ptr)
+
     def tx_event_ring_fill(self) -> float:
         """TX event-ring fill ratio in [0.0, 1.0], connection-global
         (the SPSC TX ring is shared across all WT streams on this

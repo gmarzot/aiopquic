@@ -14,6 +14,7 @@ covers TX entry points and the WT TX dispatch path.
 """
 
 import os
+import socket as _socket
 import sys
 
 cimport cython
@@ -326,6 +327,7 @@ cdef extern from "c/callback.h":
         uint64_t worker_set_priority_last_err
         uint64_t cnt_tx_event_dropped_dead_cnx
         uint64_t cnt_tx_wrong_direction_dropped
+        uint64_t cnt_tx_reattach_after_close
         uint64_t last_tx_event_ring_arm_ns
         uint64_t last_tx_event_ring_fire_ns
         uint64_t cnt_fc_credit_pushed
@@ -373,6 +375,10 @@ cdef extern from "c/callback.h":
 # owned by Python (refcount-style); picoquic-pthread reads from it via
 # stream_ctx in aiopquic_stream_cb.
 cdef extern from "c/callback.h":
+    ctypedef struct aiopquic_addr_t:
+        uint8_t family
+        uint16_t port
+        uint8_t addr[16]
     ctypedef struct aiopquic_cnx_snapshot_t:
         char alpn[32]
         uint8_t has_tp_local
@@ -386,6 +392,8 @@ cdef extern from "c/callback.h":
         picoquic_path_quality_t path_quality
         uint64_t data_sent
         uint64_t data_received
+        aiopquic_addr_t peer_addr
+        aiopquic_addr_t local_addr
 
 cdef extern from "c/stream_buf.h":
     ctypedef struct aiopquic_stream_buf_t:
@@ -909,11 +917,24 @@ cdef class RingBuffer:
         return result
 
 
+def _format_sockaddr(family, addr, port):
+    """(host, port) from a snapshot address, or None when unknown.
+    An IPv4-mapped IPv6 address is returned as IPv4."""
+    if family == 4:
+        return (_socket.inet_ntop(_socket.AF_INET, addr[:4]), port)
+    if family == 6:
+        if addr[:12] == b"\0" * 10 + b"\xff\xff":
+            return (_socket.inet_ntop(_socket.AF_INET, addr[12:16]), port)
+        return (_socket.inet_ntop(_socket.AF_INET6, addr[:16]), port)
+    return None
+
+
 # Module-level registry of live TransportContext instances. Walked by
 # dump_all_counters() (driven from aiomoqt's SIGUSR2 taskdump handler)
 # to print forensic counters from every active context. WeakSet so
 # contexts aren't kept alive by the registry.
 import weakref as _weakref
+
 _TRANSPORT_REGISTRY = _weakref.WeakSet()
 
 # TLS key-exchange group ids (IANA), for start(key_exchange_groups=...).
@@ -1201,6 +1222,7 @@ cdef class TransportContext:
             'set_priority_last_err': self._ctx.worker_set_priority_last_err,
             'tx_event_dropped_dead_cnx': self._ctx.cnt_tx_event_dropped_dead_cnx,
             'tx_wrong_direction_dropped': self._ctx.cnt_tx_wrong_direction_dropped,
+            'tx_reattach_after_close': self._ctx.cnt_tx_reattach_after_close,
             'rx_event_drops': self._ctx.worker_rx_event_drops,
             'rx_event_drops_stream_data': self._ctx.worker_rx_event_drops_stream_data,
             'rx_overflow_pushed': self._ctx.rx_overflow.pushed,
@@ -1487,9 +1509,10 @@ cdef class TransportContext:
 
     # -- connection snapshots ------------------------------------------
     # picoquic cnx state belongs to the worker thread, which frees it. The
-    # worker sends copies (aiopquic_cnx_snapshot_t) with READY, with WT
-    # session READY, with SPSC_EVT_CNX_STACK and in answer to
-    # SPSC_EVT_TX_CNX_REFRESH; the accessors below read only those copies.
+    # worker sends copies (aiopquic_cnx_snapshot_t) with READY, with a
+    # server's ALMOST_READY, with WT session READY, with SPSC_EVT_CNX_STACK,
+    # ahead of WT NEW_SESSION and in answer to SPSC_EVT_TX_CNX_REFRESH; the
+    # accessors below read only those copies.
 
     cdef object _store_snapshot(self, uintptr_t cnx_ptr, void* buf,
                                 Py_ssize_t length):
@@ -1625,6 +1648,33 @@ cdef class TransportContext:
             'remote': PyBytes_FromStringAndSize(<char*>re.id, re.id_len),
             'initial': PyBytes_FromStringAndSize(<char*>ini.id, ini.id_len),
         }
+
+    def peer_address(self, uintptr_t cnx_ptr):
+        """The peer's (host, port) as of the last worker snapshot; each
+        call asks for a fresh one. None on a NULL cnx, before the first
+        snapshot, or while unknown."""
+        if cnx_ptr == 0:
+            return None
+        snap = self._snapshot(cnx_ptr, True)
+        if snap is None:
+            return None
+        cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
+        return _format_sockaddr(s.peer_addr.family,
+                                PyBytes_FromStringAndSize(<char*>s.peer_addr.addr, 16),
+                                s.peer_addr.port)
+
+    def local_address(self, uintptr_t cnx_ptr):
+        """This side's (host, port) on the connection's path, as
+        peer_address()."""
+        if cnx_ptr == 0:
+            return None
+        snap = self._snapshot(cnx_ptr, True)
+        if snap is None:
+            return None
+        cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
+        return _format_sockaddr(s.local_addr.family,
+                                PyBytes_FromStringAndSize(<char*>s.local_addr.addr, 16),
+                                s.local_addr.port)
 
     def path_quality(self, uintptr_t cnx_ptr):
         """Snapshot of picoquic's path-quality metrics for the cnx.
@@ -1856,6 +1906,7 @@ cdef class TransportContext:
                 length = entry.data_length
                 buf = spsc_ring_take_data(entry)
                 if (entry.event_type == SPSC_EVT_READY or
+                        entry.event_type == SPSC_EVT_ALMOST_READY or
                         entry.event_type == SPSC_EVT_CNX_STACK or
                         entry.event_type == SPSC_EVT_WT_SESSION_READY):
                     # A cnx snapshot: cache it; deliver the event bare.
@@ -2125,6 +2176,7 @@ cdef class TransportContext:
                 length = entry.data_length
                 buf = spsc_ring_take_data(entry)
                 if (entry.event_type == SPSC_EVT_READY or
+                        entry.event_type == SPSC_EVT_ALMOST_READY or
                         entry.event_type == SPSC_EVT_CNX_STACK or
                         entry.event_type == SPSC_EVT_WT_SESSION_READY):
                     # A cnx snapshot: cache it; deliver the event bare.

@@ -391,6 +391,8 @@ typedef struct {
     uint64_t        cnt_sc_destroy_fc_credit_dead_cnx;
     /* WT CONNECT streams h3zero freed while their session lived. */
     uint64_t        cnt_wt_control_released;
+    /* Borrowed sc not attached because the cnx was already closing. */
+    uint64_t        cnt_tx_reattach_after_close;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -528,11 +530,37 @@ static inline uint64_t aiopquic_initial_rx_window(picoquic_cnx_t* cnx,
                  : tp->initial_max_stream_data_bidi_remote;
 }
 
+/* An IP address and port: family 4 or 6, 0 when unknown; addr in
+ * network order (IPv4 in the first 4 bytes); port in host order. */
+typedef struct {
+    uint8_t family;
+    uint8_t reserved;
+    uint16_t port;
+    uint8_t addr[16];
+} aiopquic_addr_t;
+
+static inline void aiopquic_addr_fill(const struct sockaddr* sa,
+                                      aiopquic_addr_t* a) {
+    if (sa == NULL) return;
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in* v4 = (const struct sockaddr_in*)sa;
+        a->family = 4;
+        a->port = ntohs(v4->sin_port);
+        memcpy(a->addr, &v4->sin_addr, 4);
+    } else if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6* v6 = (const struct sockaddr_in6*)sa;
+        a->family = 6;
+        a->port = ntohs(v6->sin6_port);
+        memcpy(a->addr, &v6->sin6_addr, 16);
+    }
+}
+
 /* A copy of a connection's picoquic state, taken on the worker thread and
  * delivered to asyncio as an event payload. asyncio reads the copy and
  * never touches picoquic memory, which the worker owns and frees. Sent
- * with READY (raw stack), with SPSC_EVT_WT_SESSION_READY (WebTransport
- * client), with SPSC_EVT_CNX_STACK (single-port dispatch) and in answer
+ * with READY (raw stack), with a server's ALMOST_READY, with
+ * SPSC_EVT_WT_SESSION_READY (WebTransport client), with SPSC_EVT_CNX_STACK
+ * (single-port dispatch), ahead of SPSC_EVT_WT_NEW_SESSION and in answer
  * to SPSC_EVT_TX_CNX_REFRESH. */
 typedef struct {
     char alpn[32];                      /* NUL-terminated; empty if unknown */
@@ -547,6 +575,8 @@ typedef struct {
     picoquic_path_quality_t path_quality;
     uint64_t data_sent;
     uint64_t data_received;
+    aiopquic_addr_t peer_addr;
+    aiopquic_addr_t local_addr;
 } aiopquic_cnx_snapshot_t;
 
 /* Worker thread only. */
@@ -574,6 +604,12 @@ static inline void aiopquic_cnx_snapshot_fill(picoquic_cnx_t* cnx,
     picoquic_get_default_path_quality(cnx, &s->path_quality);
     s->data_sent = picoquic_get_data_sent(cnx);
     s->data_received = picoquic_get_data_received(cnx);
+    struct sockaddr* sa = NULL;
+    picoquic_get_peer_addr(cnx, &sa);
+    aiopquic_addr_fill(sa, &s->peer_addr);
+    sa = NULL;
+    picoquic_get_local_addr(cnx, &sa);
+    aiopquic_addr_fill(sa, &s->local_addr);
 }
 
 /* TX wake-coalescing: producer-side helper. Returns 1 if a wake is
@@ -1370,8 +1406,12 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
          * event with its length only. */
         entry.data_length = (uint32_t)length;
         ret = aiopquic_rx_push(ctx, &entry, NULL, 0);
-    } else if (fin_or_event == picoquic_callback_ready) {
-        /* The handshake-time state asyncio needs rides with READY. */
+    } else if (fin_or_event == picoquic_callback_ready
+               || (fin_or_event == picoquic_callback_almost_ready
+                   && !picoquic_is_client(cnx))) {
+        /* The handshake-time state asyncio needs rides with READY; a
+         * server's ALMOST_READY creates its connection, so it carries one
+         * too. */
         aiopquic_cnx_snapshot_t snap;
         aiopquic_cnx_snapshot_fill(cnx, &snap);
         ret = aiopquic_rx_push(ctx, &entry,
@@ -1400,15 +1440,26 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     return 0;
 }
 
+/* Python frees every sc of a cnx on CLOSE / APP_CLOSE, which the worker
+ * pushes only once the cnx is disconnecting or later: a borrowed sc on a
+ * TX event popped in that state may already be freed. */
+static inline int aiopquic_cnx_closing(picoquic_cnx_t* cnx) {
+    return picoquic_get_cnx_state(cnx) >= picoquic_state_disconnecting;
+}
+
 /* picoquic_reset_stream and picoquic_stop_sending detach the stream's app
  * ctx, so stream_released, which frees sc, would never fire: put sc back.
- * sc rides the TX event without a reference; a stream picoquic still has
- * (rc is not INVALID_STREAM_ID) still holds the stream's reference.
- * Returns sc when reattached, else NULL. */
+ * sc rides the TX event without a reference and is live only while the
+ * cnx is not closing. Returns sc when reattached, else NULL. */
 static inline aiopquic_stream_ctx_t* aiopquic_stream_reattach(
-        picoquic_cnx_t* cnx, const spsc_entry_t* entry, int rc) {
+        aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx, const spsc_entry_t* entry,
+        int rc) {
     aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)entry->stream_ctx;
     if (sc == NULL || rc == PICOQUIC_ERROR_INVALID_STREAM_ID) return NULL;
+    if (aiopquic_cnx_closing(cnx)) {
+        ctx->cnt_tx_reattach_after_close++;
+        return NULL;
+    }
     (void)picoquic_set_app_stream_ctx(cnx, entry->stream_id, sc);
     return sc;
 }
@@ -1557,8 +1608,13 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                          * (h3zero owns app_stream_ctx) — use v2 so the
                          * h3zero pointer isn't clobbered. */
                         if (entry->stream_ctx != NULL) {
-                            picoquic_mark_active_stream(cnx, entry->stream_id,
-                                                         1, entry->stream_ctx);
+                            if (aiopquic_cnx_closing(cnx)) {
+                                ctx->cnt_tx_reattach_after_close++;
+                            } else {
+                                picoquic_mark_active_stream(
+                                    cnx, entry->stream_id, 1,
+                                    entry->stream_ctx);
+                            }
                         } else {
                             picoquic_mark_active_stream_v2(cnx, entry->stream_id,
                                                             1);
@@ -1634,7 +1690,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                             int rr = picoquic_reset_stream(cnx, entry->stream_id,
                                                            entry->error_code);
                             aiopquic_stream_ctx_tx_abandon(
-                                aiopquic_stream_reattach(cnx, entry, rr));
+                                aiopquic_stream_reattach(ctx, cnx, entry, rr));
                         } else {
                             ctx->cnt_tx_wrong_direction_dropped++;
                         }
@@ -1646,7 +1702,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         if (aiopquic_stream_can_receive(cnx, entry->stream_id)) {
                             int rr = picoquic_stop_sending(cnx, entry->stream_id,
                                                            entry->error_code);
-                            (void)aiopquic_stream_reattach(cnx, entry, rr);
+                            (void)aiopquic_stream_reattach(ctx, cnx, entry, rr);
                         } else {
                             ctx->cnt_tx_wrong_direction_dropped++;
                         }
