@@ -8,6 +8,7 @@ name: CI
 #   - native: picoquic_ct + picohttp_ct subprocess smoke. Required.
 #   - peer interop: qh3 + aioquic cross-stack transfers; aioquic WebTransport
 #     stream teardown and reset. Required.
+#   - sanitizers: core tier + Python peers on an ASan/UBSan build. Required.
 #   - benchmark: perf floor on shared runners — advisory only
 #     (continue-on-error); perf noise is not a correctness signal.
 
@@ -95,8 +96,73 @@ jobs:
           python -m pytest \
             tests/interop/test_aioquic.py \
             tests/interop/test_aioquic_wt.py \
+            tests/interop/test_aioquic_close.py \
             tests/interop/test_qh3.py \
             -v --tb=short
+
+  sanitizers:
+    # picoquic, picotls and the extension built with ASan + UBSan.
+    name: sanitizers (asan + ubsan)
+    runs-on: ubuntu-latest
+    env:
+      SAN_FLAGS: -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Capture submodule SHAs for cache key
+        id: shas
+        run: |
+          echo "pico=$(git -C third_party/picoquic rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "ptls=$(git -C third_party/picotls rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+          cache-dependency-path: 'pyproject.toml'
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev
+      - name: Cache sanitized picoquic build
+        id: picoquic-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/picoquic/build
+          key: picoquic-build-san-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build.sh', 'patches/*.patch', '.github/workflows/cicd.yml') }}
+      - name: Build picoquic with sanitizers
+        if: steps.picoquic-cache.outputs.cache-hit != 'true'
+        env:
+          AIOPQUIC_WHEEL_BUILD: "1"
+          PICOQUIC_C_FLAGS: ${{ env.SAN_FLAGS }}
+          LDFLAGS: -fsanitize=address,undefined
+        run: ./build.sh --native
+      - name: Apply picoquic patches
+        if: steps.picoquic-cache.outputs.cache-hit == 'true'
+        run: ./build.sh --patches
+      - name: Install Python QUIC peer stacks
+        # qh3 held below 2.0, as in peer-interop.
+        run: |
+          python -m pip install --upgrade pip
+          pip install aioquic 'qh3<2'
+      - name: Install aiopquic with sanitizers
+        env:
+          CFLAGS: ${{ env.SAN_FLAGS }}
+          LDFLAGS: -fsanitize=address,undefined
+        run: pip install -e ".[dev]"
+      - name: Run core tier and aioquic peers under sanitizers
+        timeout-minutes: 20
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        # With aioquic and qh3 installed the core tier includes their peer
+        # tests. Only the interpreter is preloaded. The 10 MB and 100 MB
+        # peer transfers outrun their timeouts on a sanitized build.
+        run: |
+          LD_PRELOAD="$(gcc -print-file-name=libasan.so)" python -m pytest \
+            tests/ -m "not interop and not native" \
+            -k "not 10485760 and not 104857600" -v --tb=short
 
   # peer-interop-native retired: s2n-quic tests are deleted (unimplemented
   # stub) and every ngtcp2 directional test is an adapter-pending skip, so
