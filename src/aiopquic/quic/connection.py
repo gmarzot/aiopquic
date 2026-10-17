@@ -156,10 +156,13 @@ class QuicConnection:
         # Per-stream wrapper map. Each stream_ctx_t holds {tx, rx} byte
         # rings + RX flow-control state and is bound to picoquic's
         # app_stream_ctx slot. Lazy-created on first contact (TX from
-        # send_stream_data, RX from picoquic stream_data callback).
-        # Destroyed via lifecycle hooks (Landing C); for now leak until
-        # process exit to avoid use-after-free with the picoquic worker.
+        # send_stream_data, RX from picoquic stream_data callback). Holds
+        # the stream's reference to each, dropped on STREAM_DESTROY (in the
+        # drain) or by _destroy_stream_ctxs on close.
         self._stream_ctxs: dict[int, int] = {}
+        # Set once _destroy_stream_ctxs ran: an sc named by a later event
+        # is no longer ours to adopt.
+        self._stream_ctxs_dropped = False
         # Pull-model datagram TX: opaque record-ring pointer (lazy,
         # created on first send so stream-only connections pay nothing),
         # a mark-owed flag for the rare TX-event-ring-full case, and the
@@ -384,7 +387,8 @@ class QuicConnection:
         effect of worker packet processing, no Python dispatch needed.
         """
         if evt_type == _EVT_STREAM_DATA or evt_type == _EVT_STREAM_FIN:
-            if _stream_ctx_ptr and stream_id not in self._stream_ctxs:
+            if (_stream_ctx_ptr and not self._stream_ctxs_dropped
+                    and stream_id not in self._stream_ctxs):
                 self._stream_ctxs[stream_id] = _stream_ctx_ptr
             self._events.append(StreamDataReceived(
                 stream_id=stream_id,
@@ -433,10 +437,8 @@ class QuicConnection:
             ring_ev = getattr(self._transport, '_tx_event_ring_drain_event', None)
             if ring_ev is not None:
                 ring_ev.set()
-            # picoquic's close callback has fired — worker has stopped
-            # invoking app callbacks for this cnx's streams. Safe to
-            # free per-stream wrappers; without this they'd leak until
-            # process exit.
+            # Events still queued for these streams hold their own
+            # references.
             self._destroy_stream_ctxs()
             # Wake any parked datagram writer first so it observes
             # _closed instead of deadlocking.
@@ -646,7 +648,8 @@ class QuicConnection:
         QuicEngine after demuxing by cnx_ptr.
         """
         if evt_type == _EVT_STREAM_DATA:
-            if stream_ctx_ptr and stream_id not in self._stream_ctxs:
+            if (stream_ctx_ptr and not self._stream_ctxs_dropped
+                    and stream_id not in self._stream_ctxs):
                 self._stream_ctxs[stream_id] = stream_ctx_ptr
             self._events.append(StreamDataReceived(
                 stream_id=stream_id,
@@ -654,7 +657,8 @@ class QuicConnection:
                 end_stream=False,
             ))
         elif evt_type == _EVT_STREAM_FIN:
-            if stream_ctx_ptr and stream_id not in self._stream_ctxs:
+            if (stream_ctx_ptr and not self._stream_ctxs_dropped
+                    and stream_id not in self._stream_ctxs):
                 self._stream_ctxs[stream_id] = stream_ctx_ptr
             self._events.append(StreamDataReceived(
                 stream_id=stream_id,
@@ -743,13 +747,10 @@ class QuicConnection:
         return sc
 
     def _destroy_stream_ctxs(self) -> None:
-        """Free all per-stream wrappers + their TX/RX byte rings.
-        Idempotent — safe to call multiple times. Called when the
-        connection-close callback has fired (picoquic worker has
-        stopped invoking app callbacks for this cnx's streams).
-        Per-stream early cleanup (before connection close) requires
-        picoquic_unlink_app_stream_ctx via SPSC dispatch; deferred to
-        a future landing — bounded leak per connection until then."""
+        """Drop the connection's reference to every stream context, on
+        close or stop(). A context is freed when the last reference goes;
+        queued events and live StreamChunks hold their own. Idempotent."""
+        self._stream_ctxs_dropped = True
         if not self._stream_ctxs:
             return
         for sc in self._stream_ctxs.values():
