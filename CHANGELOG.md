@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.0rc2
 
 - Fix: a stream reset or stop issued as the peer closes the connection no longer touches a
   freed stream context (counter `tx_reattach_after_close`).
