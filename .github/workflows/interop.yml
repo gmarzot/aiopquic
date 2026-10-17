@@ -3,7 +3,8 @@ name: Interop
 # QUIC Interop Runner matrices (hq-interop and WebTransport, qns/) against
 # peer stacks, and the public-endpoint handshakes in tests/test_interop.py.
 # Peer results are report-only; a case aiopquic runs failing against itself,
-# or a pair that produced no results, fails the job.
+# or a pair that produced no results, fails the job. Runs on pull requests that
+# touch the endpoints, the library or picoquic.
 
 on:
   workflow_dispatch:
@@ -12,6 +13,11 @@ on:
   pull_request:
     paths:
       - "qns/**"
+      - "src/**"
+      - "patches/**"
+      - "third_party/**"
+      - "build.sh"
+      - "pyproject.toml"
       - ".github/workflows/interop.yml"
 
 concurrency:
