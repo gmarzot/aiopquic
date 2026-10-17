@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix: a lost packet at the end of a GSO send batch no longer stalls the connection until the
+  idle timeout (local picoquic patch).
 - `qns/`: QUIC and WebTransport Interop Runner endpoints; the `Interop` workflow runs them
   against peer stacks and the public-endpoint handshakes.
 
