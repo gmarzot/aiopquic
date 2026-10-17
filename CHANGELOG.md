@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fix: a server or WebTransport handler that resets, stops or writes a raw QUIC stream retired
+  later in the same drained batch no longer touches its freed stream context; `drain_rx()`
+  holds the batch's references until `release_batch()`.
+
 ## v0.5.0rc3
 
 - Fix: stream frames behind a peer's CONNECTION_CLOSE in one packet no longer read a freed raw
