@@ -4,7 +4,8 @@ name: CI
 # in release.yml, triggered manually via workflow_dispatch.
 #
 # Tiers:
-#   - core: unit + loopback. Required on (linux, macos) x (3.12, 3.13, 3.14).
+#   - core: unit + loopback. Required on (linux x86_64, linux aarch64, macos)
+#     x (3.12, 3.13, 3.14).
 #   - native: picoquic_ct + picohttp_ct subprocess smoke. Required.
 #   - peer interop: qh3 + aioquic cross-stack transfers; aioquic WebTransport
 #     stream teardown and reset. Required.
@@ -35,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
         python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
@@ -74,8 +75,12 @@ jobs:
     # exchange in both directions, and aioquic as a strict WebTransport peer.
     # Skipped silently in the core tier because aioquic/qh3 aren't in our dev
     # extras; this job installs them and runs those test files specifically.
-    name: peer interop
-    runs-on: ubuntu-latest
+    name: peer interop / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -130,7 +135,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: third_party/picoquic/build
-          key: picoquic-build-san-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build.sh', 'patches/*.patch', '.github/workflows/cicd.yml') }}
+          key: picoquic-build-san-${{ runner.os }}-${{ runner.arch }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build.sh', 'patches/*.patch', '.github/workflows/cicd.yml') }}
       - name: Build picoquic with sanitizers
         if: steps.picoquic-cache.outputs.cache-hit != 'true'
         env:
