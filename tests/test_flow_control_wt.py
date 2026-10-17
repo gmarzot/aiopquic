@@ -27,6 +27,7 @@ steady state, not a transient burst.
 """
 import asyncio
 import os
+import select
 import time
 
 import pytest
@@ -63,9 +64,24 @@ CHUNK = b"\xaa" * (256 * 1024)         # 256 KB per push
 DURATION = 5.0                          # seconds of steady-state push
 
 
+def _wake_state(transport):
+    """Whether the wake fd is readable and which reader the loop holds."""
+    fd = transport.eventfd
+    readable = bool(select.select([fd], [], [], 0)[0])
+    try:
+        reader = asyncio.get_running_loop()._selector.get_key(fd).data[0]
+        reader = getattr(reader, "_callback", reader)
+        owner = getattr(getattr(reader, "__self__", None), "_transport", None)
+        registered = "ours" if owner is transport else repr(reader)
+    except (KeyError, ValueError, AttributeError):
+        registered = None
+    return f"fd={fd} readable={readable} reader={registered}"
+
+
 def _stall_report(wt, sid, sessions, server, pushed, received):
     """Where a stalled transfer stopped: each end's session state, RX
-    events left undrained, and the transports' nonzero counters."""
+    events left undrained, the wake fds, and the transports' nonzero
+    counters."""
     srv = sessions[0] if sessions else None
     keys = ("fc_credit", "rx_", "tx_event_ring", "wake", "drain", "drop",
             "dead_cnx", "overflow")
@@ -82,6 +98,8 @@ def _stall_report(wt, sid, sessions, server, pushed, received):
         f"server_inbox={ {k: q.qsize() for k, q in srv._stream_inbox.items()} if srv else None} "
         f"server_rx_ring={server._transport.rx_event_ring_count} "
         f"client_rx_ring={wt._transport.rx_event_ring_count}\n"
+        f"server_wake: {_wake_state(server._transport)}\n"
+        f"client_wake: {_wake_state(wt._transport)}\n"
         f"server={ctrs(server._transport)}\nclient={ctrs(wt._transport)}")
 
 
@@ -188,8 +206,16 @@ async def test_drained_helper_absorbs_backpressure():
             try:
                 await asyncio.wait_for(received_done.wait(), timeout=30.0)
             except asyncio.TimeoutError:
-                pytest.fail(_stall_report(wt, sid, sessions, server,
-                                          pushed, len(received)))
+                report = _stall_report(wt, sid, sessions, server,
+                                       pushed, len(received))
+                # A manual drain shows whether the events were only waiting
+                # on a wake-up.
+                before = len(received)
+                server._dispatcher._drain()
+                await asyncio.sleep(1.0)
+                pytest.fail(f"{report}\nmanual server drain: received "
+                            f"{before} -> {len(received)}, server_closed="
+                            f"{sessions[0].session_closed if sessions else None}")
 
             assert len(received) == pushed, (
                 f"received {len(received)} of {pushed} bytes")
