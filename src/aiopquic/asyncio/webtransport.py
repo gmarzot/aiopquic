@@ -1445,9 +1445,8 @@ async def serve_webtransport(
                     configuration, 'key_exchange_groups', None),
             )
         if wt_supported_protocols:
-            # WT-Protocol allowlist, most preferred first: the server picks
-            # its first entry the client offered and refuses (400) an offer
-            # with no match.
+            # WT-Protocol allowlist: the server picks the client's first
+            # offer that is on it and refuses (400) an offer with no match.
             start_kwargs["wt_supported_protocols"] = ", ".join(
                 wt_supported_protocols)
         transport.start(**start_kwargs)

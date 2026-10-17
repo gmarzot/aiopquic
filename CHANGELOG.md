@@ -7,6 +7,7 @@
 - Fix: every PATH_CHALLENGE is answered, not only the last of a burst (local picoquic patch).
 - `reset_stream_at` is advertised and accepted under 0x1d as well as the draft-07 codepoint
   (local picoquic patch).
+- WebTransport servers select the WT-Protocol by the client's offer order.
 - `qns/`: QUIC and WebTransport Interop Runner endpoints; the `Interop` workflow runs them
   against peer stacks and the public-endpoint handshakes.
 
