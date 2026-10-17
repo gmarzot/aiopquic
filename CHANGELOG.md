@@ -12,6 +12,8 @@
 - Fix: a lost packet at the end of a GSO send batch no longer stalls the connection until the
   idle timeout (local picoquic patch).
 - Fix: every PATH_CHALLENGE is answered, not only the last of a burst (local picoquic patch).
+- Fix: picoquic's process-wide public random state no longer indexes out of bounds when
+  several picoquic threads draw from it at once (local picoquic patch).
 - `reset_stream_at` is advertised and accepted under 0x1d as well as the draft-07 codepoint
   (local picoquic patch).
 - WebTransport servers select the WT-Protocol by the client's offer order.
