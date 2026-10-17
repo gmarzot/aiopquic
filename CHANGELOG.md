@@ -5,6 +5,8 @@
 - Fix: stream frames behind a peer's CONNECTION_CLOSE in one packet no longer read a freed raw
   QUIC stream context; every event carrying a stream context holds a reference to it.
 - Fix: stream contexts named by events still queued at `stop()` are released with the transport.
+- Fix: stream frames behind a peer's CONNECTION_CLOSE are ignored; a new stream there leaked
+  its context and a stream released there was released twice (counter `stream_cb_after_close`).
 
 ## v0.5.0rc2
 

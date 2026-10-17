@@ -393,6 +393,8 @@ typedef struct {
     uint64_t        cnt_wt_control_released;
     /* Borrowed sc not attached because the cnx was already closing. */
     uint64_t        cnt_tx_reattach_after_close;
+    /* Stream callbacks ignored because the cnx was already closing. */
+    uint64_t        cnt_stream_cb_after_close;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -1144,6 +1146,12 @@ static size_t aiopquic_alpn_select_cb(picoquic_quic_t* quic,
     return count;  /* no mutual ALPN — reject the handshake */
 }
 
+/* Python drops its reference to every sc of a cnx on CLOSE / APP_CLOSE,
+ * which the worker pushes only once the cnx is disconnecting or later. */
+static inline int aiopquic_cnx_closing(picoquic_cnx_t* cnx) {
+    return picoquic_get_cnx_state(cnx) >= picoquic_state_disconnecting;
+}
+
 /*
  * Picoquic stream/connection callback. Runs in the picoquic network thread.
  * Mandatory copy-out happens here: picoquic's stream-callback bytes have
@@ -1263,6 +1271,19 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
          * Defensive: signal "no data" and return without consuming
          * anything from the shared TX ring. */
         (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
+        return 0;
+    }
+
+    /* picoquic decodes the frames behind a peer's close in the same
+     * packet, but Python may already have dropped every sc of the cnx:
+     * from here on stream callbacks create, touch and release no sc. */
+    if ((fin_or_event == picoquic_callback_stream_data ||
+         fin_or_event == picoquic_callback_stream_fin ||
+         fin_or_event == picoquic_callback_stream_reset ||
+         fin_or_event == picoquic_callback_stop_sending ||
+         fin_or_event == picoquic_callback_stream_released) &&
+        aiopquic_cnx_closing(cnx)) {
+        ctx->cnt_stream_cb_after_close++;
         return 0;
     }
 
@@ -1517,12 +1538,6 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     }
 
     return 0;
-}
-
-/* Python drops its reference to every sc of a cnx on CLOSE / APP_CLOSE,
- * which the worker pushes only once the cnx is disconnecting or later. */
-static inline int aiopquic_cnx_closing(picoquic_cnx_t* cnx) {
-    return picoquic_get_cnx_state(cnx) >= picoquic_state_disconnecting;
 }
 
 /* picoquic_reset_stream and picoquic_stop_sending detach the stream's app

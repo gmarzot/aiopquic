@@ -12,6 +12,9 @@ MODE is what follows the close in the same 1-RTT packet:
   none       nothing
   data       STREAM on the client's stream 0, at its next offset
   reset      RESET_STREAM on stream 0
+  newstream  STREAM on server stream 1, never opened before
+  unifin     the FIN of server uni stream 3, which already carried data, so
+             the client releases the stream behind the close
 
 Output: one JSON line with the client's events in order and the
 process-wide live stream context and chunk counts after teardown.
@@ -58,6 +61,17 @@ def _close_then_frames(self, builder, epoch, error_code, frame_type,
         buf.push_uint_var(len(HELLO))
         buf.push_uint_var(len(TAIL))
         buf.push_bytes(TAIL)
+    elif MODE == "newstream":
+        buf = builder.start_frame(0x0A, capacity=32 + len(TAIL))  # LEN
+        buf.push_uint_var(1)
+        buf.push_uint_var(len(TAIL))
+        buf.push_bytes(TAIL)
+    elif MODE == "unifin":
+        buf = builder.start_frame(0x0F, capacity=32 + len(TAIL))  # OFF|LEN|FIN
+        buf.push_uint_var(3)
+        buf.push_uint_var(len(HELLO))
+        buf.push_uint_var(len(TAIL))
+        buf.push_bytes(TAIL)
     elif MODE == "reset":
         buf = builder.start_frame(0x04, capacity=32)
         buf.push_uint_var(0)
@@ -73,6 +87,8 @@ class Server(AioquicProtocol):
     def quic_event_received(self, event):
         if isinstance(event, AioquicData) and event.stream_id == 0:
             self._quic.send_stream_data(0, HELLO, end_stream=False)
+            if MODE == "unifin":
+                self._quic.send_stream_data(3, HELLO, end_stream=False)
             self.transmit()
             asyncio.get_event_loop().call_later(0.2, self._close)
 

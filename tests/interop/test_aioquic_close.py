@@ -1,9 +1,9 @@
 """Stream frames after the peer's CONNECTION_CLOSE in one packet.
 
-The aiopquic client sees APP_CLOSE, which drops the connection's reference
-to every stream context, and then stream events naming one of them in the
-same drain. Each event holds its own reference, so the context outlives the
-close until the drain is done with it. The scenario
+picoquic decodes the frames behind a peer's close in the same packet, after
+the aiopquic client queued APP_CLOSE, on which Python drops the connection's
+reference to every stream context. Those stream callbacks are ignored, so
+they neither read a context nor create or release one. The scenario
 (peers/aioquic_close_coalesced.py) runs in a subprocess, so a native crash
 fails the test rather than the run.
 """
@@ -51,14 +51,17 @@ def _after_close(report):
     return [ev for ev in events[first + 1:] if ev[0] != "terminated"]
 
 
-@pytest.mark.parametrize("mode", ["none", "data", "reset"])
+@pytest.mark.parametrize("mode", ["none", "data", "reset", "newstream", "unifin"])
 def test_stream_frames_after_close_release_every_context(mode):
     report = _run(mode)
     assert ["data", 0, "hello", False] in report["events"], report
     assert report["sc_alive"] == 0 and report["chunks_alive"] == 0, report
 
 
-def test_stream_data_after_close_is_delivered():
-    """The trailing STREAM frame reaches the client after the close, so the
-    drain did read the context the close released."""
-    assert _after_close(_run("data")) == [["data", 0, "world", False]]
+@pytest.mark.parametrize("mode", ["data", "reset", "newstream", "unifin"])
+def test_stream_frames_after_close_are_ignored(mode):
+    """The frames reach the client after the close and nothing past the
+    close is delivered."""
+    report = _run(mode)
+    assert report["stream_cb_after_close"] > 0, report
+    assert _after_close(report) == [], report
