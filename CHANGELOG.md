@@ -9,6 +9,15 @@
   second context its later data arrives on; `STREAM_DESTROY` names the context it retires.
 - Fix: a WebTransport `events()` reader ends when its session is closed locally, and
   `receive_stream_data()` called after the close yields `WT_SESSION_GONE` instead of hanging.
+- Fix: a lost packet at the end of a GSO send batch no longer stalls the connection until the
+  idle timeout (local picoquic patch).
+- Fix: every PATH_CHALLENGE is answered, not only the last of a burst (local picoquic patch).
+- `reset_stream_at` is advertised and accepted under 0x1d as well as the draft-07 codepoint
+  (local picoquic patch).
+- WebTransport servers select the WT-Protocol by the client's offer order.
+- WebTransport connections write TLS secrets to `secrets_log_file` / `SSLKEYLOGFILE`.
+- `qns/`: QUIC and WebTransport Interop Runner endpoints; the `Interop` workflow runs them
+  against peer stacks and the public-endpoint handshakes.
 
 ## v0.5.0rc3
 

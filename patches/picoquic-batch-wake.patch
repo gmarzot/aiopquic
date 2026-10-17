@@ -1,0 +1,15 @@
+diff --git a/picoquic/sender.c b/picoquic/sender.c
+index d232473e..d2f4a7b0 100644
+--- a/picoquic/sender.c
++++ b/picoquic/sender.c
+@@ -3818,6 +3818,10 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
+             }
+         }
+         if (*send_length > 0) {
++            /* Later packets of a batch take the fast path, which does not set the
++             * loss and PTO timers: wake now so the next call computes them. */
++            next_wake_time = current_time;
++            SET_LAST_WAKE(cnx->quic, PICOQUIC_SENDER);
+             picoquic_handle_send_train_statistics(cnx, path_x, coalesced_packet_size, send_length, send_msg_size);
+         }
+     }
