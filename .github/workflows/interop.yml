@@ -13,11 +13,6 @@ on:
   pull_request:
     paths:
       - "qns/**"
-      - "src/**"
-      - "patches/**"
-      - "third_party/**"
-      - "build.sh"
-      - "pyproject.toml"
       - ".github/workflows/interop.yml"
 
 concurrency:
