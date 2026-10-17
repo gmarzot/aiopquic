@@ -1,0 +1,96 @@
+name: QNS images
+
+# Interop Runner endpoint images (qns/) built from a released aiopquic wheel and
+# pushed to GHCR, where the runner pulls them. `latest` follows stable releases.
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  schedule:
+    - cron: "41 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "aiopquic version on PyPI (default: newest stable)"
+        required: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  REGISTRY: ghcr.io/gmarzot
+  MIN_VERSION: "0.5.0"
+
+jobs:
+  images:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Resolve the version
+        id: version
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          pip install -q packaging
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, urllib.request
+          from packaging.version import Version
+          releases = json.load(urllib.request.urlopen("https://pypi.org/pypi/aiopquic/json"))["releases"]
+          stable = max(Version(v) for v in releases if not Version(v).is_prerelease)
+          requested = os.environ["REQUESTED"].strip()
+          version = Version(requested) if requested else stable
+          if requested and str(version) not in releases:
+              raise SystemExit(f"aiopquic {version} is not on PyPI")
+          build = Version(version.base_version) >= Version(os.environ["MIN_VERSION"])
+          print(f"version={version}")
+          print(f"latest={'true' if version == stable else 'false'}")
+          print(f"build={'true' if build else 'false'}")
+          PY
+      - name: Download the wheel
+        if: steps.version.outputs.build == 'true'
+        run: >-
+          pip download "aiopquic==${{ steps.version.outputs.version }}" --no-deps --only-binary=:all:
+          --implementation cp --python-version 3.12 --platform manylinux_2_34_x86_64 -d qns/wheelhouse
+      - name: Build
+        if: steps.version.outputs.build == 'true'
+        run: |
+          source="org.opencontainers.image.source=https://github.com/${{ github.repository }}"
+          version="org.opencontainers.image.version=${{ steps.version.outputs.version }}"
+          for target in quic webtransport; do
+            docker build --target "$target" --label "$source" --label "$version" -t "qns-$target" qns
+          done
+      - name: Smoke test
+        if: steps.version.outputs.build == 'true'
+        run: |
+          for target in quic webtransport; do
+            got=$(docker run --rm --entrypoint /venv/bin/python "qns-$target" -c "import aiopquic; print(aiopquic.__version__)")
+            test "$got" = "${{ steps.version.outputs.version }}"
+            rc=0; docker run --rm -e ROLE=server -e TESTCASE=no-such-case "qns-$target" || rc=$?
+            test "$rc" = 127
+          done
+      - uses: docker/login-action@v3
+        if: steps.version.outputs.build == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push
+        if: steps.version.outputs.build == 'true'
+        run: |
+          push() {
+            local target=$1 name=$2
+            docker tag "qns-$target" "$REGISTRY/$name:${{ steps.version.outputs.version }}"
+            docker push "$REGISTRY/$name:${{ steps.version.outputs.version }}"
+            if [ "${{ steps.version.outputs.latest }}" = true ]; then
+              docker tag "qns-$target" "$REGISTRY/$name:latest"
+              docker push "$REGISTRY/$name:latest"
+            fi
+          }
+          push quic aiopquic-qns
+          push webtransport aiopquic-wt-interop

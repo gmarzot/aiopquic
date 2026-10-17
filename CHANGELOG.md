@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `qns/` Interop Runner images are published to GHCR from each release's PyPI wheel.
 - Fix: a server or WebTransport handler that resets, stops or writes a raw QUIC stream retired
   later in the same drained batch no longer touches its freed stream context; `drain_rx()`
   holds the batch's references until `release_batch()`.
