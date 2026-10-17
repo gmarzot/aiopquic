@@ -2,6 +2,8 @@
 
 ## v0.5.0rc2
 
+- `peer_address()` and `local_address()` on `QuicConnection` and `WebTransportSession` return
+  `(host, port)`, available when a server connection or session is first delivered.
 - Fix: a stream reset or stop issued as the peer closes the connection no longer touches a
   freed stream context (counter `tx_reattach_after_close`).
 

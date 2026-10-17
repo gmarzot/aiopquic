@@ -530,11 +530,37 @@ static inline uint64_t aiopquic_initial_rx_window(picoquic_cnx_t* cnx,
                  : tp->initial_max_stream_data_bidi_remote;
 }
 
+/* An IP address and port: family 4 or 6, 0 when unknown; addr in
+ * network order (IPv4 in the first 4 bytes); port in host order. */
+typedef struct {
+    uint8_t family;
+    uint8_t reserved;
+    uint16_t port;
+    uint8_t addr[16];
+} aiopquic_addr_t;
+
+static inline void aiopquic_addr_fill(const struct sockaddr* sa,
+                                      aiopquic_addr_t* a) {
+    if (sa == NULL) return;
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in* v4 = (const struct sockaddr_in*)sa;
+        a->family = 4;
+        a->port = ntohs(v4->sin_port);
+        memcpy(a->addr, &v4->sin_addr, 4);
+    } else if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6* v6 = (const struct sockaddr_in6*)sa;
+        a->family = 6;
+        a->port = ntohs(v6->sin6_port);
+        memcpy(a->addr, &v6->sin6_addr, 16);
+    }
+}
+
 /* A copy of a connection's picoquic state, taken on the worker thread and
  * delivered to asyncio as an event payload. asyncio reads the copy and
  * never touches picoquic memory, which the worker owns and frees. Sent
- * with READY (raw stack), with SPSC_EVT_WT_SESSION_READY (WebTransport
- * client), with SPSC_EVT_CNX_STACK (single-port dispatch) and in answer
+ * with READY (raw stack), with a server's ALMOST_READY, with
+ * SPSC_EVT_WT_SESSION_READY (WebTransport client), with SPSC_EVT_CNX_STACK
+ * (single-port dispatch), ahead of SPSC_EVT_WT_NEW_SESSION and in answer
  * to SPSC_EVT_TX_CNX_REFRESH. */
 typedef struct {
     char alpn[32];                      /* NUL-terminated; empty if unknown */
@@ -549,6 +575,8 @@ typedef struct {
     picoquic_path_quality_t path_quality;
     uint64_t data_sent;
     uint64_t data_received;
+    aiopquic_addr_t peer_addr;
+    aiopquic_addr_t local_addr;
 } aiopquic_cnx_snapshot_t;
 
 /* Worker thread only. */
@@ -576,6 +604,12 @@ static inline void aiopquic_cnx_snapshot_fill(picoquic_cnx_t* cnx,
     picoquic_get_default_path_quality(cnx, &s->path_quality);
     s->data_sent = picoquic_get_data_sent(cnx);
     s->data_received = picoquic_get_data_received(cnx);
+    struct sockaddr* sa = NULL;
+    picoquic_get_peer_addr(cnx, &sa);
+    aiopquic_addr_fill(sa, &s->peer_addr);
+    sa = NULL;
+    picoquic_get_local_addr(cnx, &sa);
+    aiopquic_addr_fill(sa, &s->local_addr);
 }
 
 /* TX wake-coalescing: producer-side helper. Returns 1 if a wake is
@@ -1372,8 +1406,12 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
          * event with its length only. */
         entry.data_length = (uint32_t)length;
         ret = aiopquic_rx_push(ctx, &entry, NULL, 0);
-    } else if (fin_or_event == picoquic_callback_ready) {
-        /* The handshake-time state asyncio needs rides with READY. */
+    } else if (fin_or_event == picoquic_callback_ready
+               || (fin_or_event == picoquic_callback_almost_ready
+                   && !picoquic_is_client(cnx))) {
+        /* The handshake-time state asyncio needs rides with READY; a
+         * server's ALMOST_READY creates its connection, so it carries one
+         * too. */
         aiopquic_cnx_snapshot_t snap;
         aiopquic_cnx_snapshot_fill(cnx, &snap);
         ret = aiopquic_rx_push(ctx, &entry,
