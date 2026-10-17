@@ -328,6 +328,7 @@ cdef extern from "c/callback.h":
         uint64_t cnt_tx_event_dropped_dead_cnx
         uint64_t cnt_tx_wrong_direction_dropped
         uint64_t cnt_tx_reattach_after_close
+        uint64_t cnt_stream_cb_after_close
         uint64_t last_tx_event_ring_arm_ns
         uint64_t last_tx_event_ring_fire_ns
         uint64_t cnt_fc_credit_pushed
@@ -448,6 +449,12 @@ cdef extern from "c/callback.h":
                                      aiopquic_dgram_buf_t* db)
     void aiopquic_dgram_ring_release_flush(aiopquic_ctx_t* ctx)
     void aiopquic_dgram_ring_release_undrained(aiopquic_ctx_t* ctx)
+    void aiopquic_rx_event_release(const spsc_entry_t* e)
+    int aiopquic_rx_push_sc(aiopquic_ctx_t* ctx, const spsc_entry_t* entry,
+                            const uint8_t* data, uint32_t data_len)
+    int aiopquic_tx_push_sc(aiopquic_ctx_t* ctx, const spsc_entry_t* entry,
+                            const uint8_t* data, uint32_t data_len)
+    void aiopquic_tx_sc_release_undrained(aiopquic_ctx_t* ctx)
 
 
 # Per-stream wrapper holding both TX and RX byte rings + flow-control
@@ -1023,6 +1030,17 @@ def dump_all_counters(file=None):
               file=file, flush=True)
 
 
+cdef inline int _pending_fc_add(dict pending_fc, aiopquic_stream_ctx_t* sc,
+                                void* cnx, uint64_t stream_id) except -1:
+    """Note sc for this drain cycle's credit push. The note holds a
+    reference: a later entry in the batch may drop every other one."""
+    cdef uintptr_t key = <uintptr_t>sc
+    if key not in pending_fc:
+        aiopquic_stream_ctx_ref(sc)
+        pending_fc[key] = (<uintptr_t>cnx, stream_id)
+    return 0
+
+
 cdef class TransportContext:
     """
     Manages the picoquic context and network thread.
@@ -1123,15 +1141,16 @@ cdef class TransportContext:
     def __dealloc__(self):
         self._shutdown()
         if self._ctx is not NULL:
-            self._release_undrained_links()
+            self._release_undrained_rx()
             aiopquic_ctx_destroy(self._ctx)
             self._ctx = NULL
         # WeakSet auto-removes; no explicit discard needed.
 
-    cdef void _release_undrained_links(self):
-        """Free the links of LINK_RELEASE events nobody drained. Runs after
-        the worker stopped and picoquic was freed, so this thread is the
-        ring's only user; ring destroy would skip these borrowed pointers."""
+    cdef void _release_undrained_rx(self):
+        """Free the links of LINK_RELEASE events nobody drained and drop the
+        sc references of undrained stream events. Runs after the worker
+        stopped and picoquic was freed, so this thread is the ring's only
+        user; ring destroy would skip these borrowed pointers."""
         cdef spsc_entry_t* entry
         while True:
             entry = spsc_ring_peek(self._ctx.rx_event_ring)
@@ -1144,6 +1163,7 @@ cdef class TransportContext:
                     and entry.data_buf is not NULL):
                 aiopquic_wt_stream_link_destroy(
                     <aiopquic_wt_stream_link_t*>entry.data_buf)
+            aiopquic_rx_event_release(entry)
             spsc_ring_pop(self._ctx.rx_event_ring)
 
     cdef void _shutdown(self):
@@ -1157,6 +1177,7 @@ cdef class TransportContext:
             self._thread_ctx = NULL
         if self._ctx is not NULL:
             aiopquic_dgram_ring_release_undrained(self._ctx)
+            aiopquic_tx_sc_release_undrained(self._ctx)
         if self._quic is not NULL:
             picoquic_free(self._quic)
             self._quic = NULL
@@ -1223,6 +1244,7 @@ cdef class TransportContext:
             'tx_event_dropped_dead_cnx': self._ctx.cnt_tx_event_dropped_dead_cnx,
             'tx_wrong_direction_dropped': self._ctx.cnt_tx_wrong_direction_dropped,
             'tx_reattach_after_close': self._ctx.cnt_tx_reattach_after_close,
+            'stream_cb_after_close': self._ctx.cnt_stream_cb_after_close,
             'rx_event_drops': self._ctx.worker_rx_event_drops,
             'rx_event_drops_stream_data': self._ctx.worker_rx_event_drops_stream_data,
             'rx_overflow_pushed': self._ctx.rx_overflow.pushed,
@@ -1942,8 +1964,7 @@ cdef class TransportContext:
                                 <void*>entry.cnx, entry.stream_id))
                             aiopquic_stream_ctx_rx_consumed_add(
                                 sc, <uint64_t>length)
-                            pending_fc[<uintptr_t>sc] = (
-                                <uintptr_t>entry.cnx, entry.stream_id)
+                            _pending_fc_add(pending_fc, sc, entry.cnx, entry.stream_id)
             elif entry.data_buf is not NULL and entry.data_length == 0:
                 # BORROWED-sc convention: data_buf is an aiopquic_stream_ctx_t*
                 # we don't own. Used by WT STREAM_DATA / STREAM_FIN (bytes
@@ -1973,8 +1994,7 @@ cdef class TransportContext:
                                     <void*>entry.cnx, entry.stream_id))
                                 aiopquic_stream_ctx_rx_consumed_add(
                                     sc, <uint64_t>length)
-                                pending_fc[<uintptr_t>sc] = (
-                                    <uintptr_t>entry.cnx, entry.stream_id)
+                                _pending_fc_add(pending_fc, sc, entry.cnx, entry.stream_id)
 
             # Cython-side coalescing: when the picoquic worker fires
             # multiple stream_data callbacks for the same stream
@@ -1986,6 +2006,7 @@ cdef class TransportContext:
             if (data is None and
                 (entry.event_type == SPSC_EVT_STREAM_DATA or
                  entry.event_type == SPSC_EVT_WT_STREAM_DATA)):
+                aiopquic_rx_event_release(entry)
                 spsc_ring_pop(self._ctx.rx_event_ring)
                 continue
 
@@ -2004,11 +2025,19 @@ cdef class TransportContext:
                     entry.event_type == SPSC_EVT_WT_SESSION_CLOSED or
                     entry.event_type == SPSC_EVT_WT_SESSION_REFUSED):
                 self._forget_snapshot(<uintptr_t>entry.cnx)
+            aiopquic_rx_event_release(entry)
             spsc_ring_pop(self._ctx.rx_event_ring)
 
         # Per-cycle FC dedupe flush: emit at most one push per stream
         # for the work just performed. Hysteresis inside
         # _push_fc_credit filters further.
+        self._flush_pending_fc(pending_fc)
+        aiopquic_clear_rx(self._ctx)
+        return events
+
+    cdef int _flush_pending_fc(self, dict pending_fc) except -1:
+        """One credit push per stream noted this cycle, then drop the
+        reference each note holds."""
         cdef uintptr_t sc_uint
         cdef uintptr_t cnx_uint
         cdef uint64_t sid_uint
@@ -2016,8 +2045,10 @@ cdef class TransportContext:
             self._push_fc_credit(
                 <void*><uintptr_t>cnx_uint, sid_uint,
                 <aiopquic_stream_ctx_t*><void*><uintptr_t>sc_uint)
-        aiopquic_clear_rx(self._ctx)
-        return events
+            aiopquic_stream_ctx_destroy(
+                <aiopquic_stream_ctx_t*><void*><uintptr_t>sc_uint)
+        pending_fc.clear()
+        return 0
 
     cdef inline void _push_fc_credit(self, void* cnx,
                                        uint64_t stream_id,
@@ -2206,8 +2237,7 @@ cdef class TransportContext:
                                 <void*>entry.cnx, entry.stream_id))
                             aiopquic_stream_ctx_rx_consumed_add(
                                 sc, <uint64_t>length)
-                            pending_fc[<uintptr_t>sc] = (
-                                <uintptr_t>entry.cnx, entry.stream_id)
+                            _pending_fc_add(pending_fc, sc, entry.cnx, entry.stream_id)
             elif entry.data_buf is not NULL and entry.data_length == 0:
                 sc = <aiopquic_stream_ctx_t*>entry.data_buf
                 sc_ptr = <uintptr_t>sc
@@ -2232,41 +2262,42 @@ cdef class TransportContext:
                                     <void*>entry.cnx, entry.stream_id))
                                 aiopquic_stream_ctx_rx_consumed_add(
                                     sc, <uint64_t>length)
-                                pending_fc[<uintptr_t>sc] = (
-                                    <uintptr_t>entry.cnx, entry.stream_id)
+                                _pending_fc_add(pending_fc, sc, entry.cnx, entry.stream_id)
 
             if (data is None and
                 (entry.event_type == SPSC_EVT_STREAM_DATA or
                  entry.event_type == SPSC_EVT_WT_STREAM_DATA)):
+                aiopquic_rx_event_release(entry)
                 spsc_ring_pop(self._ctx.rx_event_ring)
                 continue
 
-            handler(
-                entry.event_type,
-                entry.stream_id,
-                data,
-                entry.is_fin,
-                entry.error_code,
-                <uintptr_t>entry.cnx,
-                <uintptr_t>entry.stream_ctx,
-                sc_ptr,
-            )
+            # The entry keeps its sc reference through the handler, which
+            # may drop every other one (a close frees the connection's).
+            try:
+                handler(
+                    entry.event_type,
+                    entry.stream_id,
+                    data,
+                    entry.is_fin,
+                    entry.error_code,
+                    <uintptr_t>entry.cnx,
+                    <uintptr_t>entry.stream_ctx,
+                    sc_ptr,
+                )
+            except BaseException:
+                self._flush_pending_fc(pending_fc)
+                raise
             if (entry.event_type == SPSC_EVT_CLOSE or
                     entry.event_type == SPSC_EVT_APP_CLOSE or
                     entry.event_type == SPSC_EVT_WT_SESSION_CLOSED or
                     entry.event_type == SPSC_EVT_WT_SESSION_REFUSED):
                 self._forget_snapshot(<uintptr_t>entry.cnx)
+            aiopquic_rx_event_release(entry)
             spsc_ring_pop(self._ctx.rx_event_ring)
             count += 1
 
         # Per-cycle FC dedupe flush (same pattern as drain_rx).
-        cdef uintptr_t sc_uint
-        cdef uintptr_t cnx_uint
-        cdef uint64_t sid_uint
-        for sc_uint, (cnx_uint, sid_uint) in pending_fc.items():
-            self._push_fc_credit(
-                <void*><uintptr_t>cnx_uint, sid_uint,
-                <aiopquic_stream_ctx_t*><void*><uintptr_t>sc_uint)
+        self._flush_pending_fc(pending_fc)
         aiopquic_clear_rx(self._ctx)
         return count
 
@@ -2280,6 +2311,8 @@ cdef class TransportContext:
         stream_ctx is forwarded as the v_stream_ctx pointer for events
         that consume it (SPSC_EVT_TX_MARK_ACTIVE → picoquic_mark_active_stream).
         For the PULL-model send path it carries an aiopquic_stream_buf_t*.
+        An sc on a reset, stop-sending, mark-active or flow-control event
+        is referenced while the event is queued.
 
         is_fin is also reused as a small auxiliary flag: e.g.,
         SPSC_EVT_TX_SET_APP_FLOW_CONTROL uses it as the
@@ -2302,11 +2335,28 @@ cdef class TransportContext:
             data_ptr = <const uint8_t*>data
             data_len = <uint32_t>len(data)
 
-        cdef int ret = spsc_ring_push(self._ctx.tx_event_ring, &entry, data_ptr, data_len)
+        cdef int ret = aiopquic_tx_push_sc(self._ctx, &entry, data_ptr, data_len)
         if ret == 0:
             self._ctx.cnt_tx_event_ring_pushes += 1
         else:
             raise BufferError("TX ring buffer is full")
+
+    def _test_push_rx(self, uint32_t event_type, uint64_t stream_id,
+                      uintptr_t cnx_ptr=0, uintptr_t stream_ctx=0,
+                      uint64_t error_code=0):
+        """Test path: queue an RX event as the worker does, sc reference
+        included. Only while no worker runs: it is the ring's producer."""
+        if self._thread_ctx is not NULL:
+            raise RuntimeError("worker running")
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = event_type
+        entry.stream_id = stream_id
+        entry.cnx = <void*>cnx_ptr
+        entry.stream_ctx = <void*>stream_ctx
+        entry.error_code = error_code
+        if aiopquic_rx_push_sc(self._ctx, &entry, NULL, 0) != 0:
+            raise MemoryError("RX event push failed")
 
     def tx_send_atomic(self, uint64_t stream_id, bytes data,
                         bint end_stream, uintptr_t cnx_ptr,
@@ -2381,7 +2431,7 @@ cdef class TransportContext:
         entry.stream_id = stream_id
         entry.cnx = <void*>cnx_ptr
         entry.stream_ctx = <void*>sc
-        rc = spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0)
+        rc = aiopquic_tx_push_sc(self._ctx, &entry, NULL, 0)
         if rc == 0:
             self._ctx.cnt_tx_event_ring_pushes += 1
         else:

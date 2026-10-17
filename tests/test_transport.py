@@ -172,7 +172,9 @@ class TestDeadCnxDrop:
         """OPEN_FLOW_CONTROL holds an sc reference; dropping it on a dead cnx
         must release that reference."""
         import gc
-        from aiopquic._binding._transport import stream_ctx_create
+        from aiopquic._binding._transport import (
+            stream_ctx_create, stream_ctx_destroy,
+        )
 
         ctx = TransportContext()
         ctx.start(alpn="h3")
@@ -184,6 +186,7 @@ class TestDeadCnxDrop:
             sc = stream_ctx_create()
             ctx.push_tx_event(SPSC_EVT_TX_OPEN_FLOW_CONTROL, 0,
                               cnx_ptr=BOGUS_CNX, stream_ctx=sc)
+            stream_ctx_destroy(sc)  # the event's reference is the last
             ctx.wake_up()
             assert _wait_counter(ctx, 'tx_event_dropped_dead_cnx',
                                  dropped + 1) == dropped + 1

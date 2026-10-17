@@ -157,7 +157,9 @@ has left the ring once it is exceeded.
   event (`DGRAM_RING_RELEASE`) handled behind every MARK queued before it.
 - `aiopquic_stream_ctx_t` starts with the stream's reference; `aiopquic_stream_ctx_destroy()` is
   the unref and the last frees. Never free on our own FIN: picoquic calls back with the `sc` until
-  `stream_released`.
+  `stream_released`. Every raw-QUIC event carrying an `sc` holds a reference while queued (RX data,
+  FIN, reset, stop-sending; TX reset, stop-sending, mark-active, flow-control): push through
+  `aiopquic_rx_push_sc` / `aiopquic_tx_push_sc`, and release on every consume or drop path.
 - picoquic may free a cnx any time after its close callback. The dead-connection guard
   (`aiopquic_cnx_is_alive()`) runs before any TX event that names a cnx and drops the event on a
   miss; it compares addresses, so a new cnx at a freed one's address passes. WT TX events carry a
