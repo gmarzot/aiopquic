@@ -24,6 +24,15 @@ def route_batch(events, route) -> None:
         except Exception:
             logger.exception("event type %s dropped by its handler", ev[0])
 
+
+def drain_and_route(transport, route) -> None:
+    """Drain one batch and route it. The stream contexts the batch names
+    stay alive until every event of it has been routed."""
+    try:
+        route_batch(transport.drain_rx(), route)
+    finally:
+        transport.release_batch()
+
 from .configuration import QuicConfiguration
 from .events import (
     QuicEvent, HandshakeCompleted, ConnectionTerminated,
@@ -1244,7 +1253,7 @@ class QuicEngine:
         """
         if self._transport is None:
             return
-        route_batch(self._transport.drain_rx(), self.route_event)
+        drain_and_route(self._transport, self.route_event)
 
     def route_event(self, ev) -> None:
         """Route one already-drained event (also the entry point for an

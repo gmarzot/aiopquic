@@ -54,6 +54,15 @@ def test_undelivered_events_return_their_reference(mode):
         f"exit {proc.returncode}\n{proc.stderr[-3000:]}")
 
 
+def test_batch_keeps_contexts_until_routed():
+    """A drain_rx batch keeps every context it names alive until it has
+    been routed, so a protocol replying to an event behind which the stream
+    was already retired still hands the worker a live context."""
+    proc = _run("destroy-in-batch")
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\n{proc.stderr[-3000:]}")
+
+
 def test_connection_churn_releases_every_context():
     """Connections closed by either side mid-transfer, with data, FIN, reset
     and stop-sending streams, release every context and chunk."""
