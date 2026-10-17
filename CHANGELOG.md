@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix: a server or WebTransport handler that resets, stops or writes a raw QUIC stream retired
+  later in the same drained batch no longer touches its freed stream context; `drain_rx()`
+  holds the batch's references until `release_batch()`.
 - Fix: a lost packet at the end of a GSO send batch no longer stalls the connection until the
   idle timeout (local picoquic patch).
 - Fix: every PATH_CHALLENGE is answered, not only the last of a burst (local picoquic patch).
