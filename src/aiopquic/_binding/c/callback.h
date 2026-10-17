@@ -391,6 +391,8 @@ typedef struct {
     uint64_t        cnt_sc_destroy_fc_credit_dead_cnx;
     /* WT CONNECT streams h3zero freed while their session lived. */
     uint64_t        cnt_wt_control_released;
+    /* Borrowed sc not attached because the cnx was already closing. */
+    uint64_t        cnt_tx_reattach_after_close;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -1400,15 +1402,26 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     return 0;
 }
 
+/* Python frees every sc of a cnx on CLOSE / APP_CLOSE, which the worker
+ * pushes only once the cnx is disconnecting or later: a borrowed sc on a
+ * TX event popped in that state may already be freed. */
+static inline int aiopquic_cnx_closing(picoquic_cnx_t* cnx) {
+    return picoquic_get_cnx_state(cnx) >= picoquic_state_disconnecting;
+}
+
 /* picoquic_reset_stream and picoquic_stop_sending detach the stream's app
  * ctx, so stream_released, which frees sc, would never fire: put sc back.
- * sc rides the TX event without a reference; a stream picoquic still has
- * (rc is not INVALID_STREAM_ID) still holds the stream's reference.
- * Returns sc when reattached, else NULL. */
+ * sc rides the TX event without a reference and is live only while the
+ * cnx is not closing. Returns sc when reattached, else NULL. */
 static inline aiopquic_stream_ctx_t* aiopquic_stream_reattach(
-        picoquic_cnx_t* cnx, const spsc_entry_t* entry, int rc) {
+        aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx, const spsc_entry_t* entry,
+        int rc) {
     aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)entry->stream_ctx;
     if (sc == NULL || rc == PICOQUIC_ERROR_INVALID_STREAM_ID) return NULL;
+    if (aiopquic_cnx_closing(cnx)) {
+        ctx->cnt_tx_reattach_after_close++;
+        return NULL;
+    }
     (void)picoquic_set_app_stream_ctx(cnx, entry->stream_id, sc);
     return sc;
 }
@@ -1557,8 +1570,13 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                          * (h3zero owns app_stream_ctx) — use v2 so the
                          * h3zero pointer isn't clobbered. */
                         if (entry->stream_ctx != NULL) {
-                            picoquic_mark_active_stream(cnx, entry->stream_id,
-                                                         1, entry->stream_ctx);
+                            if (aiopquic_cnx_closing(cnx)) {
+                                ctx->cnt_tx_reattach_after_close++;
+                            } else {
+                                picoquic_mark_active_stream(
+                                    cnx, entry->stream_id, 1,
+                                    entry->stream_ctx);
+                            }
                         } else {
                             picoquic_mark_active_stream_v2(cnx, entry->stream_id,
                                                             1);
@@ -1634,7 +1652,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                             int rr = picoquic_reset_stream(cnx, entry->stream_id,
                                                            entry->error_code);
                             aiopquic_stream_ctx_tx_abandon(
-                                aiopquic_stream_reattach(cnx, entry, rr));
+                                aiopquic_stream_reattach(ctx, cnx, entry, rr));
                         } else {
                             ctx->cnt_tx_wrong_direction_dropped++;
                         }
@@ -1646,7 +1664,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         if (aiopquic_stream_can_receive(cnx, entry->stream_id)) {
                             int rr = picoquic_stop_sending(cnx, entry->stream_id,
                                                            entry->error_code);
-                            (void)aiopquic_stream_reattach(cnx, entry, rr);
+                            (void)aiopquic_stream_reattach(ctx, cnx, entry, rr);
                         } else {
                             ctx->cnt_tx_wrong_direction_dropped++;
                         }
