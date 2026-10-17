@@ -792,3 +792,26 @@ async def test_wt_write_larger_than_the_stream_ring_raises():
             wt.send_stream_data(sid, b"y" * 1024)
     finally:
         server.close()
+
+@pytest.mark.asyncio
+async def test_wt_advertises_reset_stream_at_both_codepoints(tmp_path,
+                                                             monkeypatch):
+    """reset_stream_at goes out under 0x1d (reliable-stream-reset-10) and the
+    draft-07 codepoint; each side's text log records the peer's parameters."""
+    port = next_port()
+    server_log, client_log = tmp_path / "server.log", tmp_path / "client.log"
+    monkeypatch.setenv("AIOPQUIC_TEXTLOG_FILE", str(server_log))
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt", handler=lambda session: None,
+        cert_file=CERT_FILE, key_file=KEY_FILE)
+    monkeypatch.setenv("AIOPQUIC_TEXTLOG_FILE", str(client_log))
+    try:
+        async with connect_webtransport(
+                "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            assert wt.session_ready
+    finally:
+        server.close()
+    for path in (server_log, client_log):
+        text = path.read_text()
+        assert "Extension type: 29 (reset_stream_at)" in text, path
+        assert "Extension type: 6745883625174385 (reset_stream_at)" in text, path

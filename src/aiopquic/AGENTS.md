@@ -177,6 +177,7 @@ applies nor reverse-applies stops the build: drop or regenerate it.
 | `picoquic-alpn-null-guard` | negotiated-ALPN lookup tolerates a NULL cnx | Upstream candidate |
 | `picoquic-batch-wake` | A send call that sent packets wakes the connection at once: later packets of a GSO batch take a fast path that sets no loss or PTO timer, so a lost tail waited for the idle timeout | Upstream candidate |
 | `picoquic-path-response-each` | Every PATH_CHALLENGE gets a PATH_RESPONSE (RFC 9000 §8.2.2); a second challenge before the next send overwrote the first | Upstream candidate |
+| `picoquic-reset-stream-at-tp` | `reset_stream_at` is advertised and accepted under 0x1d (reliable-stream-reset-10) as well as the draft-07 codepoint | Temporary: until upstream moves to 0x1d |
 | `picoquic-h3zero-null-file-guard` | h3zero's client skips `fwrite` on a NULL `FILE*` | Upstream candidate |
 | `picoquic-reset-at-ack-delete` | The ack of a RESET_STREAM_AT retires a stream we only sent on; picoquic gated it on the receive-side `consumed_offset`, so the stream stayed until the connection closed | Local |
 | `picoquic-stop-sending-error-getter` | `picoquic_get_remote_stop_sending_error()` returns the code of a received STOP_SENDING | Local |
