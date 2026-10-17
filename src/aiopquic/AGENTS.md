@@ -57,6 +57,10 @@ record ring is full: wait on `get_datagram_tx_drain_event()` and resend the same
 picks round robin (even) or FIFO by stream id (odd) among equal priorities. A return of 1 means the
 TX event ring was full and nothing applied.
 
+**Addresses.** `peer_address()` / `local_address()` on `QuicConnection` and
+`WebTransportSession` return `(host, port)` (IPv4-mapped IPv6 as IPv4), or None before the
+connection is known and after it closes. A server has them from its first event or handler call.
+
 **TX backpressure.** `send_stream_data()` is all-or-nothing: `BufferError` commits nothing, so
 resend the same buffer; `ValueError` means one write exceeds `stream_ring_cap` (4 MiB).
 `await send_stream_data_drained()` does the waiting. For a byte budget below ring-full use

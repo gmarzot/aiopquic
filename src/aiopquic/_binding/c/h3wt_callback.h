@@ -1238,6 +1238,16 @@ static int aiopquic_wt_server_path_callback(
         h3_ctx, s->control_stream_id,
         aiopquic_wt_path_callback, s);
 
+    {
+        /* Cached ahead of NEW_SESSION, so the accepted session has it. */
+        aiopquic_cnx_snapshot_t snap;
+        aiopquic_cnx_snapshot_fill(cnx, &snap);
+        spsc_entry_t se = {0};
+        se.event_type = SPSC_EVT_CNX_SNAPSHOT;
+        se.cnx = cnx;
+        (void)aiopquic_rx_push(bridge, &se, (const uint8_t*)&snap, sizeof(snap));
+    }
+
     spsc_entry_t entry = {0};
     entry.event_type = SPSC_EVT_WT_NEW_SESSION;
     entry.stream_id = s->control_stream_id;

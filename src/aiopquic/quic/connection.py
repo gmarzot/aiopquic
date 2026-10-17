@@ -329,6 +329,21 @@ class QuicConnection:
             return self._transport.connection_ids(self._cnx_ptr)
         return None
 
+    def peer_address(self) -> tuple[str, int] | None:
+        """The peer's (host, port), e.g. ("127.0.0.1", 4433), or None
+        before the connection is known or after it closes. An
+        IPv4-mapped IPv6 address is returned as IPv4."""
+        if self._cnx_ptr and self._transport is not None:
+            return self._transport.peer_address(self._cnx_ptr)
+        return None
+
+    def local_address(self) -> tuple[str, int] | None:
+        """This side's (host, port) on the connection's path, as
+        peer_address()."""
+        if self._cnx_ptr and self._transport is not None:
+            return self._transport.local_address(self._cnx_ptr)
+        return None
+
     def _negotiated_alpn(self, cnx_ptr):
         """The ALPN TLS actually negotiated for this cnx, falling back
         to the first configured ALPN if picoquic can't report it.
