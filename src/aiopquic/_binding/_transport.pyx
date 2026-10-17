@@ -1934,9 +1934,9 @@ cdef class TransportContext:
             # STREAM_DESTROY fires once per stream when picoquic
             # considers it fully retired. Surface to user code so the
             # consumer (QuicConnection / WebTransportSession) can pop
-            # its per-stream dicts. stream_ctx_ptr is zeroed: the
-            # consumer must not keep the pointer past the batch, which
-            # drops the stream-lifetime ref.
+            # its per-stream dicts. stream_ctx_ptr names the sc whose
+            # stream-lifetime ref the batch drops; the consumer must not
+            # keep the pointer past the batch.
             if entry.event_type == SPSC_EVT_STREAM_DESTROY:
                 events.append((
                     entry.event_type,
@@ -1945,7 +1945,7 @@ cdef class TransportContext:
                     0,
                     0,
                     <uintptr_t>entry.cnx,
-                    <uintptr_t>0,
+                    <uintptr_t>entry.stream_ctx,
                     <uintptr_t>0,
                 ))
                 if entry.stream_ctx is not NULL:
@@ -2229,7 +2229,7 @@ cdef class TransportContext:
                     0,
                     0,
                     <uintptr_t>entry.cnx,
-                    <uintptr_t>0,
+                    <uintptr_t>entry.stream_ctx,
                     <uintptr_t>0,
                 )
                 if entry.stream_ctx is not NULL:

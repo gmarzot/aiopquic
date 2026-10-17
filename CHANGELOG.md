@@ -5,6 +5,8 @@
 - Fix: a server or WebTransport handler that resets, stops or writes a raw QUIC stream retired
   later in the same drained batch no longer touches its freed stream context; `drain_rx()`
   holds the batch's references until `release_batch()`.
+- Fix: a raw QUIC stream whose context a reset or stop-sending detached no longer leaks the
+  second context its later data arrives on; `STREAM_DESTROY` names the context it retires.
 
 ## v0.5.0rc3
 

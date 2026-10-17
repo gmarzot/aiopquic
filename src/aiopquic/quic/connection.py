@@ -165,10 +165,14 @@ class QuicConnection:
         # Per-stream wrapper map. Each stream_ctx_t holds {tx, rx} byte
         # rings + RX flow-control state and is bound to picoquic's
         # app_stream_ctx slot. Lazy-created on first contact (TX from
-        # send_stream_data, RX from picoquic stream_data callback). Holds
-        # the stream's reference to each, dropped on STREAM_DESTROY (in the
-        # drain) or by _destroy_stream_ctxs on close.
+        # send_stream_data, RX from picoquic stream_data callback).
         self._stream_ctxs: dict[int, int] = {}
+        # Every context whose stream reference is still held: dropped on
+        # STREAM_DESTROY (in the drain) for the one attached then, else by
+        # _destroy_stream_ctxs on close. A reset or stop-sending detaches
+        # picoquic's context, so a stream can get a second one the map
+        # above never names.
+        self._sc_owned: set[int] = set()
         # Set once _destroy_stream_ctxs ran: an sc named by a later event
         # is no longer ours to adopt.
         self._stream_ctxs_dropped = False
@@ -396,15 +400,14 @@ class QuicConnection:
         effect of worker packet processing, no Python dispatch needed.
         """
         if evt_type == _EVT_STREAM_DATA or evt_type == _EVT_STREAM_FIN:
-            if (_stream_ctx_ptr and not self._stream_ctxs_dropped
-                    and stream_id not in self._stream_ctxs):
-                self._stream_ctxs[stream_id] = _stream_ctx_ptr
+            self._adopt_stream_ctx(stream_id, _stream_ctx_ptr)
             self._events.append(StreamDataReceived(
                 stream_id=stream_id,
                 data=data if data is not None else memoryview(b""),
                 end_stream=(evt_type == _EVT_STREAM_FIN),
             ))
         elif evt_type == _EVT_STREAM_RESET:
+            self._adopt_stream_ctx(stream_id, _stream_ctx_ptr)
             # Abnormal stream end (peer RESET_STREAM) — surface the code
             # so drop-under-load investigations see the actual reason
             # rather than inferring it from the relay's logs.
@@ -415,6 +418,7 @@ class QuicConnection:
                 error_code=error_code,
             ))
         elif evt_type == _EVT_STOP_SENDING:
+            self._adopt_stream_ctx(stream_id, _stream_ctx_ptr)
             self._events.append(StopSendingReceived(
                 stream_id=stream_id,
                 error_code=error_code,
@@ -498,8 +502,9 @@ class QuicConnection:
         elif evt_type == _EVT_STREAM_DESTROY:
             # Stream fully retired by picoquic — drop our cached
             # pointer so the dict doesn't accumulate stale entries.
-            # The C side has already dropped the stream-lifetime ref
-            # by the time this fires; don't deref.
+            # The drain drops the stream reference of the context named
+            # here; don't deref.
+            self._sc_owned.discard(_stream_ctx_ptr)
             # Wake any producer parked in await sc_event.wait() with
             # the about-to-be-popped Event still in hand. Without this
             # set(), the waiter would deadlock — the popped Event is
@@ -657,28 +662,26 @@ class QuicConnection:
         QuicEngine after demuxing by cnx_ptr.
         """
         if evt_type == _EVT_STREAM_DATA:
-            if (stream_ctx_ptr and not self._stream_ctxs_dropped
-                    and stream_id not in self._stream_ctxs):
-                self._stream_ctxs[stream_id] = stream_ctx_ptr
+            self._adopt_stream_ctx(stream_id, stream_ctx_ptr)
             self._events.append(StreamDataReceived(
                 stream_id=stream_id,
                 data=data if data is not None else memoryview(b""),
                 end_stream=False,
             ))
         elif evt_type == _EVT_STREAM_FIN:
-            if (stream_ctx_ptr and not self._stream_ctxs_dropped
-                    and stream_id not in self._stream_ctxs):
-                self._stream_ctxs[stream_id] = stream_ctx_ptr
+            self._adopt_stream_ctx(stream_id, stream_ctx_ptr)
             self._events.append(StreamDataReceived(
                 stream_id=stream_id,
                 data=data if data is not None else memoryview(b""),
                 end_stream=True,
             ))
         elif evt_type == _EVT_STREAM_RESET:
+            self._adopt_stream_ctx(stream_id, stream_ctx_ptr)
             self._events.append(StreamReset(
                 stream_id=stream_id, error_code=error_code,
             ))
         elif evt_type == _EVT_STOP_SENDING:
+            self._adopt_stream_ctx(stream_id, stream_ctx_ptr)
             self._events.append(StopSendingReceived(
                 stream_id=stream_id, error_code=error_code,
             ))
@@ -732,6 +735,7 @@ class QuicConnection:
         elif evt_type == _EVT_DATAGRAM_LOST:
             self._datagrams_lost += 1
         elif evt_type == _EVT_STREAM_DESTROY:
+            self._sc_owned.discard(stream_ctx_ptr)
             # Wake a producer parked on this stream before dropping the
             # Event it holds; see the client-path branch.
             ev = self._stream_tx_drain_events.get(stream_id)
@@ -753,18 +757,24 @@ class QuicConnection:
         if sc is None:
             sc = stream_ctx_create()
             self._stream_ctxs[stream_id] = sc
+            self._sc_owned.add(sc)
         return sc
+
+    def _adopt_stream_ctx(self, stream_id: int, sc: int) -> None:
+        if sc and not self._stream_ctxs_dropped:
+            self._sc_owned.add(sc)
+            if stream_id not in self._stream_ctxs:
+                self._stream_ctxs[stream_id] = sc
 
     def _destroy_stream_ctxs(self) -> None:
         """Drop the connection's reference to every stream context, on
         close or stop(). A context is freed when the last reference goes;
         queued events and live StreamChunks hold their own. Idempotent."""
         self._stream_ctxs_dropped = True
-        if not self._stream_ctxs:
-            return
-        for sc in self._stream_ctxs.values():
-            stream_ctx_destroy(sc)
         self._stream_ctxs.clear()
+        for sc in self._sc_owned:
+            stream_ctx_destroy(sc)
+        self._sc_owned.clear()
 
     def send_stream_data(self, stream_id: int, data: bytes,
                          end_stream: bool = False) -> None:
