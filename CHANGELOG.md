@@ -5,6 +5,15 @@
 - Fix: a server or WebTransport handler that resets, stops or writes a raw QUIC stream retired
   later in the same drained batch no longer touches its freed stream context; `drain_rx()`
   holds the batch's references until `release_batch()`.
+- Fix: a lost packet at the end of a GSO send batch no longer stalls the connection until the
+  idle timeout (local picoquic patch).
+- Fix: every PATH_CHALLENGE is answered, not only the last of a burst (local picoquic patch).
+- `reset_stream_at` is advertised and accepted under 0x1d as well as the draft-07 codepoint
+  (local picoquic patch).
+- WebTransport servers select the WT-Protocol by the client's offer order.
+- WebTransport connections write TLS secrets to `secrets_log_file` / `SSLKEYLOGFILE`.
+- `qns/`: QUIC and WebTransport Interop Runner endpoints; the `Interop` workflow runs them
+  against peer stacks and the public-endpoint handshakes.
 
 ## v0.5.0rc3
 

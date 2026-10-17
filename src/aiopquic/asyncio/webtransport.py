@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import socket
 from collections import deque
 from contextlib import asynccontextmanager, suppress
@@ -76,6 +77,13 @@ class WebTransportError(ConnectionError):
     """The session is unusable: closed, not open, refused or timed out.
     A ConnectionError, so a refused CONNECT is caught like a refused
     raw QUIC handshake."""
+
+
+def _keylog_file(configuration: QuicConfiguration | None) -> str | None:
+    """TLS secrets file: the configuration's, else SSLKEYLOGFILE."""
+    if configuration is not None and configuration.secrets_log_file:
+        return configuration.secrets_log_file
+    return os.environ.get("SSLKEYLOGFILE")
 
 
 def _resolve_host(host: str) -> str:
@@ -1325,6 +1333,7 @@ async def connect_webtransport(
                 key_exchange_groups=getattr(
                     configuration, 'key_exchange_groups', None),
             )
+        start_kwargs["keylog_filename"] = _keylog_file(configuration)
         transport.start(**start_kwargs)
 
     client = WebTransportClient(transport, host, port, path, sni=sni,
@@ -1445,11 +1454,11 @@ async def serve_webtransport(
                     configuration, 'key_exchange_groups', None),
             )
         if wt_supported_protocols:
-            # WT-Protocol allowlist, most preferred first: the server picks
-            # its first entry the client offered and refuses (400) an offer
-            # with no match.
+            # WT-Protocol allowlist: the server picks the client's first
+            # offer that is on it and refuses (400) an offer with no match.
             start_kwargs["wt_supported_protocols"] = ", ".join(
                 wt_supported_protocols)
+        start_kwargs["keylog_filename"] = _keylog_file(configuration)
         transport.start(**start_kwargs)
 
     loop = asyncio.get_event_loop()

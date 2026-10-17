@@ -190,9 +190,9 @@ async def test_wt_protocol_match_both_ends():
 
 
 @pytest.mark.asyncio
-async def test_wt_protocol_server_order_wins():
-    """The server's order decides: server prefers [22,18,16], client offers
-    ascending [14,16,18,22] -> moqt-22, not the client's first match."""
+async def test_wt_protocol_client_order_wins():
+    """The client's order decides: server allows [22,18,16], client offers
+    [14,16,18,22] -> moqt-16, its first offer the server allows."""
     port = next_port()
     seen = {}
 
@@ -208,9 +208,9 @@ async def test_wt_protocol_server_order_wins():
                 "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
                 wt_available_protocols=["moqt-14", "moqt-16", "moqt-18",
                                         "moqt-22"]) as wt:
-            assert wt.negotiated_protocol == "moqt-22"
+            assert wt.negotiated_protocol == "moqt-16"
             await asyncio.sleep(0.15)
-        assert seen.get("server") == "moqt-22"
+        assert seen.get("server") == "moqt-16"
     finally:
         server.close()
 
@@ -266,7 +266,7 @@ async def test_wt_protocol_no_offer_still_opens():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_wt_server_order_and_refusal():
+async def test_dispatch_wt_client_order_and_refusal():
     """serve_dispatch applies the same policy on its WT side."""
     port = next_port()
 
@@ -281,7 +281,7 @@ async def test_dispatch_wt_server_order_and_refusal():
         async with connect_webtransport(
                 "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
                 wt_available_protocols=["moqt-16", "moqt-18"]) as wt:
-            assert wt.negotiated_protocol == "moqt-18"
+            assert wt.negotiated_protocol == "moqt-16"
         with pytest.raises(WebTransportError, match="400"):
             async with connect_webtransport(
                     "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,

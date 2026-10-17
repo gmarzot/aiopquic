@@ -1,0 +1,217 @@
+diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
+index 94b7f6bb..ce5a6655 100644
+--- a/UnitTest1/unittest1.cpp
++++ b/UnitTest1/unittest1.cpp
+@@ -472,6 +472,13 @@ namespace UnitTest1
+             Assert::AreEqual(ret, 0);
+         }
+ 
++        TEST_METHOD(path_response_each)
++        {
++            int ret = path_response_each_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
+         TEST_METHOD(observed_address_ack_after_path_deleted)
+         {
+             int ret = observed_address_ack_after_path_deleted_test();
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index 72fc4b88..194aa0b6 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -4887,6 +4887,13 @@ const uint8_t* picoquic_decode_path_challenge_frame(picoquic_cnx_t* cnx, const u
+                                 picoquic_compare_ip_addr(addr_to, (struct sockaddr*)&tuple->local_addr) == 0) ||
+                             picoquic_compare_addr(addr_to, (struct sockaddr*)&tuple->local_addr) == 0) {
+                             is_valid = 1;
++                            /* Queue the response; drop the oldest when full. */
++                            if (tuple->nb_response_pending >= PICOQUIC_RESPONSE_PENDING_MAX) {
++                                memmove(tuple->response_pending, tuple->response_pending + 1,
++                                    (PICOQUIC_RESPONSE_PENDING_MAX - 1) * sizeof(uint64_t));
++                                tuple->nb_response_pending = PICOQUIC_RESPONSE_PENDING_MAX - 1;
++                            }
++                            tuple->response_pending[tuple->nb_response_pending++] = challenge_response;
+                             tuple->challenge_response = challenge_response;
+                             tuple->response_required = 1;
+                             break;
+diff --git a/picoquic/paths.c b/picoquic/paths.c
+index 0b5b6d35..1ea0f7fd 100644
+--- a/picoquic/paths.c
++++ b/picoquic/paths.c
+@@ -156,12 +156,23 @@ uint8_t* picoquic_prepare_tuple_challenge_frames(picoquic_cnx_t* cnx, picoquic_p
+     }
+ 
+     if (tuple->response_required) {
+-        uint8_t* bytes_response = bytes_next;
+-        if ((bytes_next = picoquic_format_path_response_frame(bytes_response, bytes_max,
+-            more_data, is_pure_ack, tuple->challenge_response)) > bytes_response) {
+-            tuple->response_required = 0;
++        /* Echo each pending challenge; those that do not fit stay queued. */
++        uint8_t nb_sent = 0;
++        while (nb_sent < tuple->nb_response_pending) {
++            uint8_t* bytes_response = bytes_next;
++            if ((bytes_next = picoquic_format_path_response_frame(bytes_response, bytes_max,
++                more_data, is_pure_ack, tuple->response_pending[nb_sent])) == bytes_response) {
++                break;
++            }
++            nb_sent++;
++        }
++        if (nb_sent > 0) {
++            tuple->nb_response_pending -= nb_sent;
++            memmove(tuple->response_pending, tuple->response_pending + nb_sent,
++                tuple->nb_response_pending * sizeof(uint64_t));
+             *is_challenge_padding_needed |= cnx->client_mode || ((path_x->bytes_sent + PICOQUIC_ENFORCED_INITIAL_MTU) <= path_x->received);
+         }
++        tuple->response_required = (tuple->nb_response_pending > 0);
+     }
+ 
+     /* TODO: consider adding an address discovery frame. */
+diff --git a/picoquic/picoquic_internal.h b/picoquic/picoquic_internal.h
+index c49a60db..324ddb91 100644
+--- a/picoquic/picoquic_internal.h
++++ b/picoquic/picoquic_internal.h
+@@ -107,6 +107,7 @@ extern "C" {
+ #define PICOQUIC_SPIN_RESERVE_MOD_256 17
+ 
+ #define PICOQUIC_CHALLENGE_REPEAT_MAX 3
++#define PICOQUIC_RESPONSE_PENDING_MAX 4
+ 
+ #define PICOQUIC_ALPN_NUMBER_MAX 32
+ 
+@@ -1011,6 +1012,8 @@ typedef struct st_picoquic_tuple_t {
+     uint64_t observed_time;
+     /* Challenge used for this path */
+     uint64_t challenge_response;
++    uint64_t response_pending[PICOQUIC_RESPONSE_PENDING_MAX];
++    uint8_t nb_response_pending;
+     uint64_t challenge[PICOQUIC_CHALLENGE_REPEAT_MAX];
+     uint64_t challenge_time;
+     uint64_t demotion_time;
+diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
+index 0af1079a..f7189a31 100644
+--- a/picoquic_t/picoquic_t.c
++++ b/picoquic_t/picoquic_t.c
+@@ -177,6 +177,7 @@ static const picoquic_test_def_t test_table[] = {
+     { "reset_stream_at_needs_repeat", reset_stream_at_needs_repeat_test },
+     { "process_ack_of_reset_stream_at", process_ack_of_reset_stream_at_test },
+     { "stop_sending_needs_repeat", stop_sending_needs_repeat_test },
++    { "path_response_each", path_response_each_test },
+     { "stream_invalid_id", stream_invalid_id_test },
+     { "stream_never_called_apis", stream_never_called_apis_test },
+     { "queue_multipath_blocked_frames", queue_multipath_blocked_frames_test },
+diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
+index dfb38c26..14023955 100644
+--- a/picoquictest/picoquictest.h
++++ b/picoquictest/picoquictest.h
+@@ -229,6 +229,7 @@ int frames_ackof_error_test(void);
+ int reset_stream_at_needs_repeat_test(void);
+ int process_ack_of_reset_stream_at_test(void);
+ int stop_sending_needs_repeat_test(void);
++int path_response_each_test(void);
+ int stream_invalid_id_test(void);
+ int stream_never_called_apis_test(void);
+ int queue_multipath_blocked_frames_test(void);
+diff --git a/picoquictest/skip_frame_test.c b/picoquictest/skip_frame_test.c
+index eea4bdab..08875f8a 100644
+--- a/picoquictest/skip_frame_test.c
++++ b/picoquictest/skip_frame_test.c
+@@ -1932,6 +1932,99 @@ int stop_sending_needs_repeat_test(void)
+     return ret;
+ }
+ 
++const uint8_t* picoquic_decode_path_challenge_frame(picoquic_cnx_t* cnx, const uint8_t* bytes, const uint8_t* bytes_max,
++    picoquic_path_t* path_x, struct sockaddr* addr_from, struct sockaddr* addr_to);
++
++static int path_response_deliver(picoquic_cnx_t* cnx, uint64_t challenge)
++{
++    uint8_t frame[9];
++
++    frame[0] = picoquic_frame_type_path_challenge;
++    picoformat_64(frame + 1, challenge);
++    return (picoquic_decode_path_challenge_frame(cnx, frame, frame + sizeof(frame),
++        cnx->path[0], NULL, NULL) == frame + sizeof(frame)) ? 0 : -1;
++}
++
++/* Prepare path frames in a buffer of size buffer_size, check that the
++ * PATH_RESPONSE frames echo the expected values in order. */
++static int path_response_check(picoquic_cnx_t* cnx, size_t buffer_size, const uint64_t* expected, size_t nb_expected)
++{
++    uint8_t buffer[256];
++    uint8_t* bytes = buffer;
++    uint8_t* bytes_next;
++    int more_data = 0;
++    int is_pure_ack = 1;
++    int is_padding_needed = 0;
++    uint64_t next_wake_time = UINT64_MAX;
++    size_t nb_found = 0;
++
++    bytes_next = picoquic_prepare_path_challenge_frames(cnx, cnx->path[0], buffer, buffer + buffer_size,
++        &more_data, &is_pure_ack, &is_padding_needed, 0, &next_wake_time);
++    while (bytes + 9 <= bytes_next) {
++        if (bytes[0] != picoquic_frame_type_path_response || nb_found >= nb_expected ||
++            PICOPARSE_64(bytes + 1) != expected[nb_found]) {
++            return -1;
++        }
++        nb_found++;
++        bytes += 9;
++    }
++    return (bytes == bytes_next && nb_found == nb_expected) ? 0 : -1;
++}
++
++int path_response_each_test(void)
++{
++    int ret = 0;
++    uint64_t simulated_time = 0;
++    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, NULL,
++        NULL, NULL, NULL, NULL, simulated_time,
++        &simulated_time, NULL, NULL, 0);
++    struct sockaddr_in saddr = { 0 };
++
++    if (qclient == NULL) {
++        ret = -1;
++    }
++    else {
++        picoquic_cnx_t* cnx = picoquic_create_cnx(qclient,
++            picoquic_null_connection_id, picoquic_null_connection_id, (struct sockaddr*)&saddr,
++            simulated_time, 0, "test-sni", "test-alpn", 1);
++
++        if (cnx == NULL) {
++            ret = -1;
++        }
++        else {
++            const uint64_t v[6] = { 0x0102030405060708ull, 0x1112131415161718ull, 0x2122232425262728ull,
++                0x3132333435363738ull, 0x4142434445464748ull, 0x5152535455565758ull };
++            picoquic_tuple_t* tuple = cnx->path[0]->first_tuple;
++
++            /* Only responses are expected from the prepare call. */
++            tuple->challenge_verified = 1;
++
++            /* Two challenges before a send: both echoed. */
++            if (path_response_deliver(cnx, v[0]) != 0 || path_response_deliver(cnx, v[1]) != 0 ||
++                path_response_check(cnx, 256, v, 2) != 0 || tuple->response_required) {
++                ret = -1;
++            }
++            /* Room for one frame: the second stays queued for the next send. */
++            if (ret == 0 && (path_response_deliver(cnx, v[2]) != 0 || path_response_deliver(cnx, v[3]) != 0 ||
++                path_response_check(cnx, 9, v + 2, 1) != 0 || !tuple->response_required ||
++                path_response_check(cnx, 256, v + 3, 1) != 0 || tuple->response_required)) {
++                ret = -1;
++            }
++            /* Queue overflow drops the oldest. */
++            for (int i = 0; ret == 0 && i < PICOQUIC_RESPONSE_PENDING_MAX + 1; i++) {
++                ret = path_response_deliver(cnx, v[i]);
++            }
++            if (ret == 0 && (path_response_check(cnx, 256, v + 1, PICOQUIC_RESPONSE_PENDING_MAX) != 0 ||
++                tuple->response_required)) {
++                ret = -1;
++            }
++            picoquic_delete_cnx(cnx);
++        }
++        picoquic_free(qclient);
++    }
++    return ret;
++}
++
+ /* A late ack of an OBSERVED_ADDRESS frame referencing a delete path must 
+ * be consumed safely instead of dereferencing the now-absent path. */
+ int observed_address_ack_after_path_deleted_test(void)
