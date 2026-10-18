@@ -1,5 +1,6 @@
 """QUIC configuration — matches qh3.quic.configuration API."""
 
+import socket
 import ssl
 from dataclasses import dataclass, field
 from collections.abc import Sequence
@@ -163,6 +164,12 @@ class QuicConfiguration:
     # saved when it stops. A later connection resumes the session and may
     # send 0-RTT data written before its handshake completes.
     session_ticket_file: str | None = None
+    # Socket family: socket.AF_INET or socket.AF_INET6 only; None binds both
+    # when IPv6 can bind the port, else IPv4.
+    ip_family: int | None = None
+    # picoquic path MTU discovery policy: "basic" probes opportunistically,
+    # "delayed" only once there is a lot to send, "blocked" never.
+    pmtud: str = "basic"
 
     def __post_init__(self) -> None:
         from aiopquic._binding._transport import (
@@ -171,6 +178,10 @@ class QuicConfiguration:
         check_congestion_control_algorithm(self.congestion_control_algorithm)
         if self.cipher_suite is not None and self.cipher_suite not in CIPHER_SUITES:
             raise ValueError(f"unsupported cipher suite {self.cipher_suite:#06x}")
+        if self.pmtud not in ("basic", "delayed", "blocked"):
+            raise ValueError(f"unsupported pmtud policy {self.pmtud!r}")
+        if self.ip_family not in (None, socket.AF_INET, socket.AF_INET6):
+            raise ValueError(f"unsupported ip_family {self.ip_family}")
         for version in self.supported_versions or ():
             if version not in (QUIC_V1, QUIC_V2):
                 raise ValueError(f"unsupported QUIC version {version:#010x}")

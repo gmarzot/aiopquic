@@ -197,8 +197,10 @@ applies nor reverse-applies stops the build: drop or regenerate it.
 - `connect_webtransport()` / `serve_webtransport()` without `configuration=` run picoquic's
   defaults, not `QuicConfiguration`'s.
 - The key-exchange order is process-wide: the last `start()` wins. ML-KEM shares need OpenSSL 3.5.
-- Servers bind the IPv4 and IPv6 wildcards when an IPv6 socket can bind, else IPv4 only; the
-  `host` argument is ignored. Clients take IPv4 or IPv6 literals and prefer a name's IPv4 address.
+- Servers bind the IPv4 and IPv6 wildcards when an IPv6 socket can bind `[::]:port`, else IPv4
+  only (with a warning unless the host has no IPv6); `QuicConfiguration.ip_family` pins one family.
+  The `host` argument is ignored. Clients take IPv4 or IPv6 literals and prefer a name's IPv4
+  address. `QuicConfiguration.pmtud="delayed"` keeps a mostly-receiving client from probing.
 - The raw-QUIC `tx_max_queued_bytes` gate reads the process-wide queued total, so one stalled peer
   parks new streams on every raw connection; the WebTransport gate is per session.
 - `max_stream_data` (16 MiB) is both the advertised window and the per-stream RX ring.

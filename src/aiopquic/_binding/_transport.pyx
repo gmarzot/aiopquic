@@ -13,6 +13,8 @@ Re-enable freethreading_compatible once the per-context locking audit
 covers TX entry points and the WT TX dispatch path.
 """
 
+import errno as _errno
+import logging as _logging
 import os
 import socket as _socket
 import sys
@@ -131,6 +133,13 @@ cdef extern from "picoquic.h":
     void picoquic_set_null_verifier(picoquic_quic_t* quic)
     void picoquic_set_default_idle_timeout(picoquic_quic_t* quic, uint64_t idle_timeout_ms)
     void picoquic_set_cookie_mode(picoquic_quic_t* quic, int cookie_mode)
+    ctypedef enum picoquic_pmtud_policy_enum:
+        picoquic_pmtud_basic
+        picoquic_pmtud_required
+        picoquic_pmtud_delayed
+        picoquic_pmtud_blocked
+    void picoquic_set_default_pmtud_policy(picoquic_quic_t* quic,
+                                           picoquic_pmtud_policy_enum pmtud_policy)
     int picoquic_set_cipher_suite(picoquic_quic_t* quic, int cipher_suite_id)
     void picoquic_set_default_crypto_epoch_length(picoquic_quic_t* quic,
                                                   uint64_t crypto_epoch_length_max)
@@ -1089,18 +1098,32 @@ cdef int _fill_sockaddr(str host, int port, sockaddr_storage* out) except -1:
     raise ValueError(f"Invalid IP address: {host}")
 
 
-def _ipv6_usable() -> bool:
-    """Whether an IPv6 UDP socket can bind here; picoquic opens none of a
-    dual-stack pair when one family fails."""
+_log = _logging.getLogger("aiopquic")
+
+_PMTUD_POLICIES = {
+    "basic": picoquic_pmtud_basic,
+    "delayed": picoquic_pmtud_delayed,
+    "blocked": picoquic_pmtud_blocked,
+}
+
+
+def _ipv6_bind_error(int port=0):
+    """None if an IPv6-only UDP socket can bind [::]:port, else the error.
+    picoquic opens neither socket of a dual-stack pair when one fails."""
     if not _socket.has_ipv6:
-        return False
+        return OSError(_errno.EAFNOSUPPORT, "IPv6 not available")
     try:
         with _socket.socket(_socket.AF_INET6, _socket.SOCK_DGRAM) as s:
             s.setsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY, 1)
-            s.bind(("::", 0))
-        return True
-    except OSError:
-        return False
+            s.bind(("::", port))
+        return None
+    except OSError as exc:
+        return exc
+
+
+def _ipv6_usable() -> bool:
+    """Whether an IPv6 UDP socket can bind here."""
+    return _ipv6_bind_error() is None
 
 
 cdef class TransportContext:
@@ -2909,7 +2932,8 @@ cdef class TransportContext:
               uint64_t key_update_interval=0,
               ticket_file=None,
               web_folder=None,
-              int ip_family=-1):
+              int ip_family=-1,
+              pmtud_policy=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -2943,8 +2967,12 @@ cdef class TransportContext:
                 and saved at stop, for resumption and 0-RTT.
             web_folder: Server mode with wt_path: serve files from this
                 directory to HTTP/3 GET requests outside the WT path.
+            pmtud_policy: picoquic path MTU discovery policy: "basic" (probe
+                opportunistically), "delayed" (only with a lot to send) or
+                "blocked"; None keeps picoquic's default (basic).
             ip_family: AF_INET, AF_INET6, or 0 for both; -1 picks both when
-                an IPv6 socket can bind, else AF_INET.
+                an IPv6 socket can bind [::]:port, else AF_INET (with a
+                warning unless the host has no IPv6).
             rx_data_ring_cap: Per-stream RX byte ring, in bytes, and the
                 advertised stream window. 0: a 4 MiB ring and picoquic's
                 default window.
@@ -3188,6 +3216,8 @@ cdef class TransportContext:
 
         if retry and not is_client:
             picoquic_set_cookie_mode(self._quic, 1)
+        if pmtud_policy is not None:
+            picoquic_set_default_pmtud_policy(self._quic, _PMTUD_POLICIES[pmtud_policy])
         if cipher_suite != 0 and picoquic_set_cipher_suite(self._quic, cipher_suite) != 0:
             picoquic_free(self._quic)
             self._quic = NULL
@@ -3249,7 +3279,14 @@ cdef class TransportContext:
         # Configure packet loop parameters (must persist — picoquic stores a pointer)
         self._param.local_port = <unsigned short>port
         if ip_family < 0:
-            ip_family = 0 if _ipv6_usable() else AF_INET
+            v6_error = _ipv6_bind_error(port)
+            if v6_error is None:
+                ip_family = 0
+            else:
+                ip_family = AF_INET
+                if v6_error.errno != _errno.EAFNOSUPPORT:
+                    _log.warning("IPv6 bind on port %d failed (%s); using IPv4 only",
+                                 port, v6_error)
         self._param.local_af = ip_family
         self._param.dest_if = 0
         # SO_RCVBUF/SO_SNDBUF request passed to picoquic. picoquic's own

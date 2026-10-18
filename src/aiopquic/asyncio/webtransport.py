@@ -1333,6 +1333,9 @@ async def connect_webtransport(
                 qlog_dir=configuration.qlog_dir,
                 key_exchange_groups=getattr(
                     configuration, 'key_exchange_groups', None),
+                ip_family=(-1 if configuration.ip_family is None
+                           else configuration.ip_family),
+                pmtud_policy=configuration.pmtud,
             )
         start_kwargs["keylog_filename"] = _keylog_file(configuration)
         transport.start(**start_kwargs)
@@ -1459,6 +1462,9 @@ async def serve_webtransport(
                     configuration, 'key_exchange_groups', None),
                 max_connections=getattr(configuration, 'max_connections',
                                         256),
+                ip_family=(-1 if configuration.ip_family is None
+                           else configuration.ip_family),
+                pmtud_policy=configuration.pmtud,
             )
         if web_folder is not None:
             start_kwargs["web_folder"] = web_folder

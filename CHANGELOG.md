@@ -10,7 +10,10 @@
 - `connect(wait_connected=False)` waits for the connection to exist, so writes before the handshake
   are sent (as 0-RTT with a ticket).
 - IPv6: servers bind both families when available; clients connect to IPv6 addresses (raw QUIC and
-  WebTransport).
+  WebTransport). When `[::]:port` cannot bind, the server logs a warning and serves IPv4 only.
+- `QuicConfiguration.ip_family`: `socket.AF_INET` or `AF_INET6` only; None binds both.
+- `QuicConfiguration.pmtud`: picoquic's path MTU discovery policy, `"basic"` (default), `"delayed"`
+  or `"blocked"`.
 - `serve_webtransport(web_folder=)` serves files to HTTP/3 GET requests.
 - `qns/`: retry, chacha20, keyupdate, v2, resumption, zerortt, http3 and ipv6 Interop Runner cases.
 

@@ -2,7 +2,9 @@
 import asyncio
 import glob
 import json
+import logging
 import os
+import socket
 import ssl
 
 import pytest
@@ -194,3 +196,53 @@ async def test_ipv6():
         await _fetch("127.0.0.1", port, _client_cfg())
     finally:
         server.close()
+
+
+@pytest.mark.skipif(not _ipv6_usable(), reason="no IPv6 on this host")
+async def test_ipv6_port_conflict_falls_back_to_ipv4(caplog):
+    port = next_port()
+    with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as squatter:
+        squatter.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        squatter.bind(("::", port))
+        with caplog.at_level(logging.WARNING, logger="aiopquic"):
+            server = await serve("::", port, configuration=_server_cfg(),
+                                 create_protocol=Server)
+        try:
+            await _fetch("127.0.0.1", port, _client_cfg())
+        finally:
+            server.close()
+    assert any("IPv6 bind" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.skipif(not _ipv6_usable(), reason="no IPv6 on this host")
+async def test_ip_family_ipv4_leaves_ipv6_port_free():
+    port = next_port()
+    server = await serve("::", port, configuration=_server_cfg(ip_family=socket.AF_INET),
+                         create_protocol=Server)
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as probe:
+            probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            probe.bind(("::", port))
+        await _fetch("127.0.0.1", port, _client_cfg())
+    finally:
+        server.close()
+
+
+def test_ip_family_and_pmtud_validation():
+    with pytest.raises(ValueError):
+        QuicConfiguration(ip_family=socket.AF_UNIX)
+    with pytest.raises(ValueError):
+        QuicConfiguration(pmtud="always")
+
+
+async def test_pmtud_delayed_sends_no_early_probe(tmp_path):
+    """pmtud="delayed": a client that mostly receives sends no full-size probe."""
+    port = next_port()
+    server = await serve("127.0.0.1", port, configuration=_server_cfg(), create_protocol=Server)
+    try:
+        await _fetch("127.0.0.1", port, _client_cfg(pmtud="delayed", qlog_dir=str(tmp_path)))
+    finally:
+        server.close()
+    probes = [h for kind, h in _packets(str(tmp_path)) if kind == "1RTT"
+              and h.get("packet_size", 0) >= 1200]
+    assert probes == []

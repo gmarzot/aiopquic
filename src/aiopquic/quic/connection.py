@@ -270,6 +270,8 @@ class QuicConnection:
             cipher_suite=cfg.cipher_suite or 0,
             key_update_interval=cfg.key_update_interval or 0,
             ticket_file=cfg.session_ticket_file,
+            ip_family=-1 if cfg.ip_family is None else cfg.ip_family,
+            pmtud_policy=cfg.pmtud,
         )
 
     def connect(self, addr: tuple[str, int], now: float = 0.0) -> None:
@@ -1263,6 +1265,8 @@ class QuicEngine:
             max_connections=getattr(cfg, 'max_connections', 256),
             cipher_suite=cfg.cipher_suite or 0,
             key_update_interval=cfg.key_update_interval or 0,
+            ip_family=-1 if cfg.ip_family is None else cfg.ip_family,
+            pmtud_policy=cfg.pmtud,
         )
         kwargs.update(extra)
         self._transport.start(**kwargs)

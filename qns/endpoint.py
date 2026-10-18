@@ -76,6 +76,9 @@ def client_configuration(testcase: str, ticket_file: str | None = None) -> QuicC
         cfg.key_update_interval = KEY_UPDATE_INTERVAL
     elif testcase == "v2":
         cfg.supported_versions = [QUIC_V2, QUIC_V1]
+    elif testcase == "zerortt":
+        # No early full-size MTU probe: the case caps the client's 1-RTT bytes.
+        cfg.pmtud = "delayed"
     return cfg
 
 
