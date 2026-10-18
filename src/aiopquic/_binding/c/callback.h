@@ -292,6 +292,7 @@ typedef struct {
     uint64_t        cnt_wake_calls;                /* picoquic_wake_up_network_thread invoked */
     uint64_t        cnt_wake_skipped_coalesced;    /* wake skipped (tx_wake_pending already 1) */
     uint64_t        cnt_prepare_to_send_empty;     /* prepare_to_send invoked with avail==0 */
+    uint64_t        cnt_loop_cb;                   /* worker loop callbacks: moves while the worker runs */
     uint64_t        last_tx_event_ring_arm_ns;           /* CLOCK_MONOTONIC of last arm */
     uint64_t        last_tx_event_ring_fire_ns;          /* CLOCK_MONOTONIC of last fire */
     /* RX flow-control observability (added 2026-05-25). Drain side
@@ -998,14 +999,13 @@ static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
  *      will write the wake fd (the producer's exchange sees 0→1).
  *   2. Drain the wake-fd counter (Linux: one read; other: read until
  *      EAGAIN).
- *   3. Re-arm by writing the wake fd if the ring is still non-empty.
+ *   3. Re-arm by writing the wake fd if the ring or the overflow is
+ *      still non-empty.
  *      Covers the race where a producer pushed an entry between the
  *      consumer's peek-empty and pending=0, observing pending=1 and
  *      thus skipping its own wake write — without re-arm those
  *      stranded entries would never wake asyncio again. */
 static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
-    /* Overflow left behind must keep the wake armed: the re-arm below
-     * looks at the ring only. */
     spsc_ring_refill_from_overflow(ctx->rx_event_ring, &ctx->rx_overflow);
     /* Exchange, so the re-check below cannot read the ring before the
      * clear is visible to aiopquic_notify_rx's exchange. */
@@ -1019,7 +1019,12 @@ static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
         /* drain */
     }
 #endif
-    if (!spsc_ring_empty(ctx->rx_event_ring)) {
+    /* Overflow counts too: a push that decided "overflow" before the
+     * refill above and counted itself after it can have its wake consumed
+     * by the read above while the ring is still empty. */
+    if (!spsc_ring_empty(ctx->rx_event_ring) ||
+            atomic_load_explicit(&ctx->rx_overflow.depth,
+                                 memory_order_seq_cst) > 0) {
 #ifdef __linux__
         uint64_t one = 1;
         (void)write(ctx->wake_write_fd, &one, sizeof(one));
@@ -1566,6 +1571,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                              void* callback_ctx,
                              void* callback_argv) {
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)callback_ctx;
+    ctx->cnt_loop_cb++;
 
     switch (cb_mode) {
         case picoquic_packet_loop_ready:

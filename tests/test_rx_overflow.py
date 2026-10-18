@@ -58,6 +58,10 @@ def _assert_spilled(counters) -> None:
     assert counters["rx_overflow_pushed"] > 0, counters
     assert counters["rx_overflow_max_depth"] > 0, counters
     assert counters["rx_event_drops"] == 0, counters
+    # Everything spilled was delivered, and the worker is running.
+    assert counters["rx_overflow_depth_now"] == 0, counters
+    assert counters["rx_notify_pending_now"] in (0, 1), counters
+    assert counters["loop_callbacks"] > 0, counters
 
 
 class _Burst(QuicConnectionProtocol):
