@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.6.0
+
+- No changes since 0.6.0rc1.
+
 ## v0.6.0rc1
 
 - `serve(..., retry=True)`: Retry for every new connection.
