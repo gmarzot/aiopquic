@@ -1460,6 +1460,8 @@ async def serve_webtransport(
                 qlog_dir=configuration.qlog_dir,
                 key_exchange_groups=getattr(
                     configuration, 'key_exchange_groups', None),
+                max_connections=getattr(configuration, 'max_connections',
+                                        256),
             )
         if wt_supported_protocols:
             # WT-Protocol allowlist: the server picks the client's first

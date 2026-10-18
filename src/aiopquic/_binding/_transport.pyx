@@ -2826,7 +2826,8 @@ cdef class TransportContext:
               bint dual=False,
               bint verify_peer=True,
               ca_file=None,
-              key_exchange_groups=None):
+              key_exchange_groups=None,
+              uint32_t max_connections=256):
         """
         Create the picoquic context and start the network thread.
 
@@ -2848,6 +2849,8 @@ cdef class TransportContext:
                 DEFAULT_KEY_EXCHANGE_GROUPS. picoquic keeps one order
                 per process, so the last start() wins.
             idle_timeout_ms: Idle timeout in milliseconds.
+            max_connections: Most connections the context holds at once;
+                picoquic refuses new ones past it (CONNECTION_REFUSED).
             rx_data_ring_cap: Per-stream RX byte ring, in bytes, and the
                 advertised stream window. 0: a 4 MiB ring and picoquic's
                 default window.
@@ -2970,7 +2973,7 @@ cdef class TransportContext:
 
         # Create picoquic context with the chosen default callback.
         self._quic = picoquic_create(
-            256,            # max connections
+            max_connections,
             c_cert, c_key,
             c_cert_root,    # trusted roots; NULL unless a verifying client
             c_alpn,
