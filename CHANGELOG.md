@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.6.0rc1
 
 - `serve(..., retry=True)`: Retry for every new connection.
 - `QuicConfiguration.cipher_suite`, `key_update_interval` and `supported_versions` (QUIC v2 by
