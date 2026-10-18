@@ -66,6 +66,13 @@ python run.py -p quic -s aiopquic -c aiopquic -t onlyTests
 For WebTransport use `implementations_webtransport.json`, `aiopquic-webtransport:ci` and
 `-p webtransport`.
 
+## Published images
+
+`ghcr.io/gmarzot/aiopquic-qns` (QUIC) and `ghcr.io/gmarzot/aiopquic-wt-interop` (WebTransport),
+amd64, built by `.github/workflows/qns-images.yml` from the aiopquic wheel on PyPI. Each release
+is tagged with its version; `latest` is the newest stable release. The workflow runs after the
+Release workflow, weekly, and on dispatch with a version.
+
 ## CI
 
 `.github/workflows/interop.yml` runs aiopquic against itself and each peer in both roles, weekly,
