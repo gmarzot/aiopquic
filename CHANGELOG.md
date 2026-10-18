@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.0
 
 - `qns/` Interop Runner images are published to GHCR from each release's PyPI wheel.
 - Fix: a server or WebTransport handler that resets, stops or writes a raw QUIC stream retired
