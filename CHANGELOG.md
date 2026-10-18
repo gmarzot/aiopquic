@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.2
 
 - Fix: an RX event pushed to the overflow while asyncio drained the ring could consume the
   wake and leave asyncio asleep with events queued; the drain re-arms while the overflow holds any.
