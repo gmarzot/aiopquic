@@ -10,18 +10,18 @@ aiopquic's public API. `Dockerfile` builds both on the network-simulator endpoin
 | `TESTCASE` | client | server |
 |---|---|---|
 | `handshake`, `transfer`, `multiconnect`, `ecn` | yes | yes |
-| `retry` | yes (picoquic follows the Retry) | 127: Retry cannot be enabled |
-| `resumption`, `zerortt` | 127: no session ticket store | 127 |
-| `chacha20` | 127: no cipher suite selection | 127 |
-| `keyupdate` | 127: no key update trigger | — |
-| `v2` | 127: no version selection | 127 |
-| `connectionmigration` | 127: no active migration | 127: no preferred address |
-| `http3` | 127: no HTTP/3 request API | 127 |
+| `retry` | yes (picoquic follows the Retry) | yes (`serve(retry=True)`) |
+| `resumption`, `zerortt` | yes (`session_ticket_file`; 0-RTT requests written before the handshake) | yes |
+| `chacha20` | yes (`cipher_suite=0x1303`) | yes |
+| `keyupdate` | yes (`key_update_interval`) | — |
+| `v2` | yes (`supported_versions`) | yes |
+| `http3` | yes (`h3client.py`, QPACK via pylsqpack) | yes (`serve_webtransport(web_folder=)`) |
+| `connectionmigration` | 127 | 127: no preferred address |
 
 The runner sends `handshake` for longrtt; `transfer` for multiplexing, amplificationlimit,
 blackhole, transferloss, transfercorruption, rebind-port, rebind-addr, ipv6, goodput and
-crosstraffic; `multiconnect` for handshakeloss and handshakecorruption. Sockets are IPv4 only:
-the client exits 127 for an IPv6-only host, and the server is unreachable over IPv6.
+crosstraffic; `multiconnect` for handshakeloss and handshakecorruption. The server binds both
+IPv4 and IPv6 when the host has IPv6.
 
 The `transfer` client advertises 1 MiB connection and 256 KiB stream windows, so files larger
 than the windows depend on window updates.

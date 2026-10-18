@@ -1,8 +1,13 @@
 """QUIC configuration — matches qh3.quic.configuration API."""
 
+import socket
 import ssl
 from dataclasses import dataclass, field
 from collections.abc import Sequence
+
+QUIC_V1 = 0x00000001
+QUIC_V2 = 0x6B3343CF
+CIPHER_SUITES = (0x1301, 0x1302, 0x1303)
 
 
 @dataclass
@@ -145,12 +150,47 @@ class QuicConfiguration:
     # Most connections one transport holds at once; a server refuses new
     # ones past it with CONNECTION_REFUSED.
     max_connections: int = 256
+    # Restrict TLS to one cipher suite, IANA id: 0x1301 AES-128-GCM,
+    # 0x1302 AES-256-GCM, 0x1303 ChaCha20-Poly1305. None offers all.
+    cipher_suite: int | None = None
+    # Packets per 1-RTT key phase before a key update. None keeps
+    # picoquic's default.
+    key_update_interval: int | None = None
+    # Client: QUIC versions, most preferred first (QUIC_V1, QUIC_V2). The
+    # connection starts in v1 and moves to the first entry by compatible
+    # version negotiation (RFC 9368) when the server supports it.
+    supported_versions: list[int] | None = None
+    # Client: session ticket store, loaded when the transport starts and
+    # saved when it stops. A later connection resumes the session and may
+    # send 0-RTT data written before its handshake completes.
+    session_ticket_file: str | None = None
+    # Socket family: socket.AF_INET or socket.AF_INET6 only; None binds both
+    # when IPv6 can bind the port, else IPv4.
+    ip_family: int | None = None
+    # picoquic path MTU discovery policy: "basic" probes opportunistically,
+    # "delayed" only once there is a lot to send, "blocked" never.
+    pmtud: str = "basic"
 
     def __post_init__(self) -> None:
         from aiopquic._binding._transport import (
             check_congestion_control_algorithm,
         )
         check_congestion_control_algorithm(self.congestion_control_algorithm)
+        if self.cipher_suite is not None and self.cipher_suite not in CIPHER_SUITES:
+            raise ValueError(f"unsupported cipher suite {self.cipher_suite:#06x}")
+        if self.pmtud not in ("basic", "delayed", "blocked"):
+            raise ValueError(f"unsupported pmtud policy {self.pmtud!r}")
+        if self.ip_family not in (None, socket.AF_INET, socket.AF_INET6):
+            raise ValueError(f"unsupported ip_family {self.ip_family}")
+        for version in self.supported_versions or ():
+            if version not in (QUIC_V1, QUIC_V2):
+                raise ValueError(f"unsupported QUIC version {version:#010x}")
+
+    @property
+    def desired_version(self) -> int:
+        """Version to move to by compatible version negotiation; 0 stays in v1."""
+        versions = self.supported_versions or ()
+        return versions[0] if versions and versions[0] != QUIC_V1 else 0
 
     def load_cert_chain(self, certfile: str, keyfile: str | None = None,
                         password: str | None = None) -> None:

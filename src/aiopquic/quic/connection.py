@@ -196,6 +196,10 @@ class QuicConnection:
         # awaited by aiomoqt's stream_write_drain on BufferError.
         # Lazy-created on first reference from either side.
         self._stream_tx_drain_events: dict[int, asyncio.Event] = {}
+        # Set once the worker has created the picoquic cnx (ALMOST_READY).
+        self._created = asyncio.Event()
+        if engine is not None:
+            self._created.set()
 
     @property
     def configuration(self) -> QuicConfiguration:
@@ -263,6 +267,11 @@ class QuicConnection:
                                         * 1000),
             socket_buffer_size=(cfg.socket_buffer_size or 0),
             qlog_dir=cfg.qlog_dir,
+            cipher_suite=cfg.cipher_suite or 0,
+            key_update_interval=cfg.key_update_interval or 0,
+            ticket_file=cfg.session_ticket_file,
+            ip_family=-1 if cfg.ip_family is None else cfg.ip_family,
+            pmtud_policy=cfg.pmtud,
         )
 
     def connect(self, addr: tuple[str, int], now: float = 0.0) -> None:
@@ -280,6 +289,7 @@ class QuicConnection:
             alpn=(cfg.alpn_protocols[0]
                   if cfg.alpn_protocols and len(cfg.alpn_protocols) == 1
                   else None),
+            desired_version=cfg.desired_version,
         )
 
     @property
@@ -359,6 +369,13 @@ class QuicConnection:
         if self._cnx_ptr and self._transport is not None:
             return self._transport.local_address(self._cnx_ptr)
         return None
+
+    def _session_resumed(self, cnx_ptr) -> bool:
+        """Whether this cnx's TLS handshake resumed a session."""
+        ptr = cnx_ptr or self._cnx_ptr
+        if ptr and self._transport is not None:
+            return bool(self._transport.session_resumed(ptr))
+        return False
 
     def _negotiated_alpn(self, cnx_ptr):
         """The ALPN TLS actually negotiated for this cnx, falling back
@@ -465,9 +482,11 @@ class QuicConnection:
             if cnx_ptr != 0:
                 self._cnx_ptr = cnx_ptr
                 self._connected = True
+                self._created.set()
                 alpn = self._negotiated_alpn(cnx_ptr)
                 self._events.append(HandshakeCompleted(
                     alpn_protocol=alpn,
+                    session_resumed=self._session_resumed(cnx_ptr),
                 ))
                 self._events.append(ProtocolNegotiated(
                     alpn_protocol=alpn,
@@ -475,6 +494,7 @@ class QuicConnection:
         elif evt_type == _EVT_ALMOST_READY:
             if cnx_ptr != 0:
                 self._cnx_ptr = cnx_ptr
+                self._created.set()
         elif evt_type == _EVT_DATAGRAM:
             self._events.append(DatagramFrameReceived(
                 data=data if data is not None else memoryview(b""),
@@ -704,7 +724,8 @@ class QuicConnection:
             self._cnx_ptr = 0
         elif evt_type == _EVT_READY:
             alpn = self._negotiated_alpn(0)
-            self._events.append(HandshakeCompleted(alpn_protocol=alpn))
+            self._events.append(HandshakeCompleted(
+                alpn_protocol=alpn, session_resumed=self._session_resumed(0)))
             self._events.append(ProtocolNegotiated(alpn_protocol=alpn))
         elif evt_type == _EVT_DATAGRAM:
             self._events.append(DatagramFrameReceived(
@@ -1242,6 +1263,10 @@ class QuicEngine:
             socket_buffer_size=(cfg.socket_buffer_size or 0),
             qlog_dir=cfg.qlog_dir,
             max_connections=getattr(cfg, 'max_connections', 256),
+            cipher_suite=cfg.cipher_suite or 0,
+            key_update_interval=cfg.key_update_interval or 0,
+            ip_family=-1 if cfg.ip_family is None else cfg.ip_family,
+            pmtud_policy=cfg.pmtud,
         )
         kwargs.update(extra)
         self._transport.start(**kwargs)

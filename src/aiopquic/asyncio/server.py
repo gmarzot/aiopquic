@@ -43,12 +43,15 @@ async def serve(
     configuration: QuicConfiguration,
     create_protocol: Callable | None = None,
     stream_handler=None,
+    retry: bool = False,
 ) -> QuicServer:
     """Start a QUIC server.
 
     create_protocol is called once per accepted connection with a fresh
     per-cnx QuicConnection. Falls back to the default
-    QuicConnectionProtocol if not supplied.
+    QuicConnectionProtocol if not supplied. retry=True answers each new
+    connection's first Initial with a Retry to validate the client's
+    address.
     """
     if create_protocol is None:
         create_protocol = (
@@ -60,7 +63,7 @@ async def serve(
         create_protocol=create_protocol,
         stream_handler=stream_handler,
     )
-    engine._start_transport(port=port)
+    engine._start_transport(port=port, retry=retry)
 
     loop = asyncio.get_event_loop()
     if engine.eventfd >= 0:

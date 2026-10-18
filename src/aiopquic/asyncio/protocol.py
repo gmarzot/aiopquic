@@ -138,6 +138,14 @@ class QuicConnectionProtocol:
             self._connected_waiter = self._loop.create_future()
         await self._connected_waiter
 
+    async def wait_created(self, timeout: float = 5.0) -> None:
+        """Wait until the network thread has created the client
+        connection, so stream writes reach it before the handshake."""
+        try:
+            await asyncio.wait_for(self._quic._created.wait(), timeout)
+        except asyncio.TimeoutError:
+            raise ConnectionError("client connection was not created") from None
+
     async def wait_closed(self) -> None:
         """Wait for connection to be fully closed."""
         await self._closed.wait()
