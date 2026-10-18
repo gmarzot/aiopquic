@@ -87,15 +87,8 @@ def _keylog_file(configuration: QuicConfiguration | None) -> str | None:
 
 
 def _resolve_host(host: str) -> str:
-    try:
-        socket.inet_aton(host)
-        return host
-    except OSError:
-        pass
-    infos = socket.getaddrinfo(host, None, socket.AF_INET)
-    if not infos:
-        raise OSError(f"Cannot resolve {host}")
-    return infos[0][4][0]
+    from aiopquic.asyncio.client import _resolve_host as resolve
+    return resolve(host)
 
 
 # =====================================================================
@@ -1408,6 +1401,7 @@ async def serve_webtransport(
         session_factory=None,
         configuration: QuicConfiguration | None = None,
         wt_supported_protocols: list[str] | None = None,
+        web_folder: str | None = None,
 ) -> WebTransportServer:
     """Start a WebTransport server listening on (host, port) at path.
 
@@ -1419,6 +1413,9 @@ async def serve_webtransport(
     exact-match (no default route), and HTTP/3 clients send `:path: /`
     for root requests (RFC 9114 §4.3.1). Without normalization, a
     server registered with "" never matches a root-path CONNECT.
+
+    web_folder serves files from that directory to HTTP/3 GET requests
+    for paths other than `path`.
     """
     if path == "":
         path = "/"
@@ -1463,6 +1460,8 @@ async def serve_webtransport(
                 max_connections=getattr(configuration, 'max_connections',
                                         256),
             )
+        if web_folder is not None:
+            start_kwargs["web_folder"] = web_folder
         if wt_supported_protocols:
             # WT-Protocol allowlist: the server picks the client's first
             # offer that is on it and refuses (400) an offer with no match.

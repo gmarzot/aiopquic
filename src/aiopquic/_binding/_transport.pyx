@@ -65,14 +65,23 @@ from aiopquic._binding.spsc_ring cimport (
 # Socket address helpers (needed by picoquic declarations)
 cdef extern from "<sys/socket.h>":
     enum: AF_INET
+    enum: AF_INET6
     cdef struct sockaddr:
         unsigned short sa_family
+    cdef struct sockaddr_storage:
+        unsigned short ss_family
 
 cdef extern from "<netinet/in.h>":
     cdef struct sockaddr_in:
         unsigned short sin_family
         unsigned short sin_port
         unsigned int sin_addr
+    cdef struct in6_addr:
+        pass
+    cdef struct sockaddr_in6:
+        unsigned short sin6_family
+        unsigned short sin6_port
+        in6_addr sin6_addr
     unsigned short htons(unsigned short hostshort)
 
 cdef extern from "<arpa/inet.h>":
@@ -121,6 +130,11 @@ cdef extern from "picoquic.h":
     uint64_t picoquic_current_time()
     void picoquic_set_null_verifier(picoquic_quic_t* quic)
     void picoquic_set_default_idle_timeout(picoquic_quic_t* quic, uint64_t idle_timeout_ms)
+    void picoquic_set_cookie_mode(picoquic_quic_t* quic, int cookie_mode)
+    int picoquic_set_cipher_suite(picoquic_quic_t* quic, int cipher_suite_id)
+    void picoquic_set_default_crypto_epoch_length(picoquic_quic_t* quic,
+                                                  uint64_t crypto_epoch_length_max)
+    int picoquic_save_session_tickets(picoquic_quic_t* quic, const char* ticket_store_filename)
     void picoquic_set_log_level(picoquic_quic_t* quic, int log_level)
     void picoquic_enable_sslkeylog(picoquic_quic_t* quic, int enable)
     void picoquic_set_key_log_file(picoquic_quic_t* quic,
@@ -272,6 +286,13 @@ cdef extern from "c/spsc_ring.h":
                                             spsc_overflow_t* ovf)
 
 cdef extern from "c/callback.h":
+    ctypedef struct aiopquic_connect_params_t:
+        sockaddr_storage addr
+        uint32_t desired_version
+        uint16_t sni_len
+        uint16_t alpn_len
+
+cdef extern from "c/callback.h":
     # Resource defaults — single source of truth in callback.h.
     enum:
         AIOPQUIC_RX_DATA_RING_CAP_DEFAULT
@@ -395,6 +416,7 @@ cdef extern from "c/callback.h":
         uint64_t data_received
         aiopquic_addr_t peer_addr
         aiopquic_addr_t local_addr
+        uint8_t session_resumed
 
 cdef extern from "c/stream_buf.h":
     ctypedef struct aiopquic_stream_buf_t:
@@ -1049,6 +1071,37 @@ cdef inline int _pending_fc_add(dict pending_fc, aiopquic_stream_ctx_t* sc,
     return 0
 
 
+cdef int _fill_sockaddr(str host, int port, sockaddr_storage* out) except -1:
+    """IPv4 or IPv6 literal and port into a zeroed sockaddr_storage."""
+    memset(out, 0, sizeof(sockaddr_storage))
+    cdef bytes b_host = host.encode()
+    cdef sockaddr_in* v4 = <sockaddr_in*>out
+    cdef sockaddr_in6* v6 = <sockaddr_in6*>out
+    if inet_pton(AF_INET, b_host, &v4.sin_addr) == 1:
+        v4.sin_family = AF_INET
+        v4.sin_port = htons(<unsigned short>port)
+        return 0
+    if inet_pton(AF_INET6, b_host, &v6.sin6_addr) == 1:
+        v6.sin6_family = AF_INET6
+        v6.sin6_port = htons(<unsigned short>port)
+        return 0
+    raise ValueError(f"Invalid IP address: {host}")
+
+
+def _ipv6_usable() -> bool:
+    """Whether an IPv6 UDP socket can bind here; picoquic opens none of a
+    dual-stack pair when one family fails."""
+    if not _socket.has_ipv6:
+        return False
+    try:
+        with _socket.socket(_socket.AF_INET6, _socket.SOCK_DGRAM) as s:
+            s.setsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY, 1)
+            s.bind(("::", 0))
+        return True
+    except OSError:
+        return False
+
+
 cdef class TransportContext:
     """
     Manages the picoquic context and network thread.
@@ -1086,6 +1139,9 @@ cdef class TransportContext:
     # parses it into a bridge-owned array of copies (client offer + server
     # allowlist). Retained only to keep the buffer alive across that call.
     cdef bytes _alpn_list_csv
+    # Paths picoquic keeps borrowed pointers to.
+    cdef bytes _ticket_file
+    cdef bytes _web_folder
     cdef picohttp_server_path_item_t _wt_path_item
     cdef picohttp_server_parameters_t _wt_params
     # Forensic counters for the atomic send_stream_data path.
@@ -1196,6 +1252,8 @@ cdef class TransportContext:
             aiopquic_dgram_ring_release_undrained(self._ctx)
             aiopquic_tx_sc_release_undrained(self._ctx)
         self._release_batch_refs()
+        if self._quic is not NULL and self._ticket_file is not None:
+            picoquic_save_session_tickets(self._quic, self._ticket_file)
         if self._quic is not NULL:
             picoquic_free(self._quic)
             self._quic = NULL
@@ -1608,6 +1666,17 @@ cdef class TransportContext:
         if refresh or snap is None:
             self._post_refresh(cnx_ptr)
         return snap
+
+    def session_resumed(self, uintptr_t cnx_ptr):
+        """Whether the cnx's TLS handshake resumed a session (PSK). False
+        on a NULL cnx or before its first snapshot."""
+        if cnx_ptr == 0:
+            return False
+        snap = self._snapshot(cnx_ptr, False)
+        if snap is None:
+            return False
+        cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
+        return s.session_resumed != 0
 
     def get_negotiated_alpn(self, uintptr_t cnx_ptr):
         """The ALPN protocol TLS actually negotiated for this cnx.
@@ -2827,7 +2896,13 @@ cdef class TransportContext:
               bint verify_peer=True,
               ca_file=None,
               key_exchange_groups=None,
-              uint32_t max_connections=256):
+              uint32_t max_connections=256,
+              bint retry=False,
+              int cipher_suite=0,
+              uint64_t key_update_interval=0,
+              ticket_file=None,
+              web_folder=None,
+              int ip_family=-1):
         """
         Create the picoquic context and start the network thread.
 
@@ -2851,6 +2926,18 @@ cdef class TransportContext:
             idle_timeout_ms: Idle timeout in milliseconds.
             max_connections: Most connections the context holds at once;
                 picoquic refuses new ones past it (CONNECTION_REFUSED).
+            retry: Server mode: answer every first Initial with a Retry.
+            cipher_suite: Restrict TLS to one IANA cipher suite (e.g.
+                0x1303, ChaCha20-Poly1305); 0 offers all. Unknown values
+                raise ValueError.
+            key_update_interval: Packets per 1-RTT key phase; 0 keeps
+                picoquic's default.
+            ticket_file: Client mode: session ticket store, loaded at start
+                and saved at stop, for resumption and 0-RTT.
+            web_folder: Server mode with wt_path: serve files from this
+                directory to HTTP/3 GET requests outside the WT path.
+            ip_family: AF_INET, AF_INET6, or 0 for both; -1 picks both when
+                an IPv6 socket can bind, else AF_INET.
             rx_data_ring_cap: Per-stream RX byte ring, in bytes, and the
                 advertised stream window. 0: a 4 MiB ring and picoquic's
                 default window.
@@ -2934,7 +3021,12 @@ cdef class TransportContext:
             self._wt_path_item.path_length = len(self._wt_path_bytes)
             self._wt_path_item.path_callback = aiopquic_wt_server_path_callback
             self._wt_path_item.path_app_ctx = <void*>self._ctx
-            self._wt_params.web_folder = NULL
+            if web_folder is not None:
+                self._web_folder = (web_folder.encode() if isinstance(web_folder, str)
+                                    else web_folder)
+                self._wt_params.web_folder = self._web_folder
+            else:
+                self._wt_params.web_folder = NULL
             self._wt_params.path_table = &self._wt_path_item
             self._wt_params.path_table_nb = 1
             if dual:
@@ -2971,6 +3063,12 @@ cdef class TransportContext:
         # Idempotent — repeats just overwrite the same static array.
         picoquic_register_all_congestion_control_algorithms()
 
+        cdef const char* c_ticket = NULL
+        if ticket_file is not None:
+            self._ticket_file = (ticket_file.encode() if isinstance(ticket_file, str)
+                                 else ticket_file)
+            c_ticket = self._ticket_file
+
         # Create picoquic context with the chosen default callback.
         self._quic = picoquic_create(
             max_connections,
@@ -2983,7 +3081,8 @@ cdef class TransportContext:
             NULL,           # no reset seed
             picoquic_current_time(),
             NULL,           # not simulated time
-            NULL, NULL, 0)  # no tickets
+            c_ticket,       # client ticket store, loaded here, saved at stop
+            NULL, 0)        # server ticket key: picoquic draws one
 
         if self._quic is NULL:
             raise RuntimeError("Failed to create picoquic context")
@@ -3080,6 +3179,15 @@ cdef class TransportContext:
         if idle_timeout_ms > 0:
             picoquic_set_default_idle_timeout(self._quic, idle_timeout_ms)
 
+        if retry and not is_client:
+            picoquic_set_cookie_mode(self._quic, 1)
+        if cipher_suite != 0 and picoquic_set_cipher_suite(self._quic, cipher_suite) != 0:
+            picoquic_free(self._quic)
+            self._quic = NULL
+            raise ValueError(f"unsupported cipher suite {cipher_suite:#06x}")
+        if key_update_interval > 0:
+            picoquic_set_default_crypto_epoch_length(self._quic, key_update_interval)
+
         # Keep-alive: stored on the ctx; the worker thread enables it
         # per-cnx at the ready callback (raw QUIC in callback.h, WT in
         # h3wt_callback.h). PING frames hold a quiet connection open
@@ -3133,7 +3241,9 @@ cdef class TransportContext:
 
         # Configure packet loop parameters (must persist — picoquic stores a pointer)
         self._param.local_port = <unsigned short>port
-        self._param.local_af = AF_INET
+        if ip_family < 0:
+            ip_family = 0 if _ipv6_usable() else AF_INET
+        self._param.local_af = ip_family
         self._param.dest_if = 0
         # SO_RCVBUF/SO_SNDBUF request passed to picoquic. picoquic's own
         # default is 0 (kernel default, ~200 KB on Linux) — far too
@@ -3254,7 +3364,8 @@ cdef class TransportContext:
             raise RuntimeError(f"Failed to wake network thread (ret={ret})")
 
     def create_client_connection(self, str host, int port,
-                                  str sni=None, str alpn=None):
+                                  str sni=None, str alpn=None,
+                                  uint32_t desired_version=0):
         """
         Create a client QUIC connection (thread-safe).
 
@@ -3263,45 +3374,33 @@ cdef class TransportContext:
         with the cnx pointer via the RX ring.
 
         Args:
-            host: Remote IP address (IPv4).
+            host: Remote IPv4 or IPv6 address.
             port: Remote port.
             sni: Server Name Indication (defaults to host).
             alpn: ALPN to negotiate (uses context default if None).
+            desired_version: QUIC version to move to by compatible version
+                negotiation (e.g. 0x6b3343cf for QUIC v2); 0 stays in v1.
         """
         if not self._started:
             raise RuntimeError("Transport not started")
 
-        # Build sockaddr_in
-        cdef sockaddr_in addr
-        addr.sin_family = AF_INET
-        addr.sin_port = htons(<unsigned short>port)
-
-        cdef bytes b_host = host.encode()
-        if inet_pton(AF_INET, b_host, &addr.sin_addr) != 1:
-            raise ValueError(f"Invalid IPv4 address: {host}")
-
-        # Pack connect params into ring data payload
-        # Layout: sockaddr_in | sni_len(2) | alpn_len(2) | sni | alpn
+        # Payload: aiopquic_connect_params_t | sni | alpn
         cdef bytes b_sni = (sni or host).encode()
         cdef bytes b_alpn = alpn.encode() if alpn else b""
 
         cdef uint32_t sni_len = <uint32_t>len(b_sni)
         cdef uint32_t alpn_len = <uint32_t>len(b_alpn)
-        cdef uint32_t hdr_size = sizeof(sockaddr_in) + 4
+        cdef uint32_t hdr_size = sizeof(aiopquic_connect_params_t)
         cdef uint32_t total = hdr_size + sni_len + alpn_len
 
         cdef bytearray buf = bytearray(total)
         cdef uint8_t* p = <uint8_t*><char*>buf
-
-        memcpy(p, &addr, sizeof(sockaddr_in))
-        p += sizeof(sockaddr_in)
-        # sni_len as little-endian uint16
-        p[0] = <uint8_t>(sni_len & 0xFF)
-        p[1] = <uint8_t>((sni_len >> 8) & 0xFF)
-        # alpn_len as little-endian uint16
-        p[2] = <uint8_t>(alpn_len & 0xFF)
-        p[3] = <uint8_t>((alpn_len >> 8) & 0xFF)
-        p += 4
+        cdef aiopquic_connect_params_t* params = <aiopquic_connect_params_t*>p
+        _fill_sockaddr(host, port, &params.addr)
+        params.desired_version = desired_version
+        params.sni_len = <uint16_t>sni_len
+        params.alpn_len = <uint16_t>alpn_len
+        p += hdr_size
 
         if sni_len > 0:
             memcpy(p, <const uint8_t*>b_sni, sni_len)
@@ -3340,7 +3439,7 @@ cdef class TransportContext:
 
 cdef extern from "c/h3wt_callback.h":
     ctypedef struct aiopquic_wt_open_params_t:
-        sockaddr_in addr
+        sockaddr_storage addr
         uint16_t sni_len
         uint16_t path_len
         uint16_t protocols_len
@@ -3452,14 +3551,6 @@ cdef class WebTransportSessionState:
         subprotocol identifiers (empty string = none, send NULL on wire).
         aiopquic does no interpretation; verbatim handed to picoquic.
         """
-        cdef sockaddr_in addr
-        memset(&addr, 0, sizeof(addr))
-        addr.sin_family = AF_INET
-        addr.sin_port = htons(<unsigned short>port)
-        cdef bytes b_host = host.encode()
-        if inet_pton(AF_INET, b_host, &addr.sin_addr) != 1:
-            raise ValueError(f"Invalid IPv4 address: {host}")
-
         cdef bytes b_sni = sni.encode()
         # Empty client path → "/" (HTTP/3 root, RFC 9114 §4.3.1).
         cdef bytes b_path = b"/" if path == "" else path.encode()
@@ -3472,13 +3563,12 @@ cdef class WebTransportSessionState:
 
         cdef bytearray buf = bytearray(total)
         cdef uint8_t* p = <uint8_t*><char*>buf
-        # Layout: addr | sni_len(2) | path_len(2) | protocols_len(2)
-        #       | sni | path | protocols
-        memcpy(p, &addr, sizeof(sockaddr_in))
-        cdef uint16_t* hdr_lens = <uint16_t*>(p + sizeof(sockaddr_in))
-        hdr_lens[0] = <uint16_t>sni_len
-        hdr_lens[1] = <uint16_t>path_len
-        hdr_lens[2] = <uint16_t>protocols_len
+        # Layout: aiopquic_wt_open_params_t | sni | path | protocols
+        cdef aiopquic_wt_open_params_t* params = <aiopquic_wt_open_params_t*>p
+        _fill_sockaddr(host, port, &params.addr)
+        params.sni_len = <uint16_t>sni_len
+        params.path_len = <uint16_t>path_len
+        params.protocols_len = <uint16_t>protocols_len
         memcpy(p + hdr_size, <const uint8_t*>b_sni, sni_len)
         memcpy(p + hdr_size + sni_len, <const uint8_t*>b_path, path_len)
         if protocols_len > 0:

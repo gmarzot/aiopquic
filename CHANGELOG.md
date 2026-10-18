@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `serve(..., retry=True)`: Retry for every new connection.
+- `QuicConfiguration.cipher_suite`, `key_update_interval` and `supported_versions` (QUIC v2 by
+  compatible version negotiation).
+- `QuicConfiguration.session_ticket_file`: session resumption and 0-RTT;
+  `HandshakeCompleted.session_resumed` is set.
+- `connect(wait_connected=False)` waits for the connection to exist, so writes before the handshake
+  are sent (as 0-RTT with a ticket).
+- IPv6: servers bind both families when available; clients connect to IPv6 addresses (raw QUIC and
+  WebTransport).
+- `serve_webtransport(web_folder=)` serves files to HTTP/3 GET requests.
+
 ## v0.5.1
 
 - `QuicConfiguration.max_connections` (default 256): most connections a transport holds at once;

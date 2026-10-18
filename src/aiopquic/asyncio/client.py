@@ -1,6 +1,7 @@
 """QUIC client — matches qh3.asyncio.client API."""
 
 import asyncio
+import ipaddress
 import socket
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Callable
@@ -10,17 +11,20 @@ from aiopquic.quic.connection import QuicConnection
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
 
 
-def _resolve_host(host: str, port: int) -> str:
-    """Resolve hostname to IP address if needed."""
+def _resolve_host(host: str, port: int | None = None) -> str:
+    """An IP literal as is; a name resolves to its first IPv4 address,
+    else its first IPv6 one."""
     try:
-        socket.inet_aton(host)
-        return host  # already an IP
-    except OSError:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
         pass
-    infos = socket.getaddrinfo(host, port, socket.AF_INET)
-    if not infos:
-        raise OSError(f"Cannot resolve {host}")
-    return infos[0][4][0]
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
+    for family in (socket.AF_INET, socket.AF_INET6):
+        for info in infos:
+            if info[0] == family:
+                return info[4][0]
+    raise OSError(f"Cannot resolve {host}")
 
 
 @asynccontextmanager
@@ -62,6 +66,10 @@ async def connect(
     try:
         if wait_connected:
             await protocol.wait_connected()
+        else:
+            # Writes before the handshake need the connection to exist; with
+            # a session ticket they go out as 0-RTT.
+            await protocol.wait_created()
         yield protocol
     finally:
         try:

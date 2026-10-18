@@ -96,7 +96,7 @@ static inline uint64_t aiopquic_wt_code_from_h3(uint64_t h) {
  * picowt_connect. Empty (protocols_len == 0) sends no header.
  */
 typedef struct {
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
     uint16_t sni_len;
     uint16_t path_len;
     uint16_t protocols_len;

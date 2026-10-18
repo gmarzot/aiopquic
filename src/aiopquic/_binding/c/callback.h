@@ -184,7 +184,8 @@ static inline int aiopquic_fc_raw_enabled(void) {
  * Stored in the entry's data_buf as: header + sni + alpn.
  */
 typedef struct {
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
+    uint32_t desired_version;           /* 0: stay in the initial version */
     uint16_t sni_len;
     uint16_t alpn_len;
     /* followed by: sni_len bytes of SNI, then alpn_len bytes of ALPN */
@@ -579,6 +580,7 @@ typedef struct {
     uint64_t data_received;
     aiopquic_addr_t peer_addr;
     aiopquic_addr_t local_addr;
+    uint8_t session_resumed;            /* TLS resumed with a PSK */
 } aiopquic_cnx_snapshot_t;
 
 /* Worker thread only. */
@@ -606,6 +608,7 @@ static inline void aiopquic_cnx_snapshot_fill(picoquic_cnx_t* cnx,
     picoquic_get_default_path_quality(cnx, &s->path_quality);
     s->data_sent = picoquic_get_data_sent(cnx);
     s->data_received = picoquic_get_data_received(cnx);
+    s->session_resumed = picoquic_tls_is_psk_handshake(cnx) ? 1 : 0;
     struct sockaddr* sa = NULL;
     picoquic_get_peer_addr(cnx, &sa);
     aiopquic_addr_fill(sa, &s->peer_addr);
@@ -1621,14 +1624,26 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                             alpn_ptr = alpn_buf;
                         }
 
-                        picoquic_cnx_t* new_cnx = picoquic_create_client_cnx(
-                            quic,
+                        /* picoquic_create_client_cnx, with the desired version
+                         * set before the first Initial goes out. */
+                        picoquic_cnx_t* new_cnx = picoquic_create_cnx(
+                            quic, picoquic_null_connection_id,
+                            picoquic_null_connection_id,
                             (struct sockaddr*)&p->addr,
-                            picoquic_current_time(),
-                            0,
-                            sni_ptr, alpn_ptr,
-                            aiopquic_stream_cb,
-                            (void*)ctx);
+                            picoquic_current_time(), 0,
+                            sni_ptr, alpn_ptr, 1);
+                        if (new_cnx) {
+                            picoquic_set_callback(new_cnx, aiopquic_stream_cb,
+                                                  (void*)ctx);
+                            if (p->desired_version != 0) {
+                                picoquic_set_desired_version(new_cnx,
+                                                             p->desired_version);
+                            }
+                            if (picoquic_start_client_cnx(new_cnx) != 0) {
+                                picoquic_delete_cnx(new_cnx);
+                                new_cnx = NULL;
+                            }
+                        }
                         if (new_cnx) {
                             spsc_entry_t resp = {0};
                             resp.event_type = SPSC_EVT_ALMOST_READY;
