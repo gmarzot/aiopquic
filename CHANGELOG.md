@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.1
 
 - `QuicConfiguration.max_connections` (default 256): most connections a transport holds at once;
   a server refuses new ones past it with CONNECTION_REFUSED.
