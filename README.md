@@ -153,6 +153,10 @@ Test-suite coverage, benchmark methodology, performance builds (`AIOPQUIC_PERF=1
 - Pure stream open/close microbench (lifecycle rate without payload, separate from `bench_stream_churn_highlevel` which bundles writes + FIN)
 - Submit aiopquic to the [QUIC interop runner](https://interop.seemann.io/) for cross-implementation coverage
 
+## Acknowledgments
+
+aiopquic is built on [picoquic](https://github.com/private-octopus/picoquic): QUIC, HTTP/3 and WebTransport all come from it. Many thanks to Christian Huitema, picoquic's author, and to its contributors for that work.
+
 ## Resources
 
 - [picoquic](https://github.com/private-octopus/picoquic) -- QUIC implementation by Christian Huitema
