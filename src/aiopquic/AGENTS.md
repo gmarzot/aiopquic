@@ -26,6 +26,10 @@ the `KEX_*` ids and `counters`; everything else there, and raw pointers, are tes
   wt:`, then `create_stream()`, `send_stream_data()`, `receive_stream_data(sid)`, `events()`.
   `serve_webtransport(host, port, path, handler=h, cert_file=..., key_file=..., configuration=cfg)`
   calls `h(session)` per CONNECT. `WebTransportError` is a `ConnectionError`.
+- `serve(..., retry=True)` validates client addresses with a Retry. `QuicConfiguration`:
+  `cipher_suite`, `key_update_interval`, `supported_versions` (QUIC v2 by compatible version
+  negotiation), `session_ticket_file` (resumption; with `connect(wait_connected=False)` writes
+  before the handshake go out as 0-RTT). `serve_webtransport(web_folder=)` serves files over HTTP/3.
 - `serve_dispatch(...)` serves both on one UDP port by ALPN (`h3` is added to `alpn_protocols`).
   WebTransport subprotocols: `wt_available_protocols=` / `wt_supported_protocols=`. The server
   picks the client's first offer on its allowlist; an offer with no match is refused with HTTP 400.
@@ -193,7 +197,10 @@ applies nor reverse-applies stops the build: drop or regenerate it.
 - `connect_webtransport()` / `serve_webtransport()` without `configuration=` run picoquic's
   defaults, not `QuicConfiguration`'s.
 - The key-exchange order is process-wide: the last `start()` wins. ML-KEM shares need OpenSSL 3.5.
-- IPv4 only: the `serve*` functions bind the IPv4 wildcard.
+- Servers bind the IPv4 and IPv6 wildcards when an IPv6 socket can bind `[::]:port`, else IPv4
+  only (with a warning unless the host has no IPv6); `QuicConfiguration.ip_family` pins one family.
+  The `host` argument is ignored. Clients take IPv4 or IPv6 literals and prefer a name's IPv4
+  address. `QuicConfiguration.pmtud="delayed"` keeps a mostly-receiving client from probing.
 - The raw-QUIC `tx_max_queued_bytes` gate reads the process-wide queued total, so one stalled peer
   parks new streams on every raw connection; the WebTransport gate is per session.
 - `max_stream_data` (16 MiB) is both the advertised window and the per-stream RX ring.

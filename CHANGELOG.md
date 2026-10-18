@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.0
+
+- No changes since 0.6.0rc1.
+
+## v0.6.0rc1
+
+- `serve(..., retry=True)`: Retry for every new connection.
+- `QuicConfiguration.cipher_suite`, `key_update_interval` and `supported_versions` (QUIC v2 by
+  compatible version negotiation).
+- `QuicConfiguration.session_ticket_file`: session resumption and 0-RTT;
+  `HandshakeCompleted.session_resumed` is set.
+- `connect(wait_connected=False)` waits for the connection to exist, so writes before the handshake
+  are sent (as 0-RTT with a ticket).
+- IPv6: servers bind both families when available; clients connect to IPv6 addresses (raw QUIC and
+  WebTransport). When `[::]:port` cannot bind, the server logs a warning and serves IPv4 only.
+- `QuicConfiguration.ip_family`: `socket.AF_INET` or `AF_INET6` only; None binds both.
+- `QuicConfiguration.pmtud`: picoquic's path MTU discovery policy, `"basic"` (default), `"delayed"`
+  or `"blocked"`.
+- `serve_webtransport(web_folder=)` serves files to HTTP/3 GET requests.
+- `qns/`: retry, chacha20, keyupdate, v2, resumption, zerortt, http3 and ipv6 Interop Runner cases.
+
 ## v0.5.2
 
 - Fix: an RX event pushed to the overflow while asyncio drained the ring could consume the

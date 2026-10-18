@@ -8,6 +8,8 @@ import pytest
 
 from aiopquic.asyncio.webtransport import connect_webtransport
 
+from aiopquic._binding._transport import _ipv6_usable
+
 from .conftest import _free_port
 
 QNS = os.path.join(os.path.dirname(__file__), "..", "..", "qns")
@@ -51,21 +53,52 @@ def _assert_same(src, dst, names) -> None:
     ("multiconnect", [1 * KB] * 3),
     # More requests than the server's initial stream limit (100).
     ("transfer", [32] * 1200),
+    ("retry", [1 * KB]),
+    ("chacha20", [1 * MB]),
+    ("keyupdate", [1 * MB]),
+    ("v2", [1 * KB]),
+    ("resumption", [1 * KB] * 3),
+    ("zerortt", [32] * 40),
+    ("http3", [1 * KB, 1 * MB]),
 ])
 async def test_hq(tmp_path, cert_paths, testcase, sizes):
+    if testcase == "http3":
+        pytest.importorskip("pylsqpack")
     www, downloads = tmp_path / "www", tmp_path / "downloads"
     names = _files(www, sizes)
     os.makedirs(downloads)
     port = _free_port()
     server = await hq.start_server(port, str(www), cert_paths["cert"],
-                                   cert_paths["key"])
+                                   cert_paths["key"], testcase)
     try:
         urls = [f"https://127.0.0.1:{port}/{n}" for n in names]
         await asyncio.wait_for(
             hq.run_client(testcase, urls, str(downloads)), 30)
     finally:
+        await _close(server)
+    _assert_same(www, downloads, names)
+
+
+@pytest.mark.skipif(not _ipv6_usable(), reason="no IPv6 on this host")
+async def test_hq_ipv6(tmp_path, cert_paths):
+    www, downloads = tmp_path / "www", tmp_path / "downloads"
+    names = _files(www, [64 * KB])
+    os.makedirs(downloads)
+    port = _free_port()
+    server = await hq.start_server(port, str(www), cert_paths["cert"], cert_paths["key"])
+    try:
+        urls = [f"https://[::1]:{port}/{n}" for n in names]
+        await asyncio.wait_for(hq.run_client("transfer", urls, str(downloads)), 30)
+    finally:
         server.close()
     _assert_same(www, downloads, names)
+
+
+async def _close(server) -> None:
+    if hasattr(server, "aclose"):
+        await server.aclose()
+    else:
+        server.close()
 
 
 @pytest.mark.parametrize("client_case,server_case,sizes", [
@@ -149,9 +182,9 @@ async def test_wt_session_on_file_url(tmp_path, cert_paths):
 
 
 @pytest.mark.parametrize("module,role,testcase", [
-    (hq, "client", "chacha20"),
-    (hq, "server", "retry"),
-    (hq, "server", "http3"),
+    (hq, "server", "keyupdate"),
+    (hq, "client", "connectionmigration"),
+    (hq, "server", "connectionmigration"),
     (hq, "client", "unknown-random-slug"),
     (wt, "client", "transfer-datagram-send"),
     (wt, "server", "transfer-datagram-receive"),

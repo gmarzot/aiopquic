@@ -6,16 +6,18 @@ unsupported TESTCASE exits 127.
 """
 
 import asyncio
+import importlib.util
 import logging
 import os
-import socket
 import ssl
 import sys
+import tempfile
 from urllib.parse import urlparse
 
 from aiopquic.asyncio import connect, serve
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
-from aiopquic.quic.configuration import QuicConfiguration
+from aiopquic.asyncio.webtransport import serve_webtransport
+from aiopquic.quic.configuration import QUIC_V1, QUIC_V2, QuicConfiguration
 from aiopquic.quic.events import (
     ConnectionTerminated, StreamDataReceived, StreamReset,
 )
@@ -26,16 +28,17 @@ CHUNK = 64 * 1024
 MAX_IN_FLIGHT = 64
 EXIT_UNSUPPORTED = 127
 
-# picoquic follows a Retry and marks ECT(0) by itself; every other case
-# needs a setting aiopquic does not expose.
-SERVER_CASES = frozenset({"handshake", "transfer", "multiconnect", "ecn"})
-CLIENT_CASES = SERVER_CASES | {"retry"}
+CHACHA20 = 0x1303
+# Packets per key phase: several key updates within the first MB.
+KEY_UPDATE_INTERVAL = 100
+# Unused WebTransport path; the http3 case serves files from web_folder.
+H3_WT_PATH = "/qns-webtransport"
+
+SERVER_CASES = frozenset({"handshake", "transfer", "multiconnect", "ecn", "retry", "chacha20",
+                          "resumption", "zerortt", "v2", "http3"})
+CLIENT_CASES = SERVER_CASES | {"keyupdate"}
 
 log = logging.getLogger("qns")
-
-
-class Unsupported(Exception):
-    """The case needs something aiopquic cannot do."""
 
 
 def _qlog_dir() -> str | None:
@@ -45,9 +48,12 @@ def _qlog_dir() -> str | None:
     return path
 
 
-def server_configuration(cert_file: str, key_file: str) -> QuicConfiguration:
+def server_configuration(cert_file: str, key_file: str,
+                         testcase: str = "transfer") -> QuicConfiguration:
     cfg = QuicConfiguration(is_client=False, alpn_protocols=[ALPN],
                             qlog_dir=_qlog_dir())
+    if testcase == "chacha20":
+        cfg.cipher_suite = CHACHA20
     # Requests are one line; the per-stream RX ring is sized to this window.
     cfg.max_stream_data = 64 * 1024
     # A client opens requests up to the limit at once; keep bursts moderate.
@@ -56,14 +62,32 @@ def server_configuration(cert_file: str, key_file: str) -> QuicConfiguration:
     return cfg
 
 
-def client_configuration(testcase: str) -> QuicConfiguration:
+def client_configuration(testcase: str, ticket_file: str | None = None) -> QuicConfiguration:
     cfg = QuicConfiguration(is_client=True, alpn_protocols=[ALPN],
-                            verify_mode=ssl.CERT_NONE, qlog_dir=_qlog_dir())
+                            verify_mode=ssl.CERT_NONE, qlog_dir=_qlog_dir(),
+                            session_ticket_file=ticket_file)
     if testcase == "transfer":
         # Smaller than the files, so the transfer depends on window updates.
         cfg.max_data = 1024 * 1024
         cfg.max_stream_data = 256 * 1024
+    elif testcase == "chacha20":
+        cfg.cipher_suite = CHACHA20
+    elif testcase == "keyupdate":
+        cfg.key_update_interval = KEY_UPDATE_INTERVAL
+    elif testcase == "v2":
+        cfg.supported_versions = [QUIC_V2, QUIC_V1]
+    elif testcase == "zerortt":
+        # No early full-size MTU probe: the case caps the client's 1-RTT bytes.
+        cfg.pmtud = "delayed"
     return cfg
+
+
+def _h3client():
+    spec = importlib.util.spec_from_file_location(
+        "h3client", os.path.join(os.path.dirname(os.path.abspath(__file__)), "h3client.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 async def send_all(quic, stream_id: int, data: bytes) -> None:
@@ -182,26 +206,32 @@ class HqClientProtocol(QuicConnectionProtocol):
         return await fut
 
 
-async def start_server(port: int, www: str, cert_file: str, key_file: str):
-    """Listen on port, serving www. Returns the server; close() stops it."""
-    protocol = type("HqServer", (HqServerProtocol,), {"www": www})
-    server = await serve("0.0.0.0", port,
-                         configuration=server_configuration(cert_file, key_file),
-                         create_protocol=protocol)
-    log.info("serving %s on UDP %d", www, port)
+async def start_server(port: int, www: str, cert_file: str, key_file: str,
+                       testcase: str = "transfer"):
+    """Listen on port, serving www (over HTTP/3 for http3, else hq-interop).
+    Returns the server; close() or aclose() stops it."""
+    if testcase == "http3":
+        server = await serve_webtransport(
+            "::", port, H3_WT_PATH, handler=lambda session: None,
+            cert_file=cert_file, key_file=key_file, web_folder=www,
+            configuration=QuicConfiguration(is_client=False, qlog_dir=_qlog_dir()))
+    else:
+        protocol = type("HqServer", (HqServerProtocol,), {"www": www})
+        server = await serve("::", port,
+                             configuration=server_configuration(cert_file, key_file, testcase),
+                             create_protocol=protocol, retry=testcase == "retry")
+    log.info("serving %s on UDP %d (%s)", www, port, testcase)
     return server
 
 
-async def _download(urls: list[str], downloads: str, testcase: str) -> None:
+async def _download(urls: list[str], downloads: str, testcase: str,
+                    ticket_file: str | None = None, early: bool = False) -> None:
+    """Fetch urls on one connection. early writes the requests before the
+    handshake completes, so a session ticket carries them as 0-RTT."""
     first = urlparse(urls[0])
-    try:
-        socket.getaddrinfo(first.hostname, None, socket.AF_INET)
-    except socket.gaierror:
-        # The ipv6 case arrives as "transfer" to an IPv6-only host.
-        raise Unsupported(f"{first.hostname}: no IPv4 address") from None
     async with connect(first.hostname, first.port or PORT,
-                       configuration=client_configuration(testcase),
-                       create_protocol=HqClientProtocol) as proto:
+                       configuration=client_configuration(testcase, ticket_file),
+                       create_protocol=HqClientProtocol, wait_connected=not early) as proto:
         in_flight = asyncio.Semaphore(MAX_IN_FLIGHT)
 
         async def one(url: str) -> None:
@@ -215,19 +245,29 @@ async def _download(urls: list[str], downloads: str, testcase: str) -> None:
 
 
 async def run_client(testcase: str, urls: list[str], downloads: str) -> None:
-    """Fetch urls into downloads: one connection, or one per file for
-    multiconnect."""
+    """Fetch urls into downloads: one connection; one per file for
+    multiconnect; the first file, then the rest on a resumed connection for
+    resumption and zerortt; HTTP/3 for http3."""
     if not urls:
         raise ValueError("REQUESTS is empty")
     if testcase == "multiconnect":
         for url in urls:
             await _download([url], downloads, testcase)
+    elif testcase in ("resumption", "zerortt"):
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets = os.path.join(tmp, "tickets.bin")
+            await _download(urls[:1], downloads, testcase, tickets)
+            if urls[1:]:
+                await _download(urls[1:], downloads, testcase, tickets,
+                                early=testcase == "zerortt")
+    elif testcase == "http3":
+        await _h3client().fetch_h3(urls, downloads, client_configuration(testcase))
     else:
         await _download(urls, downloads, testcase)
 
 
-async def _serve_forever() -> None:
-    await start_server(PORT, "/www", "/certs/cert.pem", "/certs/priv.key")
+async def _serve_forever(testcase: str) -> None:
+    await start_server(PORT, "/www", "/certs/cert.pem", "/certs/priv.key", testcase)
     await asyncio.Event().wait()
 
 
@@ -245,10 +285,7 @@ def main() -> int:
             urls = os.environ.get("REQUESTS", "").split()
             asyncio.run(run_client(testcase, urls, "/downloads"))
         else:
-            asyncio.run(_serve_forever())
-    except Unsupported as exc:
-        log.info("unsupported: %s", exc)
-        return EXIT_UNSUPPORTED
+            asyncio.run(_serve_forever(testcase))
     except Exception:
         log.exception("%s %s failed", role, testcase)
         return 1
