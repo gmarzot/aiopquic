@@ -142,6 +142,9 @@ class QuicConfiguration:
     # 1 Gbps × 33 ms); raise for high-BDP WAN paths, lower for
     # tighter latency budgets. None or 0 disables.
     tx_max_queued_bytes: int | None = 4 * 1024 * 1024
+    # Most connections one transport holds at once; a server refuses new
+    # ones past it with CONNECTION_REFUSED.
+    max_connections: int = 256
 
     def __post_init__(self) -> None:
         from aiopquic._binding._transport import (

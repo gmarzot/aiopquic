@@ -1241,6 +1241,7 @@ class QuicEngine:
                                         * 1000),
             socket_buffer_size=(cfg.socket_buffer_size or 0),
             qlog_dir=cfg.qlog_dir,
+            max_connections=getattr(cfg, 'max_connections', 256),
         )
         kwargs.update(extra)
         self._transport.start(**kwargs)

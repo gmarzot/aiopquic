@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `QuicConfiguration.max_connections` (default 256): most connections a transport holds at once;
+  a server refuses new ones past it with CONNECTION_REFUSED.
+
 ## v0.5.0
 
 - `qns/` Interop Runner images are published to GHCR from each release's PyPI wheel.
