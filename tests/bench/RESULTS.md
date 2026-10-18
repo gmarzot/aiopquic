@@ -163,3 +163,33 @@ plus minor in-flight headroom.
   no duplicates, no out-of-order at saturation. Zero loss / zero
   corruption across 1.37 M objects in the small-object bench at
   2.24 Gbps sustained.
+
+## Perf protocol
+
+`tests/bench/perf.py` implements the QUIC perf protocol
+([draft-banks-quic-performance](https://datatracker.ietf.org/doc/draft-banks-quic-performance/),
+ALPN `perf`) as both client and server, so aiopquic can be measured against other
+stacks' perf tools with the same wire format. `tests/test_perf_protocol.py` checks
+byte counts and FIN handling on loopback, and interop with `picoquicdemo` in both
+directions.
+
+```
+python tests/bench/perf.py server --port 4433 --cert cert.pem --key key.pem
+python tests/bench/perf.py client HOST 4433 --download 1G --streams 1 --cc-algo cubic --insecure
+python tests/bench/perf.py client HOST 4433 --upload 1G --duration 10 --insecure
+python tests/bench/perf.py client HOST 4433 --download 4000 --upload 512 --streams 100 --duration 10 --insecure
+```
+
+The client prints one line: `perf: up= down= elapsed= up_mbps= down_mbps= requests= rps=`.
+`--upload` counts bytes after the 8-byte size header; picoquic's post size and
+secnetperf's `-up` include it.
+
+Peer tools speaking the same protocol:
+
+| peer | server | client |
+|---|---|---|
+| picoquic | `picoquicdemo -p 4433 -c cert.pem -k key.pem` | `picoquicdemo -a perf -n SNI HOST 4433 "*1:8:1000000000;"` (post size includes the header) |
+| quinn | `perf server --listen [::]:4433 --cert cert.pem --key key.pem` | `perf client HOST:4433 --download-size 1G --upload-size 0 --bi-requests 1 --duration 10` |
+| msquic | `secnetperf` (own self-signed certificate: use `--insecure`; port 4433) | `secnetperf -target:HOST -port:4433 -down:1000000000 -up:0` (client skips certificate validation) |
+
+No comparison numbers yet: peer comparisons are pending a quiet bench host.
