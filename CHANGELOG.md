@@ -12,6 +12,7 @@
 - IPv6: servers bind both families when available; clients connect to IPv6 addresses (raw QUIC and
   WebTransport).
 - `serve_webtransport(web_folder=)` serves files to HTTP/3 GET requests.
+- `qns/`: retry, chacha20, keyupdate, v2, resumption, zerortt, http3 and ipv6 Interop Runner cases.
 
 ## v0.5.1
 

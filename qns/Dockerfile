@@ -7,11 +7,12 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY wheelhouse/ /tmp/wheelhouse/
+# pylsqpack: QPACK for the http3 client (h3client.py), image only.
 RUN python3 -m venv /venv \
- && /venv/bin/pip install --no-cache-dir /tmp/wheelhouse/aiopquic-*-cp312-*.whl \
+ && /venv/bin/pip install --no-cache-dir /tmp/wheelhouse/aiopquic-*-cp312-*.whl pylsqpack==1.0.0 \
  && rm -rf /tmp/wheelhouse
 
-COPY endpoint.py wt_endpoint.py /qns/
+COPY endpoint.py wt_endpoint.py h3client.py /qns/
 COPY run_endpoint.sh /run_endpoint.sh
 
 FROM base AS webtransport
