@@ -1,10 +1,11 @@
 name: Interop
 
 # QUIC Interop Runner matrices (hq-interop and WebTransport, qns/) against
-# peer stacks, and the public-endpoint handshakes in tests/test_interop.py.
-# Peer results are report-only; a case aiopquic runs failing against itself,
-# or a pair that produced no results, fails the job. Runs on pull requests that
-# touch the endpoints, the library or picoquic.
+# peer stacks, one job per pair and direction, and the public-endpoint
+# handshakes in tests/test_interop.py. Pull requests run the test cases only;
+# scheduled and dispatched runs add the measurements. Peer results are
+# report-only; a case aiopquic runs failing against itself, or a pair that
+# produced no results, fails the job.
 
 on:
   workflow_dispatch:
@@ -13,6 +14,7 @@ on:
   pull_request:
     paths:
       - "qns/**"
+      - "!qns/**/*.md"
       - ".github/workflows/interop.yml"
 
 concurrency:
@@ -42,27 +44,51 @@ jobs:
           name: wheel-cp312
           path: wheelhouse/*.whl
 
-  runner:
-    name: ${{ matrix.protocol }} / ${{ matrix.peer }}
-    needs: wheel
+  pairs:
+    name: pairs
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    outputs:
+      matrix: ${{ steps.pairs.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RUNNER_REPO }}
+          ref: ${{ env.RUNNER_REF }}
+      - name: One pair per peer and direction, as the peer's runner role allows
+        id: pairs
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          peers = {
+              "quic": ["picoquic", "quic-go", "aioquic", "ngtcp2", "quiche"],
+              "webtransport": ["webtransport-go", "ngtcp2", "xquic", "flupke-webtransport",
+                               "chrome", "firefox"],
+          }
+          pairs = []
+          for protocol, names in peers.items():
+              roles = json.load(open(f"implementations_{protocol}.json"))
+              pairs.append({"protocol": protocol, "server": "aiopquic", "client": "aiopquic"})
+              for peer in names:
+                  if roles[peer]["role"] in ("both", "client"):
+                      pairs.append({"protocol": protocol, "server": "aiopquic", "client": peer})
+                  if roles[peer]["role"] in ("both", "server"):
+                      pairs.append({"protocol": protocol, "server": peer, "client": "aiopquic"})
+          print("matrix=" + json.dumps({"include": pairs}))
+          PY
+
+  runner:
+    name: ${{ matrix.protocol }} / ${{ matrix.server }} · ${{ matrix.client }}
+    needs: [wheel, pairs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix:
-        protocol: [quic]
-        peer: [aiopquic, picoquic, quic-go, aioquic, ngtcp2, quiche]
-        include:
-          - { protocol: webtransport, peer: aiopquic }
-          - { protocol: webtransport, peer: webtransport-go }
-          - { protocol: webtransport, peer: ngtcp2 }
-          - { protocol: webtransport, peer: xquic }
-          - { protocol: webtransport, peer: flupke-webtransport }
-          - { protocol: webtransport, peer: chrome }
-          - { protocol: webtransport, peer: firefox }
+      matrix: ${{ fromJson(needs.pairs.outputs.matrix) }}
     env:
       PROTOCOL: ${{ matrix.protocol }}
-      PEER: ${{ matrix.peer }}
+      SERVER: ${{ matrix.server }}
+      CLIENT: ${{ matrix.client }}
+      TESTS: ${{ github.event_name == 'pull_request' && '-t onlyTests' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -102,30 +128,19 @@ jobs:
           CRON: "true"
         run: |
           mkdir -p ../results ../logs
-          pair() {
-            python run.py -p "$PROTOCOL" -s "$1" -c "$2" -l "../logs/$1_$2" -j "../results/$1_$2.json" 2>&1 | tee "../logs/$1_$2.txt" || true
-          }
-          if [ "$PEER" = aiopquic ]; then
-            pair aiopquic aiopquic
-          else
-            pair aiopquic "$PEER"
-            if [ "$(jq -r --arg p "$PEER" '.[$p].role' "implementations_$PROTOCOL.json")" != client ]; then
-              pair "$PEER" aiopquic
-            fi
-          fi
+          pair="${SERVER}_${CLIENT}"
+          python run.py -p "$PROTOCOL" -s "$SERVER" -c "$CLIENT" $TESTS -l "../logs/$pair" -j "../results/$pair.json" 2>&1 | tee "../logs/$pair.txt" || true
       - name: Summarize
         if: always()
         run: |
           python - <<'PY'
           import glob, json, os, sys
           mark = {"succeeded": "✓", "failed": "✕", "unsupported": "?", None: "–"}
-          peer, protocol = os.environ["PEER"], os.environ["PROTOCOL"]
-          role = json.load(open(f"runner/implementations_{protocol}.json"))[peer]["role"]
-          expected = (["aiopquic_aiopquic"] if peer == "aiopquic" else
-                      [f"aiopquic_{peer}"] + ([f"{peer}_aiopquic"] if role != "client" else []))
+          protocol = os.environ["PROTOCOL"]
+          expected = [f"{os.environ['SERVER']}_{os.environ['CLIENT']}"]
           found = {os.path.basename(p)[:-5]: json.load(open(p)) for p in sorted(glob.glob("results/*.json"))}
           errors = [f"{name}: no results" for name in expected if name not in found]
-          lines = [f"### {protocol} / {peer}", ""]
+          lines = [f"### {protocol} / {expected[0]}", ""]
           for name, r in found.items():
               server, client = r["servers"][0], r["clients"][0]
               tests = r["results"][0]
@@ -148,7 +163,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: interop-${{ matrix.protocol }}-${{ matrix.peer }}
+          name: interop-${{ matrix.protocol }}-${{ matrix.server }}_${{ matrix.client }}
           path: |
             results/
             logs/
