@@ -16,6 +16,12 @@ reference never frees a context an event still names.
         The same with drain_rx, one event per call, the reference dropped
         between the calls.
 
+    python tests/stream_ctx_scenarios.py second-context PORT CERT KEY
+        A stream handed a second context (picoquic's was detached by a
+        reset or stop-sending), the second retired by STREAM_DESTROY, then
+        the connection closes. Exits 0 when both contexts are released,
+        each once.
+
     python tests/stream_ctx_scenarios.py undrained PORT CERT KEY
         Queue RX STREAM_DATA and TX reset, stop-sending and mark-active
         events that name a context nothing else holds, then free the
@@ -25,6 +31,12 @@ reference never frees a context an event still names.
     python tests/stream_ctx_scenarios.py tx-ring-full PORT CERT KEY
         A reset pushed onto a full TX ring raises BufferError and returns
         its reference. Exits 0 when no context is left.
+
+    python tests/stream_ctx_scenarios.py destroy-in-batch PORT CERT KEY
+        A server engine drains STREAM_FIN, STOP_SENDING and STREAM_DESTROY
+        for one context in one drain_rx batch; the protocol resets the
+        stream when STOP_SENDING is routed. Exits 0 when the context is
+        alive at the reset and released after the transport stops.
 
     python tests/stream_ctx_scenarios.py churn PORT CERT KEY
         Loopback connections that close mid-transfer from either side, with
@@ -44,7 +56,8 @@ from aiopquic.asyncio.client import connect
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
 from aiopquic.asyncio.server import serve
 from aiopquic.quic.configuration import QuicConfiguration
-from aiopquic.quic.events import StreamDataReceived
+from aiopquic.quic.connection import QuicConnection, QuicEngine
+from aiopquic.quic.events import StopSendingReceived, StreamDataReceived
 
 SNI = "test.example.com"  # the test certificate's name
 ALPN = "hq-interop"
@@ -52,7 +65,9 @@ CA_FILE = None            # set from the cert path in __main__
 
 SPSC_EVT_STREAM_DATA = 0
 SPSC_EVT_STREAM_FIN = 1
+SPSC_EVT_STOP_SENDING = 3
 SPSC_EVT_APP_CLOSE = 5
+SPSC_EVT_STREAM_DESTROY = 17
 SPSC_EVT_TX_CNX_REFRESH = 147
 SPSC_EVT_TX_STREAM_RESET = 132
 SPSC_EVT_TX_STOP_SENDING = 133
@@ -130,6 +145,20 @@ def close_then_data_split(port, cert, key):
     _check_released("after the drains")
 
 
+def second_context(port, cert, key):
+    t = TransportContext()
+    conn = QuicConnection(configuration=QuicConfiguration(is_client=True))
+    first, second = _sc_with_rx(PAYLOAD), _sc_with_rx(PAYLOAD)
+    t._test_push_rx(SPSC_EVT_STREAM_DATA, 0, cnx_ptr=CNX, stream_ctx=first)
+    t._test_push_rx(SPSC_EVT_STREAM_DATA, 0, cnx_ptr=CNX, stream_ctx=second)
+    t._test_push_rx(SPSC_EVT_STREAM_DESTROY, 0, cnx_ptr=CNX, stream_ctx=second)
+    t._test_push_rx(SPSC_EVT_APP_CLOSE, 0, cnx_ptr=CNX)
+    t.drain_rx_callback(conn._handle_raw_event)
+    conn._events.clear()
+    del conn, t
+    _check_released("after the close")
+
+
 def undrained(port, cert, key):
     t = TransportContext()
     sc = _sc_with_rx(PAYLOAD)
@@ -165,6 +194,40 @@ def tx_ring_full(port, cert, key):
     if _alive() != 0:
         _fail("the failed push kept its reference")
     del t
+    _check_released("after the transport was freed")
+
+
+async def destroy_in_batch(port, cert, key):
+    t = TransportContext()
+    sc = stream_ctx_create()  # the stream's reference, dropped by DESTROY
+    sid = 4
+    t._test_push_rx(SPSC_EVT_STREAM_FIN, sid, cnx_ptr=CNX, stream_ctx=sc)
+    t._test_push_rx(SPSC_EVT_STOP_SENDING, sid, cnx_ptr=CNX, stream_ctx=sc,
+                    error_code=7)
+    t._test_push_rx(SPSC_EVT_STREAM_DESTROY, sid, cnx_ptr=CNX, stream_ctx=sc)
+    resets = []
+
+    class Server(QuicConnectionProtocol):
+        def quic_event_received(self, event):
+            if isinstance(event, StopSendingReceived):
+                # A freed context here is the use-after-free.
+                if _alive() != 1:
+                    _fail("context freed before STOP_SENDING was routed")
+                self._quic.reset_stream(event.stream_id, event.error_code)
+                resets.append(event.stream_id)
+
+    engine = QuicEngine(configuration=QuicConfiguration(is_client=False),
+                        create_protocol=Server)
+    engine._transport = t
+    engine.drain_and_route()
+    if resets != [sid]:
+        _fail(f"resets {resets}")
+    conn = engine._connections[CNX]
+    if conn._stream_ctxs:
+        _fail(f"stream contexts still mapped: {conn._stream_ctxs}")
+    t.stop()
+    engine._transport = None
+    del t, conn, engine
     _check_released("after the transport was freed")
 
 
@@ -233,8 +296,10 @@ async def churn(port, cert, key):
 SCENARIOS = {
     "close-then-data": close_then_data,
     "close-then-data-split": close_then_data_split,
+    "second-context": second_context,
     "undrained": undrained,
     "tx-ring-full": tx_ring_full,
+    "destroy-in-batch": destroy_in_batch,
     "churn": churn,
 }
 

@@ -1,0 +1,34 @@
+diff --git a/picoquic/tls_api.c b/picoquic/tls_api.c
+index 9d01c3a..48f711d 100644
+--- a/picoquic/tls_api.c
++++ b/picoquic/tls_api.c
+@@ -1032,13 +1032,16 @@ static uint64_t public_random_obfuscator = 0x5555555555555555ull;
+ static uint64_t picoquic_public_random_step(void)
+ {
+     uint64_t s1;
+-    const uint64_t s0 = public_random_seed[public_random_index++];
+-    public_random_index &= 15;
+-    s1 = public_random_seed[public_random_index];
++    /* Shared by every thread: masked local indexes keep a racing caller in bounds. */
++    const int i0 = public_random_index & 15;
++    const int i1 = (i0 + 1) & 15;
++    const uint64_t s0 = public_random_seed[i0];
++    public_random_index = i1;
++    s1 = public_random_seed[i1];
+     s1 ^= (s1 << 31); // a
+     s1 ^= (s1 >> 11); // b
+     s1 ^= (s0 ^ (s0 >> 30)); // c
+-    public_random_seed[public_random_index] = s1;
++    public_random_seed[i1] = s1;
+     return s1;
+ }
+ 
+@@ -1060,7 +1063,7 @@ void picoquic_public_random_seed_64(uint64_t seed, int reset)
+         public_random_obfuscator = 0x5555555555555555ull;
+     }
+ 
+-    public_random_seed[public_random_index] ^= seed;
++    public_random_seed[public_random_index & 15] ^= seed;
+ 
+     for (int i = 0; i < 16; i++) {
+         (void)picoquic_public_random_step();

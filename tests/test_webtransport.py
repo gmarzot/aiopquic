@@ -13,6 +13,7 @@ from aiopquic._binding._transport import tx_data_bytes_queued
 from aiopquic.asyncio.webtransport import (
     WebTransportError, connect_webtransport, serve_webtransport,
 )
+from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.events import (
     WebTransportStreamReset, WebTransportStopSending,
     WebTransportNewStream, WebTransportStreamDataReceived,
@@ -449,6 +450,50 @@ async def test_registry_does_not_leak_entries_across_sessions():
 
 
 @pytest.mark.asyncio
+async def test_wt_readers_end_after_a_local_close():
+    """A session closed locally ends an events() reader already parked on
+    it, and receive_stream_data() called after the close yields
+    WT_SESSION_GONE at once instead of waiting on an inbox nothing fills."""
+    from aiopquic.asyncio.webtransport import WT_SESSION_GONE
+
+    port = next_port()
+    saw_stream = asyncio.get_event_loop().create_future()
+    sessions, readers = [], []
+
+    async def handler(session):
+        sessions.append(session)
+
+        async def _events():
+            async for ev in session.events():
+                if (isinstance(ev, WebTransportNewStream)
+                        and not saw_stream.done()):
+                    saw_stream.set_result(ev.stream_id)
+        readers.append(asyncio.create_task(_events()))
+
+    async def _late_read(session, sid):
+        return [ev async for ev in session.receive_stream_data(sid)]
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI,
+                                        ca_file=CA_FILE) as wt:
+            sid = await wt.create_stream(bidir=False)
+            wt.send_stream_data(sid, b"hello")
+            server_sid = await asyncio.wait_for(saw_stream, timeout=5.0)
+            await asyncio.sleep(0.05)  # the reader parks for the next event
+            sessions[0].close(0, b"")
+            await asyncio.wait_for(readers[0], timeout=5.0)
+            late = await asyncio.wait_for(
+                _late_read(sessions[0], server_sid), timeout=5.0)
+            assert [(type(ev), ev.error_code) for ev in late] == [
+                (WebTransportStreamReset, WT_SESSION_GONE)]
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
 async def test_wt_close_resets_streams_with_session_gone():
     """The peer sees WT_SESSION_GONE on this session's streams.
 
@@ -792,3 +837,49 @@ async def test_wt_write_larger_than_the_stream_ring_raises():
             wt.send_stream_data(sid, b"y" * 1024)
     finally:
         server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_writes_tls_key_log(tmp_path):
+    """Both WebTransport ends write TLS secrets to secrets_log_file."""
+    port = next_port()
+    server_log, client_log = tmp_path / "server.keys", tmp_path / "client.keys"
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt", handler=lambda session: None,
+        cert_file=CERT_FILE, key_file=KEY_FILE,
+        configuration=QuicConfiguration(is_client=False,
+                                        secrets_log_file=str(server_log)))
+    try:
+        async with connect_webtransport(
+                "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
+                configuration=QuicConfiguration(
+                    is_client=True, secrets_log_file=str(client_log))) as wt:
+            assert wt.session_ready
+    finally:
+        server.close()
+    for path in (server_log, client_log):
+        assert "CLIENT_TRAFFIC_SECRET_0" in path.read_text(), path
+
+
+@pytest.mark.asyncio
+async def test_wt_advertises_reset_stream_at_both_codepoints(tmp_path,
+                                                             monkeypatch):
+    """reset_stream_at goes out under 0x1d (reliable-stream-reset-10) and the
+    draft-07 codepoint; each side's text log records the peer's parameters."""
+    port = next_port()
+    server_log, client_log = tmp_path / "server.log", tmp_path / "client.log"
+    monkeypatch.setenv("AIOPQUIC_TEXTLOG_FILE", str(server_log))
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt", handler=lambda session: None,
+        cert_file=CERT_FILE, key_file=KEY_FILE)
+    monkeypatch.setenv("AIOPQUIC_TEXTLOG_FILE", str(client_log))
+    try:
+        async with connect_webtransport(
+                "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            assert wt.session_ready
+    finally:
+        server.close()
+    for path in (server_log, client_log):
+        text = path.read_text()
+        assert "Extension type: 29 (reset_stream_at)" in text, path
+        assert "Extension type: 6745883625174385 (reset_stream_at)" in text, path

@@ -15,7 +15,7 @@ import asyncio
 
 from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.connection import (
-    QuicEngine, _EVT_CLOSE, _EVT_APP_CLOSE, _EVT_CNX_STACK, route_batch,
+    QuicEngine, _EVT_CLOSE, _EVT_APP_CLOSE, _EVT_CNX_STACK, drain_and_route,
 )
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
 from aiopquic.asyncio.webtransport import (
@@ -35,7 +35,7 @@ class _DualRouter:
         loop.add_reader(transport.eventfd, self._drain)
 
     def _drain(self) -> None:
-        route_batch(self._transport.drain_rx(), self.route_event)
+        drain_and_route(self._transport, self.route_event)
 
     def route_event(self, ev) -> None:
         cnx_ptr = ev[5]

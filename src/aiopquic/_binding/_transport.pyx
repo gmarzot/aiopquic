@@ -21,7 +21,7 @@ cimport cython
 from cpython.buffer cimport PyBuffer_FillInfo
 from cpython.bytes cimport PyBytes_AsString, PyBytes_FromStringAndSize
 from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t, int64_t, uintptr_t
-from libc.stdlib cimport free, malloc
+from libc.stdlib cimport free, malloc, realloc
 from libc.string cimport memcpy, memset
 
 from aiopquic._binding.spsc_ring cimport (
@@ -450,11 +450,19 @@ cdef extern from "c/callback.h":
     void aiopquic_dgram_ring_release_flush(aiopquic_ctx_t* ctx)
     void aiopquic_dgram_ring_release_undrained(aiopquic_ctx_t* ctx)
     void aiopquic_rx_event_release(const spsc_entry_t* e)
+    int aiopquic_rx_event_owns_sc(uint32_t event_type)
     int aiopquic_rx_push_sc(aiopquic_ctx_t* ctx, const spsc_entry_t* entry,
                             const uint8_t* data, uint32_t data_len)
     int aiopquic_tx_push_sc(aiopquic_ctx_t* ctx, const spsc_entry_t* entry,
                             const uint8_t* data, uint32_t data_len)
     void aiopquic_tx_sc_release_undrained(aiopquic_ctx_t* ctx)
+
+
+# A reference a drain_rx batch holds until it is released: an sc, or a WT
+# stream link (whose destroy drops the link's sc reference).
+cdef struct batch_ref_t:
+    void* ptr
+    bint is_link
 
 
 # Per-stream wrapper holding both TX and RX byte rings + flow-control
@@ -1102,6 +1110,10 @@ cdef class TransportContext:
     cdef dict _cnx_snapshots
     cdef list _snapshot_drops
     cdef set _refresh_posted
+    # References the last drain_rx batch holds; see release_batch().
+    cdef batch_ref_t* _batch_refs
+    cdef size_t _batch_refs_n
+    cdef size_t _batch_refs_cap
 
     def __cinit__(self,
                   uint32_t ring_capacity=0,
@@ -1133,6 +1145,9 @@ cdef class TransportContext:
         self._cnx_snapshots = {}
         self._snapshot_drops = []
         self._refresh_posted = set()
+        self._batch_refs = NULL
+        self._batch_refs_n = 0
+        self._batch_refs_cap = 0
         if self._ctx is NULL:
             raise MemoryError("Failed to create transport context")
         # Register for module-level SIGUSR2 counter dump.
@@ -1140,6 +1155,8 @@ cdef class TransportContext:
 
     def __dealloc__(self):
         self._shutdown()
+        free(self._batch_refs)
+        self._batch_refs = NULL
         if self._ctx is not NULL:
             self._release_undrained_rx()
             aiopquic_ctx_destroy(self._ctx)
@@ -1178,6 +1195,7 @@ cdef class TransportContext:
         if self._ctx is not NULL:
             aiopquic_dgram_ring_release_undrained(self._ctx)
             aiopquic_tx_sc_release_undrained(self._ctx)
+        self._release_batch_refs()
         if self._quic is not NULL:
             picoquic_free(self._quic)
             self._quic = NULL
@@ -1785,6 +1803,42 @@ cdef class TransportContext:
         relies on the same arm."""
         aiopquic_clear_tx_event_ring_drain_pending(self._ctx)
 
+    cdef int _hold_batch_ref(self, void* ptr, bint is_link) except -1:
+        cdef size_t cap
+        cdef batch_ref_t* grown
+        if self._batch_refs_n == self._batch_refs_cap:
+            cap = self._batch_refs_cap * 2 if self._batch_refs_cap else 64
+            grown = <batch_ref_t*>realloc(self._batch_refs,
+                                          cap * sizeof(batch_ref_t))
+            if grown is NULL:
+                raise MemoryError("drain_rx batch references")
+            self._batch_refs = grown
+            self._batch_refs_cap = cap
+        self._batch_refs[self._batch_refs_n].ptr = ptr
+        self._batch_refs[self._batch_refs_n].is_link = is_link
+        self._batch_refs_n += 1
+        return 0
+
+    cdef void _release_batch_refs(self) noexcept:
+        cdef size_t i
+        cdef size_t n = self._batch_refs_n
+        self._batch_refs_n = 0
+        for i in range(n):
+            if self._batch_refs[i].is_link:
+                if self._ctx is not NULL:
+                    self._ctx.cnt_sc_destroy_wt_link_callback_free += 1
+                aiopquic_wt_stream_link_destroy(
+                    <aiopquic_wt_stream_link_t*>self._batch_refs[i].ptr)
+            else:
+                aiopquic_stream_ctx_destroy(
+                    <aiopquic_stream_ctx_t*>self._batch_refs[i].ptr)
+
+    def release_batch(self):
+        """Drop the references the last drain_rx batch holds. Call once
+        every event of the batch has been handled; the next drain_rx and
+        stop() also release them."""
+        self._release_batch_refs()
+
     def drain_rx(self, int max_events=256):
         """
         Drain events from the RX ring.
@@ -1806,11 +1860,14 @@ cdef class TransportContext:
         after picoquic.
 
         SPSC_EVT_WT_STREAM_LINK_RELEASE is handled internally and never
-        emitted: drain_rx calls aiopquic_wt_stream_link_destroy on the
-        link pointer carried in data_buf. The SPSC ring's FIFO order
-        guarantees every preceding STREAM_DATA/FIN/RESET event for this
-        stream has been popped (and sc->rx drained) before the link
-        is freed — that's the lifetime invariant for BORROWED-sc.
+        emitted.
+
+        Every stream context and WT link the batch names stays alive until
+        release_batch(), the next drain_rx or stop(): the references its
+        events carried, STREAM_DESTROY's and LINK_RELEASE's included, are
+        held rather than dropped while the batch is built. A handler may
+        then act on any stream of the batch, even one retired by a later
+        event in it.
 
         Order matters: drain entries FIRST, then call aiopquic_clear_rx
         which atomically (a) clears the producer-skip flag, (b) drains
@@ -1836,6 +1893,7 @@ cdef class TransportContext:
         # tx_event_ring traffic at ~max(streams_per_cycle, advance_rate
         # / hysteresis_bytes) instead of per-chunk.
         cdef dict pending_fc = {}
+        self._release_batch_refs()
         self._begin_drain_cycle()
         spsc_ring_refill_from_overflow(self._ctx.rx_event_ring,
                                        &self._ctx.rx_overflow)
@@ -1847,12 +1905,10 @@ cdef class TransportContext:
                     break
                 continue
 
-            # LINK_RELEASE is internal: free the link, never emit.
+            # LINK_RELEASE is internal: free the link with the batch.
             if entry.event_type == SPSC_EVT_WT_STREAM_LINK_RELEASE:
                 if entry.data_buf is not NULL:
-                    self._ctx.cnt_sc_destroy_wt_link_callback_free += 1
-                    aiopquic_wt_stream_link_destroy(
-                        <aiopquic_wt_stream_link_t*>entry.data_buf)
+                    self._hold_batch_ref(entry.data_buf, True)
                 spsc_ring_pop(self._ctx.rx_event_ring)
                 continue
 
@@ -1878,11 +1934,9 @@ cdef class TransportContext:
             # STREAM_DESTROY fires once per stream when picoquic
             # considers it fully retired. Surface to user code so the
             # consumer (QuicConnection / WebTransportSession) can pop
-            # its per-stream dicts. stream_ctx_ptr is zeroed because
-            # the stream-lifetime ref is dropped below and the consumer
-            # must not deref the pointer. SPSC FIFO order guarantees
-            # all prior STREAM_DATA / STREAM_FIN / STREAM_RESET have
-            # been popped before this event arrives.
+            # its per-stream dicts. stream_ctx_ptr names the sc whose
+            # stream-lifetime ref the batch drops; the consumer must not
+            # keep the pointer past the batch.
             if entry.event_type == SPSC_EVT_STREAM_DESTROY:
                 events.append((
                     entry.event_type,
@@ -1891,13 +1945,12 @@ cdef class TransportContext:
                     0,
                     0,
                     <uintptr_t>entry.cnx,
-                    <uintptr_t>0,
+                    <uintptr_t>entry.stream_ctx,
                     <uintptr_t>0,
                 ))
                 if entry.stream_ctx is not NULL:
                     aiopquic_cnt_sc_destroy_rx_event_inc()
-                    aiopquic_stream_ctx_destroy(
-                        <aiopquic_stream_ctx_t*>entry.stream_ctx)
+                    self._hold_batch_ref(entry.stream_ctx, False)
                 spsc_ring_pop(self._ctx.rx_event_ring)
                 continue
 
@@ -2025,7 +2078,9 @@ cdef class TransportContext:
                     entry.event_type == SPSC_EVT_WT_SESSION_CLOSED or
                     entry.event_type == SPSC_EVT_WT_SESSION_REFUSED):
                 self._forget_snapshot(<uintptr_t>entry.cnx)
-            aiopquic_rx_event_release(entry)
+            if (entry.stream_ctx is not NULL and
+                    aiopquic_rx_event_owns_sc(entry.event_type)):
+                self._hold_batch_ref(entry.stream_ctx, False)
             spsc_ring_pop(self._ctx.rx_event_ring)
 
         # Per-cycle FC dedupe flush: emit at most one push per stream
@@ -2174,7 +2229,7 @@ cdef class TransportContext:
                     0,
                     0,
                     <uintptr_t>entry.cnx,
-                    <uintptr_t>0,
+                    <uintptr_t>entry.stream_ctx,
                     <uintptr_t>0,
                 )
                 if entry.stream_ctx is not NULL:
