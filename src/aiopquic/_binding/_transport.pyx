@@ -343,6 +343,7 @@ cdef extern from "c/callback.h":
         uint64_t cnt_wake_calls
         uint64_t cnt_wake_skipped_coalesced
         uint64_t cnt_prepare_to_send_empty
+        uint64_t cnt_loop_cb
         uint64_t worker_set_priority_applied
         uint64_t worker_set_priority_rejected
         uint64_t worker_set_priority_last_err
@@ -1295,6 +1296,9 @@ cdef class TransportContext:
             on a stream without that direction; dropped
           tx_event_ring_fire_dropped > 0: rx_event_ring full at fire time (re-arm path)
           wake_calls vs wake_skipped_coalesced: wake-coalescing efficiency
+          rx_notify_pending_now 1 with events queued (rx_event_ring_count_now
+            or rx_overflow_depth_now) while asyncio sleeps: a lost RX wake.
+            loop_callbacks still moving: the worker is running
           prepare_to_send_calls vs prepare_to_send_pulled_bytes: worker
             actually drained sc->tx vs ran with nothing to send
           last_tx_event_ring_arm_ns > last_tx_event_ring_fire_ns: an arm without
@@ -1325,6 +1329,9 @@ cdef class TransportContext:
             'rx_event_drops_stream_data': self._ctx.worker_rx_event_drops_stream_data,
             'rx_overflow_pushed': self._ctx.rx_overflow.pushed,
             'rx_overflow_max_depth': self._ctx.rx_overflow.max_depth,
+            'rx_overflow_depth_now': self._ctx.rx_overflow.depth,
+            'rx_notify_pending_now': self._ctx.rx_notify_pending,
+            'loop_callbacks': self._ctx.cnt_loop_cb,
             'rx_data_event_coalesced': self._ctx.cnt_rx_data_event_coalesced,
             'rx_byte_ring_overflow': self._ctx.worker_rx_byte_ring_overflow,
             'last_tx_event_ring_arm_ns': self._ctx.last_tx_event_ring_arm_ns,

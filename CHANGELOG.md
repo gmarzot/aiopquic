@@ -14,6 +14,12 @@
 - `serve_webtransport(web_folder=)` serves files to HTTP/3 GET requests.
 - `qns/`: retry, chacha20, keyupdate, v2, resumption, zerortt, http3 and ipv6 Interop Runner cases.
 
+## v0.5.2
+
+- Fix: an RX event pushed to the overflow while asyncio drained the ring could consume the
+  wake and leave asyncio asleep with events queued; the drain re-arms while the overflow holds any.
+- Counters `rx_notify_pending_now`, `rx_overflow_depth_now` and `loop_callbacks` (worker loop).
+
 ## v0.5.1
 
 - `QuicConfiguration.max_connections` (default 256): most connections a transport holds at once;
