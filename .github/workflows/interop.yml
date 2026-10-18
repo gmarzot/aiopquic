@@ -1,11 +1,12 @@
 name: Interop
 
 # QUIC Interop Runner matrices (hq-interop and WebTransport, qns/) against
-# peer stacks, one job per pair and direction, and the public-endpoint
-# handshakes in tests/test_interop.py. Pull requests run the test cases only;
-# scheduled and dispatched runs add the measurements. Peer results are
-# report-only; a case aiopquic runs failing against itself, or a pair that
-# produced no results, fails the job.
+# peer stacks, one job per pair and direction, h3spec against the qns HTTP/3
+# server, and the public-endpoint handshakes in tests/test_interop.py. Pull
+# requests run the test cases only; scheduled and dispatched runs add the
+# measurements. Peer and h3spec results are report-only; a case aiopquic runs
+# failing against itself, or a pair or h3spec run that produced no results,
+# fails the job.
 
 on:
   workflow_dispatch:
@@ -25,6 +26,8 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   RUNNER_REPO: quic-interop/quic-interop-runner
   RUNNER_REF: ab039a4a4b43ae2e21bb5704c9fad1f8fe6257d6
+  H3SPEC_VERSION: v0.1.14
+  H3SPEC_SHA256: 7f2e3232715a3f6ff5212d408b2a3e74d6aa3ca06f96efca9a4e5dc55f3c6860
 
 jobs:
   wheel:
@@ -167,6 +170,71 @@ jobs:
           path: |
             results/
             logs/
+          retention-days: 7
+
+  h3spec:
+    name: h3spec
+    needs: wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-cp312
+          path: wheelhouse
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install aiopquic and h3spec
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pip install wheelhouse/aiopquic-*.whl
+          gh release download "$H3SPEC_VERSION" -R kazu-yamamoto/h3spec -p h3spec-linux-x86_64
+          echo "$H3SPEC_SHA256  h3spec-linux-x86_64" | sha256sum -c
+          chmod +x h3spec-linux-x86_64
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 -subj /CN=localhost
+          mkdir -p www && echo ok > www/index.html
+      - name: Run h3spec against the qns HTTP/3 server
+        run: |
+          python - <<'PY'
+          import asyncio, os, re, sys
+          sys.path.insert(0, "qns")
+          from endpoint import start_server
+
+          async def run():
+              server = await start_server(4433, "www", "cert.pem", "key.pem", "http3")
+              try:
+                  proc = await asyncio.create_subprocess_exec(
+                      "./h3spec-linux-x86_64", "127.0.0.1", "4433", "-n",
+                      stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                  out, _ = await proc.communicate()
+              finally:
+                  await server.aclose()
+              return out.decode(errors="replace")
+
+          out = asyncio.run(run())
+          open("h3spec.txt", "w").write(out)
+          print(out)
+          total = re.search(r"^(\d+) examples?, (\d+) failures?", out, re.M)
+          failed = re.findall(r"^  \d+\) (.+)$", out.split("Failures:", 1)[-1], re.M) if total else []
+          lines = [f"### h3spec {os.environ['H3SPEC_VERSION']}", ""]
+          if total and int(total.group(1)) > 0:
+              n, f = int(total.group(1)), int(total.group(2))
+              lines.append(f"{n - f} of {n} checks pass.")
+              lines += [""] + [f"- ✕ {name}" for name in failed]
+          else:
+              lines.append("- ERROR h3spec produced no results")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write("\n".join(lines) + "\n")
+          sys.exit(0 if total and int(total.group(1)) > 0 else 1)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: h3spec
+          path: h3spec.txt
           retention-days: 7
 
   public-endpoints:
