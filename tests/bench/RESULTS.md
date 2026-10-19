@@ -190,6 +190,41 @@ Peer tools speaking the same protocol:
 |---|---|---|
 | picoquic | `picoquicdemo -p 4433 -c cert.pem -k key.pem` | `picoquicdemo -a perf -n SNI HOST 4433 "*1:8:1000000000;"` (post size includes the header) |
 | quinn | `perf server --listen [::]:4433 --cert cert.pem --key key.pem` | `perf client HOST:4433 --download-size 1G --upload-size 0 --bi-requests 1 --duration 10` |
-| msquic | `secnetperf` (own self-signed certificate: use `--insecure`; port 4433) | `secnetperf -target:HOST -port:4433 -down:1000000000 -up:0` (client skips certificate validation) |
+| msquic | `secnetperf` (own self-signed certificate: use `--insecure`; port 4433) | `secnetperf -target:HOST -port:4433 -download:1000000000 -upload:0 -ptput:1` (client skips certificate validation) |
 
-No comparison numbers yet: peer comparisons are pending a quiet bench host.
+### Comparison, 2026-10-19
+
+argo: Apple M4, macOS, 10 cores, 127.0.0.1 (macOS has no UDP GSO). Cubic at both ends, one stream,
+1 GiB per transfer; median of 3 runs, one at a time. Each tool reports its own rate: quinn's client
+runs 6 s and is averaged over its JSON intervals after the first. Load average was 1.5–2.7, with a
+Docker VM and other agents resident.
+
+Versions:
+- aiopquic 72c1d82: picoquic c9088724 with the local patches, OpenSSL 3.6.4, `-O3 -mcpu=native -flto`.
+- quinn ecc0dcfd.
+- msquic 42376ae4.
+
+Mbps, each stack against itself:
+
+| stack | download (server sends) | upload (client sends) |
+|---|---|---|
+| aiopquic | 2118 | 2146 |
+| picoquic | 2049 | 2113 |
+| quinn | 3721 | 3034 |
+| msquic | 2924 | 4640 |
+
+Mbps, aiopquic against each peer, by which side sends:
+
+| peer | aiopquic server sends | peer client sends | peer server sends | aiopquic client sends |
+|---|---|---|---|---|
+| picoquic | 2223 | 2174 | 2138 | 2234 |
+| quinn | 2203 | 3648 | 3359 | 2220 |
+| msquic | 2264 | 4123 (1 of 3 runs) | 3162 (2 of 3 runs) | 2281 |
+
+- aiopquic matches picoquic (about 3% ahead), and the Python layer costs nothing measurable here.
+- aiopquic receives at up to 4.1 Gbps from msquic, so its receive path is not the limit.
+- As a sender, aiopquic tops out near 2.2 Gbps whatever the receiver, the same as picoquic. quinn
+  and msquic send faster on macOS loopback.
+- 3 of the 12 msquic runs failed: twice the msquic client reported no result, and once the msquic
+  server closed the connection mid-transfer (code 0). picoquicdemo stalls against the msquic server
+  too, with or without our patches, so this sits between picoquic and msquic.
