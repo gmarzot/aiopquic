@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Fix: a server created a second, empty connection and protocol for the close that picoquic reports
+  after a peer's application close.
+
 ## v0.6.0
 
 - No changes since 0.6.0rc1.
