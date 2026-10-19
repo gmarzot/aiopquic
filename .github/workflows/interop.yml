@@ -223,8 +223,11 @@ jobs:
           lines = [f"### h3spec {os.environ['H3SPEC_VERSION']}", ""]
           if total and int(total.group(1)) > 0:
               n, f = int(total.group(1)), int(total.group(2))
-              lines.append(f"{n - f} of {n} checks pass.")
-              lines += [""] + [f"- ✕ {name}" for name in failed]
+              lines += [f"{n - f} of {n} checks pass.", "", "```mermaid",
+                        f"pie title h3spec {os.environ['H3SPEC_VERSION']}",
+                        f'    "pass" : {n - f}', f'    "fail" : {f}', "```", "",
+                        "<details><summary>Failing checks</summary>", ""]
+              lines += [f"- ✕ {name}" for name in failed] + ["", "</details>"]
           else:
               lines.append("- ERROR h3spec produced no results")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
