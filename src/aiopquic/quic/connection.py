@@ -1301,6 +1301,10 @@ class QuicEngine:
             return  # engine-level event, not per-cnx
         conn = self._connections.get(cnx_ptr)
         if conn is None:
+            if evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
+                # picoquic reports a peer's close as application_close,
+                # then close: the connection left on the first.
+                return
             conn = QuicConnection(
                 configuration=self._configuration,
                 engine=self, cnx_ptr=cnx_ptr,
