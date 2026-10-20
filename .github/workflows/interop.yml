@@ -17,6 +17,7 @@ on:
       - "qns/**"
       - "!qns/**/*.md"
       - ".github/workflows/interop.yml"
+      - ".github/scripts/interop_report.py"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
