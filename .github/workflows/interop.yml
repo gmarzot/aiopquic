@@ -199,7 +199,7 @@ jobs:
       - name: Run h3spec against the qns HTTP/3 server
         run: |
           python - <<'PY'
-          import asyncio, os, re, sys
+          import asyncio, json, os, re, sys
           sys.path.insert(0, "qns")
           from endpoint import start_server
 
@@ -223,9 +223,16 @@ jobs:
           lines = [f"### h3spec {os.environ['H3SPEC_VERSION']}", ""]
           if total and int(total.group(1)) > 0:
               n, f = int(total.group(1)), int(total.group(2))
+              # Status colors with icons; mid-gray text reads on light and dark.
+              theme = {"pie1": "#0ca30c", "pie2": "#d03b3b", "pieTitleTextColor": "#8c959f",
+                       "pieLegendTextColor": "#8c959f", "pieSectionTextColor": "#ffffff",
+                       "pieStrokeColor": "#8c959f", "pieOuterStrokeColor": "#8c959f",
+                       "pieOpacity": "1"}
+              init = json.dumps({"theme": "base", "themeVariables": theme})
               lines += [f"{n - f} of {n} checks pass.", "", "```mermaid",
+                        "%%{init: " + init + "}%%",
                         f"pie title h3spec {os.environ['H3SPEC_VERSION']}",
-                        f'    "pass" : {n - f}', f'    "fail" : {f}', "```", "",
+                        f'    "✅ pass {n - f}" : {n - f}', f'    "❌ fail {f}" : {f}', "```", "",
                         "<details><summary>Failing checks</summary>", ""]
               lines += [f"- ✕ {name}" for name in failed] + ["", "</details>"]
           else:
