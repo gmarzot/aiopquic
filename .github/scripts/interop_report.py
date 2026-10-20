@@ -79,11 +79,22 @@ def legend(pairs):
     return ["<details><summary>Test cases</summary>", "", items, "", "</details>"]
 
 
+# Status colors, each paired with its icon so color never carries the outcome
+# alone; mid-gray text reads on GitHub's light and dark themes.
+STATUS_COLOR = {"passed": "#0ca30c", "failed": "#d03b3b", "unsupported": "#8c959f"}
+STATUS_ICON = {"passed": "✅", "failed": "❌", "unsupported": "➖"}
+INK = "#8c959f"
+
+
 def pie(title, counts):
-    lines = ["```mermaid", f"pie title {title}"]
-    for label, n in counts.items():
-        if n:
-            lines.append(f'    "{label}" : {n}')
+    present = [(label, n) for label, n in counts.items() if n]
+    theme = {f"pie{i}": STATUS_COLOR[label] for i, (label, _) in enumerate(present, 1)}
+    theme.update(pieTitleTextColor=INK, pieLegendTextColor=INK, pieSectionTextColor="#ffffff",
+                 pieStrokeColor=INK, pieOuterStrokeColor=INK, pieOpacity="1")
+    init = json.dumps({"theme": "base", "themeVariables": theme})
+    lines = ["```mermaid", f"%%{{init: {init}}}%%", f"pie title {title}"]
+    for label, n in present:
+        lines.append(f'    "{STATUS_ICON[label]} {label} {n}" : {n}')
     return lines + ["```"]
 
 
