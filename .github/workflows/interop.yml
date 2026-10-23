@@ -2,11 +2,11 @@ name: Interop
 
 # QUIC Interop Runner matrices (hq-interop and WebTransport, qns/) against
 # peer stacks, one job per pair and direction, h3spec against the qns HTTP/3
-# server, and the public-endpoint handshakes in tests/test_interop.py. Pull
-# requests run the test cases only; scheduled and dispatched runs add the
-# measurements. Peer and h3spec results are report-only; a case aiopquic runs
-# failing against itself, or a pair or h3spec run that produced no results,
-# fails the job.
+# server, a report job that charts the pairs (.github/scripts/interop_report.py),
+# and the public-endpoint handshakes in tests/test_interop.py. Pull requests run
+# the test cases only; scheduled and dispatched runs add the measurements. Peer
+# and h3spec results are report-only; a case aiopquic runs failing against
+# itself, or a pair or h3spec run that produced no results, fails the job.
 
 on:
   workflow_dispatch:
@@ -17,6 +17,7 @@ on:
       - "qns/**"
       - "!qns/**/*.md"
       - ".github/workflows/interop.yml"
+      - ".github/scripts/interop_report.py"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -171,6 +172,30 @@ jobs:
             results/
             logs/
           retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.protocol }}-${{ matrix.server }}_${{ matrix.client }}
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  report:
+    name: report
+    needs: runner
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: results
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Charts and matrices of every pair
+        run: python .github/scripts/interop_report.py results
 
   h3spec:
     name: h3spec
