@@ -122,7 +122,7 @@ cdef extern from "picoquic.h":
         const uint8_t* ticket_encryption_key,
         size_t ticket_encryption_key_length)
 
-    void picoquic_set_default_congestion_algorithm_by_name(
+    int picoquic_set_default_congestion_algorithm_by_name(
         picoquic_quic_t* quic, const char* alg_name)
 
     void picoquic_register_all_congestion_control_algorithms()
@@ -604,6 +604,8 @@ cdef extern from "h3zero_common.h":
         size_t path_length
         picohttp_post_data_cb_fn path_callback
         void* path_app_ctx
+        const char* connect_protocol
+        size_t connect_protocol_length
 
     ctypedef struct picohttp_server_parameters_t:
         const char* web_folder
@@ -3056,6 +3058,10 @@ cdef class TransportContext:
             self._wt_path_item.path_length = len(self._wt_path_bytes)
             self._wt_path_item.path_callback = aiopquic_wt_server_path_callback
             self._wt_path_item.path_app_ctx = <void*>self._ctx
+            # An extended CONNECT needs a route that names its :protocol;
+            # h3zero takes either WebTransport token for this one.
+            self._wt_path_item.connect_protocol = b"webtransport-h3"
+            self._wt_path_item.connect_protocol_length = 15
             if web_folder is not None:
                 self._web_folder = (web_folder.encode() if isinstance(web_folder, str)
                                     else web_folder)

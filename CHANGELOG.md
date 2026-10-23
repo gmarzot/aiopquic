@@ -5,6 +5,8 @@
 - WebTransport client: when a server that advertised SETTINGS_WT_ENABLED refuses the
   `webtransport` CONNECT, it retries once with `webtransport-h3` on the same connection (xquic).
 - `connect_webtransport(connect_protocol=)`: send only `"webtransport"` or `"webtransport-h3"`.
+- picoquic 70b5fd5: Linux receive batches with `recvmmsg` and fewer `poll()` calls; one WebTransport
+  session per connection is enforced; `reset_stream_at` under both codepoints is now upstream.
 
 ## v0.6.1
 
