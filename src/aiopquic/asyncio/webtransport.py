@@ -984,6 +984,10 @@ class WebTransportSession:
 # Initiator-side: subclass adds open().
 # =====================================================================
 
+# connect_protocol -> AIOPQUIC_WT_CONNECT_* (h3wt_callback.h).
+_CONNECT_PROTOCOLS = {None: 0, "webtransport": 1, "webtransport-h3": 2}
+
+
 def _sf_string_list(items: list[str]) -> str:
     """WT-Available-Protocols value: a Structured Field List of Strings
     (RFC 9651). picoquic sends it verbatim; "" sends no header."""
@@ -997,7 +1001,12 @@ class WebTransportClient(WebTransportSession):
     def __init__(self, transport: TransportContext,
                  host: str, port: int, path: str,
                  sni: str | None = None,
-                 wt_available_protocols: list[str] | None = None):
+                 wt_available_protocols: list[str] | None = None,
+                 connect_protocol: str | None = None):
+        if connect_protocol not in _CONNECT_PROTOCOLS:
+            raise ValueError(
+                f"connect_protocol must be None, 'webtransport' or "
+                f"'webtransport-h3', not {connect_protocol!r}")
         super().__init__(transport, role="client")
         self._host = host
         self._port = port
@@ -1008,6 +1017,8 @@ class WebTransportClient(WebTransportSession):
         # aiopquic does no interpretation. Higher layers (e.g. aiomoqt)
         # set this to advertise their version namespace (moqt-NN etc.).
         self._wt_protocols = wt_available_protocols or []
+        # CONNECT :protocol; see connect_webtransport().
+        self._connect_protocol = _CONNECT_PROTOCOLS[connect_protocol]
 
     async def open(self, timeout: float = 10.0) -> None:
         """Initiate the WT session — push TX_WT_OPEN, await
@@ -1019,7 +1030,8 @@ class WebTransportClient(WebTransportSession):
 
         addr = _resolve_host(self._host)
         self._state.push_open(addr, self._port, self._path, self._sni,
-                              _sf_string_list(self._wt_protocols))
+                              _sf_string_list(self._wt_protocols),
+                              self._connect_protocol)
 
         try:
             await asyncio.wait_for(self._session_ready, timeout=timeout)
@@ -1263,6 +1275,7 @@ async def connect_webtransport(
         host: str, port: int, path: str,
         *, sni: str | None = None,
         wt_available_protocols: list[str] | None = None,
+        connect_protocol: str | None = None,
         transport: TransportContext | None = None,
         timeout: float = 10.0,
         configuration: QuicConfiguration | None = None,
@@ -1276,6 +1289,11 @@ async def connect_webtransport(
             sid = await wt.create_stream(bidir=True)
             wt.send_stream_data(sid, b'...')
             ...
+
+    `connect_protocol` is the CONNECT's :protocol: "webtransport" or
+    "webtransport-h3". None sends "webtransport", then once
+    "webtransport-h3" on the same connection if a server that advertised
+    SETTINGS_WT_ENABLED refuses the first.
 
     `transport` defaults to a fresh TransportContext started in client
     mode (alpn='h3', max_datagram_frame_size=64KB); pass an existing
@@ -1341,7 +1359,8 @@ async def connect_webtransport(
         transport.start(**start_kwargs)
 
     client = WebTransportClient(transport, host, port, path, sni=sni,
-                                  wt_available_protocols=wt_available_protocols)
+                                  wt_available_protocols=wt_available_protocols,
+                                  connect_protocol=connect_protocol)
     if configuration is not None:
         client.tx_max_queued_bytes = configuration.tx_max_queued_bytes
         client.stream_ring_cap = configuration.stream_ring_cap

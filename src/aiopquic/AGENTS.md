@@ -25,7 +25,9 @@ the `KEX_*` ids and `counters`; everything else there, and raw pointers, are tes
 - WebTransport: `async with connect_webtransport(host, port, path, sni=..., configuration=cfg) as
   wt:`, then `create_stream()`, `send_stream_data()`, `receive_stream_data(sid)`, `events()`.
   `serve_webtransport(host, port, path, handler=h, cert_file=..., key_file=..., configuration=cfg)`
-  calls `h(session)` per CONNECT. `WebTransportError` is a `ConnectionError`.
+  calls `h(session)` per CONNECT. `WebTransportError` is a `ConnectionError`. The CONNECT sends
+  `:protocol webtransport`, then `webtransport-h3` once on the same connection if a server that
+  advertised SETTINGS_WT_ENABLED refuses it; `connect_protocol=` pins one token.
 - `serve(..., retry=True)` validates client addresses with a Retry. `QuicConfiguration`:
   `cipher_suite`, `key_update_interval`, `supported_versions` (QUIC v2 by compatible version
   negotiation), `session_ticket_file` (resumption; with `connect(wait_connected=False)` writes
@@ -179,7 +181,7 @@ applies nor reverse-applies stops the build: drop or regenerate it.
 
 | Patch | What it does | Fate |
 |---|---|---|
-| `picoquic-wt-connect-protocol` | CONNECT `:protocol` is always `webtransport`; picowt sends `webtransport-h3` once the server advertises SETTINGS_WT_ENABLED, which proxygen and browsers refuse | Temporary: remove once they accept `webtransport-h3` |
+| `picoquic-wt-connect-protocol` | CONNECT `:protocol` is chosen per connection (`h3_ctx->wt_connect_protocol`), default `webtransport`: upstream sends `webtransport-h3` once the server advertises SETTINGS_WT_ENABLED, which upstream moxygen refuses with 400 | Temporary: remove once upstream moxygen accepts `webtransport-h3` |
 | `picoquic-wt-connect-lenient` | A client sends CONNECT once the server's SETTINGS arrive, dropping vetoes deployed relays fail; `AIOPQUIC_WT_STRICT_CONNECT=1` restores the gate | Local |
 | `picoquic-alpn-null-guard` | negotiated-ALPN lookup tolerates a NULL cnx | Upstream candidate |
 | `picoquic-batch-wake` | A send call that sent packets wakes the connection at once: later packets of a GSO batch take a fast path that sets no loss or PTO timer, so a lost tail waited for the idle timeout | Upstream candidate |

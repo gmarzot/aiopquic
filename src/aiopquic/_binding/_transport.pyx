@@ -3487,6 +3487,7 @@ cdef extern from "c/h3wt_callback.h":
         uint16_t sni_len
         uint16_t path_len
         uint16_t protocols_len
+        uint8_t connect_protocol
 
 
 # tp_clear would drop _transport, which __dealloc__ needs to tell whether
@@ -3587,13 +3588,16 @@ cdef class WebTransportSessionState:
         return (<bytes>self._wt.wt_protocol).decode('ascii', 'replace')
 
     def push_open(self, str host, int port, str path, str sni,
-                  str wt_protocols=""):
+                  str wt_protocols="", int connect_protocol=0):
         """Push TX_WT_OPEN to the picoquic thread. Build the params
         payload (addr + sni + path + protocols), then push entry.
 
         wt_protocols is a comma-separated string of WT-Available-Protocols
         subprotocol identifiers (empty string = none, send NULL on wire).
         aiopquic does no interpretation; verbatim handed to picoquic.
+
+        connect_protocol is AIOPQUIC_WT_CONNECT_*: 0 = "webtransport" with
+        one "webtransport-h3" retry, 1 = "webtransport", 2 = "webtransport-h3".
         """
         cdef bytes b_sni = sni.encode()
         # Empty client path → "/" (HTTP/3 root, RFC 9114 §4.3.1).
@@ -3613,6 +3617,7 @@ cdef class WebTransportSessionState:
         params.sni_len = <uint16_t>sni_len
         params.path_len = <uint16_t>path_len
         params.protocols_len = <uint16_t>protocols_len
+        params.connect_protocol = <uint8_t>connect_protocol
         memcpy(p + hdr_size, <const uint8_t*>b_sni, sni_len)
         memcpy(p + hdr_size + sni_len, <const uint8_t*>b_path, path_len)
         if protocols_len > 0:

@@ -14,7 +14,9 @@ import sys
 
 import pytest
 
-from aiopquic.asyncio.webtransport import WT_SESSION_GONE, connect_webtransport
+from aiopquic.asyncio.webtransport import (
+    WT_SESSION_GONE, WebTransportError, connect_webtransport,
+)
 from aiopquic.quic.configuration import QuicConfiguration
 
 from ..test_wt_error_codes import to_h3
@@ -125,6 +127,11 @@ def _reset_on(sid):
     return lambda e: e["event"] == "stream_reset" and e["stream_id"] == sid
 
 
+def _connects(peer):
+    return [(e["stream_id"], e["protocol"]) for e in peer.events
+            if e["event"] == "connect"]
+
+
 async def test_wt_close_keeps_strict_peer_connection():
     """Our session teardown must leave the peer's connection up.
 
@@ -219,8 +226,8 @@ async def test_wt_late_peer_stream_after_close_is_stopped():
 async def test_wt_connect_protocol_token_is_webtransport():
     """The CONNECT's :protocol stays "webtransport" even when the server
     advertises SETTINGS_WT_ENABLED, after which draft-16 wants
-    "webtransport-h3": proxygen advertises the setting and refuses the new
-    token with 400.
+    "webtransport-h3": upstream moxygen advertises the setting and refuses
+    the new token with 400.
     """
     peer = await _start_peer("--wt-enabled-setting", "--strict-protocol")
     try:
@@ -228,7 +235,69 @@ async def test_wt_connect_protocol_token_is_webtransport():
                 "127.0.0.1", peer.port, "/wt", timeout=5.0,
                 sni=SNI, ca_file=CA_FILE) as wt:
             assert wt.session_ready
-        ev = await peer.wait_for(lambda e: e["event"] == "connect", 5.0)
-        assert ev is not None and ev["protocol"] == "webtransport", peer.events
+        assert _connects(peer) == [(0, "webtransport")], peer.events
+    finally:
+        await peer.stop()
+
+
+@pytest.mark.parametrize("refusal", ["status", "reset"])
+async def test_wt_connect_retries_webtransport_h3(refusal):
+    """A draft-16 server that refuses "webtransport" (400, or STOP_SENDING
+    and RESET_STREAM as xquic does) gets one "webtransport-h3" CONNECT on
+    the same connection, and the session runs on the new request stream.
+    """
+    peer = await _start_peer("--wt-enabled-setting", "--reject-legacy", refusal)
+    try:
+        async with connect_webtransport(
+                "127.0.0.1", peer.port, "/wt", timeout=5.0,
+                sni=SNI, ca_file=CA_FILE) as wt:
+            assert wt.session_ready
+            assert wt.control_stream_id == 4
+            uni = await wt.create_stream(bidir=False)
+            wt.send_stream_data(uni, b"u" * 100, end_stream=True)
+            assert await peer.wait_for(_data_on(uni), 5.0), peer.events
+        assert _connects(peer) == [(0, "webtransport"), (4, "webtransport-h3")]
+    finally:
+        await peer.stop()
+
+
+async def test_wt_connect_no_retry_without_wt_enabled():
+    """A server without SETTINGS_WT_ENABLED does not speak draft-16, so a
+    refusal is final."""
+    peer = await _start_peer("--reject-legacy", "status")
+    try:
+        with pytest.raises(WebTransportError):
+            async with connect_webtransport(
+                    "127.0.0.1", peer.port, "/wt", timeout=5.0,
+                    sni=SNI, ca_file=CA_FILE):
+                pass
+        assert _connects(peer) == [(0, "webtransport")]
+    finally:
+        await peer.stop()
+
+
+@pytest.mark.parametrize("token", ["webtransport", "webtransport-h3"])
+async def test_wt_connect_protocol_explicit(token):
+    """An explicit connect_protocol is the only token sent."""
+    peer = await _start_peer("--wt-enabled-setting")
+    try:
+        async with connect_webtransport(
+                "127.0.0.1", peer.port, "/wt", timeout=5.0, sni=SNI,
+                ca_file=CA_FILE, connect_protocol=token) as wt:
+            assert wt.session_ready
+        assert _connects(peer) == [(0, token)]
+    finally:
+        await peer.stop()
+
+
+async def test_wt_connect_protocol_explicit_legacy_is_final():
+    peer = await _start_peer("--wt-enabled-setting", "--reject-legacy", "reset")
+    try:
+        with pytest.raises(WebTransportError):
+            async with connect_webtransport(
+                    "127.0.0.1", peer.port, "/wt", timeout=5.0, sni=SNI,
+                    ca_file=CA_FILE, connect_protocol="webtransport"):
+                pass
+        assert _connects(peer) == [(0, "webtransport")]
     finally:
         await peer.stop()

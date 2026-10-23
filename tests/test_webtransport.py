@@ -11,7 +11,8 @@ import pytest
 
 from aiopquic._binding._transport import tx_data_bytes_queued
 from aiopquic.asyncio.webtransport import (
-    WebTransportError, connect_webtransport, serve_webtransport,
+    WebTransportClient, WebTransportError, connect_webtransport,
+    serve_webtransport,
 )
 from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.events import (
@@ -38,6 +39,12 @@ pytestmark = pytest.mark.skipif(
     not (os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE)),
     reason="picoquic certs not found",
 )
+
+
+def test_connect_protocol_validated():
+    with pytest.raises(ValueError):
+        WebTransportClient(None, "127.0.0.1", 4433, "/",
+                           connect_protocol="webtransport-h2")
 
 
 async def _drain_stream(session, stream_id, *, want=None, timeout=5.0):
