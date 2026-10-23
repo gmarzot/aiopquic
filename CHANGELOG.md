@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- WebTransport client: when a server that advertised SETTINGS_WT_ENABLED refuses the
+  `webtransport` CONNECT, it retries once with `webtransport-h3` on the same connection (xquic).
+- `connect_webtransport(connect_protocol=)`: send only `"webtransport"` or `"webtransport-h3"`.
+
 ## v0.6.1
 
 - Fix: a server created a second, empty connection and protocol for the close that picoquic reports
