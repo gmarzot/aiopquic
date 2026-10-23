@@ -43,6 +43,8 @@ LIBURING_DIR="${SCRIPT_DIR}/third_party/liburing"
 BUILD_DIR="${PICOQUIC_DIR}/build"
 PATCH_DIR="${SCRIPT_DIR}/patches"
 STAMP="${SCRIPT_DIR}/.build_state"
+# An active venv's interpreter, else python3 (macOS ships no `python`).
+PYTHON="${PYTHON:-$(command -v python || command -v python3 || echo python)}"
 
 NPROC=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
@@ -175,6 +177,22 @@ reconcile_submodules() {
     fi
 }
 
+# OpenSSL: Homebrew's on macOS unless OPENSSL_ROOT_DIR is set, system on
+# Linux. Every mode resolves it, so --check fingerprints what a build uses.
+locate_openssl() {
+    if [ -z "${OPENSSL_ROOT_DIR:-}" ] && [ "$(uname -s)" = "Darwin" ] \
+            && command -v brew >/dev/null 2>&1; then
+        local pkg prefix
+        for pkg in openssl@3 openssl@1.1; do
+            prefix="$(brew --prefix "${pkg}" 2>/dev/null || true)"
+            if [ -n "${prefix}" ] && [ -d "${prefix}" ]; then
+                export OPENSSL_ROOT_DIR="${prefix}"
+                break
+            fi
+        done
+    fi
+}
+
 # --- Extension relink + verify ------------------------------------------
 
 install_extension() {
@@ -182,7 +200,7 @@ install_extension() {
     if command -v uv >/dev/null 2>&1; then
         uv pip install -e "${SCRIPT_DIR}"
     else
-        pip install -e "${SCRIPT_DIR}"
+        "${PYTHON}" -m pip install -e "${SCRIPT_DIR}"
     fi
 }
 
@@ -197,7 +215,7 @@ verify_imported() {
     if [[ "${flavor}" == perf* ]] && { [ "${arch}" = "x86_64" ] || [ "${arch}" = "amd64" ]; }; then
         expect_fusion=1
     fi
-    python - "${SCRIPT_DIR}" "${expect_fusion}" <<'PY'
+    "${PYTHON}" - "${SCRIPT_DIR}" "${expect_fusion}" <<'PY'
 import sys, os, glob, subprocess
 script_dir, expect_fusion = sys.argv[1], sys.argv[2] == "1"
 ok = True
@@ -301,19 +319,7 @@ build_native() {
 
     apply_patches
 
-    # --- Locate OpenSSL (Homebrew on macOS, system on Linux) ---
     CMAKE_OPENSSL_ARGS=()
-    if [ -z "${OPENSSL_ROOT_DIR:-}" ] && [ "$(uname -s)" = "Darwin" ]; then
-        if command -v brew >/dev/null 2>&1; then
-            for pkg in openssl@3 openssl@1.1; do
-                prefix="$(brew --prefix "${pkg}" 2>/dev/null || true)"
-                if [ -n "${prefix}" ] && [ -d "${prefix}" ]; then
-                    export OPENSSL_ROOT_DIR="${prefix}"
-                    break
-                fi
-            done
-        fi
-    fi
     if [ -n "${OPENSSL_ROOT_DIR:-}" ]; then
         echo -e "${COLOR_GREEN}Using OPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}${COLOR_OFF}"
         CMAKE_OPENSSL_ARGS+=("-DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}")
@@ -417,6 +423,11 @@ build_native() {
             PICOQUIC_PERF_ARGS+=("-DPTLS_WITH_FUSION=ON")
             PICOTLS_PERF_ARGS+=("-DWITH_FUSION=ON")
             WANT_FUSION=1
+        fi
+        if [ "$(uname -s)" = "Darwin" ]; then
+            # ld64's LTO drops the definition of picoquicdemo's bundled
+            # getopt.c that the demo references.
+            PICOQUIC_PERF_ARGS+=("-DCMAKE_EXE_LINKER_FLAGS=-Wl,-u,_getopt")
         fi
         if [ "$(uname -s)" = "Darwin" ] && [ "${PERF_ARCH}" = "arm64" ]; then
             _PERF_CC_FLAGS="-O3 -DNDEBUG -mcpu=native -flto"
@@ -604,6 +615,8 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+locate_openssl
 
 case "${MODE}" in
     check)   do_check ;;
