@@ -849,14 +849,17 @@ class TestLoopback:
         assert wait_for_ready(client), "Client not ready"
         try:
             import builtins
-            raised = False
-            for _ in range(64):
+            # Push until the ring overflows: the network thread drains
+            # it concurrently, so a fixed count can fall short.
+            err = None
+            deadline = time.monotonic() + 2.0
+            while err is None and time.monotonic() < deadline:
                 try:
                     client.tx_send_stream(0, 0, b"x" * 256)
-                except builtins.BufferError:
-                    raised = True
-                    break
-            assert raised, "TX ring overflow did not surface BufferError"
+                except builtins.BufferError as e:
+                    err = e
+            assert err is not None, "TX ring overflow did not surface BufferError"
+            assert "TX event ring full" in str(err), err
         finally:
             client.stop()
 
