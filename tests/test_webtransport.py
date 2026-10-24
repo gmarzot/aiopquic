@@ -889,4 +889,4 @@ async def test_wt_advertises_reset_stream_at_both_codepoints(tmp_path,
     for path in (server_log, client_log):
         text = path.read_text()
         assert "Extension type: 29 (reset_stream_at)" in text, path
-        assert "Extension type: 6745883625174385 (reset_stream_at)" in text, path
+        assert "Extension type: 6745883625174385 (reset_stream_at_old)" in text, path

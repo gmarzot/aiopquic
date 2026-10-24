@@ -707,6 +707,8 @@ static int aiopquic_wt_retry_connect(aiopquic_wt_session_t* s,
         return 0;
     }
     uint64_t old_id = s->control_stream_id;
+    /* picowt allows one session per connection: release the refused one. */
+    picowt_uncount_session(h3, stream_ctx);
     /* Unhook the refused CONNECT so its remaining events stay with h3zero,
      * and so dropping its prefix does not deregister the session. */
     stream_ctx->path_callback = NULL;
