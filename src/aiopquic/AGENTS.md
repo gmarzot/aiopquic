@@ -32,6 +32,12 @@ the `KEX_*` ids and `counters`; everything else there, and raw pointers, are tes
   `cipher_suite`, `key_update_interval`, `supported_versions` (QUIC v2 by compatible version
   negotiation), `session_ticket_file` (resumption; with `connect(wait_connected=False)` writes
   before the handshake go out as 0-RTT). `serve_webtransport(web_folder=)` serves files over HTTP/3.
+- `serve`, `serve_dispatch` and `serve_webtransport(..., workers=N)` (Linux, fixed port) run N
+  picoquic contexts on one port with SO_REUSEPORT; the kernel spreads connections by 4-tuple and
+  each stays on its worker. Workers share the reset seed and ticket key, so tickets, NEW_TOKEN
+  and Retry tokens verify on any worker. A client whose 4-tuple changes (NAT rebinding,
+  migration) may land on another worker and is closed by its stateless reset. `.transports`
+  lists the workers.
 - `serve_dispatch(...)` serves both on one UDP port by ALPN (`h3` is added to `alpn_protocols`).
   WebTransport subprotocols: `wt_available_protocols=` / `wt_supported_protocols=`. The server
   picks the client's first offer on its allowlist; an offer with no match is refused with HTTP 400.
@@ -156,6 +162,8 @@ has left the ring once it is exceeded.
   reached through a TX event. picoquic's thread checks are compiled out: a cross-thread call is a
   silent race. `stop()` and `__dealloc__` act only after the join.
 - asyncio never dereferences a cnx; accessors read snapshots the worker sends.
+- Several contexts (workers) share nothing but read-only keys and the port. Each ring keeps one
+  producer and one consumer. The CC table is registered once per process: workers read it.
 - asyncio alone produces `tx_event_ring`, each `sc->tx` and each datagram ring, and alone consumes
   `rx_event_ring` and `sc->rx`. Stream bytes never ride the event rings: TX posts MARK_ACTIVE and
   the worker pulls `sc->tx`; RX fills `sc->rx`. A full RX event ring spills to an order-preserving

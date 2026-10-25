@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `serve`, `serve_dispatch`, `serve_webtransport`: `workers=N` (Linux) runs N picoquic contexts on
+  one port; they share the reset seed and ticket key.
 - `serve`, `serve_dispatch` and `serve_webtransport` bind their `host`: an IP literal binds only that
   address, `"0.0.0.0"` only IPv4, a hostname at most one address per family; `None`, `""` and
   `"::"` keep both wildcards.
