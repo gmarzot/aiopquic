@@ -7,6 +7,7 @@ thread to the asyncio event loop.
 import asyncio
 import logging
 
+from aiopquic.asyncio._rxwatch import clear_reader, set_reader
 from aiopquic.quic.connection import QuicConnection
 logger = logging.getLogger(__name__)
 
@@ -45,19 +46,13 @@ class QuicConnectionProtocol:
     def _start(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
         """Register eventfd with the event loop."""
         self._loop = loop or asyncio.get_event_loop()
-        eventfd = self._quic.eventfd
-        if eventfd >= 0:
-            self._loop.add_reader(eventfd, self._on_eventfd)
+        if self._quic.eventfd >= 0:
+            set_reader(self._loop, self._quic._transport, self._on_eventfd, self)
 
     def _stop(self) -> None:
         """Unregister eventfd from the event loop."""
-        if self._loop is not None:
-            eventfd = self._quic.eventfd
-            if eventfd >= 0:
-                try:
-                    self._loop.remove_reader(eventfd)
-                except Exception:
-                    pass
+        if self._loop is not None and self._quic._transport is not None:
+            clear_reader(self._loop, self._quic._transport, self)
 
     def _on_eventfd(self) -> None:
         """Called by asyncio when eventfd is readable (RX events ready)."""
