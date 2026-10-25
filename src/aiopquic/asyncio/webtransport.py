@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import AsyncGenerator
 
 from aiopquic.quic.configuration import QuicConfiguration
+from aiopquic.asyncio._rxwatch import clear_reader, set_reader
 from aiopquic.quic.connection import drain_and_route
 from aiopquic._binding._transport import (
     TransportContext, WebTransportSessionState,
@@ -1086,7 +1087,7 @@ class _Dispatcher:
         # stop() frees the engine under it.
         self._tasks: set[asyncio.Task] = set()
         self._acceptor = None  # callable(session) -> None|coroutine
-        loop.add_reader(transport.eventfd, self._drain)
+        set_reader(loop, transport, self._drain, self)
 
     def add_session(self, session: WebTransportSession) -> None:
         self._sessions[session._state.session_ptr] = session
@@ -1153,10 +1154,7 @@ class _Dispatcher:
 
     def detach(self) -> None:
         self.cancel_tasks()
-        try:
-            self._loop.remove_reader(self._transport.eventfd)
-        except Exception:
-            pass
+        clear_reader(self._loop, self._transport, self)
 
 
 class _DispatcherRegistry:

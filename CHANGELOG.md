@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- RX: a reader that misses its wake is drained within 0.45 s and logged with the wake-protocol
+  trace (`TransportContext.wake_trace()`), the reader history and the fd's state; RX readers have
+  one owner per transport.
 - `serve`, `serve_dispatch` and `serve_webtransport` bind their `host`: an IP literal binds only that
   address, `"0.0.0.0"` only IPv4, a hostname at most one address per family; `None`, `""` and
   `"::"` keep both wildcards.
