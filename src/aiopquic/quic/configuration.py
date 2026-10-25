@@ -93,15 +93,15 @@ class QuicConfiguration:
     # shell-level fallback when this is None.
     qlog_dir: str | None = None
     # Congestion-control algorithm for picoquic to use on this transport.
-    # Default "bbr1": loss-tolerant (loss-based CCs collapse on the
-    # GIL-induced loss blips common on loopback and loaded hosts) and
-    # free of the picoquic "bbr" (v3) sub-128µs-RTT cwnd freeze
-    # (upstream #2118). Other values: "newreno", "cubic", "bbr",
-    # "prague" (L4S/ECN), "dcubic", "fast", "c4", "reno" (= newreno).
+    # Default "bbr" (v3): holds its rate under random loss and jitter,
+    # where loss-based algorithms fall behind, and has none of bbr1's
+    # 10 s ProbeRTT stalls on low-RTT paths. Other values: "bbr1",
+    # "newreno", "cubic", "prague" (L4S/ECN), "dcubic", "fast", "c4",
+    # "reno" (= newreno).
     # Matched exactly; an unknown name raises ValueError here and at
     # transport start. None defers to picoquic's compile-time default
     # (newreno).
-    congestion_control_algorithm: str | None = "bbr1"
+    congestion_control_algorithm: str | None = "bbr"
     # SPSC TX/RX event ring capacity (entries — must be a power of 2).
     # Each event is an ~64 B notification between the picoquic worker
     # thread and the asyncio drain. None defers to the compile-time

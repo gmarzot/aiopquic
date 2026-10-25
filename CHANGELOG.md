@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The default congestion control is `"bbr"` (v3), was `"bbr1"`.
 - `serve`, `serve_dispatch` and `serve_webtransport` bind their `host`: an IP literal binds only that
   address, `"0.0.0.0"` only IPv4, a hostname at most one address per family; `None`, `""` and
   `"::"` keep both wildcards.

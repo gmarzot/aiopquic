@@ -258,7 +258,7 @@ Counter signature: `*_arms = 0`, `rx_event_drops = 0`,
 | `QuicConfiguration.max_streams_uni/bidi` | 512 | initial MAX_STREAMS credit |
 | `QuicConfiguration.event_ring_capacity` | None → 2048/16384 | both event rings |
 | `QuicConfiguration.idle_timeout` | 30 s | QUIC idle timeout |
-| `QuicConfiguration.congestion_control_algorithm` | "bbr1" | CC algorithm |
+| `QuicConfiguration.congestion_control_algorithm` | "bbr" | CC algorithm |
 | aiomoqt `tx_max_inflight_bytes` | 1 MiB (None off) | one stream's outbound queue |
 | CLI `--max-queued-bytes` | (cfg default) | sets `tx_max_queued_bytes` |
 | CLI `--max-inflight-bytes` | (aiomoqt default) | sets `tx_max_inflight_bytes` |
