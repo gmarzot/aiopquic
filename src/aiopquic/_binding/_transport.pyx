@@ -304,6 +304,19 @@ cdef extern from "c/callback.h":
         uint16_t alpn_len
 
 cdef extern from "c/callback.h":
+    ctypedef struct aiopquic_wake_trace_entry_t:
+        uint64_t ts_ns
+        uint32_t kind
+        uint32_t a
+        uint64_t b
+    ctypedef struct aiopquic_wake_trace_t:
+        uint64_t next
+        aiopquic_wake_trace_entry_t e[128]
+    enum:
+        AIOPQUIC_WAKE_TRACE_LEN
+        AIOPQUIC_WAKE_DRAIN
+
+cdef extern from "c/callback.h":
     # Resource defaults — single source of truth in callback.h.
     enum:
         AIOPQUIC_RX_DATA_RING_CAP_DEFAULT
@@ -342,6 +355,15 @@ cdef extern from "c/callback.h":
         uint64_t cnt_rx_data_event_coalesced
         uint64_t worker_rx_byte_ring_overflow
         uint32_t rx_notify_pending
+        uint64_t cnt_rx_notify_flips
+        uint64_t cnt_rx_notify_skips
+        uint64_t cnt_rx_notify_write_errs
+        int last_rx_notify_errno
+        uint64_t cnt_rx_clears
+        uint64_t cnt_rx_clear_read_empty
+        uint64_t cnt_rx_rearms
+        aiopquic_wake_trace_t worker_trace
+        aiopquic_wake_trace_t asyncio_trace
         uint32_t tx_wake_pending
         uint32_t tx_event_ring_drain_pending
         uint32_t tx_event_ring_low_water
@@ -383,6 +405,10 @@ cdef extern from "c/callback.h":
                                           uint32_t low_water_pct)
     void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx)
     void aiopquic_clear_rx(aiopquic_ctx_t* ctx)
+    uint64_t aiopquic_rx_consumed(aiopquic_ctx_t* ctx)
+    void aiopquic_wake_trace_add(aiopquic_wake_trace_t* t, uint32_t kind,
+                                 uint32_t a, uint64_t b)
+    uint64_t aiopquic_wake_trace_next(aiopquic_wake_trace_t* t)
     void aiopquic_notify_rx(aiopquic_ctx_t* ctx)
     int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx)
     int aiopquic_arm_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx)
@@ -1085,6 +1111,21 @@ cdef inline int _pending_fc_add(dict pending_fc, aiopquic_stream_ctx_t* sc,
     return 0
 
 
+_WAKE_KINDS = {1: "notify", 2: "clear", 3: "drain"}
+
+
+cdef int _wake_trace_tail(aiopquic_wake_trace_t* trace, str side, int last,
+                          list out) except -1:
+    cdef uint64_t end = aiopquic_wake_trace_next(trace)
+    cdef uint64_t n = min(<uint64_t>last, end, <uint64_t>AIOPQUIC_WAKE_TRACE_LEN)
+    cdef uint64_t i
+    cdef aiopquic_wake_trace_entry_t* e
+    for i in range(end - n, end):
+        e = &trace.e[i % AIOPQUIC_WAKE_TRACE_LEN]
+        out.append((e.ts_ns, side, _WAKE_KINDS.get(e.kind, e.kind), e.a, e.b))
+    return 0
+
+
 cdef int _fill_sockaddr(str host, int port, sockaddr_storage* out,
                         unsigned int scope_id=0) except -1:
     """IPv4 or IPv6 literal and port into a zeroed sockaddr_storage."""
@@ -1362,6 +1403,24 @@ cdef class TransportContext:
         return spsc_ring_count(self._ctx.rx_event_ring)
 
     @property
+    def rx_clears(self):
+        """clear_rx calls so far: advances once per drain."""
+        return self._ctx.cnt_rx_clears
+
+    def wake_trace(self, int last=64):
+        """The latest wake-protocol events of both threads, oldest first:
+        (ts_ns, side, kind, a, b). side is "worker" or "asyncio"; kind is
+        "notify" (a: wake write errno, b: ring count), "drain" (a: events
+        popped, b: ring count after) or "clear" (a: flags 1 was pending,
+        2 re-armed, 4 wake fd read empty, 8 re-arm write failed; b: ring
+        left << 32 | counter read). Read without locks: diagnostic only."""
+        cdef list out = []
+        _wake_trace_tail(&self._ctx.worker_trace, "worker", last, out)
+        _wake_trace_tail(&self._ctx.asyncio_trace, "asyncio", last, out)
+        out.sort()
+        return out[-last:]
+
+    @property
     def tx_event_ring_count(self):
         """Number of events pending in the TX ring."""
         return spsc_ring_count(self._ctx.tx_event_ring)
@@ -1422,6 +1481,13 @@ cdef class TransportContext:
             'rx_overflow_max_depth': self._ctx.rx_overflow.max_depth,
             'rx_overflow_depth_now': self._ctx.rx_overflow.depth,
             'rx_notify_pending_now': self._ctx.rx_notify_pending,
+            'rx_notify_flips': self._ctx.cnt_rx_notify_flips,
+            'rx_notify_skips': self._ctx.cnt_rx_notify_skips,
+            'rx_notify_write_errs': self._ctx.cnt_rx_notify_write_errs,
+            'rx_notify_last_errno': self._ctx.last_rx_notify_errno,
+            'rx_clears': self._ctx.cnt_rx_clears,
+            'rx_clear_read_empty': self._ctx.cnt_rx_clear_read_empty,
+            'rx_rearms': self._ctx.cnt_rx_rearms,
             'loop_callbacks': self._ctx.cnt_loop_cb,
             'rx_data_event_coalesced': self._ctx.cnt_rx_data_event_coalesced,
             'rx_byte_ring_overflow': self._ctx.worker_rx_byte_ring_overflow,
@@ -2064,6 +2130,7 @@ cdef class TransportContext:
         self._begin_drain_cycle()
         spsc_ring_refill_from_overflow(self._ctx.rx_event_ring,
                                        &self._ctx.rx_overflow)
+        cdef uint64_t consumed0 = aiopquic_rx_consumed(self._ctx)
         for i in range(max_events):
             entry = spsc_ring_peek(self._ctx.rx_event_ring)
             if entry is NULL:
@@ -2254,6 +2321,10 @@ cdef class TransportContext:
         # for the work just performed. Hysteresis inside
         # _push_fc_credit filters further.
         self._flush_pending_fc(pending_fc)
+        aiopquic_wake_trace_add(
+            &self._ctx.asyncio_trace, AIOPQUIC_WAKE_DRAIN,
+            <uint32_t>(aiopquic_rx_consumed(self._ctx) - consumed0),
+            spsc_ring_count(self._ctx.rx_event_ring))
         aiopquic_clear_rx(self._ctx)
         return events
 

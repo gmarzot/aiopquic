@@ -58,7 +58,7 @@ on the GIL.
 CA: `QuicConfiguration.cafile` or `connect_webtransport(ca_file=)`. Accept anything:
 `verify_mode=ssl.CERT_NONE` or `verify_peer=False`. Servers never verify clients.
 
-**Congestion control.** Default `"bbr1"`; `None` is picoquic's `newreno`. Names, matched exactly:
+**Congestion control.** Default `"bbr"` (v3); `None` is picoquic's `newreno`. Names, matched exactly:
 `newreno` (alias `reno`), `cubic`, `dcubic`, `fast`, `bbr` (v3), `bbr1`, `prague`, `c4`. An unknown
 name (`"BBR1"` among them) raises `ValueError` from `QuicConfiguration` and at transport start.
 
@@ -107,6 +107,8 @@ has left the ring once it is exceeded.
   `OPENSSL_ROOT_DIR`; binding sources always relink.
 - `AIOPQUIC_PERF=1` (default) is host-tuned and not portable; `AIOPQUIC_WHEEL_BUILD=1` is portable
   (CI, wheels).
+- The Cython extensions add `-O3` after `$CFLAGS`, because setuptools replaces Python's CFLAGS
+  with the environment's; `AIOPQUIC_PERF=0` leaves the caller's flags alone.
 - OpenSSL is the main performance variable. Linux wheels bundle 3.5; for parity build with
   `OPENSSL_ROOT_DIR=<3.5 prefix> ./build.sh`.
 - Submodules are `ignore = dirty` because the build patches picoquic in place.
@@ -162,6 +164,11 @@ has left the ring once it is exceeded.
   reached through a TX event. picoquic's thread checks are compiled out: a cross-thread call is a
   silent race. `stop()` and `__dealloc__` act only after the join.
 - asyncio never dereferences a cnx; accessors read snapshots the worker sends.
+- Every asyncio RX reader is registered through `asyncio/_rxwatch.py` (`set_reader`/`clear_reader`):
+  one owner per transport, removals by others refused, fd-number reuse detected. Its timer drains
+  a ring that held events through two checks without a drain and logs a "rx wake lost" report:
+  `wake_trace()` (notify flips, drains, clears, ages in ms), wake counters, the reader history,
+  whether the eventfd was readable and which callback the loop held.
 - Several contexts (workers) share nothing but read-only keys and the port. Each ring keeps one
   producer and one consumer. The CC table is registered once per process: workers read it.
 - asyncio alone produces `tx_event_ring`, each `sc->tx` and each datagram ring, and alone consumes

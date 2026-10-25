@@ -18,6 +18,7 @@ from aiopquic.quic.connection import (
     QuicEngine, _EVT_CLOSE, _EVT_APP_CLOSE, _EVT_CNX_STACK, drain_and_route,
 )
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
+from aiopquic.asyncio._rxwatch import clear_reader, set_reader
 from aiopquic.asyncio._workers import shared_port_args, worker_count
 from aiopquic.asyncio.webtransport import (
     serve_webtransport, _EVT_WT_SESSION_READY,
@@ -33,7 +34,7 @@ class _DualRouter:
         self._engine = engine
         self._wt = wt_dispatcher
         self._is_h3: dict[int, bool] = {}
-        loop.add_reader(transport.eventfd, self._drain)
+        set_reader(loop, transport, self._drain, self)
 
     def _drain(self) -> None:
         drain_and_route(self._transport, self.route_event)
@@ -63,25 +64,24 @@ class _DualRouter:
 class DualStackServer:
     """Handle returned by serve_dispatch. close() tears down both
     stacks; the shared transport is stopped by the engine. extra holds
-    the (engine, wt_server, transport) of further workers."""
+    the (engine, wt_server, transport, router) of further workers."""
 
-    def __init__(self, engine, wt_server, loop, transport, extra=()):
+    def __init__(self, engine, wt_server, loop, transport, router=None,
+                 extra=()):
         self._engine = engine
         self._wt_server = wt_server
         self._loop = loop
         self._transport = transport
-        self._parts = [(engine, wt_server, transport)] + list(extra)
+        self._router = router
+        self._parts = [(engine, wt_server, transport, router)] + list(extra)
 
     @property
     def transports(self) -> list:
-        return [transport for _, _, transport in self._parts]
+        return [part[2] for part in self._parts]
 
     def close(self) -> None:
-        for engine, wt_server, transport in self._parts:
-            try:
-                self._loop.remove_reader(transport.eventfd)
-            except Exception:
-                pass
+        for engine, wt_server, transport, router in self._parts:
+            clear_reader(self._loop, transport, router)
             wt_server.close()   # detaches dispatcher; transport not owned
             engine.close()      # stops the shared transport
 
@@ -131,7 +131,7 @@ async def serve_dispatch(host: str, port: int, *,
                 **shared,
             )
             transport = engine._transport
-            parts.append((engine, None, transport))
+            parts.append((engine, None, transport, None))
             wt_server = await serve_webtransport(
                 host, port, wt_path,
                 handler=wt_handler,
@@ -141,18 +141,18 @@ async def serve_dispatch(host: str, port: int, *,
                 session_factory=wt_session_factory,
                 configuration=cfg,
             )
-            parts[-1] = (engine, wt_server, transport)
-            _DualRouter(loop, transport, engine, wt_server._dispatcher)
+            parts[-1] = (engine, wt_server, transport, None)
+            router = _DualRouter(loop, transport, engine,
+                                 wt_server._dispatcher)
+            parts[-1] = (engine, wt_server, transport, router)
     except BaseException:
-        for engine, wt_server, transport in parts:
-            try:
-                loop.remove_reader(transport.eventfd)
-            except Exception:
-                pass
+        for engine, wt_server, transport, router in parts:
+            if router is not None:
+                clear_reader(loop, transport, router)
             if wt_server is not None:
                 wt_server.close()
             engine.close()
         raise
-    engine, wt_server, transport = parts[0]
-    return DualStackServer(engine, wt_server, loop, transport,
+    engine, wt_server, transport, router = parts[0]
+    return DualStackServer(engine, wt_server, loop, transport, router,
                            extra=parts[1:])
