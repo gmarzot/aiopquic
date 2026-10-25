@@ -32,6 +32,8 @@
   send instead of two.
 - `QuicConfiguration.packet_train_mode` (off by default): when pacing holds a connection back,
   picoquic sends up to 10 packets in one train instead of one or two, so fewer sends per packet.
+- `serve`, `serve_dispatch`, `serve_webtransport`: `workers=N` (Linux) runs N picoquic contexts on
+  one port; they share the reset seed and ticket key.
 
 ## v0.7.1
 
