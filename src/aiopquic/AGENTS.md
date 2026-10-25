@@ -131,13 +131,13 @@ has left the ring once it is exceeded.
 - `release.yml` (`workflow_dispatch`, `version` = `N.N.N[{a,b,rc}N]`) tags the dispatched ref's
   HEAD, tests the tag, builds the sdist and wheels, publishes to TestPyPI then PyPI, and creates
   the GitHub release.
-- Flow: `main` carries only releases, and its head is the latest final tag. Work lands on the
-  minor branch `gmarzot-X.Y.Z`; release candidates are tagged on it (`release.yml` dispatched on
-  that branch). A final release merges the branch into `main` with a merge commit, never a
-  squash, and `release.yml` runs on `main`. The next minor branch starts from that tag. A patch
-  branch starts from `main` at the tag and returns the same way; `main` is then merged into the
-  current minor branch. Every tag stays in the branches' history, so setuptools_scm versions dev
-  builds above the last release.
+- Flow: work lands on the minor branch `gmarzot-X.Y.Z`; release candidates are tagged on it
+  (`release.yml` dispatched on that branch). A final release squash-merges the branch's tracking
+  PR to `main`, one commit per release, and `release.yml` tags it there. `main` is then merged
+  back into the working branches, and the next minor branch starts from the release tag.
+- Versions: release tags are squash commits outside the branches' history, so check what shipped
+  with `git diff <commit> <tag>`, not ancestry. setuptools_scm describes from final tags only and
+  bumps the minor (`pyproject.toml`), so dev builds after `vX.Y.Z` report `X.(Y+1).0.devN`.
 
 ## Conventions
 
