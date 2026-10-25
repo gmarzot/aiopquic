@@ -82,6 +82,7 @@
  * while investigating control-stream delivery regression.) */
 #define AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT 50
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -201,6 +202,48 @@ typedef struct {
     aiopquic_dgram_buf_t* db;
 } aiopquic_dgram_release_t;
 
+/* Wake-protocol trace: a small ring per thread (one writer each), read
+ * racily by asyncio for diagnostics only. Records the order of notify
+ * flips, drains and clears so a lost wake can be reconstructed. */
+#define AIOPQUIC_WAKE_TRACE_LEN 128
+enum {
+    AIOPQUIC_WAKE_NOTIFY = 1,   /* worker 0->1 flip; a = errno of the wake write (0 ok); b = ring count */
+    AIOPQUIC_WAKE_CLEAR = 2,    /* asyncio clear_rx; a = flags below; b = ring left << 32 | counter read */
+    AIOPQUIC_WAKE_DRAIN = 3,    /* asyncio drain_rx; a = events popped; b = ring count after */
+};
+#define AIOPQUIC_CLEAR_WAS_PENDING 1u
+#define AIOPQUIC_CLEAR_REARMED     2u
+#define AIOPQUIC_CLEAR_READ_EMPTY  4u
+#define AIOPQUIC_CLEAR_REARM_ERR   8u
+
+typedef struct {
+    uint64_t ts_ns;
+    uint32_t kind;
+    uint32_t a;
+    uint64_t b;
+} aiopquic_wake_trace_entry_t;
+
+typedef struct {
+    uint64_t next;
+    aiopquic_wake_trace_entry_t e[AIOPQUIC_WAKE_TRACE_LEN];
+} aiopquic_wake_trace_t;
+
+static inline void aiopquic_wake_trace_add(aiopquic_wake_trace_t* t,
+                                           uint32_t kind, uint32_t a,
+                                           uint64_t b) {
+    uint64_t n = t->next;
+    aiopquic_wake_trace_entry_t* e = &t->e[n % AIOPQUIC_WAKE_TRACE_LEN];
+    e->ts_ns = aiopquic_now_ns();
+    e->kind = kind;
+    e->a = a;
+    e->b = b;
+    __atomic_store_n(&t->next, n + 1, __ATOMIC_RELEASE);
+}
+
+static inline uint64_t aiopquic_wake_trace_next(aiopquic_wake_trace_t* t) {
+    return __atomic_load_n(&t->next, __ATOMIC_ACQUIRE);
+}
+
 typedef struct {
     spsc_ring_t*    rx_event_ring;
     spsc_ring_t*    tx_event_ring;
@@ -254,6 +297,18 @@ typedef struct {
      * it reads the eventfd. Producer-only-sets, single-writer
      * semantics — atomic exchange used to detect the 0→1 edge. */
     uint32_t        rx_notify_pending;
+    /* Wake-protocol forensics. Worker-written: flips, skips, write
+     * errors, worker_trace. asyncio-written: clears, empty reads,
+     * re-arms, asyncio_trace. */
+    uint64_t        cnt_rx_notify_flips;
+    uint64_t        cnt_rx_notify_skips;
+    uint64_t        cnt_rx_notify_write_errs;
+    int             last_rx_notify_errno;
+    uint64_t        cnt_rx_clears;
+    uint64_t        cnt_rx_clear_read_empty;
+    uint64_t        cnt_rx_rearms;
+    aiopquic_wake_trace_t worker_trace;
+    aiopquic_wake_trace_t asyncio_trace;
     /* Same coalescing on TX side: skip picoquic_wake_up_network_thread
      * unless the worker has drained since our last wake. The worker
      * sets this back to 0 whenever it observes the tx_event_ring drained
@@ -984,15 +1039,25 @@ static inline void aiopquic_tx_event_ring_drained_final(aiopquic_ctx_t* ctx) {
 static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
     if (__atomic_exchange_n(&ctx->rx_notify_pending, 1,
                               __ATOMIC_ACQ_REL) != 0) {
+        ctx->cnt_rx_notify_skips++;
         return;
     }
+    ssize_t rc;
 #ifdef __linux__
     uint64_t val = 1;
-    (void)write(ctx->wake_write_fd, &val, sizeof(val));
+    rc = write(ctx->wake_write_fd, &val, sizeof(val));
 #else
     uint8_t b = 1;
-    (void)write(ctx->wake_write_fd, &b, 1);
+    rc = write(ctx->wake_write_fd, &b, 1);
 #endif
+    int err = (rc < 0) ? errno : 0;
+    ctx->cnt_rx_notify_flips++;
+    if (err) {
+        ctx->cnt_rx_notify_write_errs++;
+        ctx->last_rx_notify_errno = err;
+    }
+    aiopquic_wake_trace_add(&ctx->worker_trace, AIOPQUIC_WAKE_NOTIFY,
+                            (uint32_t)err, spsc_ring_count(ctx->rx_event_ring));
 }
 
 /* Consumer-side wake-fd clear + re-arm. Caller (drain_rx) MUST have
@@ -1008,34 +1073,59 @@ static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
  *      consumer's peek-empty and pending=0, observing pending=1 and
  *      thus skipping its own wake write — without re-arm those
  *      stranded entries would never wake asyncio again. */
+/* Events the consumer has taken off the RX ring so far (consumer-owned). */
+static inline uint64_t aiopquic_rx_consumed(aiopquic_ctx_t* ctx) {
+    return atomic_load_explicit(&ctx->rx_event_ring->head, memory_order_relaxed);
+}
+
 static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
     spsc_ring_refill_from_overflow(ctx->rx_event_ring, &ctx->rx_overflow);
     /* Exchange, so the re-check below cannot read the ring before the
      * clear is visible to aiopquic_notify_rx's exchange. */
-    (void)__atomic_exchange_n(&ctx->rx_notify_pending, 0, __ATOMIC_ACQ_REL);
+    uint32_t was = __atomic_exchange_n(&ctx->rx_notify_pending, 0,
+                                       __ATOMIC_ACQ_REL);
+    uint64_t got = 0;
 #ifdef __linux__
-    uint64_t val;
-    (void)read(ctx->eventfd, &val, sizeof(val));
+    uint64_t val = 0;
+    if (read(ctx->eventfd, &val, sizeof(val)) > 0) {
+        got = val;
+    }
 #else
     uint8_t buf[64];
-    while (read(ctx->eventfd, buf, sizeof(buf)) > 0) {
-        /* drain */
+    ssize_t n;
+    while ((n = read(ctx->eventfd, buf, sizeof(buf))) > 0) {
+        got += (uint64_t)n;
     }
 #endif
+    uint32_t flags = was ? AIOPQUIC_CLEAR_WAS_PENDING : 0;
+    ctx->cnt_rx_clears++;
+    if (got == 0) {
+        flags |= AIOPQUIC_CLEAR_READ_EMPTY;
+        ctx->cnt_rx_clear_read_empty++;
+    }
     /* Overflow counts too: a push that decided "overflow" before the
      * refill above and counted itself after it can have its wake consumed
      * by the read above while the ring is still empty. */
-    if (!spsc_ring_empty(ctx->rx_event_ring) ||
+    uint32_t left = spsc_ring_count(ctx->rx_event_ring);
+    if (left > 0 ||
             atomic_load_explicit(&ctx->rx_overflow.depth,
                                  memory_order_seq_cst) > 0) {
+        ssize_t rc;
 #ifdef __linux__
         uint64_t one = 1;
-        (void)write(ctx->wake_write_fd, &one, sizeof(one));
+        rc = write(ctx->wake_write_fd, &one, sizeof(one));
 #else
         uint8_t b = 1;
-        (void)write(ctx->wake_write_fd, &b, 1);
+        rc = write(ctx->wake_write_fd, &b, 1);
 #endif
+        flags |= AIOPQUIC_CLEAR_REARMED;
+        ctx->cnt_rx_rearms++;
+        if (rc < 0) {
+            flags |= AIOPQUIC_CLEAR_REARM_ERR;
+        }
     }
+    aiopquic_wake_trace_add(&ctx->asyncio_trace, AIOPQUIC_WAKE_CLEAR, flags,
+                            ((uint64_t)left << 32) | (got & 0xffffffffu));
 }
 
 /* WT TX-event dispatch hook. Defined in h3wt_callback.h. The loop
