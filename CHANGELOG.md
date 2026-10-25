@@ -7,9 +7,9 @@
 - RX: a reader that misses its wake is drained within 0.45 s and logged with the wake-protocol
   trace (`TransportContext.wake_trace()`), the reader history and the fd's state; RX readers have
   one owner per transport.
-- `serve`, `serve_dispatch` and `serve_webtransport` bind their `host`: an IP literal binds only that
-  address, `"0.0.0.0"` only IPv4, a hostname at most one address per family; `None`, `""` and
-  `"::"` keep both wildcards.
+- Servers now bind the given host (0.6.x ignored it); pass `"::"` or `None` for all interfaces.
+  For `serve`, `serve_dispatch` and `serve_webtransport`, an IP literal binds only that address,
+  `"0.0.0.0"` only IPv4, a hostname at most one address per family.
 - WebTransport client: when a server that advertised SETTINGS_WT_ENABLED refuses the
   `webtransport` CONNECT, it retries once with `webtransport-h3` on the same connection (xquic).
 - `connect_webtransport(connect_protocol=)`: send only `"webtransport"` or `"webtransport-h3"`.
