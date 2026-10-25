@@ -63,7 +63,7 @@ async def serve(
         create_protocol=create_protocol,
         stream_handler=stream_handler,
     )
-    engine._start_transport(port=port, retry=retry)
+    engine._start_transport(port=port, retry=retry, host=host)
 
     loop = asyncio.get_event_loop()
     if engine.eventfd >= 0:

@@ -102,6 +102,7 @@ async def serve_dispatch(host: str, port: int, *,
     engine = QuicEngine(configuration=cfg, create_protocol=create_protocol)
     engine._start_transport(
         port=port,
+        host=host,
         alpn=None,
         alpn_list=["h3"] + list(cfg.alpn_protocols or []),
         dual=True,

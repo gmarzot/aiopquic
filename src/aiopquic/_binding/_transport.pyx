@@ -84,6 +84,7 @@ cdef extern from "<netinet/in.h>":
         unsigned short sin6_family
         unsigned short sin6_port
         in6_addr sin6_addr
+        unsigned int sin6_scope_id
     unsigned short htons(unsigned short hostshort)
 
 cdef extern from "<arpa/inet.h>":
@@ -264,6 +265,7 @@ cdef extern from "picoquic_packet_loop.h":
         int prefer_extra_socket
         int simulate_eio
         size_t send_length_max
+        sockaddr_storage local_addr[2]
 
     ctypedef int (*picoquic_packet_loop_cb_fn)(
         picoquic_quic_t* quic, int cb_mode,
@@ -1083,7 +1085,8 @@ cdef inline int _pending_fc_add(dict pending_fc, aiopquic_stream_ctx_t* sc,
     return 0
 
 
-cdef int _fill_sockaddr(str host, int port, sockaddr_storage* out) except -1:
+cdef int _fill_sockaddr(str host, int port, sockaddr_storage* out,
+                        unsigned int scope_id=0) except -1:
     """IPv4 or IPv6 literal and port into a zeroed sockaddr_storage."""
     memset(out, 0, sizeof(sockaddr_storage))
     cdef bytes b_host = host.encode()
@@ -1096,6 +1099,7 @@ cdef int _fill_sockaddr(str host, int port, sockaddr_storage* out) except -1:
     if inet_pton(AF_INET6, b_host, &v6.sin6_addr) == 1:
         v6.sin6_family = AF_INET6
         v6.sin6_port = htons(<unsigned short>port)
+        v6.sin6_scope_id = scope_id
         return 0
     raise ValueError(f"Invalid IP address: {host}")
 
@@ -1126,6 +1130,46 @@ def _ipv6_bind_error(int port=0):
 def _ipv6_usable() -> bool:
     """Whether an IPv6 UDP socket can bind here."""
     return _ipv6_bind_error() is None
+
+
+def _bind_addresses(host, int ip_family):
+    """(local_af, [(family, address, scope_id)]) for a listener's host.
+
+    None, "" and "::" keep the wildcard over the families ip_family
+    selects; "0.0.0.0" is the IPv4 wildcard; anything else resolves to at
+    most one address per family.
+    """
+    if host is None or host in ("", "::"):
+        return ip_family, []
+    if host == "0.0.0.0":
+        if ip_family == AF_INET6:
+            raise ValueError("host '0.0.0.0' is IPv4 but ip_family is AF_INET6")
+        return AF_INET, []
+    found = {}
+    for family, _, _, _, sockaddr in _socket.getaddrinfo(
+            host, None, type=_socket.SOCK_DGRAM, flags=_socket.AI_PASSIVE):
+        if family not in (_socket.AF_INET, _socket.AF_INET6) or family in found:
+            continue
+        if ip_family > 0 and family != ip_family:
+            continue
+        scope_id = sockaddr[3] if family == _socket.AF_INET6 else 0
+        found[family] = (sockaddr[0].split("%")[0], scope_id)
+    if not found:
+        raise ValueError(f"host {host!r} has no address in the requested family")
+    addrs = [(family, address, scope_id)
+             for family, (address, scope_id) in found.items()]
+    return (addrs[0][0] if len(addrs) == 1 else 0), addrs
+
+
+def _bind_preflight(addrs, int port):
+    """Raise the OSError picoquic's own bind would hit in its thread."""
+    for family, address, scope_id in addrs:
+        with _socket.socket(family, _socket.SOCK_DGRAM) as s:
+            if family == _socket.AF_INET6:
+                s.setsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY, 1)
+                s.bind((address, port, 0, scope_id))
+            else:
+                s.bind((address, port))
 
 
 cdef class TransportContext:
@@ -2935,7 +2979,8 @@ cdef class TransportContext:
               ticket_file=None,
               web_folder=None,
               int ip_family=-1,
-              pmtud_policy=None):
+              pmtud_policy=None,
+              host=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -2975,6 +3020,11 @@ cdef class TransportContext:
             ip_family: AF_INET, AF_INET6, or 0 for both; -1 picks both when
                 an IPv6 socket can bind [::]:port, else AF_INET (with a
                 warning unless the host has no IPv6).
+            host: Listener address. None, "" or "::" bind the wildcard of
+                the families ip_family selects; "0.0.0.0" the IPv4
+                wildcard; an IP literal (IPv6 may carry a scope) only that
+                address; a hostname at most one address per family. A
+                bind failure raises OSError.
             rx_data_ring_cap: Per-stream RX byte ring, in bytes, and the
                 advertised stream window. 0: a 4 MiB ring and picoquic's
                 default window.
@@ -3284,7 +3334,14 @@ cdef class TransportContext:
 
         # Configure packet loop parameters (must persist — picoquic stores a pointer)
         self._param.local_port = <unsigned short>port
-        if ip_family < 0:
+        ip_family, bind_addrs = _bind_addresses(host, ip_family)
+        if bind_addrs:
+            if port:
+                _bind_preflight(bind_addrs, port)
+            for i, (family, address, scope_id) in enumerate(bind_addrs):
+                _fill_sockaddr(address, port, &self._param.local_addr[i],
+                               scope_id)
+        elif ip_family < 0:
             v6_error = _ipv6_bind_error(port)
             if v6_error is None:
                 ip_family = 0
