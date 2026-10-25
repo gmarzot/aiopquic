@@ -13,6 +13,7 @@ from typing import Callable
 from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.connection import QuicEngine
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
+from aiopquic.asyncio._rxwatch import clear_reader, set_reader
 
 
 class QuicServer:
@@ -28,11 +29,8 @@ class QuicServer:
 
     def close(self) -> None:
         """Stop the server and tear down all live connections."""
-        if self._loop is not None and self._engine.eventfd >= 0:
-            try:
-                self._loop.remove_reader(self._engine.eventfd)
-            except Exception:
-                pass
+        if self._loop is not None and self._engine._transport is not None:
+            clear_reader(self._loop, self._engine._transport, self._engine)
         self._engine.close()
 
 
@@ -67,6 +65,6 @@ async def serve(
 
     loop = asyncio.get_event_loop()
     if engine.eventfd >= 0:
-        loop.add_reader(engine.eventfd, engine.drain_and_route)
+        set_reader(loop, engine._transport, engine.drain_and_route, engine)
 
     return QuicServer(engine, loop)

@@ -158,6 +158,11 @@ has left the ring once it is exceeded.
   reached through a TX event. picoquic's thread checks are compiled out: a cross-thread call is a
   silent race. `stop()` and `__dealloc__` act only after the join.
 - asyncio never dereferences a cnx; accessors read snapshots the worker sends.
+- Every asyncio RX reader is registered through `asyncio/_rxwatch.py` (`set_reader`/`clear_reader`):
+  one owner per transport, removals by others refused, fd-number reuse detected. Its timer drains
+  a ring that held events through two checks without a drain and logs a "rx wake lost" report:
+  `wake_trace()` (notify flips, drains, clears, ages in ms), wake counters, the reader history,
+  whether the eventfd was readable and which callback the loop held.
 - asyncio alone produces `tx_event_ring`, each `sc->tx` and each datagram ring, and alone consumes
   `rx_event_ring` and `sc->rx`. Stream bytes never ride the event rings: TX posts MARK_ACTIVE and
   the worker pulls `sc->tx`; RX fills `sc->rx`. A full RX event ring spills to an order-preserving
