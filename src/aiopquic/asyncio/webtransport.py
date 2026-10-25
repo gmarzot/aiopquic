@@ -1451,6 +1451,7 @@ async def serve_webtransport(
             transport = TransportContext()
         start_kwargs = dict(
             port=port,
+            host=host,
             cert_file=cert_file, key_file=key_file,
             alpn="h3",
             is_client=False,

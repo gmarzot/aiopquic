@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `serve`, `serve_dispatch` and `serve_webtransport` bind their `host`: an IP literal binds only that
+  address, `"0.0.0.0"` only IPv4, a hostname at most one address per family; `None`, `""` and
+  `"::"` keep both wildcards.
 - WebTransport client: when a server that advertised SETTINGS_WT_ENABLED refuses the
   `webtransport` CONNECT, it retries once with `webtransport-h3` on the same connection (xquic).
 - `connect_webtransport(connect_protocol=)`: send only `"webtransport"` or `"webtransport-h3"`.
