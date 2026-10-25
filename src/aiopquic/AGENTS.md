@@ -52,7 +52,7 @@ on the GIL.
 CA: `QuicConfiguration.cafile` or `connect_webtransport(ca_file=)`. Accept anything:
 `verify_mode=ssl.CERT_NONE` or `verify_peer=False`. Servers never verify clients.
 
-**Congestion control.** Default `"bbr1"`; `None` is picoquic's `newreno`. Names, matched exactly:
+**Congestion control.** Default `"bbr"` (v3); `None` is picoquic's `newreno`. Names, matched exactly:
 `newreno` (alias `reno`), `cubic`, `dcubic`, `fast`, `bbr` (v3), `bbr1`, `prague`, `c4`. An unknown
 name (`"BBR1"` among them) raises `ValueError` from `QuicConfiguration` and at transport start.
 
