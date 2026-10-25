@@ -719,7 +719,7 @@ def check_congestion_control_algorithm(name):
     else:
         raise ValueError(
             f"congestion_control_algorithm must be a str, not {type(name).__name__}")
-    picoquic_register_all_congestion_control_algorithms()
+    _register_cc_algorithms()
     if b"\0" in b_name or picoquic_get_congestion_algorithm(b_name) is NULL:
         raise ValueError(
             f"unknown congestion_control_algorithm {name!r}; "
@@ -1113,13 +1113,33 @@ _PMTUD_POLICIES = {
 }
 
 
-def _ipv6_bind_error(int port=0):
+cdef bint _cc_registered = False
+
+
+cdef void _register_cc_algorithms():
+    """Fill picoquic's process-wide CC table once; running network
+    threads read it, so it is never rewritten."""
+    global _cc_registered
+    if not _cc_registered:
+        picoquic_register_all_congestion_control_algorithms()
+        _cc_registered = True
+
+
+def _shared_port_socket(family, bint shared):
+    s = _socket.socket(family, _socket.SOCK_DGRAM)
+    if shared:
+        s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
+    return s
+
+
+def _ipv6_bind_error(int port=0, bint shared=False):
     """None if an IPv6-only UDP socket can bind [::]:port, else the error.
     picoquic opens neither socket of a dual-stack pair when one fails."""
     if not _socket.has_ipv6:
         return OSError(_errno.EAFNOSUPPORT, "IPv6 not available")
     try:
-        with _socket.socket(_socket.AF_INET6, _socket.SOCK_DGRAM) as s:
+        with _shared_port_socket(_socket.AF_INET6, shared) as s:
             s.setsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY, 1)
             s.bind(("::", port))
         return None
@@ -1161,10 +1181,10 @@ def _bind_addresses(host, int ip_family):
     return (addrs[0][0] if len(addrs) == 1 else 0), addrs
 
 
-def _bind_preflight(addrs, int port):
+def _bind_preflight(addrs, int port, bint shared=False):
     """Raise the OSError picoquic's own bind would hit in its thread."""
     for family, address, scope_id in addrs:
-        with _socket.socket(family, _socket.SOCK_DGRAM) as s:
+        with _shared_port_socket(family, shared) as s:
             if family == _socket.AF_INET6:
                 s.setsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY, 1)
                 s.bind((address, port, 0, scope_id))
@@ -1211,6 +1231,8 @@ cdef class TransportContext:
     cdef bytes _alpn_list_csv
     # Paths picoquic keeps borrowed pointers to.
     cdef bytes _ticket_file
+    cdef bytes _reset_seed
+    cdef bytes _ticket_key
     cdef bytes _web_folder
     cdef picohttp_server_path_item_t _wt_path_item
     cdef picohttp_server_parameters_t _wt_params
@@ -2980,7 +3002,10 @@ cdef class TransportContext:
               web_folder=None,
               int ip_family=-1,
               pmtud_policy=None,
-              host=None):
+              host=None,
+              bint is_port_shared=False,
+              reset_seed=None,
+              ticket_key=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -3025,6 +3050,14 @@ cdef class TransportContext:
                 wildcard; an IP literal (IPv6 may carry a scope) only that
                 address; a hostname at most one address per family. A
                 bind failure raises OSError.
+            is_port_shared: Bind with SO_REUSEPORT so several contexts
+                (workers) share the port; the kernel spreads connections
+                across them by 4-tuple.
+            reset_seed: 16 bytes for stateless-reset tokens; workers
+                sharing a port share it. None draws one per context.
+            ticket_key: Secret protecting TLS tickets, NEW_TOKEN and
+                Retry tokens; workers sharing a port share it. None draws
+                one per context.
             rx_data_ring_cap: Per-stream RX byte ring, in bytes, and the
                 advertised stream window. 0: a 4 MiB ring and picoquic's
                 default window.
@@ -3151,8 +3184,22 @@ cdef class TransportContext:
         # entire lifetime. picoquicdemo, pico_sim, pqbench, and every
         # picoquic test driver all call this at startup; aiopquic
         # didn't, which is what capped raw-QUIC loopback throughput.
-        # Idempotent — repeats just overwrite the same static array.
-        picoquic_register_all_congestion_control_algorithms()
+        _register_cc_algorithms()
+
+        cdef uint8_t* c_seed = NULL
+        cdef const uint8_t* c_tkey = NULL
+        cdef size_t c_tkey_len = 0
+        if reset_seed is not None:
+            if len(reset_seed) != 16:
+                raise ValueError("reset_seed must be 16 bytes")
+            self._reset_seed = bytes(reset_seed)
+            c_seed = <uint8_t*><const char*>self._reset_seed
+        if ticket_key is not None:
+            if not ticket_key:
+                raise ValueError("ticket_key must not be empty")
+            self._ticket_key = bytes(ticket_key)
+            c_tkey = <const uint8_t*><const char*>self._ticket_key
+            c_tkey_len = len(self._ticket_key)
 
         cdef const char* c_ticket = NULL
         if ticket_file is not None:
@@ -3169,11 +3216,11 @@ cdef class TransportContext:
             default_cb_fn,
             default_cb_ctx,
             NULL, NULL,     # no cnx_id callback
-            NULL,           # no reset seed
+            c_seed,         # NULL: picoquic draws one
             picoquic_current_time(),
             NULL,           # not simulated time
             c_ticket,       # client ticket store, loaded here, saved at stop
-            NULL, 0)        # server ticket key: picoquic draws one
+            c_tkey, c_tkey_len)  # NULL: picoquic draws one
 
         if self._quic is NULL:
             raise RuntimeError("Failed to create picoquic context")
@@ -3337,12 +3384,12 @@ cdef class TransportContext:
         ip_family, bind_addrs = _bind_addresses(host, ip_family)
         if bind_addrs:
             if port:
-                _bind_preflight(bind_addrs, port)
+                _bind_preflight(bind_addrs, port, is_port_shared)
             for i, (family, address, scope_id) in enumerate(bind_addrs):
                 _fill_sockaddr(address, port, &self._param.local_addr[i],
                                scope_id)
         elif ip_family < 0:
-            v6_error = _ipv6_bind_error(port)
+            v6_error = _ipv6_bind_error(port, is_port_shared)
             if v6_error is None:
                 ip_family = 0
             else:
@@ -3352,6 +3399,12 @@ cdef class TransportContext:
                                  port, v6_error)
         self._param.local_af = ip_family
         self._param.dest_if = 0
+        if is_port_shared:
+            # picoquic shares only the public_port socket; local_port stays a
+            # private ephemeral socket per worker.
+            self._param.local_port = 0
+            self._param.public_port = <unsigned short>port
+            self._param.is_port_shared = 1
         # SO_RCVBUF/SO_SNDBUF request passed to picoquic. picoquic's own
         # default is 0 (kernel default, ~200 KB on Linux) — far too
         # small: at line-rate UDP loopback (~3 Gbps at QUIC MTU) 200 KB

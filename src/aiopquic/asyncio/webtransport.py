@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import AsyncGenerator
 
 from aiopquic.quic.configuration import QuicConfiguration
+from aiopquic.asyncio._workers import shared_port_args, worker_count
 from aiopquic.quic.connection import drain_and_route
 from aiopquic._binding._transport import (
     TransportContext, WebTransportSessionState,
@@ -1394,6 +1395,10 @@ class WebTransportServer:
         self._dispatcher = dispatcher
         self._own_transport = own_transport
 
+    @property
+    def transports(self) -> list:
+        return [self._transport]
+
     async def aclose(self) -> None:
         """Close every live session, then the server."""
         for session in list(self._dispatcher._sessions.values()):
@@ -1415,6 +1420,28 @@ class WebTransportServer:
                 pass
 
 
+class WebTransportServerGroup:
+    """Handle returned by serve_webtransport(workers > 1): one server per
+    worker on the shared port."""
+
+    def __init__(self, servers: list):
+        self._servers = servers
+        self._transport = servers[0]._transport
+        self._dispatcher = servers[0]._dispatcher
+
+    @property
+    def transports(self) -> list:
+        return [server._transport for server in self._servers]
+
+    async def aclose(self) -> None:
+        for server in self._servers:
+            await server.aclose()
+
+    def close(self) -> None:
+        for server in self._servers:
+            server.close()
+
+
 async def serve_webtransport(
         host: str, port: int, path: str,
         *, handler,
@@ -1424,6 +1451,8 @@ async def serve_webtransport(
         configuration: QuicConfiguration | None = None,
         wt_supported_protocols: list[str] | None = None,
         web_folder: str | None = None,
+        workers: int = 1,
+        _start_extra: dict | None = None,
 ) -> WebTransportServer:
     """Start a WebTransport server listening on (host, port) at path.
 
@@ -1437,10 +1466,33 @@ async def serve_webtransport(
     server registered with "" never matches a root-path CONNECT.
 
     web_folder serves files from that directory to HTTP/3 GET requests
-    for paths other than `path`.
+    for paths other than `path`. workers > 1 (Linux) runs that many
+    picoquic contexts on the port.
     """
     if path == "":
         path = "/"
+    if workers != 1:
+        if transport is not None:
+            raise ValueError("workers > 1 needs serve_webtransport to own "
+                             "its transports")
+        workers = worker_count(workers, port)
+    if workers > 1:
+        shared = shared_port_args(workers)
+        servers = []
+        try:
+            for _ in range(workers):
+                servers.append(await serve_webtransport(
+                    host, port, path, handler=handler,
+                    cert_file=cert_file, key_file=key_file,
+                    session_factory=session_factory,
+                    configuration=configuration,
+                    wt_supported_protocols=wt_supported_protocols,
+                    web_folder=web_folder, _start_extra=shared))
+        except BaseException:
+            for server in servers:
+                server.close()
+            raise
+        return WebTransportServerGroup(servers)
     own_transport = transport is None
     if own_transport:
         if (configuration is not None
@@ -1494,6 +1546,8 @@ async def serve_webtransport(
             start_kwargs["wt_supported_protocols"] = ", ".join(
                 wt_supported_protocols)
         start_kwargs["keylog_filename"] = _keylog_file(configuration)
+        if _start_extra:
+            start_kwargs.update(_start_extra)
         transport.start(**start_kwargs)
 
     loop = asyncio.get_event_loop()

@@ -232,14 +232,16 @@ def client_configuration(*, server_name: str | None = None, cafile: str | None =
 
 
 async def start_server(port: int, configuration: QuicConfiguration,
-                       connections: list | None = None, host: str = "0.0.0.0"):
+                       connections: list | None = None, host: str = "0.0.0.0",
+                       workers: int = 1):
     """Serve perf on `port`; each accepted connection's protocol is appended to `connections`."""
     def factory(quic, **kw):
         proto = PerfServerProtocol(quic, **kw)
         if connections is not None:
             connections.append(proto)
         return proto
-    return await serve(host, port, configuration=configuration, create_protocol=factory)
+    return await serve(host, port, configuration=configuration, create_protocol=factory,
+                       workers=workers)
 
 
 @dataclass
@@ -305,6 +307,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--cert", required=True)
     s.add_argument("--key", required=True)
     s.add_argument("--cc-algo", default="bbr1")
+    s.add_argument("--workers", type=int, default=1,
+                   help="picoquic contexts sharing the port (Linux)")
 
     c = sub.add_parser("client")
     c.add_argument("host")
@@ -339,7 +343,8 @@ def main(argv: list[str] | None = None) -> int:
 
 async def _serve_forever(args) -> int:
     server = await start_server(args.port, server_configuration(args.cert, args.key,
-                                                                args.cc_algo))
+                                                                args.cc_algo),
+                                workers=args.workers)
     print(f"perf server on port {args.port}", flush=True)
     try:
         await asyncio.Event().wait()
