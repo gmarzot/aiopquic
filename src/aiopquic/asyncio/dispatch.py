@@ -18,6 +18,7 @@ from aiopquic.quic.connection import (
     QuicEngine, _EVT_CLOSE, _EVT_APP_CLOSE, _EVT_CNX_STACK, drain_and_route,
 )
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
+from aiopquic.asyncio._workers import shared_port_args, worker_count
 from aiopquic.asyncio.webtransport import (
     serve_webtransport, _EVT_WT_SESSION_READY,
 )
@@ -61,21 +62,28 @@ class _DualRouter:
 
 class DualStackServer:
     """Handle returned by serve_dispatch. close() tears down both
-    stacks; the shared transport is stopped by the engine."""
+    stacks; the shared transport is stopped by the engine. extra holds
+    the (engine, wt_server, transport) of further workers."""
 
-    def __init__(self, engine, wt_server, loop, transport):
+    def __init__(self, engine, wt_server, loop, transport, extra=()):
         self._engine = engine
         self._wt_server = wt_server
         self._loop = loop
         self._transport = transport
+        self._parts = [(engine, wt_server, transport)] + list(extra)
+
+    @property
+    def transports(self) -> list:
+        return [transport for _, _, transport in self._parts]
 
     def close(self) -> None:
-        try:
-            self._loop.remove_reader(self._transport.eventfd)
-        except Exception:
-            pass
-        self._wt_server.close()   # detaches dispatcher; transport not owned
-        self._engine.close()      # stops the shared transport
+        for engine, wt_server, transport in self._parts:
+            try:
+                self._loop.remove_reader(transport.eventfd)
+            except Exception:
+                pass
+            wt_server.close()   # detaches dispatcher; transport not owned
+            engine.close()      # stops the shared transport
 
 
 async def serve_dispatch(host: str, port: int, *,
@@ -83,7 +91,8 @@ async def serve_dispatch(host: str, port: int, *,
                          create_protocol=None,
                          wt_path: str, wt_handler,
                          wt_session_factory=None,
-                         wt_supported_protocols=None) -> DualStackServer:
+                         wt_supported_protocols=None,
+                         workers: int = 1) -> DualStackServer:
     """Serve raw QUIC and h3/WebTransport on one UDP port.
 
     configuration.alpn_protocols is the RAW ALPN list (e.g.
@@ -91,7 +100,8 @@ async def serve_dispatch(host: str, port: int, *,
     union here. Raw connections get create_protocol per connection
     (same contract as aiopquic.asyncio.serve); h3 connections run the
     WebTransport stack — wt_handler(session) per accepted CONNECT at
-    wt_path, wt_session_factory as in serve_webtransport.
+    wt_path, wt_session_factory as in serve_webtransport. workers > 1
+    (Linux) runs that many picoquic contexts on the port.
     """
     cfg = configuration
     if create_protocol is None:
@@ -99,30 +109,50 @@ async def serve_dispatch(host: str, port: int, *,
             lambda conn, stream_handler=None: QuicConnectionProtocol(
                 conn, stream_handler=stream_handler))
 
-    engine = QuicEngine(configuration=cfg, create_protocol=create_protocol)
-    engine._start_transport(
-        port=port,
-        host=host,
-        alpn=None,
-        alpn_list=["h3"] + list(cfg.alpn_protocols or []),
-        dual=True,
-        wt_path=wt_path,
-        wt_supported_protocols=(", ".join(wt_supported_protocols)
-                                if wt_supported_protocols else None),
-        max_datagram_frame_size=(cfg.max_datagram_frame_size or 64 * 1024),
-    )
-    transport = engine._transport
-
-    wt_server = await serve_webtransport(
-        host, port, wt_path,
-        handler=wt_handler,
-        cert_file=cfg.certificate_file,
-        key_file=cfg.private_key_file,
-        transport=transport,
-        session_factory=wt_session_factory,
-        configuration=cfg,
-    )
-
+    workers = worker_count(workers, port)
+    shared = shared_port_args(workers)
     loop = asyncio.get_event_loop()
-    _DualRouter(loop, transport, engine, wt_server._dispatcher)
-    return DualStackServer(engine, wt_server, loop, transport)
+    parts = []
+    try:
+        for _ in range(workers):
+            engine = QuicEngine(configuration=cfg,
+                                create_protocol=create_protocol)
+            engine._start_transport(
+                port=port,
+                host=host,
+                alpn=None,
+                alpn_list=["h3"] + list(cfg.alpn_protocols or []),
+                dual=True,
+                wt_path=wt_path,
+                wt_supported_protocols=(", ".join(wt_supported_protocols)
+                                        if wt_supported_protocols else None),
+                max_datagram_frame_size=(cfg.max_datagram_frame_size
+                                         or 64 * 1024),
+                **shared,
+            )
+            transport = engine._transport
+            parts.append((engine, None, transport))
+            wt_server = await serve_webtransport(
+                host, port, wt_path,
+                handler=wt_handler,
+                cert_file=cfg.certificate_file,
+                key_file=cfg.private_key_file,
+                transport=transport,
+                session_factory=wt_session_factory,
+                configuration=cfg,
+            )
+            parts[-1] = (engine, wt_server, transport)
+            _DualRouter(loop, transport, engine, wt_server._dispatcher)
+    except BaseException:
+        for engine, wt_server, transport in parts:
+            try:
+                loop.remove_reader(transport.eventfd)
+            except Exception:
+                pass
+            if wt_server is not None:
+                wt_server.close()
+            engine.close()
+        raise
+    engine, wt_server, transport = parts[0]
+    return DualStackServer(engine, wt_server, loop, transport,
+                           extra=parts[1:])

@@ -8,7 +8,9 @@ import pytest
 
 from aiopquic.asyncio.client import connect
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
+from aiopquic.asyncio.dispatch import serve_dispatch
 from aiopquic.asyncio.server import serve, worker_count
+from aiopquic.asyncio.webtransport import connect_webtransport, serve_webtransport
 from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.events import (
     ConnectionTerminated, DatagramFrameReceived, HandshakeCompleted,
@@ -24,6 +26,8 @@ CERTS_DIR = os.path.join(
     os.path.dirname(__file__), "..", "third_party", "picoquic", "certs")
 CERT_FILE = os.path.join(CERTS_DIR, "cert.pem")
 KEY_FILE = os.path.join(CERTS_DIR, "key.pem")
+CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
+SNI = "test.example.com"  # the test certificate's name
 ALPN = "hq-interop"
 REPLY = 64 * 1024
 
@@ -289,5 +293,52 @@ async def test_rebinding_survives_or_closes_fast():
             finally:
                 proxy.close()
         assert len(outcomes) == 6
+    finally:
+        server.close()
+
+
+async def _wt_session(port):
+    async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI,
+                                    ca_file=CA_FILE) as wt:
+        stream = await wt.create_stream(bidir=False)
+        wt.send_stream_data(stream, b"x" * 100)
+
+
+async def _until(cond, timeout=5.0):
+    async with asyncio.timeout(timeout):
+        while not cond():
+            await asyncio.sleep(0.01)
+
+
+async def test_webtransport_server_workers():
+    port, seen = next_port(), []
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt", handler=lambda s: seen.append(id(s._transport)),
+        cert_file=CERT_FILE, key_file=KEY_FILE, workers=2)
+    try:
+        assert len(server.transports) == 2
+        for _ in range(16):
+            await _wt_session(port)
+        await _until(lambda: len(seen) == 16)
+        assert set(seen) == {id(t) for t in server.transports}
+    finally:
+        server.close()
+
+
+async def test_dispatch_workers_serve_raw_and_webtransport():
+    port, raw_seen, wt_seen = next_port(), [], []
+    server = await serve_dispatch(
+        "127.0.0.1", port, configuration=_server_cfg(),
+        create_protocol=_recording(raw_seen), wt_path="/wt",
+        wt_handler=lambda s: wt_seen.append(id(s._transport)), workers=2)
+    try:
+        assert len(server.transports) == 2
+        for _ in range(16):
+            await _fetch(port)
+            await _wt_session(port)
+        await _until(lambda: len(wt_seen) == 16)
+        workers = {id(t) for t in server.transports}
+        assert set(raw_seen) == workers
+        assert set(wt_seen) == workers
     finally:
         server.close()
