@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The Cython extensions compile with `-O3` even when `CFLAGS` is set in the environment.
 - The default congestion control is `"bbr"` (v3), was `"bbr1"`.
 - RX: a reader that misses its wake is drained within 0.45 s and logged with the wake-protocol
   trace (`TransportContext.wake_trace()`), the reader history and the fd's state; RX readers have
