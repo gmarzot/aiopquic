@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The Cython extensions compile with `-O3` even when `CFLAGS` is set in the environment.
 - `serve`, `serve_dispatch` and `serve_webtransport` bind their `host`: an IP literal binds only that
   address, `"0.0.0.0"` only IPv4, a hostname at most one address per family; `None`, `""` and
   `"::"` keep both wildcards.

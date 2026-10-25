@@ -101,6 +101,8 @@ has left the ring once it is exceeded.
   `OPENSSL_ROOT_DIR`; binding sources always relink.
 - `AIOPQUIC_PERF=1` (default) is host-tuned and not portable; `AIOPQUIC_WHEEL_BUILD=1` is portable
   (CI, wheels).
+- The Cython extensions add `-O3` after `$CFLAGS`, because setuptools replaces Python's CFLAGS
+  with the environment's; `AIOPQUIC_PERF=0` leaves the caller's flags alone.
 - OpenSSL is the main performance variable. Linux wheels bundle 3.5; for parity build with
   `OPENSSL_ROOT_DIR=<3.5 prefix> ./build.sh`.
 - Submodules are `ignore = dirty` because the build patches picoquic in place.
