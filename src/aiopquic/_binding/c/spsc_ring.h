@@ -198,6 +198,13 @@ typedef enum {
      * guard; cnx is only a table key. */
     SPSC_EVT_TX_DGRAM_RING_RELEASE = 152,
 
+    /* Datagram priority against streams on one connection (asyncio →
+     * picoquic worker), entry.error_code the priority; same scale as
+     * stream priority. The WT twin carries a wt_session pointer in
+     * entry.cnx and sets the session's connection. */
+    SPSC_EVT_TX_SET_DATAGRAM_PRIORITY = 153,
+    SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY = 154,
+
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
      * WT control stream for session events, or the WT stream for

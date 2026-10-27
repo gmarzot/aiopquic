@@ -1159,6 +1159,33 @@ class QuicConnection:
         """
         self._transport.set_default_stream_priority(priority)
 
+    def set_datagram_priority(self, priority: int) -> int:
+        """Send priority of this connection's datagrams against its streams.
+
+        Same scale as stream priority: 0 highest, 255 lowest, picoquic's
+        default 9. Streams of a higher priority go before datagrams;
+        streams of a lower one only when no datagram is waiting; at equal
+        priority datagrams and those streams take turns.
+
+        Returns 0 when posted, 1 when the TX event ring is full (nothing
+        applied; wait on tx_event_ring_drain_event and retry).
+
+        Raises:
+            ConnectionError: no transport, or the cnx is not open.
+        """
+        if self._cnx_ptr == 0 or self._transport is None:
+            raise ConnectionError("set_datagram_priority: cnx not open")
+        return self._transport.set_datagram_priority(self._cnx_ptr, priority)
+
+    def set_default_datagram_priority(self, priority: int) -> None:
+        """Datagram priority that new connections start at.
+
+        Writes the QUIC context's default, shared by every connection on
+        this TransportContext, and applies only to connections created
+        after the call; set_datagram_priority() changes this one.
+        """
+        self._transport.set_default_datagram_priority(priority)
+
     def close(self, error_code: int = 0, frame_type: int | None = None,
               reason_phrase: str = "") -> None:
         """Close the connection."""
