@@ -582,6 +582,13 @@ class QuicConnection:
             return 0
         return self._transport.tx_data_ring_used(sc_ptr)
 
+    def _tx_backlog(self) -> int:
+        """Bytes queued in this connection's stream rings, not yet pulled."""
+        t = self._transport
+        if t is None:
+            return 0
+        return sum(t.tx_data_ring_used(sc) for sc in list(self._stream_ctxs.values()))
+
     def tx_sent_bytes(self, stream_id: int) -> int:
         """Cumulative bytes of this stream picoquic has taken from its TX
         ring into packets. Monotonic: a stream offset has left the ring
@@ -880,21 +887,23 @@ class QuicConnection:
         Pair these in a clear-arm-recheck-wait loop above the call
         to this helper.
         """
-        # Aggregate TX gate at the stream-creation boundary: raw QUIC
+        # Connection TX gate at the stream-creation boundary: raw QUIC
         # creates the per-stream sc lazily on first write, so "sid not
-        # yet in _stream_ctxs" IS stream creation. Park while the
-        # process-wide queued-TX budget (QuicConfiguration.
-        # tx_max_queued_bytes) is exceeded; resume below cap/2. The
-        # green-light is connection drain capacity — any stream's
-        # drain frees budget — so one wedged stream can never stall
-        # the gate. Bounds producer run-ahead that per-stream caps
-        # miss under short-stream churn (fresh stream = fresh budget).
+        # yet in _stream_ctxs" IS stream creation. Park while this
+        # connection's queued TX exceeds QuicConfiguration.
+        # tx_max_queued_bytes; resume below cap/2. The process-wide
+        # total, one load, gates the per-stream sum. The green-light is
+        # connection drain capacity — any stream's drain frees budget —
+        # so one wedged stream can never stall the gate. Bounds producer
+        # run-ahead that per-stream caps miss under short-stream churn
+        # (fresh stream = fresh budget).
         if stream_id not in self._stream_ctxs:
             cap = getattr(self._configuration, 'tx_max_queued_bytes',
                           4 * 1024 * 1024)
-            if cap and tx_data_bytes_queued() > cap:
+            if (cap and tx_data_bytes_queued() > cap
+                    and self._tx_backlog() > cap):
                 low = cap // 2
-                while not self._closed and tx_data_bytes_queued() > low:
+                while not self._closed and self._tx_backlog() > low:
                     await asyncio.sleep(0.002)
             if self._closed:
                 # Yield before the no-op return: an await that never

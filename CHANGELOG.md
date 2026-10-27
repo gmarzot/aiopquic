@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Raw QUIC: the `tx_max_queued_bytes` gate counts the connection's own queued bytes, so a peer that
+  stops reading no longer parks new streams on every other connection in the process.
 - `WebTransportSession.max_datagram_payload()`: the connection's datagram ceiling less h3's
   stream-ID prefix. `send_datagram_frame` raises `ValueError` above it; such a payload was accepted,
   never sent, and held back every later datagram on the session.

@@ -51,7 +51,7 @@ sequenceDiagram
     participant NIC as UDP / NIC
 
     Note over App,API: NEW STREAM only — gates before creation
-    alt aggregate queued exceeds tx_max_queued_bytes (4 MiB)
+    alt connection (WT: session) queued exceeds tx_max_queued_bytes (4 MiB)
         API->>API: park, 2 ms poll, resume below cap/2<br/>raw: send_stream_data_drained new-stream branch<br/>WT: create_stream calls _await_tx_data_capacity
     end
     opt raw QUIC, every new stream
@@ -126,7 +126,7 @@ Latency contributed by a queue = its depth ÷ drain rate.
 
 | # | Layer | Trigger | Park / resume | Scope |
 |---|---|---|---|---|
-| 1 | `tx_max_queued_bytes` (4 MiB, `QuicConfiguration`) | aggregate `pushed − pulled − discarded` over cap | park at stream creation; resume < cap/2; 2 ms poll | all streams — the only bound short-stream churn cannot bypass |
+| 1 | `tx_max_queued_bytes` (4 MiB, `QuicConfiguration`) | the connection's (WT: session's) stream rings hold more than cap | park at stream creation; resume < cap/2; 2 ms poll | all streams of the connection — the only bound short-stream churn cannot bypass |
 | 2 | `tx_max_inflight_bytes` (1 MiB, aiomoqt `MOQTPeer`) | one stream's `sc->tx` used over cap | park mid-stream on drain event; resume < cap/2 | per stream — fairness + binds on long-lived streams |
 | 3 | `sc->tx` ring full (4 MiB) | commit doesn't fit | `BufferError` → dual-event wait → retry | per stream, hard |
 | 4 | `tx_event_ring` pressure | > 90% → hard wait; > 50% → post-send `sleep(0)` | ring-drained event at ≤ 50% low-water | connection, command channel |
@@ -229,11 +229,11 @@ Counter signature: `*_arms = 0`, `rx_event_drops = 0`,
 
 **At saturation**, the binding constraint by direction:
 
-- **TX, unpaced producer**: the aggregate gate
+- **TX, unpaced producer**: the connection gate
   (`tx_max_queued_bytes`) parks producers at stream rollover;
   standing queue oscillates in the [cap/2, cap] band, so
   steady-state e2e latency ≈ `0.75 × cap ÷ drain rate` (4 MiB ≈ 8 ms
-  at ~3 Gbps). The floor below the aggregate cap is the rollover
+  at ~3 Gbps). The floor below the connection cap is the rollover
   overshoot `P × min(per-stream cap, bytes-per-stream)`; the
   per-stream cap (`tx_max_inflight_bytes`) governs below that floor.
 - **RX, slow consumer**: per-stream FC stalls the peer at the
@@ -254,7 +254,7 @@ Counter signature: `*_arms = 0`, `rx_event_drops = 0`,
 | `QuicConfiguration.max_data` | 16 MiB | cnx-level inbound FC (initial; picoquic auto-extends) |
 | `QuicConfiguration.max_stream_data` | 16 MiB | per-stream inbound window AND `sc->rx` size |
 | `QuicConfiguration.stream_ring_cap` | 4 MiB | per-stream `sc->tx` hard cap |
-| `QuicConfiguration.tx_max_queued_bytes` | 4 MiB (0/None off) | aggregate outbound queue, all streams |
+| `QuicConfiguration.tx_max_queued_bytes` | 4 MiB (0/None off) | outbound queue per connection (WT: per session) |
 | `QuicConfiguration.max_streams_uni/bidi` | 512 | initial MAX_STREAMS credit |
 | `QuicConfiguration.event_ring_capacity` | None → 2048/16384 | both event rings |
 | `QuicConfiguration.idle_timeout` | 30 s | QUIC idle timeout |
@@ -302,7 +302,7 @@ sc_alive_total growing without bound               → stream teardown starving
                                                      (drain not getting CPU) or leak
 chunks_alive_total growing without bound           → consumer pipeline retaining
                                                      memoryviews (app-side)
-tx_data_bytes_queued pinned at cap                 → gate engaged: producer at wire
+tx_data_bytes_queued pinned at cap (one cnx)       → gate engaged: producer at wire
                                                      rate (working as intended)
 sc_rx_bytes_in_flight growing                      → consumer drain lagging arrivals
 prepare_to_send_calls up, pulled_bytes flat        → nothing to send: producer-side
