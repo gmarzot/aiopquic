@@ -130,10 +130,10 @@ class QuicConfiguration:
     # workloads with very high stream-churn rates.
     max_streams_uni: int = 512
     max_streams_bidi: int = 512
-    # Aggregate cap on bytes committed to per-stream TX data rings but
-    # not yet pulled by the picoquic worker (process-wide; see
-    # aiopquic._binding._transport.tx_data_bytes_queued). Bounds
-    # producer run-ahead that per-stream caps structurally miss:
+    # Cap on bytes one connection (WebTransport: one session) has
+    # committed to its stream TX data rings but the picoquic worker has
+    # not yet pulled. Bounds producer run-ahead that per-stream caps
+    # structurally miss:
     # short-stream churn resets the per-stream budget every rollover,
     # so an unpaced producer can spread unbounded backlog across
     # thousands of fresh streams while QUIC's own throttles (CC, FC,
