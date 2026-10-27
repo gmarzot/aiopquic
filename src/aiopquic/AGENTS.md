@@ -24,8 +24,8 @@ the `KEX_*` ids and `counters`; everything else there, and raw pointers, are tes
   `QuicConnectionProtocol` and overrides `quic_event_received`.
 - WebTransport: `async with connect_webtransport(host, port, path, sni=..., configuration=cfg) as
   wt:`, then `create_stream()`, `send_stream_data()`, `receive_stream_data(sid)`, `events()`.
-  One reader per stream: once `receive_stream_data(sid)` returns or is closed, later data on that
-  stream is dropped.
+  Once `receive_stream_data(sid)` has yielded a stream's FIN or reset, the stream's inbox is freed
+  and a later call returns at once; a reader closed earlier can be resumed by calling it again.
   `serve_webtransport(host, port, path, handler=h, cert_file=..., key_file=..., configuration=cfg)`
   calls `h(session)` per CONNECT. `WebTransportError` is a `ConnectionError`. The CONNECT sends
   `:protocol webtransport`, then `webtransport-h3` once on the same connection if a server that

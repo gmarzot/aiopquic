@@ -138,8 +138,8 @@ class WebTransportSession:
         self._ring_parked_creates = 0
         # Per-stream incoming queues
         self._stream_inbox: dict[int, _Inbox] = {}
-        # Live streams whose reader has returned: their inbox is gone
-        # and later events for them are dropped. Cleared at destroy.
+        # Live streams whose reader has taken the FIN or reset: their
+        # inbox is gone and later events are dropped. Cleared at destroy.
         self._inbox_done: set[int] = set()
         # Datagram TX record ring, created on first send; a mark owed
         # when the TX event ring was full, and the writer's backpressure
@@ -729,9 +729,9 @@ class WebTransportSession:
     async def receive_stream_data(self, stream_id: int):
         """Async-generator: yield WebTransportStreamDataReceived (and
         any final WebTransportStreamReset) for stream_id, then return
-        on FIN or reset. One reader per stream: once it returns, or is
-        closed early, the stream's inbox is released and later data
-        for the stream is dropped."""
+        on FIN or reset. Once it has yielded the FIN or reset, the
+        stream's inbox is released and a later call returns at once; a
+        reader closed before that leaves the inbox for a later call."""
         if stream_id in self._inbox_done:
             return
         q = self._stream_inbox.get(stream_id)
@@ -742,16 +742,16 @@ class WebTransportSession:
                     stream_id=stream_id, error_code=WT_SESSION_GONE)
                 return
             self._stream_inbox[stream_id] = q = _Inbox()
+        done = False
         try:
-            while True:
+            while not done:
                 ev = await q.get()
+                done = (isinstance(ev, WebTransportStreamReset)
+                        or (isinstance(ev, WebTransportStreamDataReceived)
+                            and ev.end_stream))
                 yield ev
-                if isinstance(ev, WebTransportStreamDataReceived) and ev.end_stream:
-                    return
-                if isinstance(ev, WebTransportStreamReset):
-                    return
         finally:
-            if self._stream_inbox.get(stream_id) is q:
+            if done and self._stream_inbox.get(stream_id) is q:
                 del self._stream_inbox[stream_id]
                 if not q.destroyed:
                     self._inbox_done.add(stream_id)

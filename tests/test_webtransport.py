@@ -477,9 +477,9 @@ async def test_wt_finished_streams_release_their_inboxes():
 
 
 @pytest.mark.asyncio
-async def test_wt_reader_closed_early_releases_its_inbox():
-    """Closing a reader before FIN releases the inbox; the stream's later
-    data is dropped and its destroy clears the marker."""
+async def test_wt_reader_closed_early_keeps_its_inbox():
+    """A reader closed before FIN leaves the inbox: a second reader gets
+    the rest, and taking the FIN releases it."""
     port = next_port()
     more = asyncio.Event()
 
@@ -504,10 +504,11 @@ async def test_wt_reader_closed_early_releases_its_inbox():
             first = await asyncio.wait_for(reader.__anext__(), 5.0)
             assert bytes(first.data) == b"first" and not first.end_stream
             await reader.aclose()
-            assert sid not in wt._stream_inbox and sid in wt._inbox_done
+            assert sid in wt._stream_inbox and sid not in wt._inbox_done
             more.set()
-            await _until(lambda: sid not in wt._inbox_done)
+            assert await _drain_stream(wt, sid) == b"rest"
             assert sid not in wt._stream_inbox
+            await _until(lambda: sid not in wt._inbox_done)
     finally:
         server.close()
 
