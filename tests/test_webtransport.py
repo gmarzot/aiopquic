@@ -349,6 +349,90 @@ async def test_wt_datagram_oversize_is_refused():
         server.close()
 
 
+def test_varint_len_boundaries():
+    from aiopquic.asyncio.webtransport import _varint_len
+    values = (0, 63, 64, 16383, 16384, 2**30 - 1, 2**30)
+    assert [_varint_len(v) for v in values] == [1, 1, 2, 2, 4, 4, 8]
+
+
+@pytest.mark.asyncio
+async def test_wt_max_datagram_payload_both_ends():
+    """Each end's ceiling is the connection's less the session's Quarter
+    Stream ID varint; a payload of exactly that size arrives, one byte
+    more raises, and a closed session reports 0."""
+    from aiopquic.asyncio.webtransport import _varint_len
+    from aiopquic.quic.events import WebTransportDatagramReceived
+    port = next_port()
+    srv_got: asyncio.Queue = asyncio.Queue()
+    cli_got: asyncio.Queue = asyncio.Queue()
+    srv_session = asyncio.get_running_loop().create_future()
+
+    async def handler(session):
+        srv_session.set_result(session)
+        async for ev in session.events():
+            if isinstance(ev, WebTransportDatagramReceived):
+                await srv_got.put(bytes(ev.data))
+
+    async def client_recv(wt):
+        async for ev in wt.events():
+            if isinstance(ev, WebTransportDatagramReceived):
+                await cli_got.put(bytes(ev.data))
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            srv = await asyncio.wait_for(srv_session, timeout=5.0)
+            recv = asyncio.create_task(client_recv(wt))
+            for sender, got in ((wt, srv_got), (srv, cli_got)):
+                cap = sender._transport.datagram_payload_ceiling(sender.cnx_ptr)
+                assert cap == 1200
+                n = sender.max_datagram_payload()
+                assert n == cap - _varint_len(sender.control_stream_id >> 2)
+                payload = bytes(i & 0xFF for i in range(n))
+                assert sender.send_datagram_frame(payload) == n
+                assert await asyncio.wait_for(got.get(), timeout=5.0) == payload
+                with pytest.raises(ValueError):
+                    sender.send_datagram_frame(b"x" * (n + 1))
+            recv.cancel()
+        assert wt.max_datagram_payload() == 0
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_max_datagram_payload_follows_peer_tp():
+    """A peer's smaller max_datagram_frame_size lowers the ceiling; a
+    record past it would sit at the ring head forever, so it raises."""
+    from aiopquic.asyncio.webtransport import _varint_len
+    from aiopquic.quic.events import WebTransportDatagramReceived
+    port = next_port()
+    got: asyncio.Queue = asyncio.Queue()
+
+    async def handler(session):
+        async for ev in session.events():
+            if isinstance(ev, WebTransportDatagramReceived):
+                await got.put(bytes(ev.data))
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE,
+        configuration=QuicConfiguration(is_client=False,
+                                        max_datagram_frame_size=300))
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            n = wt.max_datagram_payload()
+            assert n == 300 - _varint_len(wt.control_stream_id >> 2)
+            with pytest.raises(ValueError):
+                wt.send_datagram_frame(b"p" * (n + 1))
+            for size in (n, 1):
+                assert wt.send_datagram_frame(b"p" * size) == size
+                assert await asyncio.wait_for(got.get(), timeout=5.0) == b"p" * size
+    finally:
+        server.close()
+
+
 async def _wait_counter(transport, key, target, timeout=2.0):
     """Wait for a worker counter to reach `target`; return its value."""
     loop = asyncio.get_event_loop()

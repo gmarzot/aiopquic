@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `WebTransportSession.max_datagram_payload()`: the connection's datagram ceiling less h3's
+  stream-ID prefix. `send_datagram_frame` raises `ValueError` above it; such a payload was accepted,
+  never sent, and held back every later datagram on the session.
+
 ## v0.7.0rc1
 
 - `set_datagram_priority(p)` on `QuicConnection` and `WebTransportSession`, and

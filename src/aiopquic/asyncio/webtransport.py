@@ -92,6 +92,11 @@ def _resolve_host(host: str) -> str:
     return resolve(host)
 
 
+def _varint_len(v: int) -> int:
+    """Bytes in the QUIC variable-length encoding of v (RFC 9000 §16)."""
+    return 1 if v < 0x40 else 2 if v < 0x4000 else 4 if v < 0x40000000 else 8
+
+
 # =====================================================================
 # Base: established-session API. Role-agnostic except for the .role
 # property (preserved because MoQT-level code makes role-specific
@@ -586,6 +591,19 @@ class WebTransportSession:
             raise ConnectionError("set_datagram_priority: session closed")
         return self._state.push_datagram_priority(priority)
 
+    def max_datagram_payload(self) -> int:
+        """Largest payload send_datagram_frame accepts: the connection's
+        ceiling (as QuicConnection.max_datagram_payload()) less the
+        Quarter Stream ID varint h3 prefixes to each datagram (RFC 9297).
+        0 = datagrams not negotiated or the session is closed."""
+        cnx = self.cnx_ptr
+        if cnx == 0:
+            return 0
+        cap = self._transport.datagram_payload_ceiling(cnx)
+        if cap == 0:
+            return 0
+        return max(cap - _varint_len(self.control_stream_id >> 2), 0)
+
     def send_datagram_frame(self, data: bytes) -> int:
         """Queue one WebTransport datagram for the pull-model send path.
 
@@ -596,15 +614,23 @@ class WebTransportSession:
         the SAME payload.
 
         Raises:
-            ValueError: payload exceeds datagram_max_payload; a datagram
-                frame cannot be fragmented, so this can never drain.
+            ValueError: payload exceeds max_datagram_payload(), or
+                datagrams were not negotiated; a datagram cannot be
+                fragmented, so this can never drain.
             ConnectionError: session closed.
         """
         if self._state is None or self._session_closed.is_set():
             raise ConnectionError("send_datagram_frame: session closed")
         if self._dgram_ring == 0:
+            # Records cap at the framed ceiling, so every one fits a
+            # fresh packet with its stream-ID prefix.
+            cap = self.max_datagram_payload()
+            if cap == 0:
+                raise ValueError(
+                    "send_datagram_frame: datagrams not negotiated")
+            self._dgram_max_payload = cap
             self._dgram_ring = self._transport.dgram_ring_create(
-                self._dgram_ring_bytes, self._dgram_max_payload)
+                self._dgram_ring_bytes, cap)
         if self._dgram_mark_owed:
             if self._state.push_dgram_ready(self._dgram_ring) == 0:
                 self._dgram_mark_owed = False
@@ -615,7 +641,7 @@ class WebTransportSession:
         if rc < 0:
             raise ValueError(
                 f"datagram payload {len(data)} exceeds "
-                f"{self._dgram_max_payload}")
+                f"max_datagram_payload() = {self._dgram_max_payload}")
         # Records are committed. A full TX event ring leaves the mark
         # owed; it is re-posted at the next send or drain.
         if self._state.push_dgram_ready(self._dgram_ring) != 0:
