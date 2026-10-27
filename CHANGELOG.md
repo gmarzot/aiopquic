@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- WebTransport `create_stream`: a cancelled or timed-out create no longer hands its stream to the
+  next caller (the stream is reset), and a full TX event ring waits for room instead of raising.
 - Cancelling a backpressured `send_stream_data_drained` no longer leaves two waiter tasks behind.
 - `WebTransportSession.max_datagram_payload()`: the connection's datagram ceiling less h3's
   stream-ID prefix. `send_datagram_frame` raises `ValueError` above it; such a payload was accepted,

@@ -128,6 +128,9 @@ class WebTransportSession:
         # and resolves it. Picoquic processes the TX ring serially and
         # emits responses in the same order, so 1:1 pairing is correct.
         self._pending_creates: deque[asyncio.Future] = deque()
+        self._orphan_stream_commands: deque[tuple[int, bool]] = deque()
+        self._orphan_cleanup_task: asyncio.Task | None = None
+        self._ring_parked_creates = 0
         # Per-stream incoming queues
         self._stream_inbox: dict[int, asyncio.Queue] = {}
         # Datagram TX record ring, created on first send; a mark owed
@@ -261,9 +264,10 @@ class WebTransportSession:
         Round-trips to the picoquic thread because picowt allocates
         the id internally. Multiple concurrent callers are safe:
         each appends a future to a FIFO and picoquic responds in
-        the same order TX events were pushed.
+        the same order TX events were pushed. A full TX event ring
+        waits for it to drain; timeout covers that wait too.
 
-        Parks first while the aggregate TX-queued budget is exceeded
+        Parks first while the session's TX-queued budget is exceeded
         (_await_tx_data_capacity) — the stream-creation boundary is
         the one point short-stream churn cannot bypass."""
         if self.session_closed:
@@ -271,22 +275,82 @@ class WebTransportSession:
         if not self.session_ready:
             raise WebTransportError("session not ready")
         await self._await_tx_data_capacity()
+        # Do not submit more creates while abandoned streams await retirement.
+        while self._orphan_cleanup_task is not None:
+            await asyncio.shield(self._orphan_cleanup_task)
         if self.session_closed:
             raise WebTransportError("WT session closed")
+        deadline = self._loop.time() + timeout
+        ring_event = self._transport.tx_event_ring_drain_event
+        while True:
+            ring_event.clear()
+            try:
+                self._state.push_create_stream(bidir)
+                break
+            except BufferError:
+                if self._transport.arm_tx_event_ring_drain_pending():
+                    self._ring_parked_creates += 1
+                    try:
+                        await asyncio.wait_for(
+                            ring_event.wait(), deadline - self._loop.time())
+                    finally:
+                        self._ring_parked_creates -= 1
+                else:
+                    await asyncio.sleep(0)
+            if self.session_closed:
+                raise WebTransportError("WT session closed")
+        # No await between the push and the append: replies pair in order.
         fut = self._loop.create_future()
         self._pending_creates.append(fut)
-        self._state.push_create_stream(bidir)
         try:
-            sid = await asyncio.wait_for(fut, timeout=timeout)
+            sid = await asyncio.wait_for(
+                fut, timeout=max(deadline - self._loop.time(), 0))
         except BaseException:
-            try:
-                self._pending_creates.remove(fut)
-            except ValueError:
-                pass
+            # Submitted requests retain their FIFO slot until their reply.
+            # A reply can also arrive just before cancellation reaches us.
+            if fut.done() and not fut.cancelled() and fut.exception() is None:
+                if sid := fut.result():
+                    self._retire_orphan_stream(sid)
+            else:
+                fut.cancel()
             raise
         if sid == 0:
             raise WebTransportError("WT stream create rejected")
         return sid
+
+    def _retire_orphan_stream(self, stream_id: int) -> None:
+        """Retire an allocated stream whose create caller has gone away."""
+        self._drop_stream_tx(stream_id)
+        if self.session_closed:
+            return  # Session cleanup owns all its streams.
+        self._orphan_stream_commands.append((stream_id, False))
+        if not stream_id & 2:
+            self._orphan_stream_commands.append((stream_id, True))
+        if self._orphan_cleanup_task is None:
+            self._orphan_cleanup_task = self._loop.create_task(
+                self._retire_orphan_streams())
+
+    async def _retire_orphan_streams(self) -> None:
+        """One retry task for abandoned streams; new creates wait behind it."""
+        ring_event = self._transport.tx_event_ring_drain_event
+        try:
+            while self._orphan_stream_commands and not self.session_closed:
+                sid, stop = self._orphan_stream_commands[0]
+                push = (self._state.push_stop_sending if stop
+                        else self._state.push_reset_stream)
+                ring_event.clear()
+                try:
+                    push(sid, 0)
+                except BufferError:
+                    if self._transport.arm_tx_event_ring_drain_pending():
+                        await ring_event.wait()
+                except ConnectionError:
+                    return  # Connection teardown owns the remaining streams.
+                else:
+                    self._orphan_stream_commands.popleft()
+        finally:
+            self._orphan_stream_commands.clear()
+            self._orphan_cleanup_task = None
 
     def send_stream_data(self, stream_id: int, data: bytes,
                           end_stream: bool = False) -> None:
@@ -698,6 +762,13 @@ class WebTransportSession:
         # sc's; the release does not wait on the wire. O(1) ring cost.
         self._push_or_retry(self._state.push_session_cleanup, "cleanup")
         self._stream_tx_ctxs.clear()
+        if self._orphan_cleanup_task is not None or self._ring_parked_creates:
+            self._transport.tx_event_ring_drain_event.set()
+        self._orphan_stream_commands.clear()
+        while self._pending_creates:
+            fut = self._pending_creates.popleft()
+            if not fut.done():
+                fut.set_exception(WebTransportError("WT session closed"))
         # Wake any producer parked in send_stream_data_drained awaiting a
         # per-stream sc_event or the connection-global ring_event. After
         # close the worker stops invoking drain callbacks for this
@@ -848,13 +919,6 @@ class WebTransportSession:
                 and not self._session_ready.done()):
             self._session_ready.set_exception(WebTransportError(
                 "WT session closed before READY"))
-        # Fail any pending create_stream() callers; the session
-        # is gone, no point making them wait for the timeout.
-        while self._pending_creates:
-            fut = self._pending_creates.popleft()
-            if not fut.done():
-                fut.set_exception(WebTransportError(
-                    "WT session closed"))
         self._event_queue.put_nowait(ev)
         # §6: answer an inbound close with our FIN on CONNECT.
         if not self._fin_sent:
@@ -943,17 +1007,17 @@ class WebTransportSession:
                     except BufferError:
                         pass
                 return
-            # Stash the sc pointer the C side allocated for this
-            # outbound stream so send_stream_data has it on first use.
-            if sc_ptr and error_code == 0:
+            # Every native reply consumes exactly one submitted request.
+            fut = self._pending_creates.popleft() if self._pending_creates else None
+            if error_code != 0 or fut is None or fut.done():
+                if sid:
+                    self._retire_orphan_stream(sid)
+                if fut is not None and not fut.done():
+                    fut.set_result(0)
+                return
+            if sc_ptr:
                 self._stream_tx_ctxs[sid] = sc_ptr
-            # Pair with the oldest pending create_stream() caller.
-            # Skip already-cancelled futures (caller timed out / closed).
-            while self._pending_creates:
-                fut = self._pending_creates.popleft()
-                if not fut.done():
-                    fut.set_result(0 if error_code != 0 else sid)
-                    break
+            fut.set_result(sid)
         elif evt_type == _EVT_WT_STREAM_RESET:
             if self._session_closed.is_set():
                 return
