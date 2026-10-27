@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.7.0rc1
 
 - `set_datagram_priority(p)` on `QuicConnection` and `WebTransportSession`, and
   `set_default_datagram_priority(p)`: datagrams' send priority against streams (picoquic default 9).
