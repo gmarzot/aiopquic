@@ -74,6 +74,11 @@ _EVT_WT_CNX_CLOSED = 77
 WT_SESSION_GONE = 0x170d7b68
 
 
+class _Inbox(asyncio.Queue):
+    """A stream's received events; `destroyed` once its native stream is gone."""
+    destroyed = False
+
+
 class WebTransportError(ConnectionError):
     """The session is unusable: closed, not open, refused or timed out.
     A ConnectionError, so a refused CONNECT is caught like a refused
@@ -132,7 +137,10 @@ class WebTransportSession:
         self._orphan_cleanup_task: asyncio.Task | None = None
         self._ring_parked_creates = 0
         # Per-stream incoming queues
-        self._stream_inbox: dict[int, asyncio.Queue] = {}
+        self._stream_inbox: dict[int, _Inbox] = {}
+        # Live streams whose reader has returned: their inbox is gone
+        # and later events for them are dropped. Cleared at destroy.
+        self._inbox_done: set[int] = set()
         # Datagram TX record ring, created on first send; a mark owed
         # when the TX event ring was full, and the writer's backpressure
         # event (starts set = writable), as on QuicConnection.
@@ -719,7 +727,11 @@ class WebTransportSession:
     async def receive_stream_data(self, stream_id: int):
         """Async-generator: yield WebTransportStreamDataReceived (and
         any final WebTransportStreamReset) for stream_id, then return
-        on FIN or reset."""
+        on FIN or reset. One reader per stream: once it returns, or is
+        closed early, the stream's inbox is released and later data
+        for the stream is dropped."""
+        if stream_id in self._inbox_done:
+            return
         q = self._stream_inbox.get(stream_id)
         if q is None:
             if self._session_closed.is_set():
@@ -727,14 +739,20 @@ class WebTransportSession:
                 yield WebTransportStreamReset(
                     stream_id=stream_id, error_code=WT_SESSION_GONE)
                 return
-            self._stream_inbox[stream_id] = q = asyncio.Queue()
-        while True:
-            ev = await q.get()
-            yield ev
-            if isinstance(ev, WebTransportStreamDataReceived) and ev.end_stream:
-                return
-            if isinstance(ev, WebTransportStreamReset):
-                return
+            self._stream_inbox[stream_id] = q = _Inbox()
+        try:
+            while True:
+                ev = await q.get()
+                yield ev
+                if isinstance(ev, WebTransportStreamDataReceived) and ev.end_stream:
+                    return
+                if isinstance(ev, WebTransportStreamReset):
+                    return
+        finally:
+            if self._stream_inbox.get(stream_id) is q:
+                del self._stream_inbox[stream_id]
+                if not q.destroyed:
+                    self._inbox_done.add(stream_id)
 
     # --- session close ------------------------------------------------
 
@@ -795,6 +813,7 @@ class WebTransportSession:
             q.put_nowait(WebTransportStreamReset(
                 stream_id=sid, error_code=WT_SESSION_GONE))
         self._stream_inbox.clear()
+        self._inbox_done.clear()
 
     def _push_or_retry(self, push, what: str) -> None:
         """Queue a session command. A full TX ring reschedules it once
@@ -949,7 +968,9 @@ class WebTransportSession:
                 stream_id=sid, data=payload, end_stream=False)
             q = self._stream_inbox.get(sid)
             if q is None:
-                self._stream_inbox[sid] = q = asyncio.Queue()
+                if sid in self._inbox_done:
+                    return
+                self._stream_inbox[sid] = q = _Inbox()
             q.put_nowait(ev)
         elif evt_type == _EVT_WT_STREAM_FIN:
             if self._session_closed.is_set():
@@ -959,7 +980,9 @@ class WebTransportSession:
                 stream_id=sid, data=payload, end_stream=True)
             q = self._stream_inbox.get(sid)
             if q is None:
-                self._stream_inbox[sid] = q = asyncio.Queue()
+                if sid in self._inbox_done:
+                    return
+                self._stream_inbox[sid] = q = _Inbox()
             q.put_nowait(ev)
             # Peer FINed the stream — no further reads, but we may
             # still be writing on a bidi until our own FIN goes out.
@@ -1024,9 +1047,10 @@ class WebTransportSession:
             ev = WebTransportStreamReset(stream_id=sid,
                                             error_code=error_code)
             q = self._stream_inbox.get(sid)
-            if q is None:
-                self._stream_inbox[sid] = q = asyncio.Queue()
-            q.put_nowait(ev)
+            if q is None and sid not in self._inbox_done:
+                self._stream_inbox[sid] = q = _Inbox()
+            if q is not None:
+                q.put_nowait(ev)
             # Peer reset → our tx side is also gone. Drop sc reference.
             self._drop_stream_tx(sid)
         elif evt_type == _EVT_WT_STOP_SENDING:
@@ -1071,6 +1095,7 @@ class WebTransportSession:
             # the _EVT_WT_STREAM_DESTROY path below.
             self._drop_stream_tx(sid)
             self._stream_inbox.pop(sid, None)
+            self._inbox_done.discard(sid)
         elif evt_type == _EVT_WT_STREAM_DESTROY:
             # picohttp_callback_free fired for this WT data stream.
             # The link + sc are still alive at this point (LINK_RELEASE
@@ -1079,10 +1104,13 @@ class WebTransportSession:
             # accumulate stale entries. Do NOT pop _stream_inbox: a
             # consumer task may not have called receive_stream_data
             # yet — popping the queue races with consumers that hold
-            # a deferred reference and would hang them. Inbox queues
-            # for fully-drained streams are reclaimed at session
-            # close.
+            # a deferred reference and would hang them. A reader that
+            # has returned released the inbox already.
             self._drop_stream_tx(sid)
+            self._inbox_done.discard(sid)
+            q = self._stream_inbox.get(sid)
+            if q is not None:
+                q.destroyed = True
 
 
 # =====================================================================

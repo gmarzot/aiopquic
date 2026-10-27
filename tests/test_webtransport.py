@@ -433,6 +433,85 @@ async def test_wt_max_datagram_payload_follows_peer_tp():
         server.close()
 
 
+async def _until(cond, timeout=5.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not cond():
+        assert loop.time() < deadline, "condition not reached"
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_wt_finished_streams_release_their_inboxes():
+    """A reader that returns releases its stream's inbox and the stream's
+    destroy clears its marker: a long session keeps no per-stream state
+    for streams it has read."""
+    port = next_port()
+    n = 200
+
+    async def handler(session):
+        for i in range(n):
+            sid = await session.create_stream(bidir=False)
+            session.send_stream_data(sid, b"d%d" % i, end_stream=True)
+        async for _ in session.events():
+            pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            readers = []
+            async for ev in wt.events():
+                if isinstance(ev, WebTransportNewStream):
+                    readers.append(asyncio.create_task(
+                        _drain_stream(wt, ev.stream_id)))
+                    if len(readers) == n:
+                        break
+            got = await asyncio.wait_for(asyncio.gather(*readers), 10.0)
+            assert sorted(got) == sorted(b"d%d" % i for i in range(n))
+            assert not wt._stream_inbox
+            await _until(lambda: not wt._inbox_done)
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_reader_closed_early_releases_its_inbox():
+    """Closing a reader before FIN releases the inbox; the stream's later
+    data is dropped and its destroy clears the marker."""
+    port = next_port()
+    more = asyncio.Event()
+
+    async def handler(session):
+        sid = await session.create_stream(bidir=False)
+        session.send_stream_data(sid, b"first")
+        await more.wait()
+        session.send_stream_data(sid, b"rest", end_stream=True)
+        async for _ in session.events():
+            pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            async for ev in wt.events():
+                if isinstance(ev, WebTransportNewStream):
+                    sid = ev.stream_id
+                    break
+            reader = wt.receive_stream_data(sid)
+            first = await asyncio.wait_for(reader.__anext__(), 5.0)
+            assert bytes(first.data) == b"first" and not first.end_stream
+            await reader.aclose()
+            assert sid not in wt._stream_inbox and sid in wt._inbox_done
+            more.set()
+            await _until(lambda: sid not in wt._inbox_done)
+            assert sid not in wt._stream_inbox
+    finally:
+        server.close()
+
+
 async def _wait_counter(transport, key, target, timeout=2.0):
     """Wait for a worker counter to reach `target`; return its value."""
     loop = asyncio.get_event_loop()
