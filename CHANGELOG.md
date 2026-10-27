@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `set_datagram_priority(p)` on `QuicConnection` and `WebTransportSession`, and
+  `set_default_datagram_priority(p)`: datagrams' send priority against streams (picoquic default 9).
 - RX: a wake is no longer lost when a late notify lands between the consumer clearing its pending
   flag and reading the wake fd (RX stalled until the safety net); the safety net checks every 25 ms.
 - The Cython extensions compile with `-O3` even when `CFLAGS` is set in the environment.

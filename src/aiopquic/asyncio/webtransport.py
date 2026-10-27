@@ -570,6 +570,22 @@ class WebTransportSession:
             raise ConnectionError("set_stream_priority: session closed")
         return self._state.push_stream_priority(stream_id, priority)
 
+    def set_datagram_priority(self, priority: int) -> int:
+        """Send priority of this session's datagrams against its streams.
+
+        Same scale as stream priority (0 highest, picoquic default 9) and
+        the same rules as QuicConnection.set_datagram_priority(); it sets
+        the priority of the connection the session runs on.
+
+        Returns 0 posted, 1 TX event ring full (nothing applied; retry).
+
+        Raises:
+            ConnectionError: session closed.
+        """
+        if self._state is None or self._session_closed.is_set():
+            raise ConnectionError("set_datagram_priority: session closed")
+        return self._state.push_datagram_priority(priority)
+
     def send_datagram_frame(self, data: bytes) -> int:
         """Queue one WebTransport datagram for the pull-model send path.
 

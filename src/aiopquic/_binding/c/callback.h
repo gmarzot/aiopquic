@@ -431,6 +431,7 @@ typedef struct {
     uint64_t        worker_set_priority_applied;
     uint64_t        worker_set_priority_rejected;
     uint64_t        worker_set_priority_last_err;
+    uint64_t        worker_set_dgram_priority_applied;
     /* TX events discarded because their cnx was freed between push
      * and pop. Covers every event type behind the stale-cnx guard. */
     uint64_t        cnt_tx_event_dropped_dead_cnx;
@@ -1782,6 +1783,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     entry->event_type == SPSC_EVT_TX_WT_SESSION_CLEANUP ||
                     entry->event_type == SPSC_EVT_TX_MARK_WT_DATAGRAM_READY ||
                     entry->event_type == SPSC_EVT_TX_WT_SET_STREAM_PRIORITY ||
+                    entry->event_type == SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY ||
                     entry->event_type == SPSC_EVT_TX_WT_FIN) {
                     (void)aiopquic_wt_handle_tx(quic, ctx, entry);
                     ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
@@ -1869,6 +1871,12 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;
                     }
+                    case SPSC_EVT_TX_SET_DATAGRAM_PRIORITY:
+                        picoquic_set_datagram_priority(cnx, (uint8_t)entry->error_code);
+                        ctx->worker_set_dgram_priority_applied++;
+                        ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
+                        aiopquic_maybe_fire_tx_event_ring_drained(ctx);
+                        break;
                     case SPSC_EVT_TX_CNX_REFRESH: {
                         /* cnx liveness already verified by the outer
                          * aiopquic_cnx_is_alive() guard above. */

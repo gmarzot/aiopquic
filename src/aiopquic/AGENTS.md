@@ -61,7 +61,11 @@ record ring is full: wait on `get_datagram_tx_drain_event()` and resend the same
 
 **Priority.** `set_stream_priority(sid, p)`: 0 highest, 255 lowest, picoquic default 9; the low bit
 picks round robin (even) or FIFO by stream id (odd) among equal priorities. A return of 1 means the
-TX event ring was full and nothing applied.
+TX event ring was full and nothing applied. `set_datagram_priority(p)` (on `QuicConnection` and
+`WebTransportSession`, per connection) places datagrams on the same scale: higher-priority streams go
+first, lower ones only when no datagram waits, equal ones take turns. Defaults:
+`set_default_stream_priority` / `set_default_datagram_priority`, for connections or streams created
+after the call.
 
 **Addresses.** `peer_address()` / `local_address()` on `QuicConnection` and
 `WebTransportSession` return `(host, port)` (IPv4-mapped IPv6 as IPv4), or None before the
