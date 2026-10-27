@@ -57,6 +57,8 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_MARK_WT_DATAGRAM_READY,
     SPSC_EVT_TX_SET_STREAM_PRIORITY,
     SPSC_EVT_TX_WT_SET_STREAM_PRIORITY,
+    SPSC_EVT_TX_SET_DATAGRAM_PRIORITY,
+    SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY,
     SPSC_EVT_DATAGRAM_TX_DRAINED,
     SPSC_EVT_TX_CNX_REFRESH,
     SPSC_EVT_CNX_STACK, SPSC_EVT_CNX_SNAPSHOT,
@@ -96,6 +98,8 @@ cdef extern from "picoquic.h":
         pass
     void picoquic_set_default_priority(picoquic_quic_t* quic,
                                        uint8_t default_stream_priority)
+    void picoquic_set_default_datagram_priority(picoquic_quic_t* quic,
+                                                uint8_t default_datagram_priority)
     ctypedef struct picoquic_cnx_t:
         pass
 
@@ -380,6 +384,7 @@ cdef extern from "c/callback.h":
         uint64_t worker_set_priority_applied
         uint64_t worker_set_priority_rejected
         uint64_t worker_set_priority_last_err
+        uint64_t worker_set_dgram_priority_applied
         uint64_t cnt_tx_event_dropped_dead_cnx
         uint64_t cnt_tx_wrong_direction_dropped
         uint64_t cnt_tx_reattach_after_close
@@ -1449,6 +1454,7 @@ cdef class TransportContext:
             'set_priority_applied': self._ctx.worker_set_priority_applied,
             'set_priority_rejected': self._ctx.worker_set_priority_rejected,
             'set_priority_last_err': self._ctx.worker_set_priority_last_err,
+            'set_dgram_priority_applied': self._ctx.worker_set_dgram_priority_applied,
             'tx_event_dropped_dead_cnx': self._ctx.cnt_tx_event_dropped_dead_cnx,
             'tx_wrong_direction_dropped': self._ctx.cnt_tx_wrong_direction_dropped,
             'tx_reattach_after_close': self._ctx.cnt_tx_reattach_after_close,
@@ -2884,6 +2890,31 @@ cdef class TransportContext:
             raise ConnectionError("quic context not started")
         picoquic_set_default_priority(self._quic, priority)
 
+    def set_datagram_priority(self, uintptr_t cnx_ptr, uint8_t priority):
+        """Datagram send priority against this connection's streams, on
+        the stream scale (0 highest, picoquic default 9). Returns 0 posted,
+        1 TX event ring full (retry)."""
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_SET_DATAGRAM_PRIORITY
+        entry.cnx = <void*>cnx_ptr
+        entry.error_code = priority
+        while spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            if aiopquic_arm_tx_event_ring_drain_pending(self._ctx):
+                return 1
+        self._ctx.cnt_tx_event_ring_pushes += 1
+        if self._thread_ctx is not NULL:
+            if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+                picoquic_wake_up_network_thread(self._thread_ctx)
+        return 0
+
+    def set_default_datagram_priority(self, uint8_t priority):
+        """Datagram priority new connections start at (picoquic default 9).
+        Applies to connections created after the call."""
+        if self._quic is NULL:
+            raise ConnectionError("quic context not started")
+        picoquic_set_default_datagram_priority(self._quic, priority)
+
     def dgram_push(self, uintptr_t db_ptr, bytes data):
         """Commit one datagram record WITHOUT arming a scheduler — the
         WebTransport path arms per control stream, not per connection.
@@ -4041,6 +4072,25 @@ cdef class WebTransportSessionState:
         self._transport.wake_up()
         return 0
 
+    def push_datagram_priority(self, uint8_t priority):
+        """Datagram priority for this session's connection, on the stream
+        scale. Returns 0 posted, 1 TX event ring full (retry)."""
+        cdef spsc_entry_t entry
+        if self._wt is NULL:
+            raise ConnectionError("WT session closed")
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY
+        entry.cnx = <void*>self._wt
+        entry.stream_ctx = <void*>self._wt
+        entry.error_code = priority
+        while spsc_ring_push(
+                self._transport._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            if aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx):
+                return 1
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
+        self._transport.wake_up()
+        return 0
+
     def push_stop_sending(self, uint64_t stream_id, uint64_t error_code):
         cdef spsc_entry_t entry
         memset(&entry, 0, sizeof(entry))
@@ -4079,12 +4129,34 @@ cdef class WebTransportSessionState:
 #   stream_buf_destroy(sb)
 # ---------------------------------------------------------------------------
 
+cdef extern from "c/test_access.h":
+    int aiopquic_test_cnx_datagram_priority(picoquic_cnx_t* cnx)
+    int aiopquic_test_default_datagram_priority(picoquic_quic_t* quic)
+
+
+def _datagram_priority(uintptr_t cnx_ptr):
+    """picoquic's datagram priority for a connection, -1 for none (test only)."""
+    return aiopquic_test_cnx_datagram_priority(<picoquic_cnx_t*>cnx_ptr)
+
+
+def _default_datagram_priority(TransportContext t):
+    """The context's default datagram priority, -1 before start (test only)."""
+    return aiopquic_test_default_datagram_priority(t._quic)
+
+
+def _wt_datagram_priority(WebTransportSessionState st):
+    """Datagram priority of a WT session's connection, -1 for none (test only)."""
+    if st._wt is NULL:
+        return -1
+    return aiopquic_test_cnx_datagram_priority(st._wt.cnx)
+
+
 cdef extern from "c/litmus.h":
     int64_t aiopquic_litmus_run(int kind, uint64_t rounds) nogil
 
 _LITMUS_KINDS = {
     'rx_notify': 0, 'tx_wake': 1, 'rx_event': 2,
-    'tx_drain': 3, 'tx_ring': 4, 'dgram': 5,
+    'tx_drain': 3, 'tx_ring': 4, 'dgram': 5, 'rx_drained': 6,
 }
 
 

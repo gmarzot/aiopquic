@@ -432,6 +432,7 @@ typedef struct {
     uint64_t        worker_set_priority_applied;
     uint64_t        worker_set_priority_rejected;
     uint64_t        worker_set_priority_last_err;
+    uint64_t        worker_set_dgram_priority_applied;
     /* TX events discarded because their cnx was freed between push
      * and pop. Covers every event type behind the stale-cnx guard. */
     uint64_t        cnt_tx_event_dropped_dead_cnx;
@@ -1032,10 +1033,10 @@ static inline void aiopquic_tx_event_ring_drained_final(aiopquic_ctx_t* ctx) {
 /* Signal asyncio that there are RX events.
  * Coalesced: write the wake fd only on the 0→1 transition of
  * rx_notify_pending. The consumer (aiopquic_clear_rx) restores the
- * flag to 0 after it has drained its ring snapshot AND re-armed if
- * the ring is still non-empty, so any push that races against the
- * consumer's drain is guaranteed to wake asyncio at least once.
- * ACQ_REL pairs with the consumer's RELEASE store on the same flag
+ * flag to 0 after draining its ring snapshot and the wake fd, then
+ * re-arms if the ring is still non-empty, so any push that races
+ * against the consumer's drain is guaranteed to wake asyncio at least
+ * once. ACQ_REL pairs with the consumer's exchange on the same flag
  * and ACQUIRE on the ring entries. */
 static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
     if (__atomic_exchange_n(&ctx->rx_notify_pending, 1,
@@ -1064,16 +1065,18 @@ static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
 /* Consumer-side wake-fd clear + re-arm. Caller (drain_rx) MUST have
  * already drained as many ring entries as it intends to consume in
  * this cycle BEFORE calling this. We then:
- *   1. RELEASE-store rx_notify_pending=0 so the NEXT producer push
- *      will write the wake fd (the producer's exchange sees 0→1).
- *   2. Drain the wake-fd counter (Linux: one read; other: read until
+ *   1. Drain the wake-fd counter (Linux: one read; other: read until
  *      EAGAIN).
+ *   2. Exchange rx_notify_pending to 0 so the NEXT producer push will
+ *      write the wake fd (the producer's exchange sees 0→1).
  *   3. Re-arm by writing the wake fd if the ring or the overflow is
  *      still non-empty.
- *      Covers the race where a producer pushed an entry between the
- *      consumer's peek-empty and pending=0, observing pending=1 and
- *      thus skipping its own wake write — without re-arm those
- *      stranded entries would never wake asyncio again. */
+ * Read before clear: a notify that flips the flag after step 2 leaves
+ * its write unread, so the reader runs again. Clearing first would let
+ * step 1 consume such a write after its entry was drained, leaving
+ * pending=1 with no wake to read and every later push skipping its
+ * write. A push that saw pending=1 before step 2 skipped its write;
+ * step 3 finds its entry. */
 /* Events the consumer has taken off the RX ring so far (consumer-owned). */
 static inline uint64_t aiopquic_rx_consumed(aiopquic_ctx_t* ctx) {
     return atomic_load_explicit(&ctx->rx_event_ring->head, memory_order_relaxed);
@@ -1081,10 +1084,6 @@ static inline uint64_t aiopquic_rx_consumed(aiopquic_ctx_t* ctx) {
 
 static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
     spsc_ring_refill_from_overflow(ctx->rx_event_ring, &ctx->rx_overflow);
-    /* Exchange, so the re-check below cannot read the ring before the
-     * clear is visible to aiopquic_notify_rx's exchange. */
-    uint32_t was = __atomic_exchange_n(&ctx->rx_notify_pending, 0,
-                                       __ATOMIC_ACQ_REL);
     uint64_t got = 0;
 #ifdef __linux__
     uint64_t val = 0;
@@ -1098,6 +1097,10 @@ static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
         got += (uint64_t)n;
     }
 #endif
+    /* Exchange, so the re-check below cannot read the ring before the
+     * clear is visible to aiopquic_notify_rx's exchange. */
+    uint32_t was = __atomic_exchange_n(&ctx->rx_notify_pending, 0,
+                                       __ATOMIC_ACQ_REL);
     uint32_t flags = was ? AIOPQUIC_CLEAR_WAS_PENDING : 0;
     ctx->cnt_rx_clears++;
     if (got == 0) {
@@ -1786,6 +1789,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     entry->event_type == SPSC_EVT_TX_WT_SESSION_CLEANUP ||
                     entry->event_type == SPSC_EVT_TX_MARK_WT_DATAGRAM_READY ||
                     entry->event_type == SPSC_EVT_TX_WT_SET_STREAM_PRIORITY ||
+                    entry->event_type == SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY ||
                     entry->event_type == SPSC_EVT_TX_WT_FIN) {
                     (void)aiopquic_wt_handle_tx(quic, ctx, entry);
                     ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
@@ -1873,6 +1877,12 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;
                     }
+                    case SPSC_EVT_TX_SET_DATAGRAM_PRIORITY:
+                        picoquic_set_datagram_priority(cnx, (uint8_t)entry->error_code);
+                        ctx->worker_set_dgram_priority_applied++;
+                        ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
+                        aiopquic_maybe_fire_tx_event_ring_drained(ctx);
+                        break;
                     case SPSC_EVT_TX_CNX_REFRESH: {
                         /* cnx liveness already verified by the outer
                          * aiopquic_cnx_is_alive() guard above. */

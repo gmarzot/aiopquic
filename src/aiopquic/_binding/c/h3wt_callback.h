@@ -1627,6 +1627,16 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         return 1;
     }
 
+    case SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY: {
+        if (!s || !s->cnx) {
+            ctx->cnt_tx_event_dropped_dead_cnx++;
+            return 1;
+        }
+        picoquic_set_datagram_priority(s->cnx, (uint8_t)entry->error_code);
+        ctx->worker_set_dgram_priority_applied++;
+        return 1;
+    }
+
     case SPSC_EVT_TX_WT_STOP_SENDING: {
         if (!s || !s->cnx) return 1;
         if (aiopquic_stream_can_receive(s->cnx, entry->stream_id)) {

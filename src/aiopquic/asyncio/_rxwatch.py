@@ -17,7 +17,7 @@ import weakref
 
 _log = logging.getLogger("aiopquic")
 
-PERIOD = 0.15            # seconds between checks; a stall is drained within 3 periods
+PERIOD = 0.025           # seconds between checks; a stall is drained within 3 periods
 _FULL_REPORTS = 3        # rescues logged with the full report, per transport
 _BRIEF_EVERY = 60.0      # seconds between one-line reports after that
 _COUNTERS = (
