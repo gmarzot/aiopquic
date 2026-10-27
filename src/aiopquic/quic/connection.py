@@ -5,7 +5,6 @@ events into QuicEvent objects that match qh3's event interface.
 """
 
 import asyncio
-import contextlib
 import logging
 import os
 from collections import deque
@@ -966,17 +965,14 @@ class QuicConnection:
                 # Events were cleared BEFORE the call so no lost wakeup.
                 sc_wait = asyncio.create_task(sc_event.wait())
                 ring_wait = asyncio.create_task(ring_event.wait())
-                done, pending = await asyncio.wait(
-                    [sc_wait, ring_wait],
-                    return_when=asyncio.FIRST_COMPLETED)
-                # Cancellation hygiene: await the cancelled task under
-                # suppress so the loop reaps it now instead of leaking
-                # a pending Task until the next scheduler turn (matters
-                # under teardown storms).
-                for t in pending:
-                    t.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await t
+                try:
+                    await asyncio.wait(
+                        [sc_wait, ring_wait],
+                        return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for task in (sc_wait, ring_wait):
+                        task.cancel()
+                    await asyncio.gather(sc_wait, ring_wait, return_exceptions=True)
                 # Re-check close after the wait — the close handler
                 # may have set our events to unpark us cleanly.
                 if self._closed:

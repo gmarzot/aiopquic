@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Cancelling a backpressured `send_stream_data_drained` no longer leaves two waiter tasks behind.
 - `WebTransportSession.max_datagram_payload()`: the connection's datagram ceiling less h3's
   stream-ID prefix. `send_datagram_frame` raises `ValueError` above it; such a payload was accepted,
   never sent, and held back every later datagram on the session.

@@ -25,7 +25,7 @@ import logging
 import os
 import socket
 from collections import deque
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from aiopquic.quic.configuration import QuicConfiguration
@@ -513,16 +513,14 @@ class WebTransportSession:
                 # Events were cleared BEFORE the call so no lost wakeup.
                 sc_wait = asyncio.create_task(sc_event.wait())
                 ring_wait = asyncio.create_task(ring_event.wait())
-                done, pending = await asyncio.wait(
-                    [sc_wait, ring_wait],
-                    return_when=asyncio.FIRST_COMPLETED)
-                # Cancellation hygiene: await the cancelled task under
-                # suppress so the loop reaps it now instead of leaking
-                # a pending Task until the next scheduler turn.
-                for t in pending:
-                    t.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await t
+                try:
+                    await asyncio.wait(
+                        [sc_wait, ring_wait],
+                        return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for task in (sc_wait, ring_wait):
+                        task.cancel()
+                    await asyncio.gather(sc_wait, ring_wait, return_exceptions=True)
                 # Re-check close after the wait — the session-close
                 # handler may have set our events to unpark us cleanly.
                 if self.session_closed:
