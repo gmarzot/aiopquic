@@ -92,9 +92,9 @@ def _keylog_file(configuration: QuicConfiguration | None) -> str | None:
     return os.environ.get("SSLKEYLOGFILE")
 
 
-def _resolve_host(host: str) -> str:
+async def _resolve_host(host: str) -> str:
     from aiopquic.asyncio.client import _resolve_host as resolve
-    return resolve(host)
+    return await resolve(host)
 
 
 def _varint_len(v: int) -> int:
@@ -1163,7 +1163,7 @@ class WebTransportClient(WebTransportSession):
         self._attach_dispatcher()
         self._session_ready = self._loop.create_future()
 
-        addr = _resolve_host(self._host)
+        addr = await _resolve_host(self._host)
         self._state.push_open(addr, self._port, self._path, self._sni,
                               _sf_string_list(self._wt_protocols),
                               self._connect_protocol)

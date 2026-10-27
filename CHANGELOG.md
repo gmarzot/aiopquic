@@ -7,6 +7,7 @@
 - Cancelling a backpressured `send_stream_data_drained` no longer leaves two waiter tasks behind.
 - WebTransport: a stream's inbox is released when its reader returns, not at session close.
 - `send_datagram_frame` raises `ValueError` on an empty payload, which wedged every later datagram.
+- `connect` and `connect_webtransport` resolve host names without blocking the event loop.
 - `WebTransportSession.max_datagram_payload()`: the connection's datagram ceiling less h3's
   stream-ID prefix. `send_datagram_frame` raises `ValueError` above it; such a payload was accepted,
   never sent, and held back every later datagram on the session.

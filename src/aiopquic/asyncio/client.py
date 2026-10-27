@@ -11,15 +11,16 @@ from aiopquic.quic.connection import QuicConnection
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
 
 
-def _resolve_host(host: str, port: int | None = None) -> str:
-    """An IP literal as is; a name resolves to its first IPv4 address,
-    else its first IPv6 one."""
+async def _resolve_host(host: str, port: int | None = None) -> str:
+    """An IP literal as is; a name resolves, without blocking the event
+    loop, to its first IPv4 address, else its first IPv6 one."""
     try:
         ipaddress.ip_address(host)
         return host
     except ValueError:
         pass
-    infos = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
+    infos = await asyncio.get_running_loop().getaddrinfo(
+        host, port, type=socket.SOCK_DGRAM)
     for family in (socket.AF_INET, socket.AF_INET6):
         for info in infos:
             if info[0] == family:
@@ -49,7 +50,7 @@ async def connect(
     if configuration.server_name is None:
         configuration.server_name = host
 
-    addr = _resolve_host(host, port)
+    addr = await _resolve_host(host, port)
 
     quic = QuicConnection(configuration=configuration)
     quic._start_transport(port=local_port)

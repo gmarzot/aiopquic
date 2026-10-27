@@ -378,3 +378,23 @@ async def test_write_larger_than_the_stream_ring_raises():
             client._quic.send_stream_data(sid, b"y" * 1024, end_stream=True)
     finally:
         server.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_host_runs_off_the_loop_thread(monkeypatch):
+    """A name resolves in the loop's executor; an IP literal not at all."""
+    import socket
+    import threading
+    from aiopquic.asyncio.client import _resolve_host
+    threads = []
+    real = socket.getaddrinfo
+
+    def recording(*args, **kwargs):
+        threads.append(threading.current_thread())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", recording)
+    assert await _resolve_host("127.0.0.1") == "127.0.0.1"
+    assert threads == []
+    assert await _resolve_host("localhost", 4433) in ("127.0.0.1", "::1")
+    assert threads and threading.main_thread() not in threads
