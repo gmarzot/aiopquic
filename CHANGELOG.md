@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- picoquic, Linux: the packet loop sleeps with `ppoll()` until the next paced send instead of spinning
+  on non-blocking receives when it is under 1 ms away.
 - The Cython extensions compile with `-O3` even when `CFLAGS` is set in the environment.
 - The default congestion control is `"bbr"` (v3), was `"bbr1"`.
 - RX: a reader that misses its wake is drained within 0.45 s and logged with the wake-protocol
