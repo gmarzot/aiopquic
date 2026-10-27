@@ -58,6 +58,9 @@ name (`"BBR1"` among them) raises `ValueError` from `QuicConfiguration` and at t
 
 **Datagrams** are on by default. `send_datagram_frame(data)` returns `len(data)`, or 0 when the
 record ring is full: wait on `get_datagram_tx_drain_event()` and resend the same payload.
+`max_datagram_payload()` is the largest payload one datagram carries (0 = not negotiated). On
+`WebTransportSession` it is the connection's less the session's stream-ID prefix (1 byte while the
+session's stream ID is under 256), and `send_datagram_frame` raises `ValueError` above it.
 
 **Priority.** `set_stream_priority(sid, p)`: 0 highest, 255 lowest, picoquic default 9; the low bit
 picks round robin (even) or FIFO by stream id (odd) among equal priorities. A return of 1 means the
