@@ -178,6 +178,7 @@ static inline int aiopquic_fc_raw_enabled(void) {
 
 #ifdef __linux__
 #include <sys/eventfd.h>
+#include <sys/prctl.h>
 #endif
 
 /*
@@ -1669,6 +1670,11 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
     switch (cb_mode) {
         case picoquic_packet_loop_ready:
             ctx->quic = quic;
+#ifdef __linux__
+            /* The loop sleeps in ppoll() until the next paced send, often
+             * tens of µs away; the default 50 µs timer slack overshoots it. */
+            (void)prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);
+#endif
             {
                 spsc_entry_t ready = {0};
                 ready.event_type = SPSC_EVT_READY;

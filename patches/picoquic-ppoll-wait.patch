@@ -1,5 +1,5 @@
 diff --git a/picoquic/sockloop.c b/picoquic/sockloop.c
-index 35c925f2..a2a3498a 100644
+index 35c925f2..c2929428 100644
 --- a/picoquic/sockloop.c
 +++ b/picoquic/sockloop.c
 @@ -2175,7 +2175,17 @@ int picoquic_packet_loop_poll(
@@ -20,22 +20,7 @@ index 35c925f2..a2a3498a 100644
  
      if (received_ecn != NULL) {
          *received_ecn = 0;
-@@ -2916,6 +2926,14 @@ void* picoquic_packet_loop_v3(void* v_ctx)
-     picoquic_packet_loop_cb_fn loop_callback = thread_ctx->loop_callback;
-     void* loop_callback_ctx = thread_ctx->loop_callback_ctx;
-     int ret = 0;
-+#if defined(__linux__)
-+    {
-+        const char* slack_ns = getenv("AIOPQUIC_TIMERSLACK_NS");
-+        if (slack_ns != NULL) {
-+            (void)prctl(PR_SET_TIMERSLACK, (unsigned long)atol(slack_ns), 0, 0, 0);
-+        }
-+    }
-+#endif
-     uint64_t current_time = picoquic_get_quic_time(quic);
-     int64_t delay_max = 10000000;
-     struct sockaddr_storage addr_from;
-@@ -3142,12 +3160,22 @@ void* picoquic_packet_loop_v3(void* v_ctx)
+@@ -3142,12 +3152,18 @@ void* picoquic_packet_loop_v3(void* v_ctx)
              &addr_from, &addr_to, &if_index_to, &received_ecn,
              &received_buffer, &action, &socket_rank);
  #elif defined(PICOQUIC_WITH_POLL)
@@ -52,11 +37,7 @@ index 35c925f2..a2a3498a 100644
 +         * does. Skipping for a later send spins until it is due. QMux still
 +         * needs poll for TCP events. */
 +#if defined(__linux__)
-+        static int64_t poll_min_delta = -1;
-+        if (poll_min_delta < 0) {
-+            const char* spin_us = getenv("AIOPQUIC_SPIN_US");
-+            poll_min_delta = (spin_us != NULL) ? atoll(spin_us) : 1;
-+        }
++        const int64_t poll_min_delta = 1;
 +#else
 +        const int64_t poll_min_delta = 1000;
 +#endif
