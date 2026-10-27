@@ -1,0 +1,47 @@
+diff --git a/picoquic/sockloop.c b/picoquic/sockloop.c
+index 35c925f2..c2929428 100644
+--- a/picoquic/sockloop.c
++++ b/picoquic/sockloop.c
+@@ -2175,7 +2175,17 @@ int picoquic_packet_loop_poll(
+ 
+     picoquic_packet_loop_set_fds(poll_list, poll_list_size, s_ctx, nb_sockets, sqmux_ctx, nb_qmux_sockets,
+         thread_ctx, current_time);
++#if defined(__linux__)
++    /* ppoll() waits in microseconds instead of the rounded milliseconds. */
++    struct timespec poll_ts = { 0, 0 };
++    if (delta_t > 0) {
++        poll_ts.tv_sec = (time_t)(delta_t / 1000000);
++        poll_ts.tv_nsec = (long)(delta_t % 1000000) * 1000;
++    }
++    ret_poll = ppoll(poll_list, poll_max, (delta_t_ms < 0) ? NULL : &poll_ts, NULL);
++#else
+     ret_poll = poll(poll_list, poll_max, delta_t_ms);
++#endif
+ 
+     if (received_ecn != NULL) {
+         *received_ecn = 0;
+@@ -3142,12 +3152,18 @@ void* picoquic_packet_loop_v3(void* v_ctx)
+             &addr_from, &addr_to, &if_index_to, &received_ecn,
+             &received_buffer, &action, &socket_rank);
+ #elif defined(PICOQUIC_WITH_POLL)
+-        /* poll() is millisecond resolution. If picoquic already has send-ready
+-         * streams (delta_t < 1ms), skip it and try a nonblocking recv so ACKs
+-         * still land while we keep sending. select() does not need this shortcut:
+-         * its timeout is a timeval in microseconds, so a sub-millisecond delta_t
+-         * is already exact. QMux still needs poll for TCP events. */
+-        if (delta_t < 1000 && nb_qmux_sockets == 0) {
++        /* When a send is due sooner than the wait can resolve, skip the wait
++         * and try a nonblocking recv so ACKs still land while we keep sending.
++         * Linux waits with ppoll() in microseconds, so only "due now" skips it;
++         * poll() elsewhere is millisecond resolution, so anything under 1 ms
++         * does. Skipping for a later send spins until it is due. QMux still
++         * needs poll for TCP events. */
++#if defined(__linux__)
++        const int64_t poll_min_delta = 1;
++#else
++        const int64_t poll_min_delta = 1000;
++#endif
++        if (delta_t < poll_min_delta && nb_qmux_sockets == 0) {
+             bytes_recv = picoquic_packet_loop_try_recv(
+                 s_ctx, nb_sockets_available,
+                 &addr_from, &addr_to, &if_index_to, &received_ecn,
