@@ -4084,7 +4084,7 @@ cdef extern from "c/litmus.h":
 
 _LITMUS_KINDS = {
     'rx_notify': 0, 'tx_wake': 1, 'rx_event': 2,
-    'tx_drain': 3, 'tx_ring': 4, 'dgram': 5,
+    'tx_drain': 3, 'tx_ring': 4, 'dgram': 5, 'rx_drained': 6,
 }
 
 
