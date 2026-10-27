@@ -20,6 +20,7 @@ enum {
     AIOPQUIC_LITMUS_TX_DRAIN = 3,    /* send_data arm vs worker take */
     AIOPQUIC_LITMUS_TX_RING = 4,     /* TX event ring arm vs worker drain */
     AIOPQUIC_LITMUS_DGRAM = 5,       /* datagram push arm vs worker take */
+    AIOPQUIC_LITMUS_RX_DRAINED = 6,  /* late notify_rx for a drained entry vs clear_rx */
 };
 
 typedef struct {
@@ -140,6 +141,20 @@ static inline void aiopquic_litmus_setup(aiopquic_litmus_t* L) {
         aiopquic_litmus_dgram_fill(L->db);
         atomic_store(&L->db->drain_pending, 0);
         break;
+    case AIOPQUIC_LITMUS_RX_DRAINED: {
+        /* An earlier notify flipped pending and wrote the wake fd. */
+        aiopquic_litmus_ring_clear(ctx->rx_event_ring);
+        (void)aiopquic_litmus_fd_readable(ctx);
+        __atomic_store_n(&ctx->rx_notify_pending, 1, __ATOMIC_SEQ_CST);
+#ifdef __linux__
+        uint64_t one = 1;
+        (void)!write(ctx->wake_write_fd, &one, sizeof(one));
+#else
+        uint8_t b = 1;
+        (void)!write(ctx->wake_write_fd, &b, 1);
+#endif
+        break;
+    }
     }
 }
 
@@ -178,6 +193,17 @@ static inline void aiopquic_litmus_produce(aiopquic_litmus_t* L) {
     case AIOPQUIC_LITMUS_DGRAM: {
         uint8_t b[8] = {0};
         L->waits = aiopquic_dgram_buf_push_record(L->db, b, sizeof(b)) == 0;
+        break;
+    }
+    case AIOPQUIC_LITMUS_RX_DRAINED: {
+        /* Push and notify are separate steps: the consumer can drain the
+         * entry before its notify runs. The delay spans clear_rx. */
+        static uint32_t seed = 0x6a09e667u;
+        e.event_type = SPSC_EVT_READY;
+        (void)spsc_ring_push(ctx->rx_event_ring, &e, NULL, 0);
+        uint32_t n = aiopquic_litmus_rand(&seed) & 2047;
+        for (volatile uint32_t i = 0; i < n; i++) { }
+        aiopquic_notify_rx(ctx);
         break;
     }
     }
@@ -224,6 +250,11 @@ static inline int aiopquic_litmus_consume(aiopquic_litmus_t* L) {
         }
         return 0x20 | aiopquic_dgram_buf_drain_take(L->db);
     }
+    case AIOPQUIC_LITMUS_RX_DRAINED:
+        while (spsc_ring_peek(ctx->rx_event_ring) == NULL) { }
+        spsc_ring_pop(ctx->rx_event_ring);
+        aiopquic_clear_rx(ctx);
+        return 0;
     }
     return 0;
 }
@@ -242,6 +273,11 @@ static inline int aiopquic_litmus_check(aiopquic_litmus_t* L, int c) {
     case AIOPQUIC_LITMUS_TX_DRAIN:
     case AIOPQUIC_LITMUS_DGRAM:
         return L->waits && !(c & 1);
+    case AIOPQUIC_LITMUS_RX_DRAINED: {
+        /* pending=1 with no wake to read: every later push skips its write. */
+        int pending = __atomic_load_n(&ctx->rx_notify_pending, __ATOMIC_SEQ_CST);
+        return pending && !aiopquic_litmus_fd_readable(ctx);
+    }
     case AIOPQUIC_LITMUS_TX_RING: {
         int fired = 0;
         spsc_entry_t* e;
