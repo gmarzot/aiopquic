@@ -988,14 +988,17 @@ class QuicConnection:
         committed).
 
         Raises:
-            ValueError: payload exceeds datagram_max_payload. A QUIC
-                DATAGRAM frame cannot be fragmented, so an oversize
-                record could never be sent — permanent, do not retry.
+            ValueError: payload is empty or exceeds
+                datagram_max_payload. The send ring cannot carry an
+                empty record, and a QUIC DATAGRAM frame cannot be
+                fragmented — permanent, do not retry.
             ConnectionError: connection not ready or already closed.
         """
         if self._closed or self._cnx_ptr == 0:
             raise ConnectionError(
                 "send_datagram_frame: connection not ready or closed")
+        if not data:
+            raise ValueError("send_datagram_frame: empty payload")
         if self._dgram_ring == 0:
             cfg = self._configuration
             self._dgram_ring = self._transport.dgram_ring_create(

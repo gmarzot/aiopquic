@@ -175,6 +175,37 @@ class TestAsyncConnect:
             srv_quic.stop()
 
     @pytest.mark.asyncio
+    async def test_empty_datagram_is_refused(self):
+        """An empty datagram raises instead of wedging the record ring;
+        the next one still arrives."""
+        port = next_port()
+        got: asyncio.Queue = asyncio.Queue()
+
+        class ServerProtocol(QuicConnectionProtocol):
+            def quic_event_received(self, event):
+                if isinstance(event, DatagramFrameReceived):
+                    got.put_nowait(bytes(event.data))
+
+        srv_cfg = server_config(port, max_datagram_frame_size=1200)
+        srv_quic = QuicConnection(configuration=srv_cfg)
+        srv_quic._start_transport(port=port)
+        srv_protocol = ServerProtocol(srv_quic)
+        srv_protocol._start(asyncio.get_event_loop())
+
+        try:
+            async with connect(
+                "127.0.0.1", port,
+                configuration=client_config(max_datagram_frame_size=1200),
+            ) as client:
+                with pytest.raises(ValueError):
+                    client._quic.send_datagram_frame(b"")
+                assert client._quic.send_datagram_frame(b"after") == 5
+                assert await asyncio.wait_for(got.get(), 5.0) == b"after"
+        finally:
+            srv_protocol._stop()
+            srv_quic.stop()
+
+    @pytest.mark.asyncio
     async def test_stop_after_vanished_peer_releases_queued_tx(self):
         """stop() after an aclose() that timed out on a vanished peer frees
         the remaining stream contexts: the process-wide queued TX total

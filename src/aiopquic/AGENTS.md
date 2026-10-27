@@ -59,7 +59,8 @@ CA: `QuicConfiguration.cafile` or `connect_webtransport(ca_file=)`. Accept anyth
 name (`"BBR1"` among them) raises `ValueError` from `QuicConfiguration` and at transport start.
 
 **Datagrams** are on by default. `send_datagram_frame(data)` returns `len(data)`, or 0 when the
-record ring is full: wait on `get_datagram_tx_drain_event()` and resend the same payload.
+record ring is full: wait on `get_datagram_tx_drain_event()` and resend the same payload. An empty
+payload raises `ValueError`.
 `max_datagram_payload()` is the largest payload one datagram carries (0 = not negotiated). On
 `WebTransportSession` it is the connection's less the session's stream-ID prefix (1 byte while the
 session's stream ID is under 256), and `send_datagram_frame` raises `ValueError` above it.

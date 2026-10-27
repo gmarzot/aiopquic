@@ -512,6 +512,32 @@ async def test_wt_reader_closed_early_releases_its_inbox():
         server.close()
 
 
+@pytest.mark.asyncio
+async def test_wt_empty_datagram_is_refused():
+    """An empty datagram raises instead of wedging the record ring; the
+    next one still arrives."""
+    from aiopquic.quic.events import WebTransportDatagramReceived
+    port = next_port()
+    got: asyncio.Queue = asyncio.Queue()
+
+    async def handler(session):
+        async for ev in session.events():
+            if isinstance(ev, WebTransportDatagramReceived):
+                await got.put(bytes(ev.data))
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            with pytest.raises(ValueError):
+                wt.send_datagram_frame(b"")
+            assert wt.send_datagram_frame(b"after") == 5
+            assert await asyncio.wait_for(got.get(), timeout=5.0) == b"after"
+    finally:
+        server.close()
+
+
 async def _wait_counter(transport, key, target, timeout=2.0):
     """Wait for a worker counter to reach `target`; return its value."""
     loop = asyncio.get_event_loop()

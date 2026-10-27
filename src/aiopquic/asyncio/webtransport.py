@@ -684,13 +684,15 @@ class WebTransportSession:
         the SAME payload.
 
         Raises:
-            ValueError: payload exceeds max_datagram_payload(), or
-                datagrams were not negotiated; a datagram cannot be
-                fragmented, so this can never drain.
+            ValueError: payload is empty or exceeds
+                max_datagram_payload(), or datagrams were not
+                negotiated; such a record could never drain.
             ConnectionError: session closed.
         """
         if self._state is None or self._session_closed.is_set():
             raise ConnectionError("send_datagram_frame: session closed")
+        if not data:
+            raise ValueError("send_datagram_frame: empty payload")
         if self._dgram_ring == 0:
             # Records cap at the framed ceiling, so every one fits a
             # fresh packet with its stream-ID prefix.
