@@ -369,7 +369,7 @@ cdef extern from "c/callback.h":
         uint64_t cnt_rx_rearms
         aiopquic_wake_trace_t worker_trace
         aiopquic_wake_trace_t asyncio_trace
-        uint32_t tx_wake_pending
+        uint32_t tx_worker_idle
         uint32_t tx_event_ring_drain_pending
         uint32_t tx_event_ring_low_water
         # Observability counters (added without behavior change).
@@ -416,7 +416,7 @@ cdef extern from "c/callback.h":
                                  uint32_t a, uint64_t b)
     uint64_t aiopquic_wake_trace_next(aiopquic_wake_trace_t* t)
     void aiopquic_notify_rx(aiopquic_ctx_t* ctx)
-    int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx)
+    int aiopquic_tx_wake_needed(aiopquic_ctx_t* ctx)
     int aiopquic_arm_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx)
     void aiopquic_clear_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx)
     void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx, void* cnx,
@@ -1481,7 +1481,7 @@ cdef class TransportContext:
             'tx_event_ring_count_now': spsc_ring_count(self._ctx.tx_event_ring),
             'rx_event_ring_count_now': spsc_ring_count(self._ctx.rx_event_ring),
             'tx_event_ring_drain_pending_now': self._ctx.tx_event_ring_drain_pending,
-            'tx_wake_pending_now': self._ctx.tx_wake_pending,
+            'tx_worker_idle_now': self._ctx.tx_worker_idle,
             # RX flow-control observability (added 2026-05-25)
             'fc_credit_pushed': self._ctx.cnt_fc_credit_pushed,
             'fc_credit_handled': self._ctx.cnt_fc_credit_handled,
@@ -1805,7 +1805,7 @@ cdef class TransportContext:
             return
         self._refresh_posted.add(cnx_ptr)
         self._ctx.cnt_tx_event_ring_pushes += 1
-        if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+        if aiopquic_tx_wake_needed(self._ctx):
             picoquic_wake_up_network_thread(self._thread_ctx)
 
     cdef object _snapshot(self, uintptr_t cnx_ptr, bint refresh):
@@ -2724,15 +2724,10 @@ cdef class TransportContext:
             self._send_busy_event_ring += 1
             return 1
 
-        # Coalesce the wake_up syscall: only invoke
-        # picoquic_wake_up_network_thread on the 0→1 transition of
-        # tx_wake_pending. The worker clears the flag back to 0 on
-        # entry to its wake handler (BEFORE draining the tx ring), so
-        # any push that races against the worker drain is guaranteed
-        # to either land in the ring before the drain loop's next peek
-        # OR cause a fresh wake.
+        # Wake only an idle worker; a running one drains the ring
+        # before it waits.
         if self._thread_ctx is not NULL:
-            if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+            if aiopquic_tx_wake_needed(self._ctx):
                 picoquic_wake_up_network_thread(self._thread_ctx)
 
         return 0
@@ -2838,7 +2833,7 @@ cdef class TransportContext:
                 return 1
         self._ctx.cnt_tx_event_ring_pushes += 1
         if self._thread_ctx is not NULL:
-            if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+            if aiopquic_tx_wake_needed(self._ctx):
                 picoquic_wake_up_network_thread(self._thread_ctx)
         return 0
 
@@ -2882,7 +2877,7 @@ cdef class TransportContext:
                 return 1
         self._ctx.cnt_tx_event_ring_pushes += 1
         if self._thread_ctx is not NULL:
-            if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+            if aiopquic_tx_wake_needed(self._ctx):
                 picoquic_wake_up_network_thread(self._thread_ctx)
         return 0
 
@@ -2907,7 +2902,7 @@ cdef class TransportContext:
                 return 1
         self._ctx.cnt_tx_event_ring_pushes += 1
         if self._thread_ctx is not NULL:
-            if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+            if aiopquic_tx_wake_needed(self._ctx):
                 picoquic_wake_up_network_thread(self._thread_ctx)
         return 0
 
@@ -3589,11 +3584,14 @@ cdef class TransportContext:
     def wake_up(self):
         """Signal the network thread to process TX ring entries.
 
+        Writes the wake only when the thread may be asleep: a running
+        thread drains the ring before it waits.
+
         No-op when the network thread is stopped — teardown is a normal
         state for unsynchronized push_* callers (e.g. subgroup-task
         cancel handlers firing after the transport has shut down).
         """
-        if self._thread_ctx is NULL:
+        if self._thread_ctx is NULL or not aiopquic_tx_wake_needed(self._ctx):
             return
         cdef int ret = picoquic_wake_up_network_thread(self._thread_ctx)
         if ret != 0:

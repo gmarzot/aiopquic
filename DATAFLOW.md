@@ -26,10 +26,12 @@ eventfd:
 
 Worker→asyncio wakeups go through one eventfd
 (`loop.add_reader`); asyncio→worker through
-`picoquic_wake_up_network_thread`. Both directions coalesce:
-`tx_wake_pending` dedupes producer wakes (raw-QUIC sends and the FC
-push path; **WT sends wake unconditionally** — `push_stream_data`, `_transport.pyx`),
-and `rx_notify_pending` dedupes eventfd writes (`aiopquic_notify_rx`, `callback.h`).
+`picoquic_wake_up_network_thread`. Both directions coalesce.
+A TX push wakes the worker only if it is idle (`tx_worker_idle`,
+`aiopquic_tx_wake_needed`): before a wait that can block, the worker marks
+itself idle in picoquic's `time_check` callback, re-checks the TX ring, and
+drains what was pushed while it ran. Raw QUIC and WT share this path.
+`rx_notify_pending` dedupes eventfd writes (`aiopquic_notify_rx`, `callback.h`).
 
 WebTransport shares everything above: `wt_session->bridge` *is* the
 transport's `aiopquic_ctx_t` — same event rings, same eventfd
@@ -72,7 +74,7 @@ sequenceDiagram
     CY->>CY: pre-check tx_event_ring slot
     CY->>SCTX: commit bytes (all-or-nothing)
     CY->>TXR: TX_MARK_ACTIVE
-    CY->>WK: wake (raw path coalesced via tx_wake_pending)
+    CY->>WK: wake, only if the worker is idle
     API-->>App: return (no copy retained)
 
     Note over WK,NIC: worker pull, wire pace
@@ -286,7 +288,7 @@ Counter signature: `*_arms = 0`, `rx_event_drops = 0`,
 | Stream creation | lazy — sc created on first write; one `sleep(0)` yield per new stream | explicit worker round-trip (`create_stream` awaits WT_STREAM_CREATED) — naturally suspending |
 | sc ownership (Python) | `_stream_ctxs` — Python owns, frees at close | `_stream_tx_ctxs` — borrowed; C link owns lifetime |
 | Destroy | `stream_released` → STREAM_DESTROY event | WT_STREAM_DESTROY then LINK_RELEASE (FIFO-ordered; drain frees the link internally) |
-| Send wake | coalesced | unconditional |
+| Send wake | only to an idle worker | same |
 | Aggregate gate site | `send_stream_data_drained` new-stream branch | `create_stream` |
 | Event rings | shared per transport | same rings (`bridge` == the transport ctx) |
 

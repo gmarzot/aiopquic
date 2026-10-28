@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- A send wakes the network thread only when it may be asleep: raw QUIC and WebTransport no longer
+  make a wake syscall per write while the thread runs (WT made one on every write).
+
 ## v0.7.0rc2
 
 - Dev builds after a pre-release tag report the next pre-release's dev version (`0.7.0rc3.devN`
