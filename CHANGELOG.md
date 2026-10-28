@@ -4,6 +4,8 @@
 
 - A send wakes the network thread only when it may be asleep: raw QUIC and WebTransport no longer
   make a wake syscall per write while the thread runs (WT made one on every write).
+- `TransportContext.set_max_connections(n)` lowers the connection limit while the server runs; new
+  connections past it are refused at once with CONNECTION_REFUSED, existing ones are kept.
 
 ## v0.7.0rc2
 

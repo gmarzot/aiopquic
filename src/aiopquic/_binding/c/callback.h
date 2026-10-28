@@ -1927,6 +1927,14 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     continue;
                 }
 
+                if (entry->event_type == SPSC_EVT_TX_SET_MAX_CONNECTIONS) {
+                    (void)picoquic_adjust_max_connections(
+                        quic, (uint32_t)entry->error_code);
+                    ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
+                    aiopquic_maybe_fire_tx_event_ring_drained(ctx);
+                    continue;
+                }
+
                 /* Ahead of the stale-cnx guard: the ring is released
                  * whether or not its cnx lives; cnx is only a table key. */
                 if (entry->event_type == SPSC_EVT_TX_DGRAM_RING_RELEASE) {

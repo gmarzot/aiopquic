@@ -59,6 +59,7 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_WT_SET_STREAM_PRIORITY,
     SPSC_EVT_TX_SET_DATAGRAM_PRIORITY,
     SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY,
+    SPSC_EVT_TX_SET_MAX_CONNECTIONS,
     SPSC_EVT_DATAGRAM_TX_DRAINED,
     SPSC_EVT_TX_CNX_REFRESH,
     SPSC_EVT_CNX_STACK, SPSC_EVT_CNX_SNAPSHOT,
@@ -1246,6 +1247,7 @@ cdef class TransportContext:
     cdef picoquic_network_thread_ctx_t* _thread_ctx
     cdef picoquic_packet_loop_param_t _param
     cdef bint _started
+    cdef uint32_t _max_connections
     # WT server-mode storage; must persist for picoquic's lifetime.
     cdef bytes _wt_path_bytes
     # Server WT subprotocol allowlist (CSV). Held here so the borrowed
@@ -2888,6 +2890,28 @@ cdef class TransportContext:
             raise ConnectionError("quic context not started")
         picoquic_set_default_priority(self._quic, priority)
 
+    def set_max_connections(self, uint32_t n):
+        """Refuse new connections while the context holds n or more; n is
+        at most start()'s max_connections, and 0 refuses all. A refused
+        client gets CONNECTION_REFUSED at once; existing connections are
+        kept. Returns 0 posted, 1 TX event ring full (retry)."""
+        cdef spsc_entry_t entry
+        if self._thread_ctx is NULL:
+            raise ConnectionError("network thread not running")
+        if n > self._max_connections:
+            raise ValueError(
+                f"{n} is above start()'s max_connections {self._max_connections}")
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_SET_MAX_CONNECTIONS
+        entry.error_code = n
+        while spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            if aiopquic_arm_tx_event_ring_drain_pending(self._ctx):
+                return 1
+        self._ctx.cnt_tx_event_ring_pushes += 1
+        if aiopquic_tx_wake_needed(self._ctx):
+            picoquic_wake_up_network_thread(self._thread_ctx)
+        return 0
+
     def set_datagram_priority(self, uintptr_t cnx_ptr, uint8_t priority):
         """Datagram send priority against this connection's streams, on
         the stream scale (0 highest, picoquic default 9). Returns 0 posted,
@@ -3538,6 +3562,7 @@ cdef class TransportContext:
         # — a type mismatch here is a silent UAF-class corruption.
         self._ctx.thread_ctx = self._thread_ctx
 
+        self._max_connections = max_connections if max_connections > 0 else 1  # picoquic's floor
         self._started = True
 
     def stop(self, double drain_timeout=0.05):
