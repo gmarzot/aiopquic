@@ -5,7 +5,6 @@ events into QuicEvent objects that match qh3's event interface.
 """
 
 import asyncio
-import contextlib
 import logging
 import os
 from collections import deque
@@ -975,17 +974,14 @@ class QuicConnection:
                 # Events were cleared BEFORE the call so no lost wakeup.
                 sc_wait = asyncio.create_task(sc_event.wait())
                 ring_wait = asyncio.create_task(ring_event.wait())
-                done, pending = await asyncio.wait(
-                    [sc_wait, ring_wait],
-                    return_when=asyncio.FIRST_COMPLETED)
-                # Cancellation hygiene: await the cancelled task under
-                # suppress so the loop reaps it now instead of leaking
-                # a pending Task until the next scheduler turn (matters
-                # under teardown storms).
-                for t in pending:
-                    t.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await t
+                try:
+                    await asyncio.wait(
+                        [sc_wait, ring_wait],
+                        return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for task in (sc_wait, ring_wait):
+                        task.cancel()
+                    await asyncio.gather(sc_wait, ring_wait, return_exceptions=True)
                 # Re-check close after the wait — the close handler
                 # may have set our events to unpark us cleanly.
                 if self._closed:
@@ -1001,14 +997,17 @@ class QuicConnection:
         committed).
 
         Raises:
-            ValueError: payload exceeds datagram_max_payload. A QUIC
-                DATAGRAM frame cannot be fragmented, so an oversize
-                record could never be sent — permanent, do not retry.
+            ValueError: payload is empty or exceeds
+                datagram_max_payload. The send ring cannot carry an
+                empty record, and a QUIC DATAGRAM frame cannot be
+                fragmented — permanent, do not retry.
             ConnectionError: connection not ready or already closed.
         """
         if self._closed or self._cnx_ptr == 0:
             raise ConnectionError(
                 "send_datagram_frame: connection not ready or closed")
+        if not data:
+            raise ValueError("send_datagram_frame: empty payload")
         if self._dgram_ring == 0:
             cfg = self._configuration
             self._dgram_ring = self._transport.dgram_ring_create(

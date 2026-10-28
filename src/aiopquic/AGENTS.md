@@ -24,6 +24,8 @@ the `KEX_*` ids and `counters`; everything else there, and raw pointers, are tes
   `QuicConnectionProtocol` and overrides `quic_event_received`.
 - WebTransport: `async with connect_webtransport(host, port, path, sni=..., configuration=cfg) as
   wt:`, then `create_stream()`, `send_stream_data()`, `receive_stream_data(sid)`, `events()`.
+  Once `receive_stream_data(sid)` has yielded a stream's FIN or reset, the stream's inbox is freed
+  and a later call returns at once; a reader closed earlier can be resumed by calling it again.
   `serve_webtransport(host, port, path, handler=h, cert_file=..., key_file=..., configuration=cfg)`
   calls `h(session)` per CONNECT. `WebTransportError` is a `ConnectionError`. The CONNECT sends
   `:protocol webtransport`, then `webtransport-h3` once on the same connection if a server that
@@ -57,7 +59,8 @@ CA: `QuicConfiguration.cafile` or `connect_webtransport(ca_file=)`. Accept anyth
 name (`"BBR1"` among them) raises `ValueError` from `QuicConfiguration` and at transport start.
 
 **Datagrams** are on by default. `send_datagram_frame(data)` returns `len(data)`, or 0 when the
-record ring is full: wait on `get_datagram_tx_drain_event()` and resend the same payload.
+record ring is full: wait on `get_datagram_tx_drain_event()` and resend the same payload. An empty
+payload raises `ValueError`.
 `max_datagram_payload()` is the largest payload one datagram carries (0 = not negotiated). On
 `WebTransportSession` it is the connection's less the session's stream-ID prefix (1 byte while the
 session's stream ID is under 256), and `send_datagram_frame` raises `ValueError` above it.

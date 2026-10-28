@@ -1485,7 +1485,12 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
     }
 
     case SPSC_EVT_TX_WT_CREATE_STREAM: {
-        if (!s || !s->cnx || !s->h3_ctx) return 1;
+        if (!s) return 1;
+        if (!s->cnx || !s->h3_ctx) {
+            /* Python pairs replies with requests in order: always reply. */
+            aiopquic_wt_push_stream_created(s, 0, NULL, 1);
+            return 1;
+        }
         int is_bidir = entry->is_fin;
         h3zero_stream_ctx_t* new_stream = picowt_create_local_stream(
             s->cnx, is_bidir, s->h3_ctx, s->control_stream_id);
