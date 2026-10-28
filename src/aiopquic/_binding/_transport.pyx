@@ -381,6 +381,7 @@ cdef extern from "c/callback.h":
         uint64_t cnt_tx_event_ring_fire_dropped
         uint64_t cnt_wake_calls
         uint64_t cnt_wake_skipped_coalesced
+        uint64_t cnt_tx_wake_lost
         uint64_t cnt_prepare_to_send_empty
         uint64_t cnt_loop_cb
         uint64_t worker_set_priority_applied
@@ -1450,6 +1451,7 @@ cdef class TransportContext:
             'tx_event_ring_fire_dropped': self._ctx.cnt_tx_event_ring_fire_dropped,
             'wake_calls': self._ctx.cnt_wake_calls,
             'wake_skipped_coalesced': self._ctx.cnt_wake_skipped_coalesced,
+            'tx_wake_lost': self._ctx.cnt_tx_wake_lost,
             'prepare_to_send_calls': self._ctx.worker_prepare_to_send_calls,
             'prepare_to_send_pulled_bytes': self._ctx.worker_prepare_to_send_pulled_bytes,
             'prepare_to_send_empty': self._ctx.cnt_prepare_to_send_empty,
@@ -3621,6 +3623,15 @@ cdef class TransportContext:
         cdef int ret = picoquic_wake_up_network_thread(self._thread_ctx)
         if ret != 0:
             raise RuntimeError(f"Failed to wake network thread (ret={ret})")
+
+    def _tx_push_unwoken(self):
+        """Queue a no-op TX event and skip the wake: a lost wake (test only)."""
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_SET_STREAM_PRIORITY
+        if spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            raise BufferError("TX event ring full")
+        self._ctx.cnt_tx_event_ring_pushes += 1
 
     def create_client_connection(self, str host, int port,
                                   str sni=None, str alpn=None,

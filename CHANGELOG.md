@@ -6,6 +6,8 @@
   make a wake syscall per write while the thread runs (WT made one on every write).
 - `TransportContext.set_max_connections(n)` lowers the connection limit while the server runs; new
   connections past it are refused at once with CONNECTION_REFUSED, existing ones are kept.
+- `counters["tx_wake_lost"]` counts TX events found queued after a sleep no producer woke; it stays 0
+  unless a wake was lost.
 
 ## v0.7.0rc2
 

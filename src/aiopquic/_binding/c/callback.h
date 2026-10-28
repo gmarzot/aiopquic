@@ -82,6 +82,11 @@
  * while investigating control-stream delivery regression.) */
 #define AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT 50
 
+/* A worker that planned and slept a wait at least this long, then wakes
+ * on its own and finds TX entries queued, counts a lost wake. A shorter
+ * sleep can end between a producer's push and its wake check. */
+#define AIOPQUIC_TX_WAKE_LOST_US 50000
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdatomic.h>
@@ -455,6 +460,8 @@ typedef struct {
     /* Resets waiting for their reliable bytes to be sent (worker only). */
     struct aiopquic_deferred_reset* deferred_resets;
     uint64_t        deferred_resets_swept;  /* last liveness sweep, us */
+    uint64_t        tx_worker_armed_at;     /* worker only: arm time of a long wait, else 0 */
+    uint64_t        cnt_tx_wake_lost;       /* TX entries found after a long sleep no producer woke */
 } aiopquic_ctx_t;
 
 /* A RESET_STREAM_AT held until its reliable bytes are sent: picoquic
@@ -1827,7 +1834,16 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
     ctx->cnt_loop_cb++;
     /* Running: producers may skip the wake until time_check re-arms. */
     if (__atomic_load_n(&ctx->tx_worker_idle, __ATOMIC_RELAXED) != 0) {
-        __atomic_store_n(&ctx->tx_worker_idle, 0, __ATOMIC_RELAXED);
+        if (ctx->tx_worker_armed_at == 0) {
+            __atomic_store_n(&ctx->tx_worker_idle, 0, __ATOMIC_RELAXED);
+        } else if (__atomic_exchange_n(&ctx->tx_worker_idle, 0, __ATOMIC_RELAXED) != 0 &&
+                picoquic_current_time() - ctx->tx_worker_armed_at
+                    >= AIOPQUIC_TX_WAKE_LOST_US &&
+                spsc_ring_peek(ctx->tx_event_ring) != NULL) {
+            /* Woke on its own from a long wait with entries queued: a
+             * producer skipped the wake. */
+            ctx->cnt_tx_wake_lost++;
+        }
     }
 
     switch (cb_mode) {
@@ -1852,6 +1868,10 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
             /* Runs before every wait that can block. */
             packet_loop_time_check_arg_t* tc =
                 (packet_loop_time_check_arg_t*)callback_argv;
+            if (tc->delta_t > 0) {
+                ctx->tx_worker_armed_at = (tc->delta_t >= AIOPQUIC_TX_WAKE_LOST_US)
+                    ? tc->current_time : 0;
+            }
             int queued = (tc->delta_t > 0)
                 ? aiopquic_tx_worker_idle_arm(ctx)
                 : spsc_ring_peek(ctx->tx_event_ring) != NULL;
