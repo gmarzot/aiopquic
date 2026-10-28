@@ -205,6 +205,10 @@ typedef enum {
     SPSC_EVT_TX_SET_DATAGRAM_PRIORITY = 153,
     SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY = 154,
 
+    /* New-connection limit (asyncio → picoquic worker), entry.error_code
+     * the limit; no cnx. */
+    SPSC_EVT_TX_SET_MAX_CONNECTIONS = 155,
+
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
      * WT control stream for session events, or the WT stream for
