@@ -315,7 +315,20 @@ with open(_build_info_path, "w") as _f:
     )
 
 
+def _version_scheme(version):
+    """Pre-release tag: the next pre-release's dev (0.7.0rc2 -> 0.7.0rc3.devN).
+    Final tag: release-branch-semver (0.7.0 -> 0.8.0.devN)."""
+    from setuptools_scm.version import guess_next_dev_version, release_branch_semver_version
+    if version.tag.is_prerelease:
+        return guess_next_dev_version(version)
+    return release_branch_semver_version(version)
+
+
 setup(
+    use_scm_version={
+        "version_scheme": _version_scheme,
+        "scm": {"git": {"describe_command": "git describe --dirty --tags --long --match v[0-9]*"}},
+    },
     ext_modules=cythonize(
         extensions,
         compiler_directives={

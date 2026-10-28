@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Dev builds after a pre-release tag report the next pre-release's dev version (`0.7.0rc3.devN`
+  after rc2), so source builds satisfy an `aiopquic>=0.7.0rc2` floor.
 - `reset_stream(..., reliable_size=N)` on `QuicConnection` and `WebTransportSession` sends
   RESET_STREAM_AT, so the first N bytes (a MoQT stream header) still arrive; raw QUIC now
   advertises it (`QuicConfiguration.reset_stream_at`), and `reset_stream_at_negotiated()` says so.
