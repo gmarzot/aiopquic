@@ -310,12 +310,10 @@ typedef struct {
     uint64_t        cnt_rx_rearms;
     aiopquic_wake_trace_t worker_trace;
     aiopquic_wake_trace_t asyncio_trace;
-    /* Same coalescing on TX side: skip picoquic_wake_up_network_thread
-     * unless the worker has drained since our last wake. The worker
-     * sets this back to 0 whenever it observes the tx_event_ring drained
-     * to empty (after popping all entries) so the next producer push
-     * triggers a wake. */
-    uint32_t        tx_wake_pending;
+    /* 1 while the worker may sleep: set before a wait that can block,
+     * cleared when it runs and by the producer that wakes it. Producers
+     * call picoquic_wake_up_network_thread only on that 1→0. */
+    uint32_t        tx_worker_idle;
     /* Per-stream RX byte ring overflow counter. Replaces the
      * fprintf(stderr,...) on full from the previous diagnostic —
      * libc stdio holds a global lock and stalls the picoquic worker
@@ -347,7 +345,7 @@ typedef struct {
     uint64_t        cnt_tx_event_ring_fires;             /* worker fired SPSC_EVT_TX_EVENT_RING_DRAINED */
     uint64_t        cnt_tx_event_ring_fire_dropped;      /* fire CAS won but rx_event_ring push failed → re-armed */
     uint64_t        cnt_wake_calls;                /* picoquic_wake_up_network_thread invoked */
-    uint64_t        cnt_wake_skipped_coalesced;    /* wake skipped (tx_wake_pending already 1) */
+    uint64_t        cnt_wake_skipped_coalesced;    /* wake skipped: worker not idle */
     uint64_t        cnt_prepare_to_send_empty;     /* prepare_to_send invoked with avail==0 */
     uint64_t        cnt_loop_cb;                   /* worker loop callbacks: moves while the worker runs */
     uint64_t        last_tx_event_ring_arm_ns;           /* CLOCK_MONOTONIC of last arm */
@@ -772,27 +770,29 @@ static inline void aiopquic_cnx_snapshot_fill(picoquic_cnx_t* cnx,
     aiopquic_addr_fill(sa, &s->local_addr);
 }
 
-/* TX wake-coalescing: producer-side helper. Returns 1 if a wake is
- * already pending (caller should skip the picoquic_wake_up syscall),
- * 0 if this caller should write the wake. The worker clears the flag
- * back to 0 when it finishes draining the TX ring. Single-producer
- * (asyncio thread) so atomic exchange is sufficient. */
-static inline int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx) {
-    uint32_t prev = __atomic_exchange_n(&ctx->tx_wake_pending, 1,
-                                         __ATOMIC_RELEASE);
-    if (prev == 0) {
-        ctx->cnt_wake_calls++;  /* this caller WILL invoke wake_up */
-    } else {
-        ctx->cnt_wake_skipped_coalesced++;  /* coalesced under prior wake */
+/* Producer, after a TX event ring push: 1 if the caller must wake the
+ * worker. A running worker drains the ring before it waits, so only an
+ * idle one needs the syscall. The fence pairs with the one in
+ * aiopquic_tx_worker_idle_arm: the worker sees the entry or this sees idle. */
+static inline int aiopquic_tx_wake_needed(aiopquic_ctx_t* ctx) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&ctx->tx_worker_idle, __ATOMIC_RELAXED) == 0 ||
+            __atomic_exchange_n(&ctx->tx_worker_idle, 0, __ATOMIC_ACQ_REL) == 0) {
+        ctx->cnt_wake_skipped_coalesced++;
+        return 0;
     }
-    return (int)prev;
+    ctx->cnt_wake_calls++;
+    return 1;
 }
 
-/* Worker: clear tx_wake_pending before draining the TX ring. An
- * exchange, not a store: the store could pass the ring peek that follows
- * while the producer's exchange still read 1, losing the wake. */
-static inline void aiopquic_tx_wake_clear(aiopquic_ctx_t* ctx) {
-    (void)__atomic_exchange_n(&ctx->tx_wake_pending, 0, __ATOMIC_ACQ_REL);
+/* Worker, before a wait that can block: mark idle, then re-check the TX
+ * ring. Returns 1, idle cleared, if entries are queued. */
+static inline int aiopquic_tx_worker_idle_arm(aiopquic_ctx_t* ctx) {
+    __atomic_store_n(&ctx->tx_worker_idle, 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (spsc_ring_peek(ctx->tx_event_ring) == NULL) return 0;
+    __atomic_store_n(&ctx->tx_worker_idle, 0, __ATOMIC_RELAXED);
+    return 1;
 }
 
 /* Forward decl: aiopquic_maybe_fire_tx_event_ring_drained pushes
@@ -931,8 +931,8 @@ static inline void aiopquic_clear_tx_event_ring_drain_pending(aiopquic_ctx_t* ct
  *
  * entry.stream_ctx carries the BORROWED aiopquic_stream_ctx_t* so
  * the worker can read both sc->rx_buf_free and sc->bytes_pending_release
- * when computing the effective grant. Wake is coalesced via
- * tx_wake_pending — many back-to-back pushes collapse to one wake. */
+ * when computing the effective grant. The wake is written only to an
+ * idle worker (aiopquic_tx_wake_needed). */
 static inline void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx,
                                             void* cnx,
                                             uint64_t stream_id,
@@ -954,14 +954,12 @@ static inline void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx,
     if (spsc_ring_push(ctx->tx_event_ring, &entry, NULL, 0) == 0) {
         ctx->cnt_tx_event_ring_pushes++;
         ctx->cnt_fc_credit_pushed++;
-        /* Wake only if the thread is running. Coalesced via
-         * tx_wake_pending so back-to-back pushes collapse to one
-         * syscall. CRITICAL: picoquic_wake_up_network_thread takes
+        /* Wake only a running thread, and only when idle.
+         * CRITICAL: picoquic_wake_up_network_thread takes
          * picoquic_network_thread_ctx_t*, NOT picoquic_quic_t* —
          * passing the wrong type is a UAF-class bug that silently
          * corrupts picoquic state. */
-        if (ctx->thread_ctx != NULL &&
-            aiopquic_tx_wake_set_pending(ctx) == 0) {
+        if (ctx->thread_ctx != NULL && aiopquic_tx_wake_needed(ctx)) {
             picoquic_wake_up_network_thread(ctx->thread_ctx);
         }
     } else {
@@ -994,7 +992,7 @@ static inline int aiopquic_dgram_ring_release_post(aiopquic_ctx_t* ctx,
         return -1;
     }
     ctx->cnt_tx_event_ring_pushes++;
-    if (aiopquic_tx_wake_set_pending(ctx) == 0) {
+    if (aiopquic_tx_wake_needed(ctx)) {
         picoquic_wake_up_network_thread(ctx->thread_ctx);
     }
     return 0;
@@ -1818,7 +1816,8 @@ static void aiopquic_run_deferred_resets(picoquic_quic_t* quic,
 }
 
 /*
- * Packet loop callback — handles wake-up events to drain the TX ring.
+ * Packet loop callback. The TX ring drains on a wake-up and, for entries
+ * whose producers skipped the wake, before each wait.
  */
 static int aiopquic_loop_cb(picoquic_quic_t* quic,
                              picoquic_packet_loop_cb_enum cb_mode,
@@ -1826,10 +1825,17 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                              void* callback_argv) {
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)callback_ctx;
     ctx->cnt_loop_cb++;
+    /* Running: producers may skip the wake until time_check re-arms. */
+    if (__atomic_load_n(&ctx->tx_worker_idle, __ATOMIC_RELAXED) != 0) {
+        __atomic_store_n(&ctx->tx_worker_idle, 0, __ATOMIC_RELAXED);
+    }
 
     switch (cb_mode) {
         case picoquic_packet_loop_ready:
             ctx->quic = quic;
+            if (callback_argv != NULL) {
+                ((picoquic_packet_loop_options_t*)callback_argv)->do_time_check = 1;
+            }
 #ifdef __linux__
             /* The loop sleeps in ppoll() until the next paced send, often
              * tens of µs away; the default 50 µs timer slack overshoots it. */
@@ -1842,18 +1848,21 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
             }
             break;
 
+        case picoquic_packet_loop_time_check: {
+            /* Runs before every wait that can block. */
+            packet_loop_time_check_arg_t* tc =
+                (packet_loop_time_check_arg_t*)callback_argv;
+            int queued = (tc->delta_t > 0)
+                ? aiopquic_tx_worker_idle_arm(ctx)
+                : spsc_ring_peek(ctx->tx_event_ring) != NULL;
+            if (!queued) {
+                break;
+            }
+            /* Drained entries can make a send due now. */
+            tc->delta_t = 0;
+        }
+            /* fall through */
         case picoquic_packet_loop_wake_up:
-            /* Clear pending BEFORE draining. Race-safe ordering:
-             * - If producer pushes BEFORE we clear: their exchange
-             *   sees 1, skips wake — but their entry is in the ring,
-             *   we'll see it on the next peek (still in the loop).
-             * - If producer pushes AFTER we clear: their exchange
-             *   sees 0, fires wake — picoquic re-enters this case.
-             * - If producer pushes between our peek-empty and clear:
-             *   their exchange could see 1 (stale) and skip — that's
-             *   why we clear FIRST. Producer always sees 0 when the
-             *   ring was actually drained. */
-            aiopquic_tx_wake_clear(ctx);
             while (1) {
                 spsc_entry_t* entry = spsc_ring_peek(ctx->tx_event_ring);
                 if (!entry) break;

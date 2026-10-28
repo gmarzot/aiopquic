@@ -15,7 +15,7 @@
 
 enum {
     AIOPQUIC_LITMUS_RX_NOTIFY = 0,   /* notify_rx vs clear_rx */
-    AIOPQUIC_LITMUS_TX_WAKE = 1,     /* tx_wake_set_pending vs worker clear */
+    AIOPQUIC_LITMUS_TX_WAKE = 1,     /* tx_wake_needed vs worker idle arm */
     AIOPQUIC_LITMUS_RX_EVENT = 2,    /* rx_event_pending arm vs clear */
     AIOPQUIC_LITMUS_TX_DRAIN = 3,    /* send_data arm vs worker take */
     AIOPQUIC_LITMUS_TX_RING = 4,     /* TX event ring arm vs worker drain */
@@ -107,8 +107,9 @@ static inline void aiopquic_litmus_setup(aiopquic_litmus_t* L) {
         __atomic_store_n(&ctx->rx_notify_pending, 1, __ATOMIC_SEQ_CST);
         break;
     case AIOPQUIC_LITMUS_TX_WAKE:
+        /* The worker is running and about to wait. */
         aiopquic_litmus_ring_clear(ctx->tx_event_ring);
-        __atomic_store_n(&ctx->tx_wake_pending, 1, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&ctx->tx_worker_idle, 0, __ATOMIC_SEQ_CST);
         break;
     case AIOPQUIC_LITMUS_RX_EVENT: {
         uint32_t used = aiopquic_stream_buf_used(L->sc->rx);
@@ -170,7 +171,7 @@ static inline void aiopquic_litmus_produce(aiopquic_litmus_t* L) {
     case AIOPQUIC_LITMUS_TX_WAKE:
         e.event_type = SPSC_EVT_TX_SET_STREAM_PRIORITY;
         (void)spsc_ring_push(ctx->tx_event_ring, &e, NULL, 0);
-        L->woke = aiopquic_tx_wake_set_pending(ctx) == 0;
+        L->woke = aiopquic_tx_wake_needed(ctx);
         break;
     case AIOPQUIC_LITMUS_RX_EVENT: {
         uint8_t b[8] = {0};
@@ -217,8 +218,7 @@ static inline int aiopquic_litmus_consume(aiopquic_litmus_t* L) {
         aiopquic_clear_rx(ctx);
         return 0;
     case AIOPQUIC_LITMUS_TX_WAKE: {
-        aiopquic_tx_wake_clear(ctx);
-        int saw = spsc_ring_peek(ctx->tx_event_ring) != NULL;
+        int saw = aiopquic_tx_worker_idle_arm(ctx);
         return 0x10 | saw;
     }
     case AIOPQUIC_LITMUS_RX_EVENT: {
