@@ -152,8 +152,11 @@ has left the ring once it is exceeded.
   PR to `main`, one commit per release, and `release.yml` tags it there. `main` is then merged
   back into the working branches, and the next minor branch starts from the release tag.
 - Versions: release tags are squash commits outside the branches' history, so check what shipped
-  with `git diff <commit> <tag>`, not ancestry. setuptools_scm describes from final tags only and
-  bumps the minor (`pyproject.toml`), so dev builds after `vX.Y.Z` report `X.(Y+1).0.devN`.
+  with `git diff <commit> <tag>`, not ancestry. Dev builds version from the nearest tag
+  (`setup.py`): after `vX.Y.ZrcN` they report `X.Y.Zrc(N+1).devM`, after `vX.Y.Z`
+  `X.(Y+1).0.devM`. A minor branch keeps its rc numbering after its final release, so new work
+  goes on the next minor branch. `python -m setuptools_scm` skips `setup.py`; use
+  `python setup.py --version`.
 
 ## Conventions
 
