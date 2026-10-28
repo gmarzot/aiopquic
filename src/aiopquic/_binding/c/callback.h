@@ -319,7 +319,6 @@ typedef struct {
      * cleared when it runs and by the producer that wakes it. Producers
      * call picoquic_wake_up_network_thread only on that 1→0. */
     uint32_t        tx_worker_idle;
-    uint64_t        tx_worker_armed_at;            /* worker only: picoquic time of the last idle arm */
     /* Per-stream RX byte ring overflow counter. Replaces the
      * fprintf(stderr,...) on full from the previous diagnostic —
      * libc stdio holds a global lock and stalls the picoquic worker
@@ -352,7 +351,6 @@ typedef struct {
     uint64_t        cnt_tx_event_ring_fire_dropped;      /* fire CAS won but rx_event_ring push failed → re-armed */
     uint64_t        cnt_wake_calls;                /* picoquic_wake_up_network_thread invoked */
     uint64_t        cnt_wake_skipped_coalesced;    /* wake skipped: worker not idle */
-    uint64_t        cnt_tx_wake_lost;              /* TX entries found after a long sleep no producer woke */
     uint64_t        cnt_prepare_to_send_empty;     /* prepare_to_send invoked with avail==0 */
     uint64_t        cnt_loop_cb;                   /* worker loop callbacks: moves while the worker runs */
     uint64_t        last_tx_event_ring_arm_ns;           /* CLOCK_MONOTONIC of last arm */
@@ -462,6 +460,8 @@ typedef struct {
     /* Resets waiting for their reliable bytes to be sent (worker only). */
     struct aiopquic_deferred_reset* deferred_resets;
     uint64_t        deferred_resets_swept;  /* last liveness sweep, us */
+    uint64_t        tx_worker_armed_at;     /* worker only: picoquic time of the last idle arm */
+    uint64_t        cnt_tx_wake_lost;       /* TX entries found after a long sleep no producer woke */
 } aiopquic_ctx_t;
 
 /* A RESET_STREAM_AT held until its reliable bytes are sent: picoquic
@@ -1833,8 +1833,8 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)callback_ctx;
     ctx->cnt_loop_cb++;
     /* Running: producers may skip the wake until time_check re-arms. */
-    if (__atomic_load_n(&ctx->tx_worker_idle, __ATOMIC_RELAXED) != 0) {
-        __atomic_store_n(&ctx->tx_worker_idle, 0, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&ctx->tx_worker_idle, __ATOMIC_RELAXED) != 0 &&
+            __atomic_exchange_n(&ctx->tx_worker_idle, 0, __ATOMIC_RELAXED) != 0) {
         /* Woke on its own with entries queued: a producer skipped the wake. */
         if (spsc_ring_peek(ctx->tx_event_ring) != NULL &&
                 picoquic_current_time() - ctx->tx_worker_armed_at

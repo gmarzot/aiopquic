@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(not os.path.exists(CERT_FILE),
 
 WRITES = 1000   # under the TX event ring's 2048 entries
 CHUNK = b"x" * 64
-QUIET = 0.3     # long enough for the network thread to sleep idle
+QUIET = 0.1     # the network thread sleeps idle this long before a send
 PROMPT = 0.5    # a lost wake waits for the next packet or timer: seconds
 ROUNDS = 10
 
@@ -134,6 +134,23 @@ def _lost(*transports):
     return [t.counters["tx_wake_lost"] for t in transports]
 
 
+async def _asleep(transport, span=QUIET, timeout=5.0):
+    """Wait until the network thread has slept idle, running no callback,
+    for span seconds. Returns its loop callback count."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        c = transport.counters
+        if c["tx_worker_idle_now"] == 1:
+            n = c["loop_callbacks"]
+            await asyncio.sleep(span)
+            c = transport.counters
+            if c["tx_worker_idle_now"] == 1 and c["loop_callbacks"] == n:
+                return n
+        else:
+            await asyncio.sleep(0.01)
+    raise AssertionError(f"network thread never slept idle for {span} s")
+
+
 async def test_raw_send_after_quiet_is_prompt():
     port = next_port()
     server = await _raw_server(port)
@@ -141,7 +158,7 @@ async def test_raw_send_after_quiet_is_prompt():
         async with _raw_client(port) as client:
             q = client._quic
             for i in range(ROUNDS):
-                await asyncio.sleep(QUIET)
+                await _asleep(q._transport)
                 sid = q.get_next_available_stream_id()
                 want = b"q%d" % i
                 q.send_stream_data(sid, want, end_stream=True)
@@ -179,7 +196,7 @@ async def test_wt_send_after_quiet_is_prompt():
         async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI,
                                         ca_file=CA_FILE) as wt:
             for i in range(ROUNDS):
-                await asyncio.sleep(QUIET)
+                await _asleep(wt._transport)
                 want = b"q%d" % i
                 sid = await asyncio.wait_for(wt.create_stream(bidir=False), PROMPT)
                 wt.send_stream_data(sid, want, end_stream=True)
@@ -196,16 +213,13 @@ async def test_lost_wake_is_counted():
     try:
         async with _raw_client(port) as client:
             q = client._quic
-            # A worker timer can end the sleep before the wake counts as lost.
-            for _ in range(3):
-                await asyncio.sleep(QUIET)
-                st._tx_push_unwoken()
-                await asyncio.sleep(0.1)
-                sid = q.get_next_available_stream_id()
-                q.send_stream_data(sid, b"rx", end_stream=True)
-                assert await _until(lambda: bytes(_Sink.got.get(sid, b"")) == b"rx")
-                if st.counters["tx_wake_lost"]:
-                    break
+            n = await _asleep(st)
+            st._tx_push_unwoken()
+            assert st.counters["loop_callbacks"] == n, "network thread ran during the push"
+            # Asleep over 50 ms with the event queued; the client's packet wakes it.
+            sid = q.get_next_available_stream_id()
+            q.send_stream_data(sid, b"rx", end_stream=True)
+            assert await _until(lambda: bytes(_Sink.got.get(sid, b"")) == b"rx")
             assert st.counters["tx_wake_lost"] == 1
             assert await _until(lambda: st.counters["tx_event_ring_count_now"] == 0)
     finally:
