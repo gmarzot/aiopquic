@@ -4,7 +4,6 @@ it picoquic refuses new connections."""
 import asyncio
 import contextlib
 import os
-import time
 
 import pytest
 
@@ -103,13 +102,19 @@ class _Sink(QuicConnectionProtocol):
             _Sink.got.extend(event.data)
 
 
-async def _refused_at_once(open_one, exc, match=None):
-    t0 = time.monotonic()
+async def _set_limit(transport, n):
+    # Applied once the network thread has drained the TX event ring.
+    assert transport.set_max_connections(n) == 0
+    async with asyncio.timeout(5):
+        while transport.counters["tx_event_ring_count_now"]:
+            await asyncio.sleep(0.001)
+
+
+async def _assert_refused(open_one, exc, match=None):
     with pytest.raises(exc, match=match):
         async with asyncio.timeout(5):
             async with open_one():
                 pass
-    return time.monotonic() - t0
 
 
 async def test_raw_quic_set_max_connections_refuses_new_keeps_existing():
@@ -127,15 +132,15 @@ async def test_raw_quic_set_max_connections_refuses_new_keeps_existing():
         with pytest.raises(ValueError):
             transport.set_max_connections(cfg.max_connections + 1)
         async with _open() as held:
-            assert transport.set_max_connections(0) == 0
-            assert await _refused_at_once(_open, ConnectionError, "error_code=2") < 1.0
+            await _set_limit(transport, 0)
+            await _assert_refused(_open, ConnectionError, "error_code=2")
             q = held._quic
             q.send_stream_data(q.get_next_available_stream_id(), b"kept",
                                end_stream=True)
             async with asyncio.timeout(5):
                 while bytes(_Sink.got) != b"kept":
                     await asyncio.sleep(0.01)
-        assert transport.set_max_connections(cfg.max_connections) == 0
+        await _set_limit(transport, cfg.max_connections)
         async with _open():
             pass
     finally:
@@ -172,16 +177,31 @@ async def test_webtransport_set_max_connections_refuses_new_keeps_existing():
                                     ca_file=CA_FILE)
     try:
         async with _open() as held:
-            assert transport.set_max_connections(0) == 0
-            assert await _refused_at_once(_open, WebTransportError) < 1.0
+            await _set_limit(transport, 0)
+            await _assert_refused(_open, WebTransportError)
             sid = await held.create_stream(bidir=False)
             held.send_stream_data(sid, b"kept", end_stream=True)
             assert await asyncio.wait_for(got, timeout=5) == b"kept"
-        assert transport.set_max_connections(QuicConfiguration().max_connections) == 0
+        await _set_limit(transport, QuicConfiguration().max_connections)
         async with _open():
             pass
     finally:
         await server.aclose()
+
+
+async def test_set_max_connections_ceiling_is_picoquics():
+    # picoquic holds at least one connection, so a 0 at start allows 1.
+    cfg = QuicConfiguration(is_client=False, alpn_protocols=[ALPN], max_connections=0)
+    cfg.load_cert_chain(CERT_FILE, KEY_FILE)
+    server = await serve("127.0.0.1", next_port(), configuration=cfg)
+    transport = server._engine._transport
+    try:
+        await _set_limit(transport, 0)
+        await _set_limit(transport, 1)
+        with pytest.raises(ValueError):
+            transport.set_max_connections(2)
+    finally:
+        server.close()
 
 
 def test_default_is_256():

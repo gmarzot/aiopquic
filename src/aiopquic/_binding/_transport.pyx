@@ -3562,7 +3562,7 @@ cdef class TransportContext:
         # — a type mismatch here is a silent UAF-class corruption.
         self._ctx.thread_ctx = self._thread_ctx
 
-        self._max_connections = max_connections
+        self._max_connections = max_connections if max_connections > 0 else 1  # picoquic's floor
         self._started = True
 
     def stop(self, double drain_timeout=0.05):
