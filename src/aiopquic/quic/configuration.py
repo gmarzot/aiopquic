@@ -58,6 +58,9 @@ class QuicConfiguration:
     # Enables datagrams by default (h3zero only advertises h3_datagram
     # + webtransport_max_sessions when this is non-zero).
     max_datagram_frame_size: int | None = 65535
+    # Advertise RESET_STREAM_AT, so a reset can keep the first bytes of
+    # its stream (reset_stream's reliable_size). WebTransport always does.
+    reset_stream_at: bool = True
     # Per-connection datagram TX record ring (pull-model send path).
     # Bounded capacity IS the backpressure: send_datagram_frame returns
     # 0 when full instead of queueing unboundedly. Steady-state datagram

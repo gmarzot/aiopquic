@@ -598,21 +598,37 @@ class WebTransportSession:
                 if self.session_closed:
                     return
 
-    def reset_stream(self, stream_id: int, error_code: int = 0) -> None:
-        """Reset a WT stream we send on. A stream we opened is reset with
-        RESET_STREAM_AT once reset_stream_at is negotiated and its header is
-        sent, else with RESET_STREAM. Unsent bytes stop counting against the
-        TX budget, and later or parked writes on the stream raise
-        WebTransportError. On a stream we only receive on, the request is
-        dropped and counted in tx_wrong_direction_dropped.
+    def reset_stream(self, stream_id: int, error_code: int = 0,
+                     reliable_size: int = 0) -> None:
+        """Reset a WT stream we send on. Once reset_stream_at is
+        negotiated the reset is a RESET_STREAM_AT that keeps the WT header
+        of a stream we opened and the first reliable_size bytes written
+        (capped at what was written); sends stop at them and the reset
+        waits until they are sent. Else RESET_STREAM. Unsent bytes stop
+        counting against the TX budget, and later or parked writes on the
+        stream raise WebTransportError. On a stream we only receive on,
+        the request is dropped and counted in tx_wrong_direction_dropped.
 
         error_code is a 32-bit application code, sent in the
         WT_APPLICATION_ERROR range (draft-ietf-webtrans-http3 §4.4); larger
         values are HTTP/3 codes (WT_SESSION_GONE) and go out unchanged.
         Received reset and STOP_SENDING codes are mapped back the same way;
-        a code outside the range is delivered as received."""
-        self._state.push_reset_stream(stream_id, error_code)
+        a code outside the range is delivered as received.
+
+        Raises:
+            ValueError: reliable_size outside 0..2**32-1."""
+        if not 0 <= reliable_size <= 0xFFFFFFFF:
+            raise ValueError("reset_stream: reliable_size out of range")
+        self._state.push_reset_stream(stream_id, error_code, reliable_size)
         self._drop_stream_tx(stream_id)
+
+    def reset_stream_at_negotiated(self) -> bool:
+        """Both ends advertised RESET_STREAM_AT, so reset_stream keeps its
+        reliable_size. False once the session is closed."""
+        cnx = self.cnx_ptr
+        if cnx == 0:
+            return False
+        return self._transport.reset_stream_at_negotiated(cnx)
 
     def stop_stream(self, stream_id: int, error_code: int = 0) -> None:
         """Send STOP_SENDING on a WT stream we receive on (the peer should

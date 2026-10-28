@@ -79,6 +79,7 @@ cdef extern from "picoquic.h":
         unsigned int migration_disabled
         uint32_t max_datagram_frame_size
         int enable_loss_bit
+        int is_reset_stream_at_enabled
         int enable_time_stamp
         uint64_t min_ack_delay
         int do_grease_quic_bit

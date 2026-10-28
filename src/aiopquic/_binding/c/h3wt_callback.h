@@ -669,6 +669,9 @@ static int aiopquic_wt_cnx_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
                 continue;
             }
             aiopquic_wt_session_t* s = (aiopquic_wt_session_t*)p->function_ctx;
+            if (s->bridge && s->bridge->deferred_resets) {
+                aiopquic_deferred_resets_drop_cnx(s->bridge, cnx);
+            }
             if (!s->session_closing) {
                 aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_CLOSED,
                                         s->control_stream_id, code, NULL, 0);
@@ -1000,9 +1003,11 @@ static int aiopquic_wt_path_callback(
         /* FIN before the tail; see the raw prepare_to_send path. */
         int fin_after = aiopquic_stream_buf_fin_pending(sb);
         uint32_t avail = aiopquic_stream_buf_used(sb);
-        uint32_t to_send = (avail < want) ? avail : want;
-        int is_fin = (fin_after && to_send == avail) ? 1 : 0;
-        int still_active = (avail > to_send) ? 1 : 0;
+        uint32_t sendable = aiopquic_stream_ctx_tx_sendable(sc, avail);
+        uint32_t to_send = (sendable < want) ? sendable : want;
+        int is_fin = (fin_after && !sc->tx_reset_pending
+                      && to_send == avail) ? 1 : 0;
+        int still_active = (sendable > to_send) ? 1 : 0;
         uint8_t* buf = picoquic_provide_stream_data_buffer(
             bytes, to_send, is_fin, still_active);
         if (buf && to_send > 0) {
@@ -1365,18 +1370,56 @@ static void aiopquic_wt_stream_reattach(picoquic_cnx_t* cnx,
     (void)picoquic_set_app_stream_ctx(cnx, st->stream_id, st);
 }
 
-/* picoquic sends nothing more on a reset stream: release what is still
- * queued in its ring, crediting the TX totals. */
-static void aiopquic_wt_abandon_stream_tx(aiopquic_wt_session_t* s,
-                                          h3zero_stream_ctx_t* st) {
+/* The sc of session s behind h3zero stream st, or NULL. */
+static aiopquic_stream_ctx_t* aiopquic_wt_stream_sc(aiopquic_wt_session_t* s,
+                                                    h3zero_stream_ctx_t* st) {
     if (st->path_callback_ctx != NULL
             && *(uint32_t*)st->path_callback_ctx == AIOPQUIC_WT_CTX_LINK) {
         aiopquic_wt_stream_link_t* lk =
             (aiopquic_wt_stream_link_t*)st->path_callback_ctx;
         if (lk->session == s) {
-            aiopquic_stream_ctx_tx_abandon(lk->sc);
+            return lk->sc;
         }
     }
+    return NULL;
+}
+
+/* Bytes h3zero sends ahead of the app's data on a WT stream we opened:
+ * the stream or frame type, then the session id (as picowt_reset_stream
+ * counts them). */
+static uint64_t aiopquic_wt_preamble_len(picoquic_cnx_t* cnx,
+                                         h3zero_stream_ctx_t* st) {
+    if (!aiopquic_stream_is_local(cnx, st->stream_id)) return 0;
+    uint64_t v = st->ps.stream_state.control_stream_id;
+    return 2 + (v < 0x40 ? 1 : v < 0x4000 ? 2 : v < 0x40000000 ? 4 : 8);
+}
+
+/* RESET_STREAM_AT of st keeping its preamble and first `reliable` app
+ * bytes. Returns 0 when the stream is reset. */
+static int aiopquic_wt_reset_stream_reliable(picoquic_cnx_t* cnx,
+        h3zero_stream_ctx_t* st, uint64_t code, uint64_t preamble,
+        uint64_t reliable) {
+    int rr = aiopquic_reset_stream_reliable(cnx, st->stream_id, code,
+                                            preamble + reliable);
+    if (rr == 0) {
+        st->ps.stream_state.is_fin_sent = 1;
+    }
+    return rr;
+}
+
+static void aiopquic_wt_deferred_reset(aiopquic_ctx_t* ctx,
+                                       aiopquic_deferred_reset_t* d) {
+    (void)ctx;
+    h3zero_callback_ctx_t* h3_ctx =
+        (h3zero_callback_ctx_t*)picoquic_get_callback_context(d->cnx);
+    h3zero_stream_ctx_t* st =
+        h3_ctx ? h3zero_find_stream(h3_ctx, d->stream_id) : NULL;
+    if (!st) return;
+    if (aiopquic_wt_reset_stream_reliable(d->cnx, st, d->error_code,
+            d->preamble, d->sc->tx_reliable_size) == 0) {
+        aiopquic_stream_ctx_tx_abandon(d->sc);
+    }
+    aiopquic_wt_stream_reattach(d->cnx, st);
 }
 
 /*
@@ -1584,9 +1627,29 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
             ctx->cnt_tx_wrong_direction_dropped++;
             return 1;
         }
-        if (aiopquic_wt_reset_stream(s->cnx, st,
-                aiopquic_wt_code_to_h3(entry->error_code)) == 0) {
-            aiopquic_wt_abandon_stream_tx(s, st);
+        uint64_t code = aiopquic_wt_code_to_h3(entry->error_code);
+        aiopquic_stream_ctx_t* sc = aiopquic_wt_stream_sc(s, st);
+        if (sc && sc->tx_reset_pending) {
+            return 1;   /* already resetting */
+        }
+        uint64_t reliable = aiopquic_reset_reliable_size(s->cnx, sc, entry->aux);
+        int rr;
+        if (reliable == 0) {
+            rr = aiopquic_wt_reset_stream(s->cnx, st, code);
+        } else {
+            uint64_t preamble = aiopquic_wt_preamble_len(s->cnx, st);
+            if (reliable > atomic_load_explicit(&sc->tx->head,
+                                                memory_order_relaxed)
+                    && aiopquic_defer_reset(ctx, s->cnx, sc, entry->stream_id,
+                                            code, reliable, preamble, 1) == 0) {
+                picoquic_mark_active_stream_v2(s->cnx, entry->stream_id, 1);
+                return 1;
+            }
+            rr = aiopquic_wt_reset_stream_reliable(s->cnx, st, code,
+                                                   preamble, reliable);
+        }
+        if (rr == 0) {
+            aiopquic_stream_ctx_tx_abandon(sc);
         }
         aiopquic_wt_stream_reattach(s->cnx, st);
         return 1;

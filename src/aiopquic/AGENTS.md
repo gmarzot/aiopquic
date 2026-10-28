@@ -30,6 +30,10 @@ the `KEX_*` ids and `counters`; everything else there, and raw pointers, are tes
   calls `h(session)` per CONNECT. `WebTransportError` is a `ConnectionError`. The CONNECT sends
   `:protocol webtransport`, then `webtransport-h3` once on the same connection if a server that
   advertised SETTINGS_WT_ENABLED refuses it; `connect_protocol=` pins one token.
+- `reset_stream(sid, code, reliable_size=N)` (raw and WT) keeps the stream's first N bytes, for
+  example a MoQT stream header, when both ends advertise RESET_STREAM_AT: on by default, raw QUIC
+  can turn it off with `QuicConfiguration.reset_stream_at=False`; `reset_stream_at_negotiated()`
+  reports it. Bytes not yet sent are sent first and nothing after them; without it, RESET_STREAM.
 - `serve(..., retry=True)` validates client addresses with a Retry. `QuicConfiguration`:
   `cipher_suite`, `key_update_interval`, `supported_versions` (QUIC v2 by compatible version
   negotiation), `session_ticket_file` (resumption; with `connect(wait_connected=False)` writes
@@ -192,6 +196,9 @@ has left the ring once it is exceeded.
   (`aiopquic_cnx_is_alive()`) runs before any TX event that names a cnx and drops the event on a
   miss; it compares addresses, so a new cnx at a freed one's address passes. WT TX events carry a
   session and test `s->cnx` instead; ring releases bypass the guard (the cnx is only a table key).
+- picoquic refuses a reliable size past what it has sent, so a reset with one still in `sc->tx` is
+  held on `ctx->deferred_resets` and sent after the send pass that clears it; sends stop at the
+  size. A cnx's held resets are dropped in its close callback, or by a once-a-second sweep.
 - Cython does not None-check typed `cdef` attributes, and `tp_clear` can clear them before
   `__dealloc__`: check first. New `aiopquic_ctx_t` fields go at the tail.
 
