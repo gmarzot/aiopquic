@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.7.0rc2
 
 - Dev builds after a pre-release tag report the next pre-release's dev version (`0.7.0rc3.devN`
   after rc2), so source builds satisfy an `aiopquic>=0.7.0rc2` floor.
