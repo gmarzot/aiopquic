@@ -82,6 +82,11 @@
  * while investigating control-stream delivery regression.) */
 #define AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT 50
 
+/* A worker that wakes on its own after sleeping at least this long and
+ * finds TX entries queued counts a lost wake. A shorter sleep can end
+ * between a producer's push and its wake check. */
+#define AIOPQUIC_TX_WAKE_LOST_US 50000
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdatomic.h>
@@ -314,6 +319,7 @@ typedef struct {
      * cleared when it runs and by the producer that wakes it. Producers
      * call picoquic_wake_up_network_thread only on that 1→0. */
     uint32_t        tx_worker_idle;
+    uint64_t        tx_worker_armed_at;            /* worker only: picoquic time of the last idle arm */
     /* Per-stream RX byte ring overflow counter. Replaces the
      * fprintf(stderr,...) on full from the previous diagnostic —
      * libc stdio holds a global lock and stalls the picoquic worker
@@ -346,6 +352,7 @@ typedef struct {
     uint64_t        cnt_tx_event_ring_fire_dropped;      /* fire CAS won but rx_event_ring push failed → re-armed */
     uint64_t        cnt_wake_calls;                /* picoquic_wake_up_network_thread invoked */
     uint64_t        cnt_wake_skipped_coalesced;    /* wake skipped: worker not idle */
+    uint64_t        cnt_tx_wake_lost;              /* TX entries found after a long sleep no producer woke */
     uint64_t        cnt_prepare_to_send_empty;     /* prepare_to_send invoked with avail==0 */
     uint64_t        cnt_loop_cb;                   /* worker loop callbacks: moves while the worker runs */
     uint64_t        last_tx_event_ring_arm_ns;           /* CLOCK_MONOTONIC of last arm */
@@ -1828,6 +1835,12 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
     /* Running: producers may skip the wake until time_check re-arms. */
     if (__atomic_load_n(&ctx->tx_worker_idle, __ATOMIC_RELAXED) != 0) {
         __atomic_store_n(&ctx->tx_worker_idle, 0, __ATOMIC_RELAXED);
+        /* Woke on its own with entries queued: a producer skipped the wake. */
+        if (spsc_ring_peek(ctx->tx_event_ring) != NULL &&
+                picoquic_current_time() - ctx->tx_worker_armed_at
+                    >= AIOPQUIC_TX_WAKE_LOST_US) {
+            ctx->cnt_tx_wake_lost++;
+        }
     }
 
     switch (cb_mode) {
@@ -1852,6 +1865,9 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
             /* Runs before every wait that can block. */
             packet_loop_time_check_arg_t* tc =
                 (packet_loop_time_check_arg_t*)callback_argv;
+            if (tc->delta_t > 0) {
+                ctx->tx_worker_armed_at = tc->current_time;
+            }
             int queued = (tc->delta_t > 0)
                 ? aiopquic_tx_worker_idle_arm(ctx)
                 : spsc_ring_peek(ctx->tx_event_ring) != NULL;

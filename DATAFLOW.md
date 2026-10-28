@@ -31,6 +31,8 @@ A TX push wakes the worker only if it is idle (`tx_worker_idle`,
 `aiopquic_tx_wake_needed`): before a wait that can block, the worker marks
 itself idle in picoquic's `time_check` callback, re-checks the TX ring, and
 drains what was pushed while it ran. Raw QUIC and WT share this path.
+A worker that wakes on its own after sleeping 50 ms or more and finds entries
+queued counts `tx_wake_lost`, which stays 0 unless a wake was lost.
 `rx_notify_pending` dedupes eventfd writes (`aiopquic_notify_rx`, `callback.h`).
 
 WebTransport shares everything above: `wt_session->bridge` *is* the
