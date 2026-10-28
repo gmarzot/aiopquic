@@ -4199,6 +4199,21 @@ def _litmus(str kind, uint64_t n):
     return lost
 
 
+def _tx_wake_gate(uint32_t idle, uint64_t n):
+    """Run n producer wake gates against a worker held idle (1) or running
+    (0), with no worker thread. Returns (wakes, skipped) (test only)."""
+    cdef aiopquic_ctx_t* ctx = aiopquic_ctx_create(16, 64, 50)
+    cdef uint64_t i
+    if ctx is NULL:
+        raise MemoryError("ctx create failed")
+    ctx.tx_worker_idle = idle
+    for i in range(n):
+        aiopquic_tx_wake_needed(ctx)
+    r = (ctx.cnt_wake_calls, ctx.cnt_wake_skipped_coalesced)
+    aiopquic_ctx_destroy(ctx)
+    return r
+
+
 def stream_buf_create(uint32_t capacity):
     """Allocate a per-stream send buffer of `capacity` bytes (power of 2).
 

@@ -1,12 +1,13 @@
-"""TX wake coalescing: a write wakes the network thread only when it may
-be asleep. Back-to-back writes find it running and skip the syscall; every
-write still goes through the gate, so the counters account for each one."""
+"""TX wake gate: a write wakes the network thread only when it may be
+asleep. The gate is checked against a worker held running or idle; live
+bursts check that every write goes through it and is delivered."""
 import asyncio
 import os
 import time
 
 import pytest
 
+from aiopquic._binding._transport import _tx_wake_gate
 from aiopquic.asyncio.client import connect
 from aiopquic.asyncio.server import serve
 from aiopquic.asyncio.webtransport import (
@@ -27,11 +28,8 @@ try:
 except ImportError:
     from _ports import next_port
 
-pytestmark = [
-    pytest.mark.asyncio,
-    pytest.mark.skipif(not os.path.exists(CERT_FILE),
-                       reason="picoquic certs not found"),
-]
+pytestmark = pytest.mark.skipif(not os.path.exists(CERT_FILE),
+                                reason="picoquic certs not found")
 
 WRITES = 1000   # under the TX event ring's 2048 entries
 CHUNK = b"x" * 64
@@ -42,6 +40,14 @@ async def _until(cond, timeout=5.0):
     while time.monotonic() < deadline and not cond():
         await asyncio.sleep(0.01)
     return cond()
+
+
+def test_gate_skips_wakes_while_worker_runs():
+    assert _tx_wake_gate(0, WRITES) == (0, WRITES)
+
+
+def test_gate_wakes_idle_worker_once():
+    assert _tx_wake_gate(1, WRITES) == (1, WRITES - 1)
 
 
 def _wakes(transport):
@@ -56,12 +62,11 @@ async def _burst(transport, send, sent):
     total = WRITES * len(CHUNK)
     assert await _until(lambda: sent() == total), f"{sent()} of {total} bytes sent"
     calls1, skipped1 = _wakes(transport)
-    calls, gated = calls1 - calls0, (calls1 + skipped1) - (calls0 + skipped0)
+    gated = (calls1 + skipped1) - (calls0 + skipped0)
     assert gated >= WRITES, f"{gated} of {WRITES} writes went through the wake gate"
-    assert calls * 4 < WRITES, f"{calls} wakes for {WRITES} back-to-back writes"
 
 
-async def test_raw_back_to_back_writes_skip_most_wakes():
+async def test_raw_writes_go_through_wake_gate():
     port = next_port()
     scfg = QuicConfiguration(is_client=False, alpn_protocols=[ALPN])
     scfg.load_cert_chain(CERT_FILE, KEY_FILE)
@@ -79,7 +84,7 @@ async def test_raw_back_to_back_writes_skip_most_wakes():
         server.close()
 
 
-async def test_wt_back_to_back_writes_skip_most_wakes():
+async def test_wt_writes_go_through_wake_gate():
     port = next_port()
     server = await serve_webtransport(
         "127.0.0.1", port, "/wt", handler=lambda session: None,
