@@ -454,7 +454,99 @@ typedef struct {
     uint64_t        cnt_tx_reattach_after_close;
     /* Stream callbacks ignored because the cnx was already closing. */
     uint64_t        cnt_stream_cb_after_close;
+    /* Resets waiting for their reliable bytes to be sent (worker only). */
+    struct aiopquic_deferred_reset* deferred_resets;
+    uint64_t        deferred_resets_swept;  /* last liveness sweep, us */
 } aiopquic_ctx_t;
+
+/* A RESET_STREAM_AT held until its reliable bytes are sent: picoquic
+ * takes no reliable size beyond the bytes it has sent. */
+typedef struct aiopquic_deferred_reset {
+    struct aiopquic_deferred_reset* next;
+    picoquic_cnx_t*        cnx;
+    aiopquic_stream_ctx_t* sc;          /* referenced */
+    uint64_t               stream_id;
+    uint64_t               error_code;  /* as sent */
+    uint64_t               preamble;    /* WT stream header bytes */
+    uint8_t                is_wt;
+} aiopquic_deferred_reset_t;
+
+/* Both ends advertised reset_stream_at. Worker only. */
+static inline int aiopquic_reset_stream_at_negotiated(picoquic_cnx_t* cnx) {
+    const picoquic_tp_t* lt = picoquic_get_transport_parameters(cnx, 1);
+    const picoquic_tp_t* rt = picoquic_get_transport_parameters(cnx, 0);
+    return lt && rt && lt->is_reset_stream_at_enabled
+           && rt->is_reset_stream_at_enabled;
+}
+
+/* Reliable bytes a reset of sc keeps: the requested size capped at what
+ * was written, or 0 when reset_stream_at was not negotiated. */
+static inline uint64_t aiopquic_reset_reliable_size(
+        picoquic_cnx_t* cnx, aiopquic_stream_ctx_t* sc, uint64_t requested) {
+    if (requested == 0 || !sc || !sc->tx
+            || !aiopquic_reset_stream_at_negotiated(cnx)) {
+        return 0;
+    }
+    uint64_t written = atomic_load_explicit(&sc->tx->tail, memory_order_acquire);
+    return requested < written ? requested : written;
+}
+
+/* RESET_STREAM_AT keeping the first `reliable` bytes on the wire (stream
+ * offsets); RESET_STREAM when reliable is 0 or picoquic refuses it. */
+static inline int aiopquic_reset_stream_reliable(picoquic_cnx_t* cnx,
+        uint64_t stream_id, uint64_t code, uint64_t reliable) {
+    if (reliable > 0) {
+        int rr = picoquic_reset_stream_at(cnx, stream_id, code, reliable);
+        if (rr != PICOQUIC_ERROR_OFFSET_TOO_BIG
+                && rr != PICOQUIC_ERROR_ILLEGAL_TRANSPORT_EXTENSION) {
+            return rr;
+        }
+    }
+    return picoquic_reset_stream(cnx, stream_id, code);
+}
+
+static inline void aiopquic_deferred_reset_free(aiopquic_deferred_reset_t* d) {
+    d->sc->tx_reset_pending = 0;
+    aiopquic_stream_ctx_destroy(d->sc);
+    free(d);
+}
+
+/* Forget the held resets of a closing cnx. Worker only. */
+static inline void aiopquic_deferred_resets_drop_cnx(aiopquic_ctx_t* ctx,
+                                                     picoquic_cnx_t* cnx) {
+    aiopquic_deferred_reset_t** pp = &ctx->deferred_resets;
+    while (*pp) {
+        aiopquic_deferred_reset_t* d = *pp;
+        if (d->cnx == cnx) {
+            *pp = d->next;
+            aiopquic_deferred_reset_free(d);
+        } else {
+            pp = &d->next;
+        }
+    }
+}
+
+/* Hold the reset of sc until its first `reliable` bytes are sent; sends
+ * stop there (aiopquic_stream_ctx_tx_sendable). Returns 0 when held. */
+static inline int aiopquic_defer_reset(aiopquic_ctx_t* ctx,
+        picoquic_cnx_t* cnx, aiopquic_stream_ctx_t* sc, uint64_t stream_id,
+        uint64_t code, uint64_t reliable, uint64_t preamble, int is_wt) {
+    aiopquic_deferred_reset_t* d =
+        (aiopquic_deferred_reset_t*)calloc(1, sizeof(*d));
+    if (!d) return -1;
+    aiopquic_stream_ctx_ref(sc);
+    sc->tx_reset_pending = 1;
+    sc->tx_reliable_size = reliable;
+    d->cnx = cnx;
+    d->sc = sc;
+    d->stream_id = stream_id;
+    d->error_code = code;
+    d->preamble = preamble;
+    d->is_wt = (uint8_t)is_wt;
+    d->next = ctx->deferred_resets;
+    ctx->deferred_resets = d;
+    return 0;
+}
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
 
@@ -545,6 +637,11 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
         spsc_ring_destroy(ctx->rx_event_ring);
         spsc_ring_destroy(ctx->tx_event_ring);
         aiopquic_dgram_table_destroy(&ctx->dgram_table);
+        while (ctx->deferred_resets) {
+            aiopquic_deferred_reset_t* d = ctx->deferred_resets;
+            ctx->deferred_resets = d->next;
+            aiopquic_deferred_reset_free(d);
+        }
         for (uint32_t i = 0; i < ctx->dgram_release_owed_n; i++) {
             aiopquic_dgram_buf_unref(ctx->dgram_release_owed[i].db);
         }
@@ -1312,9 +1409,11 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
              * other order can FIN at an old tail and drop the rest. */
             int fin_after = aiopquic_stream_buf_fin_pending(sb);
             uint32_t avail = aiopquic_stream_buf_used(sb);
-            uint32_t to_send = (avail < want) ? avail : want;
-            int is_fin = (fin_after && to_send == avail) ? 1 : 0;
-            int is_still_active = (avail > to_send) ? 1 : 0;
+            uint32_t sendable = aiopquic_stream_ctx_tx_sendable(sc, avail);
+            uint32_t to_send = (sendable < want) ? sendable : want;
+            int is_fin = (fin_after && !sc->tx_reset_pending
+                          && to_send == avail) ? 1 : 0;
+            int is_still_active = (sendable > to_send) ? 1 : 0;
             uint8_t* buf = picoquic_provide_stream_data_buffer(
                 bytes, to_send, is_fin, is_still_active);
             if (buf && to_send > 0) {
@@ -1465,6 +1564,13 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                 bytes, 0, picoquic_datagram_active_any_path);
         }
         return 0;
+    }
+
+    if (ctx->deferred_resets
+            && (fin_or_event == picoquic_callback_close
+                || fin_or_event == picoquic_callback_application_close
+                || fin_or_event == picoquic_callback_stateless_reset)) {
+        aiopquic_deferred_resets_drop_cnx(ctx, cnx);
     }
 
     int evt = aiopquic_map_event(fin_or_event);
@@ -1647,17 +1753,68 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
  * Once the cnx is closing, Python may have dropped the stream's reference
  * and only the event's keeps sc alive, so it is not handed back to
  * picoquic. Returns sc when reattached, else NULL. */
-static inline aiopquic_stream_ctx_t* aiopquic_stream_reattach(
-        aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx, const spsc_entry_t* entry,
-        int rc) {
-    aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)entry->stream_ctx;
+static inline aiopquic_stream_ctx_t* aiopquic_stream_reattach_sc(
+        aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx, uint64_t stream_id,
+        aiopquic_stream_ctx_t* sc, int rc) {
     if (sc == NULL || rc == PICOQUIC_ERROR_INVALID_STREAM_ID) return NULL;
     if (aiopquic_cnx_closing(cnx)) {
         ctx->cnt_tx_reattach_after_close++;
         return NULL;
     }
-    (void)picoquic_set_app_stream_ctx(cnx, entry->stream_id, sc);
+    (void)picoquic_set_app_stream_ctx(cnx, stream_id, sc);
     return sc;
+}
+
+static inline aiopquic_stream_ctx_t* aiopquic_stream_reattach(
+        aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx, const spsc_entry_t* entry,
+        int rc) {
+    return aiopquic_stream_reattach_sc(
+        ctx, cnx, entry->stream_id,
+        (aiopquic_stream_ctx_t*)entry->stream_ctx, rc);
+}
+
+/* WT half of a held reset. Defined in h3wt_callback.h. */
+static void aiopquic_wt_deferred_reset(aiopquic_ctx_t* ctx,
+                                       aiopquic_deferred_reset_t* d);
+
+/* After a send pass: send the held resets whose reliable bytes are out.
+ * Once a second, also drop those of cnxs that went away without a close
+ * callback. Worker only. */
+static void aiopquic_run_deferred_resets(picoquic_quic_t* quic,
+                                         aiopquic_ctx_t* ctx) {
+    uint64_t now = picoquic_get_quic_time(quic);
+    int sweep = now - ctx->deferred_resets_swept >= 1000000;
+    if (sweep) ctx->deferred_resets_swept = now;
+    aiopquic_deferred_reset_t** pp = &ctx->deferred_resets;
+    while (*pp) {
+        aiopquic_deferred_reset_t* d = *pp;
+        uint64_t head = atomic_load_explicit(&d->sc->tx->head,
+                                             memory_order_relaxed);
+        int ready = head >= d->sc->tx_reliable_size;
+        if (!ready && !sweep) {
+            pp = &d->next;
+            continue;
+        }
+        int alive = aiopquic_cnx_is_alive(quic, d->cnx);
+        if (alive && !ready) {
+            pp = &d->next;
+            continue;
+        }
+        *pp = d->next;
+        d->next = NULL;
+        if (alive && !aiopquic_cnx_closing(d->cnx)) {
+            d->sc->tx_reset_pending = 0;
+            if (d->is_wt) {
+                aiopquic_wt_deferred_reset(ctx, d);
+            } else {
+                int rr = aiopquic_reset_stream_reliable(d->cnx, d->stream_id,
+                    d->error_code, d->sc->tx_reliable_size);
+                aiopquic_stream_ctx_tx_abandon(aiopquic_stream_reattach_sc(
+                    ctx, d->cnx, d->stream_id, d->sc, rr));
+            }
+        }
+        aiopquic_deferred_reset_free(d);
+    }
 }
 
 /*
@@ -1906,11 +2063,27 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     }
                     case SPSC_EVT_TX_STREAM_RESET: {
-                        if (aiopquic_stream_can_send(cnx, entry->stream_id)) {
-                            int rr = picoquic_reset_stream(cnx, entry->stream_id,
-                                                           entry->error_code);
-                            aiopquic_stream_ctx_tx_abandon(
-                                aiopquic_stream_reattach(ctx, cnx, entry, rr));
+                        aiopquic_stream_ctx_t* sc =
+                            (aiopquic_stream_ctx_t*)entry->stream_ctx;
+                        if (sc && sc->tx_reset_pending) {
+                            /* Already resetting. */
+                        } else if (aiopquic_stream_can_send(cnx, entry->stream_id)) {
+                            uint64_t reliable = aiopquic_reset_reliable_size(
+                                cnx, sc, entry->aux);
+                            if (reliable > 0 && reliable > atomic_load_explicit(
+                                    &sc->tx->head, memory_order_relaxed)
+                                    && aiopquic_defer_reset(ctx, cnx, sc,
+                                        entry->stream_id, entry->error_code,
+                                        reliable, 0, 0) == 0) {
+                                (void)picoquic_mark_active_stream(
+                                    cnx, entry->stream_id, 1, sc);
+                            } else {
+                                int rr = aiopquic_reset_stream_reliable(cnx,
+                                    entry->stream_id, entry->error_code,
+                                    reliable);
+                                aiopquic_stream_ctx_tx_abandon(
+                                    aiopquic_stream_reattach(ctx, cnx, entry, rr));
+                            }
                         } else {
                             ctx->cnt_tx_wrong_direction_dropped++;
                         }
@@ -2012,6 +2185,12 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                 }
             }
             aiopquic_tx_event_ring_drained_final(ctx);
+            break;
+
+        case picoquic_packet_loop_after_send:
+            if (ctx->deferred_resets) {
+                aiopquic_run_deferred_resets(quic, ctx);
+            }
             break;
 
         default:

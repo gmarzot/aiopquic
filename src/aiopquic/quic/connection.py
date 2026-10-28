@@ -271,6 +271,7 @@ class QuicConnection:
             ticket_file=cfg.session_ticket_file,
             ip_family=-1 if cfg.ip_family is None else cfg.ip_family,
             pmtud_policy=cfg.pmtud,
+            reset_stream_at=getattr(cfg, 'reset_stream_at', True),
         )
 
     def connect(self, addr: tuple[str, int], now: float = 0.0) -> None:
@@ -1103,16 +1104,36 @@ class QuicConnection:
             self._next_bidi_id += 4
         return stream_id
 
-    def reset_stream(self, stream_id: int, error_code: int) -> None:
-        """Reset a stream with the given error code. On a stream we only
-        receive on, the request is dropped and counted in
-        tx_wrong_direction_dropped."""
+    def reset_stream(self, stream_id: int, error_code: int,
+                     reliable_size: int = 0) -> None:
+        """Reset a stream with the given error code.
+
+        With reliable_size and reset_stream_at negotiated, the reset is a
+        RESET_STREAM_AT: the first reliable_size bytes written (capped at
+        what was written) still reach the peer. Sends stop at them, and
+        the reset waits until they are sent. Otherwise RESET_STREAM, which
+        may lose bytes not yet delivered. On a stream we only receive on,
+        the request is dropped and counted in tx_wrong_direction_dropped.
+
+        Raises:
+            ValueError: reliable_size outside 0..2**32-1.
+        """
+        if not 0 <= reliable_size <= 0xFFFFFFFF:
+            raise ValueError("reset_stream: reliable_size out of range")
         self._transport.push_tx_event(
             _TX_STREAM_RESET, stream_id,
             error_code=error_code, cnx_ptr=self._cnx_ptr,
             stream_ctx=self._stream_ctxs.get(stream_id, 0),
+            aux=reliable_size,
         )
         self._transport.wake_up()
+
+    def reset_stream_at_negotiated(self) -> bool:
+        """Both ends advertised RESET_STREAM_AT, so reset_stream keeps its
+        reliable_size. False until the handshake completes."""
+        if self._cnx_ptr == 0:
+            return False
+        return self._transport.reset_stream_at_negotiated(self._cnx_ptr)
 
     def stop_stream(self, stream_id: int, error_code: int) -> None:
         """Send STOP_SENDING on a stream. On a stream we only send on, the
@@ -1302,6 +1323,7 @@ class QuicEngine:
             key_update_interval=cfg.key_update_interval or 0,
             ip_family=-1 if cfg.ip_family is None else cfg.ip_family,
             pmtud_policy=cfg.pmtud,
+            reset_stream_at=getattr(cfg, 'reset_stream_at', True),
         )
         kwargs.update(extra)
         self._transport.start(**kwargs)

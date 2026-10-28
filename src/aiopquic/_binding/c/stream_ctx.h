@@ -109,6 +109,10 @@ typedef struct {
     _Atomic(uint32_t) rx_event_pending;
     /* fin/reset arrived; free wrapper after final drain. */
     uint8_t  pending_destroy;
+    /* RESET_STREAM_AT waiting for its reliable bytes (worker only):
+     * sends stop at tx_reliable_size, then the reset goes out. */
+    uint8_t  tx_reset_pending;
+    uint64_t tx_reliable_size;
     /* Observability counters (single-writer; relaxed semantics).
      * Aligned with the connection-global ring_event counters in
      * aiopquic_ctx_t so the SIGUSR2 dump can correlate per-stream
@@ -413,6 +417,16 @@ static inline void aiopquic_stream_ctx_tx_abandon(aiopquic_stream_ctx_t* sc) {
                                   tail - head, memory_order_relaxed);
         atomic_store_explicit(&sc->tx->head, tail, memory_order_release);
     }
+}
+
+/* Bytes of sc->tx the worker may hand to picoquic: avail, or only those
+ * below a pending reset's reliable size. Worker only. */
+static inline uint32_t aiopquic_stream_ctx_tx_sendable(
+        const aiopquic_stream_ctx_t* sc, uint32_t avail) {
+    if (!sc->tx_reset_pending) return avail;
+    uint64_t head = atomic_load_explicit(&sc->tx->head, memory_order_relaxed);
+    uint64_t left = sc->tx_reliable_size > head ? sc->tx_reliable_size - head : 0;
+    return left < avail ? (uint32_t)left : avail;
 }
 
 /* Atomic accessors for cross-thread fields. Cython sees plain uint64_t

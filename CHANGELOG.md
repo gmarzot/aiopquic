@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `reset_stream(..., reliable_size=N)` on `QuicConnection` and `WebTransportSession` sends
+  RESET_STREAM_AT, so the first N bytes (a MoQT stream header) still arrive; raw QUIC now
+  advertises it (`QuicConfiguration.reset_stream_at`), and `reset_stream_at_negotiated()` says so.
 - WebTransport `create_stream`: a cancelled or timed-out create no longer hands its stream to the
   next caller (the stream is reset), and a full TX event ring waits for room instead of raising.
 - Cancelling a backpressured `send_stream_data_drained` no longer leaves two waiter tasks behind.

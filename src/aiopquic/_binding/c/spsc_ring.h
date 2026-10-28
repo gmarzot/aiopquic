@@ -248,7 +248,8 @@ typedef struct {
     uint32_t    event_type;
     uint32_t    data_length;
     uint8_t     is_fin;
-    uint8_t     reserved[7];
+    uint8_t     reserved[3];
+    uint32_t    aux;            /* event argument: reliable size of a stream reset */
     void*       data_buf;       /* owned malloc'd payload (NULL if no data) */
     void*       cnx;
     void*       stream_ctx;

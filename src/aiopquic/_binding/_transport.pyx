@@ -182,6 +182,7 @@ cdef extern from *:
         unsigned int migration_disabled
         uint32_t max_datagram_frame_size
         int enable_loss_bit
+        int is_reset_stream_at_enabled
         int enable_time_stamp
         uint64_t min_ack_delay
         int do_grease_quic_bit
@@ -2581,7 +2582,7 @@ cdef class TransportContext:
     def push_tx_event(self, uint32_t event_type, uint64_t stream_id,
                 bytes data=None, uint64_t error_code=0,
                 uintptr_t cnx_ptr=0, uintptr_t stream_ctx=0,
-                uint8_t is_fin=0):
+                uint8_t is_fin=0, uint32_t aux=0):
         """
         Push a command into the TX ring (asyncio → picoquic thread).
 
@@ -2594,6 +2595,7 @@ cdef class TransportContext:
         is_fin is also reused as a small auxiliary flag: e.g.,
         SPSC_EVT_TX_SET_APP_FLOW_CONTROL uses it as the
         `use_app_flow_control` argument to picoquic_set_app_flow_control.
+        aux is the reliable size of an SPSC_EVT_TX_STREAM_RESET.
 
         After pushing, caller should call wake_up() to signal the network thread.
         """
@@ -2607,6 +2609,7 @@ cdef class TransportContext:
         entry.cnx = <void*>cnx_ptr
         entry.stream_ctx = <void*>stream_ctx
         entry.error_code = error_code
+        entry.aux = aux
 
         if data is not None:
             data_ptr = <const uint8_t*>data
@@ -2961,6 +2964,20 @@ cdef class TransportContext:
         cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
         return s.dgram_ceiling
 
+    def reset_stream_at_negotiated(self, uintptr_t cnx_ptr):
+        """Both ends advertised reset_stream_at, so a reset keeps its
+        reliable bytes. Read from the cnx snapshot, like
+        datagram_payload_ceiling."""
+        if cnx_ptr == 0:
+            return False
+        snap = self._snapshot(cnx_ptr, False)
+        if snap is None:
+            return False
+        cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
+        return bool(s.has_tp_local and s.has_tp_remote
+                    and s.tp_local.is_reset_stream_at_enabled
+                    and s.tp_remote.is_reset_stream_at_enabled)
+
     def cnx_data_counters(self, uintptr_t cnx_ptr):
         """(bytes placed on the wire, bytes received from the wire) for
         the cnx, picoquic-side accounting, as of the last worker snapshot;
@@ -3082,7 +3099,8 @@ cdef class TransportContext:
               web_folder=None,
               int ip_family=-1,
               pmtud_policy=None,
-              host=None):
+              host=None,
+              bint reset_stream_at=True):
         """
         Create the picoquic context and start the network thread.
 
@@ -3130,6 +3148,9 @@ cdef class TransportContext:
             rx_data_ring_cap: Per-stream RX byte ring, in bytes, and the
                 advertised stream window. 0: a 4 MiB ring and picoquic's
                 default window.
+            reset_stream_at: Advertise RESET_STREAM_AT
+                (draft-ietf-quic-reliable-stream-reset). WebTransport
+                always advertises it.
             congestion_control_algorithm: picoquic algorithm name, matched
                 exactly; an unknown name raises ValueError. None keeps
                 picoquic's default (newreno).
@@ -3432,6 +3453,12 @@ cdef class TransportContext:
                     tp.initial_max_stream_id_unidir = initial_max_streams_uni
                 if initial_max_streams_bidi > 0:
                     tp.initial_max_stream_id_bidir = initial_max_streams_bidi
+                picoquic_set_default_tp(self._quic, &tp)
+        if reset_stream_at:
+            cur_tp = picoquic_get_default_tp(self._quic)
+            if cur_tp != NULL:
+                tp = cur_tp[0]
+                tp.is_reset_stream_at_enabled = 1
                 picoquic_set_default_tp(self._quic, &tp)
 
         # Configure packet loop parameters (must persist — picoquic stores a pointer)
@@ -3991,7 +4018,8 @@ cdef class WebTransportSessionState:
         self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 
-    def push_reset_stream(self, uint64_t stream_id, uint64_t error_code):
+    def push_reset_stream(self, uint64_t stream_id, uint64_t error_code,
+                          uint32_t reliable_size=0):
         cdef spsc_entry_t entry
         memset(&entry, 0, sizeof(entry))
         entry.event_type = SPSC_EVT_TX_WT_RESET_STREAM
@@ -3999,6 +4027,7 @@ cdef class WebTransportSessionState:
         entry.stream_ctx = <void*>self._wt
         entry.stream_id = stream_id
         entry.error_code = error_code
+        entry.aux = reliable_size
         cdef int ret = spsc_ring_push(
             self._transport._ctx.tx_event_ring, &entry, NULL, 0)
         if ret != 0:

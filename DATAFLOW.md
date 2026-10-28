@@ -119,6 +119,17 @@ both ride picoquic's app wake timer. `WT_CNX_CLOSED` completes `aclose()`. A ser
 never closes the shared connection. Connection-level events reach the sessions
 through `aiopquic_wt_cnx_cb`, installed on every cnx that carries sessions.
 
+### Stream reset with a reliable size
+
+`reset_stream(sid, code, reliable_size=N)` carries N in the TX entry's `aux`. When both ends
+advertised reset_stream_at, the worker sends RESET_STREAM_AT keeping the first N bytes written
+(capped at what was written), plus the WT stream header on a WT stream we opened. picoquic takes
+no reliable size beyond the bytes it has sent, so a reset whose bytes are still in `sc->tx` is
+held on `ctx->deferred_resets`: the pull callbacks stop at N and withhold FIN, and after each send
+pass (`picoquic_packet_loop_after_send`) the held resets whose bytes are out go out. A closing
+cnx's held resets are dropped in its close callback, and a once-a-second liveness sweep drops
+those of a cnx gone without one. Without reset_stream_at the reset is RESET_STREAM.
+
 ### TX backpressure layers
 
 Layered from coarsest to finest; whichever binds first governs.

@@ -67,6 +67,7 @@ cdef extern from "c/spsc_ring.h":
         uint32_t    event_type
         uint32_t    data_length
         uint8_t     is_fin
+        uint32_t    aux
         void*       data_buf
         void*       cnx
         void*       stream_ctx
