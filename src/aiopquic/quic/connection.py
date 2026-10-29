@@ -148,8 +148,7 @@ class QuicConnection:
             self._cnx_ptr = 0
             self._connected = False
             self._closed = False
-        # ConnectionTerminated queued; picoquic follows an application close
-        # with its final close callback.
+        # One ConnectionTerminated: an application close is followed by close.
         self._terminated = False
         # deque, not list: next_event() pops from the head per event
         # while the consumer parses — list.pop(0) is O(n) memmove,
@@ -661,9 +660,7 @@ class QuicConnection:
         return self._transport.tx_event_ring_count / cap
 
     def _append_terminated(self, evt_type: int, error_code: int, data) -> None:
-        """Queue the connection's one ConnectionTerminated: frame_type None
-        for the peer's application close, 0 for a transport close (picoquic
-        does not keep the frame type); data is the peer's reason phrase."""
+        """frame_type None for an application close, else 0."""
         if self._terminated:
             return
         self._terminated = True
@@ -1233,9 +1230,8 @@ class QuicConnection:
 
     def close(self, error_code: int = 0, frame_type: int | None = None,
               reason_phrase: str = "") -> None:
-        """Close the connection with an APPLICATION_CLOSE carrying
-        error_code and reason_phrase (UTF-8, cut to 512 bytes). frame_type
-        is accepted for aioquic compatibility and unused."""
+        """APPLICATION_CLOSE with error_code and reason_phrase (512 bytes max).
+        frame_type is unused."""
         if self._transport is not None and not self._closed:
             reason = (reason_phrase.replace("\0", "").encode("utf-8")[:512]
                       .decode("utf-8", "ignore").encode("utf-8"))

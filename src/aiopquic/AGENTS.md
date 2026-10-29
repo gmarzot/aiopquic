@@ -50,11 +50,9 @@ WebTransport session built directly instead of through `connect_webtransport()` 
 `await session.detach()` after `aclose()` and before `transport.stop()`, or its transport's
 event dispatcher (and the wake fd) is held for the life of the process.
 
-**Close events.** One `ConnectionTerminated` per connection: `frame_type` None for the peer's
-application close, 0 for a transport close, idle timeout or our own close; `reason_phrase` is the
-peer's. `close(code, reason_phrase=)` sends an APPLICATION_CLOSE with it. `WebTransportSessionClosed`
-has `connection_closed` False for a session close (capsule, CONNECT FIN or reset) and True when the
-QUIC connection closed, with `frame_type` as above.
+**Close events.** One `ConnectionTerminated` per connection; `frame_type` None = peer application
+close, 0 = transport close; `reason_phrase` is the peer's. `WebTransportSessionClosed.connection_closed`
+is True when the QUIC connection closed, not just the session.
 
 **Threading.** One network thread per `TransportContext`. Call everything on a transport, `stop()`
 included, from its event loop's thread: each TX ring has one producer and the producer side relies
@@ -201,9 +199,8 @@ has left the ring once it is exceeded.
   `stream_released`. Every raw-QUIC event carrying an `sc` holds a reference while queued (RX data,
   FIN, reset, stop-sending; TX reset, stop-sending, mark-active, flow-control): push through
   `aiopquic_rx_push_sc` / `aiopquic_tx_push_sc`, and release on every consume or drop path.
-- `picoquic_close_ex` keeps a pointer to its reason phrase: the worker owns a copy in
-  `ctx->close_reasons` and frees it at the cnx's final callback (close or stateless reset, never
-  application close) or at `aiopquic_ctx_destroy`.
+- `picoquic_close_ex` borrows its reason: `ctx->close_reasons` holds it until the cnx's close or
+  stateless-reset callback (not application close).
 - picoquic may free a cnx any time after its close callback. The dead-connection guard
   (`aiopquic_cnx_is_alive()`) runs before any TX event that names a cnx and drops the event on a
   miss; it compares addresses, so a new cnx at a freed one's address passes. WT TX events carry a

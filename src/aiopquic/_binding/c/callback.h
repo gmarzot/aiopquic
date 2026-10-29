@@ -462,8 +462,7 @@ typedef struct {
     uint64_t        deferred_resets_swept;  /* last liveness sweep, us */
     uint64_t        tx_worker_armed_at;     /* worker only: arm time of a long wait, else 0 */
     uint64_t        cnt_tx_wake_lost;       /* TX entries found after a long sleep no producer woke */
-    /* Reason phrases passed to picoquic_close_ex, which keeps the pointer
-     * until the cnx's final callback (worker only). */
+    /* Reasons lent to picoquic_close_ex (worker only). */
     struct aiopquic_close_reason* close_reasons;
 } aiopquic_ctx_t;
 
@@ -540,8 +539,7 @@ static inline void aiopquic_deferred_resets_drop_cnx(aiopquic_ctx_t* ctx,
     }
 }
 
-/* The NUL-terminated reason phrase to close cnx with, kept until its final
- * callback; NULL for none. A cnx keeps its first reason. Worker only. */
+/* cnx's close reason, held until its final callback; NULL for none. */
 static inline const char* aiopquic_close_reason_hold(aiopquic_ctx_t* ctx,
         picoquic_cnx_t* cnx, const void* data, uint32_t len) {
     if (len == 0 || data == NULL) {
@@ -565,8 +563,7 @@ static inline const char* aiopquic_close_reason_hold(aiopquic_ctx_t* ctx,
     return r->text;
 }
 
-/* Free cnx's close reason; call only from its final callback (close or
- * stateless reset), after which picoquic sends no close frame. */
+/* Only from cnx's final callback: close or stateless reset. */
 static inline void aiopquic_close_reason_drop(aiopquic_ctx_t* ctx,
                                               picoquic_cnx_t* cnx) {
     aiopquic_close_reason_t** pp = &ctx->close_reasons;
@@ -1791,7 +1788,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                                (const uint8_t*)&snap, sizeof(snap));
     } else if (fin_or_event == picoquic_callback_close
                || fin_or_event == picoquic_callback_application_close) {
-        /* The peer's reason phrase rides with the close. */
+        /* The peer's reason phrase. */
         const char* reason = picoquic_get_remote_error_reason(cnx);
         ret = aiopquic_rx_push_sc(ctx, &entry, (const uint8_t*)reason,
                                   reason ? (uint32_t)strlen(reason) : 0);
