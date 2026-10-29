@@ -58,6 +58,9 @@ _EVT_DATAGRAM_TX_DRAINED = 19
 _EVT_WT_SESSION_READY = 64
 _EVT_WT_SESSION_REFUSED = 65
 _EVT_WT_SESSION_CLOSED = 66
+# Close source of SESSION_CLOSED / CNX_CLOSED (h3wt_callback.h AIOPQUIC_WT_CLOSE_*).
+_WT_CLOSE_SESSION = 0
+_WT_CLOSE_TRANSPORT = 2
 _EVT_WT_SESSION_DRAINING = 67
 _EVT_WT_STREAM_DATA = 68
 _EVT_WT_STREAM_FIN = 69
@@ -946,9 +949,13 @@ class WebTransportSession:
         self._stream_tx_ctxs.pop(sid, None)
         self._stream_tx_drain_events.pop(sid, None)
 
-    def _on_session_closed(self, error_code, data) -> None:
+    def _on_session_closed(self, error_code, data,
+                           source=_WT_CLOSE_SESSION) -> None:
         reason = data if data is not None else memoryview(b"")
-        ev = WebTransportSessionClosed(error_code=error_code, reason=reason)
+        ev = WebTransportSessionClosed(
+            error_code=error_code, reason=reason,
+            connection_closed=source != _WT_CLOSE_SESSION,
+            frame_type=0 if source == _WT_CLOSE_TRANSPORT else None)
         self._session_close_event = ev
         self._session_closed.set()
         self._release_session_resources()
@@ -1026,10 +1033,10 @@ class WebTransportSession:
                     f"WT CONNECT refused ({reason})"))
             self._event_queue.put_nowait(err)
         elif evt_type == _EVT_WT_SESSION_CLOSED:
-            self._on_session_closed(error_code, data)
+            self._on_session_closed(error_code, data, _is_fin)
         elif evt_type == _EVT_WT_CNX_CLOSED:
             if not self.session_closed:
-                self._on_session_closed(error_code, None)
+                self._on_session_closed(error_code, None, _is_fin)
             self._cnx_closed.set()
         elif evt_type == _EVT_WT_SESSION_DRAINING:
             self._draining = True

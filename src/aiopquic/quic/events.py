@@ -25,6 +25,9 @@ class HandshakeCompleted(QuicEvent):
 
 @dataclass
 class ConnectionTerminated(QuicEvent):
+    """The connection closed. frame_type is None for the peer's application
+    close (error_code is the application's), else 0: a transport close,
+    idle timeout or our own close. reason_phrase is the peer's."""
     error_code: int = 0
     frame_type: int | None = None
     reason_phrase: str = ""
@@ -94,9 +97,14 @@ class WebTransportSessionRefused(QuicEvent):
 
 @dataclass
 class WebTransportSessionClosed(QuicEvent):
-    """CLOSE_WEBTRANSPORT_SESSION capsule received or control stream FIN."""
+    """The session ended. connection_closed is False for a
+    CLOSE_WEBTRANSPORT_SESSION capsule, control-stream FIN or reset
+    (error_code is the session's), True when its QUIC connection closed;
+    frame_type then follows ConnectionTerminated."""
     error_code: int = 0
     reason: memoryview = field(default_factory=lambda: memoryview(b""))
+    connection_closed: bool = False
+    frame_type: int | None = None
 
 
 @dataclass

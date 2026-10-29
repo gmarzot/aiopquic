@@ -148,6 +148,9 @@ class QuicConnection:
             self._cnx_ptr = 0
             self._connected = False
             self._closed = False
+        # ConnectionTerminated queued; picoquic follows an application close
+        # with its final close callback.
+        self._terminated = False
         # deque, not list: next_event() pops from the head per event
         # while the consumer parses — list.pop(0) is O(n) memmove,
         # which under a receive backlog turns consumption quadratic
@@ -448,14 +451,13 @@ class QuicConnection:
             # anything else is abnormal (warning).
             _kind = ("app" if evt_type == _EVT_APP_CLOSE
                      else "transport")
-            if error_code:
-                logger.warning("connection closed (%s): error=%d",
-                               _kind, error_code)
-            else:
-                logger.debug("connection closed (%s, clean)", _kind)
-            self._events.append(ConnectionTerminated(
-                error_code=error_code,
-            ))
+            if not self._terminated:
+                if error_code:
+                    logger.warning("connection closed (%s): error=%d",
+                                   _kind, error_code)
+                else:
+                    logger.debug("connection closed (%s, clean)", _kind)
+                self._append_terminated(evt_type, error_code, data)
             # Wake any producer parked in send_stream_data_drained /
             # stream_write_drain waiting on per-stream or ring drain
             # events. After close the worker stops invoking drain
@@ -658,6 +660,20 @@ class QuicConnection:
             return 0.0
         return self._transport.tx_event_ring_count / cap
 
+    def _append_terminated(self, evt_type: int, error_code: int, data) -> None:
+        """Queue the connection's one ConnectionTerminated: frame_type None
+        for the peer's application close, 0 for a transport close (picoquic
+        does not keep the frame type); data is the peer's reason phrase."""
+        if self._terminated:
+            return
+        self._terminated = True
+        self._events.append(ConnectionTerminated(
+            error_code=error_code,
+            frame_type=None if evt_type == _EVT_APP_CLOSE else 0,
+            reason_phrase=(bytes(data).decode("utf-8", "replace")
+                           if data is not None else ""),
+        ))
+
     def next_event(self) -> QuicEvent | None:
         """Dequeue next event from the connection.
 
@@ -714,7 +730,7 @@ class QuicConnection:
             ))
         elif evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
             self._closed = True
-            self._events.append(ConnectionTerminated(error_code=error_code))
+            self._append_terminated(evt_type, error_code, data)
             # Wake parked drain waiters — see matching block ~line 256.
             for ev in self._stream_tx_drain_events.values():
                 ev.set()
@@ -1217,10 +1233,14 @@ class QuicConnection:
 
     def close(self, error_code: int = 0, frame_type: int | None = None,
               reason_phrase: str = "") -> None:
-        """Close the connection."""
+        """Close the connection with an APPLICATION_CLOSE carrying
+        error_code and reason_phrase (UTF-8, cut to 512 bytes). frame_type
+        is accepted for aioquic compatibility and unused."""
         if self._transport is not None and not self._closed:
+            reason = (reason_phrase.replace("\0", "").encode("utf-8")[:512]
+                      .decode("utf-8", "ignore").encode("utf-8"))
             self._transport.push_tx_event(
-                _TX_CLOSE, 0,
+                _TX_CLOSE, 0, data=reason or None,
                 error_code=error_code, cnx_ptr=self._cnx_ptr,
             )
             self._transport.wake_up()

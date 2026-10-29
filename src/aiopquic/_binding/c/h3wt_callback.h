@@ -484,6 +484,28 @@ static inline void aiopquic_wt_push_event(
     }
 }
 
+/* Source of a SESSION_CLOSED / CNX_CLOSED, carried in is_fin. */
+#define AIOPQUIC_WT_CLOSE_SESSION      0   /* capsule, control-stream FIN or reset */
+#define AIOPQUIC_WT_CLOSE_APPLICATION  1   /* QUIC APPLICATION_CLOSE */
+#define AIOPQUIC_WT_CLOSE_TRANSPORT    2   /* QUIC transport close, idle timeout, stateless reset */
+
+static inline void aiopquic_wt_push_close(
+        aiopquic_wt_session_t* s,
+        uint32_t event_type,
+        uint64_t error_code,
+        const char* reason,
+        uint8_t source) {
+    spsc_entry_t entry = {0};
+    entry.event_type = event_type;
+    entry.stream_id = s->control_stream_id;
+    entry.error_code = error_code;
+    entry.is_fin = source;
+    entry.cnx = s->cnx;
+    entry.stream_ctx = s;
+    (void)aiopquic_rx_push(s->bridge, &entry, (const uint8_t*)reason,
+                           reason ? (uint32_t)strlen(reason) : 0);
+}
+
 /*
  * Push NEW_STREAM with a BORROWED sc pointer so Python can stash it
  * in its _stream_tx_ctxs dict for subsequent push_stream_data calls
@@ -658,11 +680,17 @@ static int aiopquic_wt_cnx_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
     case picoquic_callback_application_close:
     case picoquic_callback_stateless_reset: {
         uint64_t code = 0;
+        uint8_t source = AIOPQUIC_WT_CLOSE_TRANSPORT;
+        const char* reason = NULL;
         if (event == picoquic_callback_application_close) {
             code = picoquic_get_application_error(cnx);
+            source = AIOPQUIC_WT_CLOSE_APPLICATION;
+            reason = picoquic_get_remote_error_reason(cnx);
         } else if (event == picoquic_callback_close) {
             code = picoquic_get_remote_error(cnx);
+            reason = picoquic_get_remote_error_reason(cnx);
         }
+        int final = event != picoquic_callback_application_close;
         for (h3zero_stream_prefix_t* p = h3->stream_prefixes.first; p != NULL;
                 p = p->next) {
             if (p->function_call != aiopquic_wt_path_callback) {
@@ -672,14 +700,17 @@ static int aiopquic_wt_cnx_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
             if (s->bridge && s->bridge->deferred_resets) {
                 aiopquic_deferred_resets_drop_cnx(s->bridge, cnx);
             }
+            if (final && s->bridge && s->bridge->close_reasons) {
+                aiopquic_close_reason_drop(s->bridge, cnx);
+            }
             if (!s->session_closing) {
-                aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_CLOSED,
-                                        s->control_stream_id, code, NULL, 0);
+                aiopquic_wt_push_close(s, SPSC_EVT_WT_SESSION_CLOSED, code,
+                                       reason, source);
                 s->session_closing = 1;
             }
             if (client) {
-                aiopquic_wt_push_event(s, SPSC_EVT_WT_CNX_CLOSED,
-                                        s->control_stream_id, code, NULL, 0);
+                aiopquic_wt_push_close(s, SPSC_EVT_WT_CNX_CLOSED, code,
+                                       NULL, source);
             } else {
                 s->cnx = NULL;
                 s->h3_ctx = NULL;
