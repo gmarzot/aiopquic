@@ -130,6 +130,8 @@ cdef extern from "picoquic.h":
 
     int picoquic_set_default_congestion_algorithm_by_name(
         picoquic_quic_t* quic, const char* alg_name)
+    void picoquic_set_default_congestion_algorithm_ex(
+        picoquic_quic_t* quic, const void* alg, const char* alg_option_string)
 
     void picoquic_register_all_congestion_control_algorithms()
     const void* picoquic_get_congestion_algorithm(const char* alg_name)
@@ -1259,9 +1261,10 @@ cdef class TransportContext:
     # parses it into a bridge-owned array of copies (client offer + server
     # allowlist). Retained only to keep the buffer alive across that call.
     cdef bytes _alpn_list_csv
-    # Paths picoquic keeps borrowed pointers to.
+    # Strings picoquic keeps borrowed pointers to.
     cdef bytes _ticket_file
     cdef bytes _web_folder
+    cdef bytes _cc_options
     cdef picohttp_server_path_item_t _wt_path_item
     cdef picohttp_server_parameters_t _wt_params
     # Forensic counters for the atomic send_stream_data path.
@@ -3342,6 +3345,14 @@ cdef class TransportContext:
             _c_cc = _b_cc
             picoquic_set_default_congestion_algorithm_by_name(
                 self._quic, _c_cc)
+            # Algorithm option string, e.g. BBR "Q0.02" (send quantum ratio).
+            import os
+            _env_cc_opts = os.environ.get("AIOPQUIC_CC_OPTIONS")
+            if _env_cc_opts:
+                self._cc_options = _env_cc_opts.encode()
+                picoquic_set_default_congestion_algorithm_ex(
+                    self._quic, picoquic_get_congestion_algorithm(_c_cc),
+                    self._cc_options)
 
         cdef bytes _b_log
         # Textlog: per-cnx human-readable log of every packet, ACK, FC
