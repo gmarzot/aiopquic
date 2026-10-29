@@ -8,6 +8,13 @@
   connections past it are refused at once with CONNECTION_REFUSED, existing ones are kept.
 - `counters["tx_wake_lost"]` counts TX events found queued after a sleep no producer woke; it stays 0
   unless a wake was lost.
+- `ConnectionTerminated.frame_type` is None for the peer's application close and 0 for a transport
+  close (CONNECTION_REFUSED, idle timeout); `reason_phrase` is the peer's reason phrase.
+- `QuicConnection.close(error_code, reason_phrase=...)` sends the reason phrase (up to 512 bytes).
+- `WebTransportSessionClosed` adds `connection_closed` and `frame_type`; a session ended by its QUIC
+  connection's close carries that close's reason.
+- Fix: a peer's application close produced two `ConnectionTerminated` events, the second with code 0;
+  it produces one.
 
 ## v0.7.0rc2
 
