@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Connection closes log at DEBUG (were WARNING for a nonzero code); the application gets them as
+  `ConnectionTerminated`.
 - A send wakes the network thread only when it may be asleep: raw QUIC and WebTransport no longer
   make a wake syscall per write while the thread runs (WT made one on every write).
 - `TransportContext.set_max_connections(n)` lowers the connection limit while the server runs; new

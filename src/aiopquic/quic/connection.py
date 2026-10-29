@@ -444,18 +444,11 @@ class QuicConnection:
             ))
         elif evt_type == _EVT_CLOSE or evt_type == _EVT_APP_CLOSE:
             self._closed = True
-            # Log the close so drop-under-load investigations can read
-            # the actual cause: transport vs application close + the
-            # error code. error_code 0 is a clean close (debug);
-            # anything else is abnormal (warning).
-            _kind = ("app" if evt_type == _EVT_APP_CLOSE
-                     else "transport")
             if not self._terminated:
-                if error_code:
-                    logger.warning("connection closed (%s): error=%d",
-                                   _kind, error_code)
-                else:
-                    logger.debug("connection closed (%s, clean)", _kind)
+                # The application sees the close as ConnectionTerminated.
+                logger.debug("connection closed (%s): error=%d",
+                             "app" if evt_type == _EVT_APP_CLOSE
+                             else "transport", error_code)
                 self._append_terminated(evt_type, error_code, data)
             # Wake any producer parked in send_stream_data_drained /
             # stream_write_drain waiting on per-stream or ring drain

@@ -1,6 +1,7 @@
 """A close reaches the application once, says whether the peer closed at the
 application or the transport level, and carries the peer's reason phrase."""
 import asyncio
+import logging
 import os
 
 import pytest
@@ -163,3 +164,27 @@ async def test_wt_idle_timeout_is_a_transport_close():
     ev = await _wt_session_closed(lambda session: None, client_cfg=cfg,
                                   timeout=10.0)
     assert (ev.error_code, ev.connection_closed, ev.frame_type) == (0, True, 0)
+
+
+def _aiopquic_warnings(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.name.startswith("aiopquic") and r.levelno >= logging.WARNING]
+
+
+async def test_quic_closes_log_no_warning(caplog):
+    caplog.set_level(logging.DEBUG, logger="aiopquic")
+    await test_peer_application_close_is_one_event_with_its_reason()
+    await test_our_close_reason_reaches_the_peer()
+    await test_refused_connection_is_a_transport_close()
+    assert any(r.getMessage() == "connection closed (app): error=5"
+               for r in caplog.records)
+    assert any(r.getMessage() == "connection closed (transport): error=2"
+               for r in caplog.records)
+    assert _aiopquic_warnings(caplog) == []
+
+
+async def test_wt_closes_log_no_warning(caplog):
+    caplog.set_level(logging.DEBUG, logger="aiopquic")
+    await test_wt_session_close_is_not_a_connection_close()
+    await test_wt_quic_application_close_carries_kind_and_reason()
+    assert _aiopquic_warnings(caplog) == []
