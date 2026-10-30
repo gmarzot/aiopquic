@@ -462,7 +462,15 @@ typedef struct {
     uint64_t        deferred_resets_swept;  /* last liveness sweep, us */
     uint64_t        tx_worker_armed_at;     /* worker only: arm time of a long wait, else 0 */
     uint64_t        cnt_tx_wake_lost;       /* TX entries found after a long sleep no producer woke */
+    /* Reasons lent to picoquic_close_ex (worker only). */
+    struct aiopquic_close_reason* close_reasons;
 } aiopquic_ctx_t;
+
+typedef struct aiopquic_close_reason {
+    struct aiopquic_close_reason* next;
+    picoquic_cnx_t* cnx;
+    char text[];
+} aiopquic_close_reason_t;
 
 /* A RESET_STREAM_AT held until its reliable bytes are sent: picoquic
  * takes no reliable size beyond the bytes it has sent. */
@@ -528,6 +536,45 @@ static inline void aiopquic_deferred_resets_drop_cnx(aiopquic_ctx_t* ctx,
         } else {
             pp = &d->next;
         }
+    }
+}
+
+/* cnx's close reason, held until its final callback; NULL for none. */
+static inline const char* aiopquic_close_reason_hold(aiopquic_ctx_t* ctx,
+        picoquic_cnx_t* cnx, const void* data, uint32_t len) {
+    if (len == 0 || data == NULL) {
+        return NULL;
+    }
+    for (aiopquic_close_reason_t* r = ctx->close_reasons; r; r = r->next) {
+        if (r->cnx == cnx) {
+            return r->text;
+        }
+    }
+    aiopquic_close_reason_t* r =
+        (aiopquic_close_reason_t*)malloc(sizeof(*r) + (size_t)len + 1);
+    if (!r) {
+        return NULL;
+    }
+    r->cnx = cnx;
+    memcpy(r->text, data, len);
+    r->text[len] = '\0';
+    r->next = ctx->close_reasons;
+    ctx->close_reasons = r;
+    return r->text;
+}
+
+/* Only from cnx's final callback: close or stateless reset. */
+static inline void aiopquic_close_reason_drop(aiopquic_ctx_t* ctx,
+                                              picoquic_cnx_t* cnx) {
+    aiopquic_close_reason_t** pp = &ctx->close_reasons;
+    while (*pp) {
+        aiopquic_close_reason_t* r = *pp;
+        if (r->cnx == cnx) {
+            *pp = r->next;
+            free(r);
+            return;
+        }
+        pp = &r->next;
     }
 }
 
@@ -646,6 +693,11 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
             aiopquic_deferred_reset_t* d = ctx->deferred_resets;
             ctx->deferred_resets = d->next;
             aiopquic_deferred_reset_free(d);
+        }
+        while (ctx->close_reasons) {
+            aiopquic_close_reason_t* r = ctx->close_reasons;
+            ctx->close_reasons = r->next;
+            free(r);
         }
         for (uint32_t i = 0; i < ctx->dgram_release_owed_n; i++) {
             aiopquic_dgram_buf_unref(ctx->dgram_release_owed[i].db);
@@ -1577,6 +1629,11 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                 || fin_or_event == picoquic_callback_stateless_reset)) {
         aiopquic_deferred_resets_drop_cnx(ctx, cnx);
     }
+    if (ctx->close_reasons
+            && (fin_or_event == picoquic_callback_close
+                || fin_or_event == picoquic_callback_stateless_reset)) {
+        aiopquic_close_reason_drop(ctx, cnx);
+    }
 
     int evt = aiopquic_map_event(fin_or_event);
     if (evt < 0) {
@@ -1729,6 +1786,12 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         aiopquic_cnx_snapshot_fill(cnx, &snap);
         ret = aiopquic_rx_push(ctx, &entry,
                                (const uint8_t*)&snap, sizeof(snap));
+    } else if (fin_or_event == picoquic_callback_close
+               || fin_or_event == picoquic_callback_application_close) {
+        /* The peer's reason phrase. */
+        const char* reason = picoquic_get_remote_error_reason(cnx);
+        ret = aiopquic_rx_push_sc(ctx, &entry, (const uint8_t*)reason,
+                                  reason ? (uint32_t)strlen(reason) : 0);
     } else {
         ret = aiopquic_rx_push_sc(ctx, &entry, bytes, (uint32_t)length);
     }
@@ -2094,7 +2157,13 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     case SPSC_EVT_TX_CLOSE: {
                         /* cnx liveness already verified by the outer
                          * aiopquic_cnx_is_alive() guard above. */
-                        picoquic_close(cnx, entry->error_code);
+                        const char* reason = aiopquic_close_reason_hold(
+                            ctx, cnx, entry->data_buf, entry->data_length);
+                        if (reason) {
+                            picoquic_close_ex(cnx, entry->error_code, reason);
+                        } else {
+                            picoquic_close(cnx, entry->error_code);
+                        }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;

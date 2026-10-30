@@ -56,8 +56,8 @@ typedef enum {
     SPSC_EVT_STREAM_FIN = 1,
     SPSC_EVT_STREAM_RESET = 2,
     SPSC_EVT_STOP_SENDING = 3,
-    SPSC_EVT_CLOSE = 4,
-    SPSC_EVT_APP_CLOSE = 5,
+    SPSC_EVT_CLOSE = 4,                    /* data = the peer's reason phrase, if any */
+    SPSC_EVT_APP_CLOSE = 5,                /* data = the peer's reason phrase, if any */
     SPSC_EVT_READY = 6,
     SPSC_EVT_ALMOST_READY = 7,
     SPSC_EVT_DATAGRAM = 8,
@@ -218,7 +218,8 @@ typedef enum {
     SPSC_EVT_WT_SESSION_READY = 64,        /* CONNECT accepted by peer. Payload:
                                               aiopquic_cnx_snapshot_t. */
     SPSC_EVT_WT_SESSION_REFUSED = 65,      /* CONNECT refused */
-    SPSC_EVT_WT_SESSION_CLOSED = 66,       /* CLOSE_WEBTRANSPORT_SESSION received */
+    SPSC_EVT_WT_SESSION_CLOSED = 66,       /* session ended; is_fin = AIOPQUIC_WT_CLOSE_* source,
+                                              data = the reason */
     SPSC_EVT_WT_SESSION_DRAINING = 67,     /* DRAIN_WEBTRANSPORT_SESSION received */
     SPSC_EVT_WT_STREAM_DATA = 68,          /* data on a WT stream */
     SPSC_EVT_WT_STREAM_FIN = 69,           /* FIN on a WT stream */
@@ -244,7 +245,8 @@ typedef enum {
                                               data_buf = link*; not exposed
                                               to Python. */
     SPSC_EVT_WT_CNX_CLOSED = 77,           /* WT client cnx gone: close, application close or
-                                              stateless reset; error_code = the peer's code */
+                                              stateless reset; error_code = the peer's code,
+                                              is_fin = AIOPQUIC_WT_CLOSE_* source */
 } spsc_event_type_t;
 
 typedef struct {

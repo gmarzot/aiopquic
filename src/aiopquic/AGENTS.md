@@ -50,6 +50,10 @@ WebTransport session built directly instead of through `connect_webtransport()` 
 `await session.detach()` after `aclose()` and before `transport.stop()`, or its transport's
 event dispatcher (and the wake fd) is held for the life of the process.
 
+**Close events.** One `ConnectionTerminated` per connection; `frame_type` None = peer application
+close, 0 = transport close; `reason_phrase` is the peer's. `WebTransportSessionClosed.connection_closed`
+is True when the QUIC connection closed, not just the session.
+
 **Threading.** One network thread per `TransportContext`. Call everything on a transport, `stop()`
 included, from its event loop's thread: each TX ring has one producer and the producer side relies
 on the GIL.
@@ -195,6 +199,8 @@ has left the ring once it is exceeded.
   `stream_released`. Every raw-QUIC event carrying an `sc` holds a reference while queued (RX data,
   FIN, reset, stop-sending; TX reset, stop-sending, mark-active, flow-control): push through
   `aiopquic_rx_push_sc` / `aiopquic_tx_push_sc`, and release on every consume or drop path.
+- `picoquic_close_ex` borrows its reason: `ctx->close_reasons` holds it until the cnx's close or
+  stateless-reset callback (not application close).
 - picoquic may free a cnx any time after its close callback. The dead-connection guard
   (`aiopquic_cnx_is_alive()`) runs before any TX event that names a cnx and drops the event on a
   miss; it compares addresses, so a new cnx at a freed one's address passes. WT TX events carry a
@@ -220,6 +226,7 @@ applies nor reverse-applies stops the build: drop or regenerate it.
 | `picoquic-h3zero-null-file-guard` | h3zero's client skips `fwrite` on a NULL `FILE*` | Upstream candidate |
 | `picoquic-reset-at-ack-delete` | The ack of a RESET_STREAM_AT retires a stream we only sent on; picoquic gated it on the receive-side `consumed_offset`, so the stream stayed until the connection closed | Local |
 | `picoquic-stop-sending-error-getter` | `picoquic_get_remote_stop_sending_error()` returns the code of a received STOP_SENDING | Local |
+| `picoquic-remote-error-reason-getter` | `picoquic_get_remote_error_reason()` returns the reason phrase of the peer's CONNECTION_CLOSE or APPLICATION_CLOSE | Upstream candidate |
 
 ## Known traps
 

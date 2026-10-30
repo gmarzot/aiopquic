@@ -1,0 +1,31 @@
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+index 00477235..3445c394 100644
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -1806,6 +1806,9 @@ uint64_t picoquic_get_remote_error(picoquic_cnx_t* cnx);
+ /* Returns the application error after application close */
+ uint64_t picoquic_get_application_error(picoquic_cnx_t* cnx);
+ 
++/* Returns the reason phrase of the peer's close, or NULL. */
++char const* picoquic_get_remote_error_reason(picoquic_cnx_t* cnx);
++
+ /* Returns the remote error for the given stream. */
+ uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t* cnx, uint64_t stream_id);
+ 
+diff --git a/picoquic/quicctx.c b/picoquic/quicctx.c
+index e0fcc2e1..4fada4f5 100644
+--- a/picoquic/quicctx.c
++++ b/picoquic/quicctx.c
+@@ -5369,6 +5369,12 @@ uint64_t picoquic_get_application_error(picoquic_cnx_t* cnx)
+     return cnx->remote_application_error;
+ }
+ 
++char const* picoquic_get_remote_error_reason(picoquic_cnx_t* cnx)
++{
++    PICOQUIC_THREAD_CHECK(cnx->quic);
++    return cnx->remote_error_reason;
++}
++
+ uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t* cnx, uint64_t stream_id)
+ {
+     uint64_t remote_error = 0;
