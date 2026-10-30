@@ -61,6 +61,7 @@ _EVT_WT_SESSION_CLOSED = 66
 # AIOPQUIC_WT_CLOSE_* in h3wt_callback.h.
 _WT_CLOSE_SESSION = 0
 _WT_CLOSE_TRANSPORT = 2
+_CLOSE_LOCAL = 0x80  # AIOPQUIC_CLOSE_LOCAL in spsc_ring.h
 _EVT_WT_SESSION_DRAINING = 67
 _EVT_WT_STREAM_DATA = 68
 _EVT_WT_STREAM_FIN = 69
@@ -952,10 +953,17 @@ class WebTransportSession:
     def _on_session_closed(self, error_code, data,
                            source=_WT_CLOSE_SESSION) -> None:
         reason = data if data is not None else memoryview(b"")
+        local_error, local_reason = 0, ""
+        if source & _CLOSE_LOCAL:
+            source &= ~_CLOSE_LOCAL
+            local_error = error_code
+            local_reason = bytes(reason).decode("utf-8", "replace")
+            error_code, reason = 0, memoryview(b"")
         ev = WebTransportSessionClosed(
             error_code=error_code, reason=reason,
             connection_closed=source != _WT_CLOSE_SESSION,
-            frame_type=0 if source == _WT_CLOSE_TRANSPORT else None)
+            frame_type=0 if source == _WT_CLOSE_TRANSPORT else None,
+            local_error=local_error, local_reason=local_reason)
         self._session_close_event = ev
         self._session_closed.set()
         self._release_session_resources()
