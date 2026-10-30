@@ -52,8 +52,8 @@ jobs:
         include:
         - os: ubuntu-latest                   # manylinux_2_34 x86_64
         - os: ubuntu-24.04-arm                # manylinux_2_34 aarch64
-        - os: macos-14
-          macosx_deployment_target: "14.0"
+        - os: macos-15
+          macosx_deployment_target: "15.0"
         # macos-13 (Intel x86_64) retired by GitHub Oct 2025.
         # Intel Mac users install via sdist.
     steps:
