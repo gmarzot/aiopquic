@@ -1507,6 +1507,8 @@ async def connect_webtransport(
                 idle_timeout_ms=int(configuration.idle_timeout * 1000),
                 congestion_control_algorithm=(
                     configuration.congestion_control_algorithm),
+                congestion_control_options=(
+                    configuration.congestion_control_options),
                 keep_alive_interval_ms=int(
                     (configuration.keep_alive_interval or 0) * 1000),
                 socket_buffer_size=(
@@ -1636,6 +1638,8 @@ async def serve_webtransport(
                 idle_timeout_ms=int(configuration.idle_timeout * 1000),
                 congestion_control_algorithm=(
                     configuration.congestion_control_algorithm),
+                congestion_control_options=(
+                    configuration.congestion_control_options),
                 keep_alive_interval_ms=int(
                     (configuration.keep_alive_interval or 0) * 1000),
                 socket_buffer_size=(

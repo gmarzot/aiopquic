@@ -130,6 +130,8 @@ cdef extern from "picoquic.h":
 
     int picoquic_set_default_congestion_algorithm_by_name(
         picoquic_quic_t* quic, const char* alg_name)
+    void picoquic_set_default_congestion_algorithm_ex(
+        picoquic_quic_t* quic, const void* alg, const char* alg_option_string)
 
     void picoquic_register_all_congestion_control_algorithms()
     const void* picoquic_get_congestion_algorithm(const char* alg_name)
@@ -760,6 +762,18 @@ def check_congestion_control_algorithm(name):
             f"expected one of {', '.join(_CC_NAMES)}")
 
 
+def check_congestion_control_options(options, name):
+    """Raise ValueError unless options is None, or a str with an algorithm
+    named to take it."""
+    if options is None:
+        return
+    if not isinstance(options, str) or "\0" in options:
+        raise ValueError("congestion_control_options must be a str")
+    if name is None:
+        raise ValueError(
+            "congestion_control_options needs a congestion_control_algorithm")
+
+
 def tx_data_bytes_queued():
     """Process-wide bytes committed to per-stream sc->tx data rings
     and not yet pulled by a picoquic worker (nor discarded at stream
@@ -1259,9 +1273,10 @@ cdef class TransportContext:
     # parses it into a bridge-owned array of copies (client offer + server
     # allowlist). Retained only to keep the buffer alive across that call.
     cdef bytes _alpn_list_csv
-    # Paths picoquic keeps borrowed pointers to.
+    # Strings picoquic keeps borrowed pointers to.
     cdef bytes _ticket_file
     cdef bytes _web_folder
+    cdef bytes _cc_options
     cdef picohttp_server_path_item_t _wt_path_item
     cdef picohttp_server_parameters_t _wt_params
     # Forensic counters for the atomic send_stream_data path.
@@ -3121,7 +3136,8 @@ cdef class TransportContext:
               int ip_family=-1,
               pmtud_policy=None,
               host=None,
-              bint reset_stream_at=True):
+              bint reset_stream_at=True,
+              congestion_control_options=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -3175,6 +3191,8 @@ cdef class TransportContext:
             congestion_control_algorithm: picoquic algorithm name, matched
                 exactly; an unknown name raises ValueError. None keeps
                 picoquic's default (newreno).
+            congestion_control_options: Option string for that algorithm,
+                passed to picoquic as is, e.g. "Q0.02" for bbr.
             max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
             wt_path: Server-mode WebTransport path (e.g. "/moq").
                 When set, uses h3zero_callback as picoquic's default
@@ -3188,6 +3206,8 @@ cdef class TransportContext:
         if self._started:
             raise RuntimeError("Transport already started")
         check_congestion_control_algorithm(congestion_control_algorithm)
+        check_congestion_control_options(congestion_control_options,
+                                         congestion_control_algorithm)
 
         # Stash per-stream RX ring capacity on the C ctx so the
         # stream_data callback sizes per-stream byte rings to match the
@@ -3340,8 +3360,14 @@ cdef class TransportContext:
                      if isinstance(congestion_control_algorithm, str)
                      else congestion_control_algorithm)
             _c_cc = _b_cc
-            picoquic_set_default_congestion_algorithm_by_name(
-                self._quic, _c_cc)
+            if congestion_control_options is None:
+                picoquic_set_default_congestion_algorithm_by_name(
+                    self._quic, _c_cc)
+            else:
+                self._cc_options = congestion_control_options.encode()
+                picoquic_set_default_congestion_algorithm_ex(
+                    self._quic, picoquic_get_congestion_algorithm(_c_cc),
+                    self._cc_options)
 
         cdef bytes _b_log
         # Textlog: per-cnx human-readable log of every packet, ACK, FC
@@ -4195,6 +4221,7 @@ cdef class WebTransportSessionState:
 cdef extern from "c/test_access.h":
     int aiopquic_test_cnx_datagram_priority(picoquic_cnx_t* cnx)
     int aiopquic_test_default_datagram_priority(picoquic_quic_t* quic)
+    const char* aiopquic_test_cnx_cc_options(picoquic_cnx_t* cnx)
 
 
 def _datagram_priority(uintptr_t cnx_ptr):
@@ -4212,6 +4239,24 @@ def _wt_datagram_priority(WebTransportSessionState st):
     if st._wt is NULL:
         return -1
     return aiopquic_test_cnx_datagram_priority(st._wt.cnx)
+
+
+cdef _cnx_cc_options(picoquic_cnx_t* cnx):
+    cdef const char* s = aiopquic_test_cnx_cc_options(cnx)
+    return None if s is NULL else s.decode()
+
+
+def _cc_options(uintptr_t cnx_ptr):
+    """picoquic's congestion-control option string for a connection, or None
+    (test only)."""
+    return _cnx_cc_options(<picoquic_cnx_t*>cnx_ptr)
+
+
+def _wt_cc_options(WebTransportSessionState st):
+    """The option string of a WT session's connection, or None (test only)."""
+    if st._wt is NULL:
+        return None
+    return _cnx_cc_options(st._wt.cnx)
 
 
 cdef extern from "c/litmus.h":
