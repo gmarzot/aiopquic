@@ -484,7 +484,8 @@ static inline void aiopquic_wt_push_event(
     }
 }
 
-/* Source of a SESSION_CLOSED / CNX_CLOSED, carried in is_fin. */
+/* Source of a SESSION_CLOSED / CNX_CLOSED, carried in is_fin, with
+ * AIOPQUIC_CLOSE_LOCAL or'ed in for a local cause. */
 #define AIOPQUIC_WT_CLOSE_SESSION      0   /* capsule, control-stream FIN or reset */
 #define AIOPQUIC_WT_CLOSE_APPLICATION  1   /* QUIC APPLICATION_CLOSE */
 #define AIOPQUIC_WT_CLOSE_TRANSPORT    2   /* QUIC transport close, idle timeout, stateless reset */
@@ -689,6 +690,11 @@ static int aiopquic_wt_cnx_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
         } else if (event == picoquic_callback_close) {
             code = picoquic_get_remote_error(cnx);
             reason = picoquic_get_remote_error_reason(cnx);
+            if (code == 0 && picoquic_get_local_error(cnx) != 0) {
+                code = picoquic_get_local_error(cnx);
+                reason = picoquic_error_name(code);
+                source |= AIOPQUIC_CLOSE_LOCAL;
+            }
         }
         int final = event != picoquic_callback_application_close;
         for (h3zero_stream_prefix_t* p = h3->stream_prefixes.first; p != NULL;
@@ -710,7 +716,8 @@ static int aiopquic_wt_cnx_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
             }
             if (client) {
                 aiopquic_wt_push_close(s, SPSC_EVT_WT_CNX_CLOSED, code,
-                                       NULL, source);
+                                       (source & AIOPQUIC_CLOSE_LOCAL)
+                                       ? reason : NULL, source);
             } else {
                 s->cnx = NULL;
                 s->h3_ctx = NULL;

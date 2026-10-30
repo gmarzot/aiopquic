@@ -1,5 +1,6 @@
 """A close reaches the application once, says whether the peer closed at the
-application or the transport level, and carries the peer's reason phrase."""
+application or the transport level, and carries the peer's reason phrase; a
+close the stack made itself carries picoquic's local error instead."""
 import asyncio
 import logging
 import os
@@ -22,6 +23,7 @@ CA_FILE = os.path.join(CERTS_DIR, "test-ca.crt")
 SNI = "test.example.com"
 ALPN = "hq-interop"
 CONNECTION_REFUSED = 0x2
+IDLE_TIMEOUT = 0x433  # PICOQUIC_ERROR_IDLE_TIMEOUT
 H3_NO_ERROR = 0x100
 
 
@@ -94,10 +96,11 @@ async def test_our_close_reason_reaches_the_peer():
             await _until(lambda: servers[0].terminated)
             assert servers[0].terminated == [ConnectionTerminated(
                 error_code=9, frame_type=None, reason_phrase="client-bye")]
-            # Our own close also ends in exactly one event.
+            # Our own close also ends in exactly one event, not a local one.
             await _until(lambda: client.terminated)
             await asyncio.sleep(0.3)
             assert len(client.terminated) == 1
+            assert client.terminated[0].local_error == 0
     finally:
         server.close()
 
@@ -114,8 +117,25 @@ async def test_refused_connection_is_a_transport_close():
                            wait_connected=False) as client:
             await _until(lambda: client.terminated)
             await asyncio.sleep(0.3)
-            assert [(t.error_code, t.frame_type) for t in client.terminated] == [
-                (CONNECTION_REFUSED, 0)]
+            assert [(t.error_code, t.frame_type, t.local_error)
+                    for t in client.terminated] == [(CONNECTION_REFUSED, 0, 0)]
+    finally:
+        server.close()
+
+
+async def test_quic_idle_timeout_is_a_local_close():
+    port = next_port()
+    server = await serve("127.0.0.1", port, configuration=_server_cfg())
+    try:
+        cfg = _client_cfg()
+        cfg.idle_timeout = 1
+        async with connect("127.0.0.1", port, configuration=cfg,
+                           create_protocol=_Recorder) as client:
+            await _until(lambda: client.terminated, timeout=10.0)
+            await asyncio.sleep(0.3)
+            assert client.terminated == [ConnectionTerminated(
+                error_code=0, frame_type=0, local_error=IDLE_TIMEOUT,
+                local_reason="idle timeout")]
     finally:
         server.close()
 
@@ -163,7 +183,8 @@ async def test_wt_idle_timeout_is_a_transport_close():
     cfg = QuicConfiguration(is_client=True, idle_timeout=1)
     ev = await _wt_session_closed(lambda session: None, client_cfg=cfg,
                                   timeout=10.0)
-    assert (ev.error_code, ev.connection_closed, ev.frame_type) == (0, True, 0)
+    assert (ev.error_code, ev.connection_closed, ev.frame_type, ev.local_error,
+            ev.local_reason) == (0, True, 0, IDLE_TIMEOUT, "idle timeout")
 
 
 def _aiopquic_warnings(caplog):

@@ -70,6 +70,7 @@ _EVT_STREAM_FIN = 1
 _EVT_STREAM_RESET = 2
 _EVT_STOP_SENDING = 3
 _EVT_CLOSE = 4
+_CLOSE_LOCAL = 0x80  # AIOPQUIC_CLOSE_LOCAL in spsc_ring.h
 _EVT_APP_CLOSE = 5
 _EVT_READY = 6
 _EVT_ALMOST_READY = 7
@@ -447,9 +448,10 @@ class QuicConnection:
             if not self._terminated:
                 # The application sees the close as ConnectionTerminated.
                 logger.debug("connection closed (%s): error=%d",
-                             "app" if evt_type == _EVT_APP_CLOSE
+                             "local" if is_fin & _CLOSE_LOCAL
+                             else "app" if evt_type == _EVT_APP_CLOSE
                              else "transport", error_code)
-                self._append_terminated(evt_type, error_code, data)
+                self._append_terminated(evt_type, error_code, data, is_fin)
             # Wake any producer parked in send_stream_data_drained /
             # stream_write_drain waiting on per-stream or ring drain
             # events. After close the worker stops invoking drain
@@ -652,16 +654,21 @@ class QuicConnection:
             return 0.0
         return self._transport.tx_event_ring_count / cap
 
-    def _append_terminated(self, evt_type: int, error_code: int, data) -> None:
+    def _append_terminated(self, evt_type: int, error_code: int, data,
+                           flags: int = 0) -> None:
         """frame_type None for an application close, else 0."""
         if self._terminated:
             return
         self._terminated = True
+        text = bytes(data).decode("utf-8", "replace") if data is not None else ""
+        if flags & _CLOSE_LOCAL:
+            self._events.append(ConnectionTerminated(
+                frame_type=0, local_error=error_code, local_reason=text))
+            return
         self._events.append(ConnectionTerminated(
             error_code=error_code,
             frame_type=None if evt_type == _EVT_APP_CLOSE else 0,
-            reason_phrase=(bytes(data).decode("utf-8", "replace")
-                           if data is not None else ""),
+            reason_phrase=text,
         ))
 
     def next_event(self) -> QuicEvent | None:
@@ -720,7 +727,7 @@ class QuicConnection:
             ))
         elif evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
             self._closed = True
-            self._append_terminated(evt_type, error_code, data)
+            self._append_terminated(evt_type, error_code, data, is_fin)
             # Wake parked drain waiters — see matching block ~line 256.
             for ev in self._stream_tx_drain_events.values():
                 ev.set()

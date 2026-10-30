@@ -1656,6 +1656,10 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         aiopquic_dgram_table_remove(&ctx->dgram_table, cnx);
     } else if (fin_or_event == picoquic_callback_close) {
         entry.error_code = picoquic_get_remote_error(cnx);
+        if (entry.error_code == 0 && picoquic_get_local_error(cnx) != 0) {
+            entry.error_code = picoquic_get_local_error(cnx);
+            entry.is_fin = AIOPQUIC_CLOSE_LOCAL;
+        }
         aiopquic_dgram_table_remove(&ctx->dgram_table, cnx);
     }
 
@@ -1788,8 +1792,10 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                                (const uint8_t*)&snap, sizeof(snap));
     } else if (fin_or_event == picoquic_callback_close
                || fin_or_event == picoquic_callback_application_close) {
-        /* The peer's reason phrase. */
-        const char* reason = picoquic_get_remote_error_reason(cnx);
+        /* The peer's reason phrase, or the local cause's name. */
+        const char* reason = (entry.is_fin & AIOPQUIC_CLOSE_LOCAL)
+            ? picoquic_error_name(entry.error_code)
+            : picoquic_get_remote_error_reason(cnx);
         ret = aiopquic_rx_push_sc(ctx, &entry, (const uint8_t*)reason,
                                   reason ? (uint32_t)strlen(reason) : 0);
     } else {
