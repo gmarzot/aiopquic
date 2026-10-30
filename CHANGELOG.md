@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `ConnectionTerminated` and `WebTransportSessionClosed` add `local_error` and `local_reason`: a close the
+  stack made itself (idle timeout, a protocol error it raised) carries picoquic's code and its name;
+  `error_code` stays 0.
 - Connection closes log at DEBUG (were WARNING for a nonzero code); the application gets them as
   `ConnectionTerminated`.
 - A send wakes the network thread only when it may be asleep: raw QUIC and WebTransport no longer

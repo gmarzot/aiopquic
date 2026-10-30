@@ -56,7 +56,8 @@ typedef enum {
     SPSC_EVT_STREAM_FIN = 1,
     SPSC_EVT_STREAM_RESET = 2,
     SPSC_EVT_STOP_SENDING = 3,
-    SPSC_EVT_CLOSE = 4,                    /* data = the peer's reason phrase, if any */
+    SPSC_EVT_CLOSE = 4,                    /* data = the peer's reason phrase, if any;
+                                              see AIOPQUIC_CLOSE_LOCAL */
     SPSC_EVT_APP_CLOSE = 5,                /* data = the peer's reason phrase, if any */
     SPSC_EVT_READY = 6,
     SPSC_EVT_ALMOST_READY = 7,
@@ -248,6 +249,11 @@ typedef enum {
                                               stateless reset; error_code = the peer's code,
                                               is_fin = AIOPQUIC_WT_CLOSE_* source */
 } spsc_event_type_t;
+
+/* is_fin flag on CLOSE, WT_SESSION_CLOSED and WT_CNX_CLOSED: the stack closed
+ * the connection itself (idle timeout, a protocol error it raised) and the
+ * peer sent no code; error_code = picoquic's local error, data = its name. */
+#define AIOPQUIC_CLOSE_LOCAL 0x80
 
 typedef struct {
     uint64_t    stream_id;
