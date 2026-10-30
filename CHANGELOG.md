@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.7.0rc3
 
 - picoquic 3012b39c (1.1.54.0), picotls e446233b: fixes QUIC v2 compatible version negotiation and
   multipath ACKs; picotls brings its audit fixes and Brotli off by default. `picoquic_get_remote_error_reason()`
