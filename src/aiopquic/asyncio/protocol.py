@@ -73,9 +73,11 @@ class QuicConnectionProtocol:
                 # the idle timeout. A post-handshake close is a normal
                 # teardown and must not raise here.
                 if not self._quic._connected:
+                    cause = (f"{event.local_reason} (0x{event.local_error:x})"
+                             if event.local_error
+                             else f"error_code={event.error_code}")
                     exc = ConnectionError(
-                        "connection terminated during handshake "
-                        f"(error_code={event.error_code})")
+                        f"connection terminated during handshake ({cause})")
                     self._handshake_error = exc
                     if (self._connected_waiter is not None
                             and not self._connected_waiter.done()):

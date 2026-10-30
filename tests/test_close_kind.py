@@ -140,6 +140,14 @@ async def test_quic_idle_timeout_is_a_local_close():
         server.close()
 
 
+async def test_handshake_timeout_says_why():
+    cfg = _client_cfg()
+    cfg.idle_timeout = 1
+    with pytest.raises(ConnectionError, match=r"idle timeout \(0x433\)"):
+        async with connect("127.0.0.1", next_port(), configuration=cfg):
+            pass
+
+
 async def _wt_session_closed(handler, client_cfg=None, timeout=5.0):
     """The client's WebTransportSessionClosed after the server handler runs."""
     port = next_port()

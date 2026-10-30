@@ -19,14 +19,29 @@
 ### Features
 
 - QUIC client and server: `connect`, `serve`, `QuicConnectionProtocol`
-- Stream data send/receive with FIN signaling, stream reset, stop_sending
-- WebTransport client + server: `serve_webtransport`, `WebTransportSession`
-- QUIC and WebTransport datagram TX + RX
-- Connection migration / 0-RTT (inherited from picoquic)
-- Connection management: create, close, idle timeout, application close codes
-- Per-cnx multiplexing on the server side via `QuicEngine`
-- TLS keylog (NSS Key Log Format) for pcap decryption
-- Native picoquic_ct / picohttp_ct subprocess smoke (catches upstream regressions on every submodule update)
+- WebTransport client and server: `connect_webtransport`, `serve_webtransport`, `WebTransportSession`;
+  subprotocol negotiation (`wt_available_protocols` / `wt_supported_protocols`); static files over
+  HTTP/3 (`serve_webtransport(web_folder=...)`)
+- Raw QUIC and WebTransport on one UDP port, dispatched by ALPN: `serve_dispatch`
+- Streams: FIN, reset, stop_sending, and RESET_STREAM_AT (`reset_stream(..., reliable_size=N)`);
+  all-or-nothing writes with drain events for backpressure
+- QUIC and WebTransport datagrams, TX + RX
+- Stream and datagram priority on one scale: `set_stream_priority`, `set_datagram_priority`
+- Congestion control by name: `bbr` (v3, default), `bbr1`, `cubic`, `dcubic`, `newreno`, `fast`,
+  `prague`, `c4`
+- Address validation with Retry (`serve(..., retry=True)`), QUIC v2 by compatible version
+  negotiation (`supported_versions`), session resumption and 0-RTT (`session_ticket_file`)
+- TLS: certificate verification against certifi's roots or a private CA, post-quantum key exchange
+  (`KEX_X25519MLKEM768`, OpenSSL 3.5), cipher suite selection, key update interval
+- Dual-stack IPv4/IPv6 servers, a bind host, `ip_family` to pin one family
+- Connection limits: `max_connections`, and `set_max_connections` at runtime (new connections are
+  refused with CONNECTION_REFUSED)
+- Path MTU discovery policy: `pmtud="basic" | "delayed" | "blocked"`
+- Connection management: idle timeout, keep-alive, application close codes
+- Connection migration (inherited from picoquic)
+- Per-connection multiplexing on the server side via `QuicEngine`
+- qlog (`qlog_dir`), TLS keylog (NSS Key Log Format) for pcap decryption, and a version report
+  (`python -m aiopquic.versions`)
 
 ### Performance
 
@@ -68,47 +83,89 @@ python -m aiopquic.versions   # or the console script: aiopquic-versions
 Sample output:
 
 ```
-aiopquic:  0.3.7.dev12+g6eef9caf6 (~/Projects/moq/aiopquic/src/aiopquic) [2026-06-12 08:55]
-  - picoquic:  1.1.49.2 (d6c5653d) [2026-06-05]
-  - picotls:   master (bfa67875) [2026-04-20]
+aiopquic:  0.7.0rc2 (.venv/lib/python3.13/site-packages/aiopquic) [2026-10-29 09:21]
+  - picoquic:  1.1.53.0 (2026.10.22.70b5fd5-0-70b5fd5a) [2026-10-22]
+  - picotls:   master (f06553b8) [2026-09-30]
+  - openssl:   OpenSSL 3.5.8 (.venv/lib/python3.13/site-packages/aiopquic.libs/libcrypto-c37e28d8.so.3.5.8)
 ```
 
 If you're running aiomoqt on top, prefer `python -m aiomoqt.versions` — it chains through to this report and includes the aiomoqt version too.
 
 ## Usage
 
-### Low-level Transport API
+### QUIC client and server
+
+Subclass `QuicConnectionProtocol` and override `quic_event_received`; `self._quic` is the
+connection. An echo server:
 
 ```python
-from aiopquic._binding._transport import TransportContext
+import asyncio
 
-server = TransportContext()
-server.start(port=4433, cert_file="cert.pem", key_file="key.pem", alpn="moq-00", is_client=False)
-
-client = TransportContext()
-client.start(port=0, alpn="moq-00", is_client=True)
-client.create_client_connection("127.0.0.1", 4433, sni="localhost", alpn="moq-00")
-```
-
-### Asyncio API
-
-```python
-from aiopquic.asyncio.client import connect
+from aiopquic.asyncio import QuicConnectionProtocol, serve
 from aiopquic.quic.configuration import QuicConfiguration
+from aiopquic.quic.events import StreamDataReceived
 
-configuration = QuicConfiguration(alpn_protocols=["myproto"], is_client=True)
 
-async with connect("server", 4433, configuration=configuration) as protocol:
-    quic = protocol._quic
-    stream_id = quic.get_next_available_stream_id()
-    quic.send_stream_data(stream_id, payload, end_stream=True)
+class Echo(QuicConnectionProtocol):
+    def quic_event_received(self, event):
+        if isinstance(event, StreamDataReceived):
+            self._quic.send_stream_data(event.stream_id, bytes(event.data),
+                                        end_stream=event.end_stream)
+
+
+async def main():
+    cfg = QuicConfiguration(is_client=False, alpn_protocols=["echo"])
+    cfg.load_cert_chain("cert.pem", "key.pem")
+    server = await serve("::", 4433, configuration=cfg, create_protocol=Echo)
+    try:
+        await asyncio.Future()          # serve until cancelled
+    finally:
+        server.close()
+
+asyncio.run(main())
 ```
 
-`payload` is opaque bytes; the library doesn't impose framing. Consumers
-that want HTTP/3 layer on top of `aiopquic`'s `picowt`-backed h3zero
-plumbing; consumers that want WebTransport use `serve_webtransport` /
-`connect_webtransport`. Most direct users of the asyncio API ship their
-own protocol bytes (MoQT, custom binary frames, etc.).
+And a client for it:
+
+```python
+import asyncio
+
+from aiopquic.asyncio import QuicConnectionProtocol, connect
+from aiopquic.quic.configuration import QuicConfiguration
+from aiopquic.quic.events import StreamDataReceived
+
+
+class Client(QuicConnectionProtocol):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reply = bytearray()
+        self.done = asyncio.Event()
+
+    def quic_event_received(self, event):
+        if isinstance(event, StreamDataReceived):
+            self.reply += event.data
+            if event.end_stream:
+                self.done.set()
+
+
+async def main():
+    cfg = QuicConfiguration(is_client=True, alpn_protocols=["echo"],
+                            server_name="localhost", cafile="ca.pem")
+    async with connect("localhost", 4433, configuration=cfg,
+                       create_protocol=Client) as client:
+        quic = client._quic
+        sid = quic.get_next_available_stream_id()
+        quic.send_stream_data(sid, b"hello", end_stream=True)
+        await client.done.wait()
+        print(bytes(client.reply))
+
+asyncio.run(main())
+```
+
+Payloads are opaque bytes; the library imposes no framing. `send_stream_data` is all-or-nothing:
+`BufferError` means the stream's TX ring is full and nothing was taken, so resend the same buffer,
+or `await send_stream_data_drained(...)` to wait. [DATAFLOW.md](DATAFLOW.md) covers the
+backpressure model.
 
 Clients verify the server's certificate chain and name against certifi's
 roots. A private CA goes in `QuicConfiguration.cafile` (or
@@ -122,11 +179,95 @@ post-quantum key exchange with servers that support it.
 
 ### WebTransport
 
+The server calls `handler(session)` once per accepted CONNECT. `session.events()` yields new
+streams, datagrams and the session's close; `receive_stream_data(sid)` yields one stream's data
+up to its FIN or reset.
+
 ```python
-from aiopquic.asyncio.webtransport import (
-    serve_webtransport, WebTransportSession,
-)
-# See src/aiopquic/asyncio/webtransport.py and tests/ for full examples.
+import asyncio
+
+from aiopquic.asyncio.webtransport import serve_webtransport
+from aiopquic.quic.events import (WebTransportNewStream,
+                                  WebTransportStreamDataReceived)
+
+
+async def echo(session, sid):
+    async for ev in session.receive_stream_data(sid):
+        if isinstance(ev, WebTransportStreamDataReceived):
+            session.send_stream_data(sid, bytes(ev.data), end_stream=ev.end_stream)
+
+
+async def handler(session):             # once per accepted CONNECT
+    tasks = set()
+    async for ev in session.events():
+        if isinstance(ev, WebTransportNewStream):
+            task = asyncio.create_task(echo(session, ev.stream_id))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+
+async def main():
+    server = await serve_webtransport("::", 4433, "/echo", handler=handler,
+                                      cert_file="cert.pem", key_file="key.pem")
+    try:
+        await asyncio.Future()
+    finally:
+        server.close()
+
+asyncio.run(main())
+```
+
+```python
+import asyncio
+
+from aiopquic.asyncio.webtransport import connect_webtransport
+from aiopquic.quic.events import WebTransportStreamDataReceived
+
+
+async def main():
+    async with connect_webtransport("localhost", 4433, "/echo",
+                                    ca_file="ca.pem") as wt:
+        sid = await wt.create_stream()
+        wt.send_stream_data(sid, b"hello", end_stream=True)
+        reply = bytearray()
+        async for ev in wt.receive_stream_data(sid):
+            if isinstance(ev, WebTransportStreamDataReceived):
+                reply += ev.data
+        print(bytes(reply))
+
+asyncio.run(main())
+```
+
+`connect_webtransport()` and `serve_webtransport()` without `configuration=` run picoquic's
+defaults, not `QuicConfiguration`'s; pass one to set congestion control, flow-control windows and
+the rest.
+
+### Raw QUIC and WebTransport on one port
+
+`serve_dispatch` routes each connection by ALPN: raw QUIC to `create_protocol`, `h3` to the
+WebTransport handler. With the `Echo` protocol and `handler` above:
+
+```python
+server = await serve_dispatch("::", 4433, configuration=cfg, create_protocol=Echo,
+                              wt_path="/echo", wt_handler=handler)
+```
+
+### Low-level binding: TransportContext
+
+The asyncio API runs on `TransportContext`, which owns one picoquic instance and its network
+thread. Use it directly only to share one transport between WebTransport sessions
+(`connect_webtransport(..., transport=t)`, `serve_webtransport(..., transport=t)`) or in tests;
+the rest of `aiopquic._binding._transport` is internal.
+
+```python
+from aiopquic._binding._transport import TransportContext
+
+server = TransportContext()
+server.start(port=4433, cert_file="cert.pem", key_file="key.pem", alpn="echo", is_client=False)
+
+client = TransportContext()
+client.start(port=0, alpn="echo", is_client=True)
+client.create_client_connection("127.0.0.1", 4433, sni="localhost", alpn="echo")
 ```
 
 ## Development
@@ -134,6 +275,10 @@ from aiopquic.asyncio.webtransport import (
 ```bash
 uv pip install -e '.[dev]'    # or: pip install -e '.[dev]'
 python -m pytest tests/ -v -m "not interop and not native"
+
+# picoquic's own picoquic_ct / picohttp_ct suites, run as subprocesses (catches upstream
+# regressions on a submodule update)
+python -m pytest tests -m native
 
 # Microbenches (opt-in)
 python -m pytest tests/bench
@@ -151,7 +296,7 @@ Test-suite coverage, benchmark methodology, performance builds (`AIOPQUIC_PERF=1
 - Free-threaded Python (3.14t) support after producer-side locking audit
 - Datagram benches: latency percentiles, payload-size sweep, loss / jitter under load (today's `bench_datagram` is fire-and-count throughput only)
 - Pure stream open/close microbench (lifecycle rate without payload, separate from `bench_stream_churn_highlevel` which bundles writes + FIN)
-- Submit aiopquic to the [QUIC interop runner](https://interop.seemann.io/) for cross-implementation coverage
+- [QUIC interop runner](https://interop.seemann.io/): client and server endpoints proposed upstream in [quic-interop-runner#518](https://github.com/quic-interop/quic-interop-runner/pull/518), awaiting review
 
 ## Acknowledgments
 

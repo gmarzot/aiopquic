@@ -5,6 +5,9 @@
 - picoquic 3012b39c (1.1.54.0), picotls e446233b: fixes QUIC v2 compatible version negotiation and
   multipath ACKs; picotls brings its audit fixes and Brotli off by default. `picoquic_get_remote_error_reason()`
   is upstream, so its patch is gone.
+- A handshake ended by our side (e.g. a timeout) raises `ConnectionError` naming the local cause.
+- `QuicConfiguration.congestion_control_options` passes an option string to the congestion
+  controller, e.g. `"Q0.02"` for bbr's send quantum.
 - `ConnectionTerminated` and `WebTransportSessionClosed` add `local_error` and `local_reason`: a close the
   stack made itself (idle timeout, a protocol error it raised) carries picoquic's code and its name;
   `error_code` stays 0.
