@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A handshake ended by our side (e.g. a timeout) raises `ConnectionError` naming the local cause.
 - `ConnectionTerminated` and `WebTransportSessionClosed` add `local_error` and `local_reason`: a close the
   stack made itself (idle timeout, a protocol error it raised) carries picoquic's code and its name;
   `error_code` stays 0.
