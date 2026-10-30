@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `QuicConfiguration.congestion_control_options` passes an option string to the congestion
+  controller, e.g. `"Q0.02"` for bbr's send quantum.
 - Connection closes log at DEBUG (were WARNING for a nonzero code); the application gets them as
   `ConnectionTerminated`.
 - A send wakes the network thread only when it may be asleep: raw QUIC and WebTransport no longer

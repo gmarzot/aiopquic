@@ -105,6 +105,9 @@ class QuicConfiguration:
     # transport start. None defers to picoquic's compile-time default
     # (newreno).
     congestion_control_algorithm: str | None = "bbr"
+    # Option string for that algorithm, passed to picoquic as is. bbr:
+    # "Q0.02" sends bursts of 20 ms of pacing rate (default 1 ms).
+    congestion_control_options: str | None = None
     # SPSC TX/RX event ring capacity (entries — must be a power of 2).
     # Each event is an ~64 B notification between the picoquic worker
     # thread and the asyncio drain. None defers to the compile-time
@@ -176,9 +179,11 @@ class QuicConfiguration:
 
     def __post_init__(self) -> None:
         from aiopquic._binding._transport import (
-            check_congestion_control_algorithm,
+            check_congestion_control_algorithm, check_congestion_control_options,
         )
         check_congestion_control_algorithm(self.congestion_control_algorithm)
+        check_congestion_control_options(self.congestion_control_options,
+                                         self.congestion_control_algorithm)
         if self.cipher_suite is not None and self.cipher_suite not in CIPHER_SUITES:
             raise ValueError(f"unsupported cipher suite {self.cipher_suite:#06x}")
         if self.pmtud not in ("basic", "delayed", "blocked"):
