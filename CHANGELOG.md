@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.8.0 (unreleased)
+
+- `QuicConfiguration.packet_train_mode` (off by default): when pacing holds a connection back,
+  picoquic sends up to 10 packets in one train instead of one or two, so fewer sends per packet.
+
 ## v0.7.0
 
 - No changes since 0.7.0rc3.
