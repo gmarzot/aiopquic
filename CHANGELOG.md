@@ -5,6 +5,12 @@
 - `WebTransportSession.create_stream()` takes `initial`, `end_stream` and `priority`: the stream's first
   bytes, FIN and priority travel with the create, so the stream header and the first data leave in one
   send instead of two.
+- `QuicConfiguration.packet_train_mode` (off by default): when pacing holds a connection back,
+  picoquic sends up to 10 packets in one train instead of one or two, so fewer sends per packet.
+
+## v0.7.0
+
+- No changes since 0.7.0rc3.
 
 ## v0.7.0rc3
 
