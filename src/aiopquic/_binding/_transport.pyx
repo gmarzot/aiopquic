@@ -132,6 +132,7 @@ cdef extern from "picoquic.h":
         picoquic_quic_t* quic, const char* alg_name)
     void picoquic_set_default_congestion_algorithm_ex(
         picoquic_quic_t* quic, const void* alg, const char* alg_option_string)
+    void picoquic_set_packet_train_mode(picoquic_quic_t* quic, int train_mode)
 
     void picoquic_register_all_congestion_control_algorithms()
     const void* picoquic_get_congestion_algorithm(const char* alg_name)
@@ -3137,7 +3138,8 @@ cdef class TransportContext:
               pmtud_policy=None,
               host=None,
               bint reset_stream_at=True,
-              congestion_control_options=None):
+              congestion_control_options=None,
+              bint packet_train_mode=False):
         """
         Create the picoquic context and start the network thread.
 
@@ -3193,6 +3195,8 @@ cdef class TransportContext:
                 picoquic's default (newreno).
             congestion_control_options: Option string for that algorithm,
                 passed to picoquic as is, e.g. "Q0.02" for bbr.
+            packet_train_mode: When pacing holds a connection back, wait
+                for up to 10 packets of credit and send them together.
             max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
             wt_path: Server-mode WebTransport path (e.g. "/moq").
                 When set, uses h3zero_callback as picoquic's default
@@ -3368,6 +3372,8 @@ cdef class TransportContext:
                 picoquic_set_default_congestion_algorithm_ex(
                     self._quic, picoquic_get_congestion_algorithm(_c_cc),
                     self._cc_options)
+        if packet_train_mode:
+            picoquic_set_packet_train_mode(self._quic, 1)
 
         cdef bytes _b_log
         # Textlog: per-cnx human-readable log of every packet, ACK, FC
@@ -4222,6 +4228,7 @@ cdef extern from "c/test_access.h":
     int aiopquic_test_cnx_datagram_priority(picoquic_cnx_t* cnx)
     int aiopquic_test_default_datagram_priority(picoquic_quic_t* quic)
     const char* aiopquic_test_cnx_cc_options(picoquic_cnx_t* cnx)
+    int aiopquic_test_cnx_packet_train_mode(picoquic_cnx_t* cnx)
 
 
 def _datagram_priority(uintptr_t cnx_ptr):
@@ -4257,6 +4264,18 @@ def _wt_cc_options(WebTransportSessionState st):
     if st._wt is NULL:
         return None
     return _cnx_cc_options(st._wt.cnx)
+
+
+def _packet_train_mode(uintptr_t cnx_ptr):
+    """1 if a connection's context paces in packet trains, else 0 (test only)."""
+    return aiopquic_test_cnx_packet_train_mode(<picoquic_cnx_t*>cnx_ptr)
+
+
+def _wt_packet_train_mode(WebTransportSessionState st):
+    """Packet train mode of a WT session's context, -1 for none (test only)."""
+    if st._wt is NULL:
+        return -1
+    return aiopquic_test_cnx_packet_train_mode(st._wt.cnx)
 
 
 cdef extern from "c/litmus.h":

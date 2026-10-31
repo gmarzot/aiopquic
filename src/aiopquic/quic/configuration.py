@@ -108,6 +108,9 @@ class QuicConfiguration:
     # Option string for that algorithm, passed to picoquic as is. bbr:
     # "Q0.02" sends bursts of 20 ms of pacing rate (default 1 ms).
     congestion_control_options: str | None = None
+    # When pacing holds a connection back, wait for up to 10 packets of
+    # credit and send them in one train: fewer sends, burstier pacing.
+    packet_train_mode: bool = False
     # SPSC TX/RX event ring capacity (entries — must be a power of 2).
     # Each event is an ~64 B notification between the picoquic worker
     # thread and the asyncio drain. None defers to the compile-time
