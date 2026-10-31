@@ -58,6 +58,9 @@ class QuicConfiguration:
     # Enables datagrams by default (h3zero only advertises h3_datagram
     # + webtransport_max_sessions when this is non-zero).
     max_datagram_frame_size: int | None = 65535
+    # Advertise RESET_STREAM_AT, so a reset can keep the first bytes of
+    # its stream (reset_stream's reliable_size). WebTransport always does.
+    reset_stream_at: bool = True
     # Per-connection datagram TX record ring (pull-model send path).
     # Bounded capacity IS the backpressure: send_datagram_frame returns
     # 0 when full instead of queueing unboundedly. Steady-state datagram
@@ -93,15 +96,18 @@ class QuicConfiguration:
     # shell-level fallback when this is None.
     qlog_dir: str | None = None
     # Congestion-control algorithm for picoquic to use on this transport.
-    # Default "bbr1": loss-tolerant (loss-based CCs collapse on the
-    # GIL-induced loss blips common on loopback and loaded hosts) and
-    # free of the picoquic "bbr" (v3) sub-128µs-RTT cwnd freeze
-    # (upstream #2118). Other values: "newreno", "cubic", "bbr",
-    # "prague" (L4S/ECN), "dcubic", "fast", "c4", "reno" (= newreno).
+    # Default "bbr" (v3): holds its rate under random loss and jitter,
+    # where loss-based algorithms fall behind, and has none of bbr1's
+    # 10 s ProbeRTT stalls on low-RTT paths. Other values: "bbr1",
+    # "newreno", "cubic", "prague" (L4S/ECN), "dcubic", "fast", "c4",
+    # "reno" (= newreno).
     # Matched exactly; an unknown name raises ValueError here and at
     # transport start. None defers to picoquic's compile-time default
     # (newreno).
-    congestion_control_algorithm: str | None = "bbr1"
+    congestion_control_algorithm: str | None = "bbr"
+    # Option string for that algorithm, passed to picoquic as is. bbr:
+    # "Q0.02" sends bursts of 20 ms of pacing rate (default 1 ms).
+    congestion_control_options: str | None = None
     # SPSC TX/RX event ring capacity (entries — must be a power of 2).
     # Each event is an ~64 B notification between the picoquic worker
     # thread and the asyncio drain. None defers to the compile-time
@@ -130,10 +136,10 @@ class QuicConfiguration:
     # workloads with very high stream-churn rates.
     max_streams_uni: int = 512
     max_streams_bidi: int = 512
-    # Aggregate cap on bytes committed to per-stream TX data rings but
-    # not yet pulled by the picoquic worker (process-wide; see
-    # aiopquic._binding._transport.tx_data_bytes_queued). Bounds
-    # producer run-ahead that per-stream caps structurally miss:
+    # Cap on bytes one connection (WebTransport: one session) has
+    # committed to its stream TX data rings but the picoquic worker has
+    # not yet pulled. Bounds producer run-ahead that per-stream caps
+    # structurally miss:
     # short-stream churn resets the per-stream budget every rollover,
     # so an unpaced producer can spread unbounded backlog across
     # thousands of fresh streams while QUIC's own throttles (CC, FC,
@@ -173,9 +179,11 @@ class QuicConfiguration:
 
     def __post_init__(self) -> None:
         from aiopquic._binding._transport import (
-            check_congestion_control_algorithm,
+            check_congestion_control_algorithm, check_congestion_control_options,
         )
         check_congestion_control_algorithm(self.congestion_control_algorithm)
+        check_congestion_control_options(self.congestion_control_options,
+                                         self.congestion_control_algorithm)
         if self.cipher_suite is not None and self.cipher_suite not in CIPHER_SUITES:
             raise ValueError(f"unsupported cipher suite {self.cipher_suite:#06x}")
         if self.pmtud not in ("basic", "delayed", "blocked"):

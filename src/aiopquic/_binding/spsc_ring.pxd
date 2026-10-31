@@ -43,6 +43,9 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_TX_MARK_WT_DATAGRAM_READY
         SPSC_EVT_TX_SET_STREAM_PRIORITY
         SPSC_EVT_TX_WT_SET_STREAM_PRIORITY
+        SPSC_EVT_TX_SET_DATAGRAM_PRIORITY
+        SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY
+        SPSC_EVT_TX_SET_MAX_CONNECTIONS
         SPSC_EVT_TX_CNX_REFRESH
         SPSC_EVT_DATAGRAM_TX_DRAINED
         SPSC_EVT_CNX_STACK
@@ -65,6 +68,7 @@ cdef extern from "c/spsc_ring.h":
         uint32_t    event_type
         uint32_t    data_length
         uint8_t     is_fin
+        uint32_t    aux
         void*       data_buf
         void*       cnx
         void*       stream_ctx

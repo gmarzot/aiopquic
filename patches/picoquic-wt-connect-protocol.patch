@@ -1,33 +1,124 @@
+diff --git a/picohttp/h3zero_common.h b/picohttp/h3zero_common.h
+index 17b5fc49..4a1c893a 100644
+--- a/picohttp/h3zero_common.h
++++ b/picohttp/h3zero_common.h
+@@ -240,6 +240,7 @@ extern "C" {
+         int nb_open_streams;
+         int nb_open_files;
+         uint32_t nb_client_streams;
++        int wt_connect_protocol; /* picowt_connect_protocol_t */
+     } h3zero_callback_ctx_t;
+ 
+     void picowt_clear_pending_connect(h3zero_callback_ctx_t* ctx, h3zero_stream_ctx_t* stream_ctx);
+diff --git a/picohttp/pico_webtransport.h b/picohttp/pico_webtransport.h
+index 8d6cb41a..61a605ed 100644
+--- a/picohttp/pico_webtransport.h
++++ b/picohttp/pico_webtransport.h
+@@ -36,6 +36,13 @@ extern "C" {
+     void picowt_set_default_transport_parameters(picoquic_quic_t* quic);
+ 
+     /* Create the control stream for the Web Transport session on the client. */
++    /* :protocol of the CONNECT a client sends, from h3_ctx->wt_connect_protocol. */
++    typedef enum {
++        picowt_connect_protocol_legacy = 0,   /* "webtransport" */
++        picowt_connect_protocol_settings = 1, /* "webtransport-h3" if the server sent SETTINGS_WT_ENABLED */
++        picowt_connect_protocol_h3 = 2        /* "webtransport-h3" */
++    } picowt_connect_protocol_t;
++
+     h3zero_stream_ctx_t* picowt_set_control_stream(picoquic_cnx_t* cnx, h3zero_callback_ctx_t* h3_ctx);
+ 
+ 
 diff --git a/picohttp/webtransport.c b/picohttp/webtransport.c
-index cb15e6e1..78a3a66f 100644
+index cb15e6e1..c407a0da 100644
 --- a/picohttp/webtransport.c
 +++ b/picohttp/webtransport.c
-@@ -345,8 +345,13 @@ const char* picowt_get_authority(h3zero_stream_ctx_t* stream_ctx)
+@@ -343,10 +343,21 @@ const char* picowt_get_authority(h3zero_stream_ctx_t* stream_ctx)
+     return (const char*)stream_ctx->ps.stream_state.header.authority;
+ }
  
- static const char* picowt_connect_protocol_from_settings(const h3zero_settings_t* settings)
+-static const char* picowt_connect_protocol_from_settings(const h3zero_settings_t* settings)
++static const char* picowt_connect_protocol_from_settings(const h3zero_callback_ctx_t* ctx)
  {
 -    return (settings != NULL && settings->webtransport_enabled > 0) ?
 -        H3ZERO_WEBTRANSPORT_H3_PROTOCOL : H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD;
-+    /* COMPATIBILITY PATCH, remove when proxygen and browsers accept
-+     * "webtransport-h3". draft-ietf-webtrans-http3-16 (since -15) wants that
-+     * token once the server advertises SETTINGS_WT_ENABLED; browsers still
-+     * send "webtransport", and proxygen advertises the setting yet answers
-+     * the new token with 400. */
-+    (void)settings;
-+    return H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD;
++    /* COMPATIBILITY PATCH, remove when upstream moxygen accepts "webtransport-h3".
++     * draft-ietf-webtrans-http3-16 (since -15) wants that token once the
++     * server advertises SETTINGS_WT_ENABLED; moxygen advertises the setting
++     * yet answers the new token with 400, so "webtransport" is the default. */
++    switch (ctx->wt_connect_protocol) {
++    case picowt_connect_protocol_h3:
++        return H3ZERO_WEBTRANSPORT_H3_PROTOCOL;
++    case picowt_connect_protocol_settings:
++        return (ctx->settings.webtransport_enabled > 0) ?
++            H3ZERO_WEBTRANSPORT_H3_PROTOCOL : H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD;
++    default:
++        return H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD;
++    }
  }
  
  /* Not declared static because used in tests. */
+@@ -516,7 +527,7 @@ static int picowt_send_pending_connect(picoquic_cnx_t* cnx, h3zero_callback_ctx_
+     else {
+         ret = picowt_format_connect_frame(stream_ctx,
+             pending->authority, pending->path,
+-            picowt_connect_protocol_from_settings(&ctx->settings),
++            picowt_connect_protocol_from_settings(ctx),
+             pending->wt_available_protocols, pending->extra,
+             pending->extra_length, &connect_length);
+     }
+@@ -609,7 +620,7 @@ int picowt_connect_ex(picoquic_cnx_t* cnx, h3zero_callback_ctx_t* ctx,  h3zero_s
+             }
+             else {
+                 ret = picowt_format_connect_frame(stream_ctx, authority, path,
+-                    picowt_connect_protocol_from_settings(&ctx->settings),
++                    picowt_connect_protocol_from_settings(ctx),
+                     wt_available_protocols, extra, extra_length, &connect_length);
+             }
+ 
 diff --git a/picoquictest/webtransport_test.c b/picoquictest/webtransport_test.c
-index 8dc0aee1..1a2e6223 100644
+index 8dc0aee1..7edb813d 100644
 --- a/picoquictest/webtransport_test.c
 +++ b/picoquictest/webtransport_test.c
-@@ -688,7 +688,7 @@ static int picowt_connect_protocol_test_one(picoquic_cnx_t* cnx,
+@@ -641,7 +641,7 @@ static int picowt_parse_connect_protocol(uint8_t* frame, h3zero_header_parts_t*
+ }
+ 
+ static int picowt_connect_protocol_test_one(picoquic_cnx_t* cnx,
+-    int draft15, const char* expected_protocol)
++    int draft15, picowt_connect_protocol_t mode, const char* expected_protocol)
+ {
+     h3zero_callback_ctx_t h3_ctx = { 0 };
+     h3zero_stream_ctx_t* stream_ctx = NULL;
+@@ -649,6 +649,7 @@ static int picowt_connect_protocol_test_one(picoquic_cnx_t* cnx,
+     int ret = 0;
+ 
+     h3zero_init_stream_tree(&h3_ctx.h3_stream_tree);
++    h3_ctx.wt_connect_protocol = mode;
+     h3_ctx.settings.settings_received = 1;
+     h3_ctx.settings.h3_datagram = 1;
+     if (draft15) {
+@@ -688,10 +689,22 @@ static int picowt_connect_protocol_test_one(picoquic_cnx_t* cnx,
  
  static int picowt_connect_protocol_test(picoquic_cnx_t* cnx)
  {
 -    int ret = picowt_connect_protocol_test_one(cnx, 1, H3ZERO_WEBTRANSPORT_H3_PROTOCOL);
-+    int ret = picowt_connect_protocol_test_one(cnx, 1, H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD);
++    const struct {
++        int draft15;
++        picowt_connect_protocol_t mode;
++        const char* expected;
++    } cases[] = {
++        { 1, picowt_connect_protocol_legacy, H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD },
++        { 0, picowt_connect_protocol_legacy, H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD },
++        { 1, picowt_connect_protocol_settings, H3ZERO_WEBTRANSPORT_H3_PROTOCOL },
++        { 0, picowt_connect_protocol_settings, H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD },
++        { 0, picowt_connect_protocol_h3, H3ZERO_WEBTRANSPORT_H3_PROTOCOL },
++    };
++    int ret = 0;
  
-     if (ret == 0) {
-         ret = picowt_connect_protocol_test_one(cnx, 0, H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD);
+-    if (ret == 0) {
+-        ret = picowt_connect_protocol_test_one(cnx, 0, H3ZERO_WEBTRANSPORT_H3_PROTOCOL_OLD);
++    for (size_t i = 0; ret == 0 && i < sizeof(cases) / sizeof(cases[0]); i++) {
++        ret = picowt_connect_protocol_test_one(cnx, cases[i].draft15, cases[i].mode,
++            cases[i].expected);
+     }
+ 
+     return ret;

@@ -5,7 +5,6 @@ events into QuicEvent objects that match qh3's event interface.
 """
 
 import asyncio
-import contextlib
 import logging
 import os
 from collections import deque
@@ -71,6 +70,7 @@ _EVT_STREAM_FIN = 1
 _EVT_STREAM_RESET = 2
 _EVT_STOP_SENDING = 3
 _EVT_CLOSE = 4
+_CLOSE_LOCAL = 0x80  # AIOPQUIC_CLOSE_LOCAL in spsc_ring.h
 _EVT_APP_CLOSE = 5
 _EVT_READY = 6
 _EVT_ALMOST_READY = 7
@@ -149,6 +149,8 @@ class QuicConnection:
             self._cnx_ptr = 0
             self._connected = False
             self._closed = False
+        # One ConnectionTerminated: an application close is followed by close.
+        self._terminated = False
         # deque, not list: next_event() pops from the head per event
         # while the consumer parses — list.pop(0) is O(n) memmove,
         # which under a receive backlog turns consumption quadratic
@@ -260,6 +262,7 @@ class QuicConnection:
             keylog_filename=keylog,
             rx_data_ring_cap=cfg.max_stream_data,
             congestion_control_algorithm=cfg.congestion_control_algorithm,
+            congestion_control_options=cfg.congestion_control_options,
             initial_max_data=cfg.max_data,
             initial_max_streams_uni=getattr(cfg, 'max_streams_uni', 0) or 0,
             initial_max_streams_bidi=getattr(cfg, 'max_streams_bidi', 0) or 0,
@@ -272,6 +275,7 @@ class QuicConnection:
             ticket_file=cfg.session_ticket_file,
             ip_family=-1 if cfg.ip_family is None else cfg.ip_family,
             pmtud_policy=cfg.pmtud,
+            reset_stream_at=getattr(cfg, 'reset_stream_at', True),
         )
 
     def connect(self, addr: tuple[str, int], now: float = 0.0) -> None:
@@ -442,20 +446,13 @@ class QuicConnection:
             ))
         elif evt_type == _EVT_CLOSE or evt_type == _EVT_APP_CLOSE:
             self._closed = True
-            # Log the close so drop-under-load investigations can read
-            # the actual cause: transport vs application close + the
-            # error code. error_code 0 is a clean close (debug);
-            # anything else is abnormal (warning).
-            _kind = ("app" if evt_type == _EVT_APP_CLOSE
-                     else "transport")
-            if error_code:
-                logger.warning("connection closed (%s): error=%d",
-                               _kind, error_code)
-            else:
-                logger.debug("connection closed (%s, clean)", _kind)
-            self._events.append(ConnectionTerminated(
-                error_code=error_code,
-            ))
+            if not self._terminated:
+                # The application sees the close as ConnectionTerminated.
+                logger.debug("connection closed (%s): error=%d",
+                             "local" if is_fin & _CLOSE_LOCAL
+                             else "app" if evt_type == _EVT_APP_CLOSE
+                             else "transport", error_code)
+                self._append_terminated(evt_type, error_code, data, is_fin)
             # Wake any producer parked in send_stream_data_drained /
             # stream_write_drain waiting on per-stream or ring drain
             # events. After close the worker stops invoking drain
@@ -582,6 +579,13 @@ class QuicConnection:
             return 0
         return self._transport.tx_data_ring_used(sc_ptr)
 
+    def _tx_backlog(self) -> int:
+        """Bytes queued in this connection's stream rings, not yet pulled."""
+        t = self._transport
+        if t is None:
+            return 0
+        return sum(t.tx_data_ring_used(sc) for sc in list(self._stream_ctxs.values()))
+
     def tx_sent_bytes(self, stream_id: int) -> int:
         """Cumulative bytes of this stream picoquic has taken from its TX
         ring into packets. Monotonic: a stream offset has left the ring
@@ -651,6 +655,23 @@ class QuicConnection:
             return 0.0
         return self._transport.tx_event_ring_count / cap
 
+    def _append_terminated(self, evt_type: int, error_code: int, data,
+                           flags: int = 0) -> None:
+        """frame_type None for an application close, else 0."""
+        if self._terminated:
+            return
+        self._terminated = True
+        text = bytes(data).decode("utf-8", "replace") if data is not None else ""
+        if flags & _CLOSE_LOCAL:
+            self._events.append(ConnectionTerminated(
+                frame_type=0, local_error=error_code, local_reason=text))
+            return
+        self._events.append(ConnectionTerminated(
+            error_code=error_code,
+            frame_type=None if evt_type == _EVT_APP_CLOSE else 0,
+            reason_phrase=text,
+        ))
+
     def next_event(self) -> QuicEvent | None:
         """Dequeue next event from the connection.
 
@@ -707,7 +728,7 @@ class QuicConnection:
             ))
         elif evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
             self._closed = True
-            self._events.append(ConnectionTerminated(error_code=error_code))
+            self._append_terminated(evt_type, error_code, data, is_fin)
             # Wake parked drain waiters — see matching block ~line 256.
             for ev in self._stream_tx_drain_events.values():
                 ev.set()
@@ -880,21 +901,23 @@ class QuicConnection:
         Pair these in a clear-arm-recheck-wait loop above the call
         to this helper.
         """
-        # Aggregate TX gate at the stream-creation boundary: raw QUIC
+        # Connection TX gate at the stream-creation boundary: raw QUIC
         # creates the per-stream sc lazily on first write, so "sid not
-        # yet in _stream_ctxs" IS stream creation. Park while the
-        # process-wide queued-TX budget (QuicConfiguration.
-        # tx_max_queued_bytes) is exceeded; resume below cap/2. The
-        # green-light is connection drain capacity — any stream's
-        # drain frees budget — so one wedged stream can never stall
-        # the gate. Bounds producer run-ahead that per-stream caps
-        # miss under short-stream churn (fresh stream = fresh budget).
+        # yet in _stream_ctxs" IS stream creation. Park while this
+        # connection's queued TX exceeds QuicConfiguration.
+        # tx_max_queued_bytes; resume below cap/2. The process-wide
+        # total, one load, gates the per-stream sum. The green-light is
+        # connection drain capacity — any stream's drain frees budget —
+        # so one wedged stream can never stall the gate. Bounds producer
+        # run-ahead that per-stream caps miss under short-stream churn
+        # (fresh stream = fresh budget).
         if stream_id not in self._stream_ctxs:
             cap = getattr(self._configuration, 'tx_max_queued_bytes',
                           4 * 1024 * 1024)
-            if cap and tx_data_bytes_queued() > cap:
+            if (cap and tx_data_bytes_queued() > cap
+                    and self._tx_backlog() > cap):
                 low = cap // 2
-                while not self._closed and tx_data_bytes_queued() > low:
+                while not self._closed and self._tx_backlog() > low:
                     await asyncio.sleep(0.002)
             if self._closed:
                 # Yield before the no-op return: an await that never
@@ -966,17 +989,14 @@ class QuicConnection:
                 # Events were cleared BEFORE the call so no lost wakeup.
                 sc_wait = asyncio.create_task(sc_event.wait())
                 ring_wait = asyncio.create_task(ring_event.wait())
-                done, pending = await asyncio.wait(
-                    [sc_wait, ring_wait],
-                    return_when=asyncio.FIRST_COMPLETED)
-                # Cancellation hygiene: await the cancelled task under
-                # suppress so the loop reaps it now instead of leaking
-                # a pending Task until the next scheduler turn (matters
-                # under teardown storms).
-                for t in pending:
-                    t.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await t
+                try:
+                    await asyncio.wait(
+                        [sc_wait, ring_wait],
+                        return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for task in (sc_wait, ring_wait):
+                        task.cancel()
+                    await asyncio.gather(sc_wait, ring_wait, return_exceptions=True)
                 # Re-check close after the wait — the close handler
                 # may have set our events to unpark us cleanly.
                 if self._closed:
@@ -992,14 +1012,17 @@ class QuicConnection:
         committed).
 
         Raises:
-            ValueError: payload exceeds datagram_max_payload. A QUIC
-                DATAGRAM frame cannot be fragmented, so an oversize
-                record could never be sent — permanent, do not retry.
+            ValueError: payload is empty or exceeds
+                datagram_max_payload. The send ring cannot carry an
+                empty record, and a QUIC DATAGRAM frame cannot be
+                fragmented — permanent, do not retry.
             ConnectionError: connection not ready or already closed.
         """
         if self._closed or self._cnx_ptr == 0:
             raise ConnectionError(
                 "send_datagram_frame: connection not ready or closed")
+        if not data:
+            raise ValueError("send_datagram_frame: empty payload")
         if self._dgram_ring == 0:
             cfg = self._configuration
             self._dgram_ring = self._transport.dgram_ring_create(
@@ -1095,16 +1118,36 @@ class QuicConnection:
             self._next_bidi_id += 4
         return stream_id
 
-    def reset_stream(self, stream_id: int, error_code: int) -> None:
-        """Reset a stream with the given error code. On a stream we only
-        receive on, the request is dropped and counted in
-        tx_wrong_direction_dropped."""
+    def reset_stream(self, stream_id: int, error_code: int,
+                     reliable_size: int = 0) -> None:
+        """Reset a stream with the given error code.
+
+        With reliable_size and reset_stream_at negotiated, the reset is a
+        RESET_STREAM_AT: the first reliable_size bytes written (capped at
+        what was written) still reach the peer. Sends stop at them, and
+        the reset waits until they are sent. Otherwise RESET_STREAM, which
+        may lose bytes not yet delivered. On a stream we only receive on,
+        the request is dropped and counted in tx_wrong_direction_dropped.
+
+        Raises:
+            ValueError: reliable_size outside 0..2**32-1.
+        """
+        if not 0 <= reliable_size <= 0xFFFFFFFF:
+            raise ValueError("reset_stream: reliable_size out of range")
         self._transport.push_tx_event(
             _TX_STREAM_RESET, stream_id,
             error_code=error_code, cnx_ptr=self._cnx_ptr,
             stream_ctx=self._stream_ctxs.get(stream_id, 0),
+            aux=reliable_size,
         )
         self._transport.wake_up()
+
+    def reset_stream_at_negotiated(self) -> bool:
+        """Both ends advertised RESET_STREAM_AT, so reset_stream keeps its
+        reliable_size. False until the handshake completes."""
+        if self._cnx_ptr == 0:
+            return False
+        return self._transport.reset_stream_at_negotiated(self._cnx_ptr)
 
     def stop_stream(self, stream_id: int, error_code: int) -> None:
         """Send STOP_SENDING on a stream. On a stream we only send on, the
@@ -1159,12 +1202,42 @@ class QuicConnection:
         """
         self._transport.set_default_stream_priority(priority)
 
+    def set_datagram_priority(self, priority: int) -> int:
+        """Send priority of this connection's datagrams against its streams.
+
+        Same scale as stream priority: 0 highest, 255 lowest, picoquic's
+        default 9. Streams of a higher priority go before datagrams;
+        streams of a lower one only when no datagram is waiting; at equal
+        priority datagrams and those streams take turns.
+
+        Returns 0 when posted, 1 when the TX event ring is full (nothing
+        applied; wait on tx_event_ring_drain_event and retry).
+
+        Raises:
+            ConnectionError: no transport, or the cnx is not open.
+        """
+        if self._cnx_ptr == 0 or self._transport is None:
+            raise ConnectionError("set_datagram_priority: cnx not open")
+        return self._transport.set_datagram_priority(self._cnx_ptr, priority)
+
+    def set_default_datagram_priority(self, priority: int) -> None:
+        """Datagram priority that new connections start at.
+
+        Writes the QUIC context's default, shared by every connection on
+        this TransportContext, and applies only to connections created
+        after the call; set_datagram_priority() changes this one.
+        """
+        self._transport.set_default_datagram_priority(priority)
+
     def close(self, error_code: int = 0, frame_type: int | None = None,
               reason_phrase: str = "") -> None:
-        """Close the connection."""
+        """APPLICATION_CLOSE with error_code and reason_phrase (512 bytes max).
+        frame_type is unused."""
         if self._transport is not None and not self._closed:
+            reason = (reason_phrase.replace("\0", "").encode("utf-8")[:512]
+                      .decode("utf-8", "ignore").encode("utf-8"))
             self._transport.push_tx_event(
-                _TX_CLOSE, 0,
+                _TX_CLOSE, 0, data=reason or None,
                 error_code=error_code, cnx_ptr=self._cnx_ptr,
             )
             self._transport.wake_up()
@@ -1255,6 +1328,7 @@ class QuicEngine:
             keylog_filename=keylog,
             rx_data_ring_cap=cfg.max_stream_data,
             congestion_control_algorithm=cfg.congestion_control_algorithm,
+            congestion_control_options=cfg.congestion_control_options,
             initial_max_data=cfg.max_data,
             initial_max_streams_uni=getattr(cfg, 'max_streams_uni', 0) or 0,
             initial_max_streams_bidi=getattr(cfg, 'max_streams_bidi', 0) or 0,
@@ -1267,6 +1341,7 @@ class QuicEngine:
             key_update_interval=cfg.key_update_interval or 0,
             ip_family=-1 if cfg.ip_family is None else cfg.ip_family,
             pmtud_policy=cfg.pmtud,
+            reset_stream_at=getattr(cfg, 'reset_stream_at', True),
         )
         kwargs.update(extra)
         self._transport.start(**kwargs)

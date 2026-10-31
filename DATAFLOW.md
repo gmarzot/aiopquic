@@ -26,10 +26,14 @@ eventfd:
 
 Worker→asyncio wakeups go through one eventfd
 (`loop.add_reader`); asyncio→worker through
-`picoquic_wake_up_network_thread`. Both directions coalesce:
-`tx_wake_pending` dedupes producer wakes (raw-QUIC sends and the FC
-push path; **WT sends wake unconditionally** — `push_stream_data`, `_transport.pyx`),
-and `rx_notify_pending` dedupes eventfd writes (`aiopquic_notify_rx`, `callback.h`).
+`picoquic_wake_up_network_thread`. Both directions coalesce.
+A TX push wakes the worker only if it is idle (`tx_worker_idle`,
+`aiopquic_tx_wake_needed`): before a wait that can block, the worker marks
+itself idle in picoquic's `time_check` callback, re-checks the TX ring, and
+drains what was pushed while it ran. Raw QUIC and WT share this path.
+A worker that wakes on its own after sleeping 50 ms or more and finds entries
+queued counts `tx_wake_lost`, which stays 0 unless a wake was lost.
+`rx_notify_pending` dedupes eventfd writes (`aiopquic_notify_rx`, `callback.h`).
 
 WebTransport shares everything above: `wt_session->bridge` *is* the
 transport's `aiopquic_ctx_t` — same event rings, same eventfd
@@ -51,7 +55,7 @@ sequenceDiagram
     participant NIC as UDP / NIC
 
     Note over App,API: NEW STREAM only — gates before creation
-    alt aggregate queued exceeds tx_max_queued_bytes (4 MiB)
+    alt connection (WT: session) queued exceeds tx_max_queued_bytes (4 MiB)
         API->>API: park, 2 ms poll, resume below cap/2<br/>raw: send_stream_data_drained new-stream branch<br/>WT: create_stream calls _await_tx_data_capacity
     end
     opt raw QUIC, every new stream
@@ -72,7 +76,7 @@ sequenceDiagram
     CY->>CY: pre-check tx_event_ring slot
     CY->>SCTX: commit bytes (all-or-nothing)
     CY->>TXR: TX_MARK_ACTIVE
-    CY->>WK: wake (raw path coalesced via tx_wake_pending)
+    CY->>WK: wake, only if the worker is idle
     API-->>App: return (no copy retained)
 
     Note over WK,NIC: worker pull, wire pace
@@ -119,6 +123,17 @@ both ride picoquic's app wake timer. `WT_CNX_CLOSED` completes `aclose()`. A ser
 never closes the shared connection. Connection-level events reach the sessions
 through `aiopquic_wt_cnx_cb`, installed on every cnx that carries sessions.
 
+### Stream reset with a reliable size
+
+`reset_stream(sid, code, reliable_size=N)` carries N in the TX entry's `aux`. When both ends
+advertised reset_stream_at, the worker sends RESET_STREAM_AT keeping the first N bytes written
+(capped at what was written), plus the WT stream header on a WT stream we opened. picoquic takes
+no reliable size beyond the bytes it has sent, so a reset whose bytes are still in `sc->tx` is
+held on `ctx->deferred_resets`: the pull callbacks stop at N and withhold FIN, and after each send
+pass (`picoquic_packet_loop_after_send`) the held resets whose bytes are out go out. A closing
+cnx's held resets are dropped in its close callback, and a once-a-second liveness sweep drops
+those of a cnx gone without one. Without reset_stream_at the reset is RESET_STREAM.
+
 ### TX backpressure layers
 
 Layered from coarsest to finest; whichever binds first governs.
@@ -126,7 +141,7 @@ Latency contributed by a queue = its depth ÷ drain rate.
 
 | # | Layer | Trigger | Park / resume | Scope |
 |---|---|---|---|---|
-| 1 | `tx_max_queued_bytes` (4 MiB, `QuicConfiguration`) | aggregate `pushed − pulled − discarded` over cap | park at stream creation; resume < cap/2; 2 ms poll | all streams — the only bound short-stream churn cannot bypass |
+| 1 | `tx_max_queued_bytes` (4 MiB, `QuicConfiguration`) | the connection's (WT: session's) stream rings hold more than cap | park at stream creation; resume < cap/2; 2 ms poll | all streams of the connection — the only bound short-stream churn cannot bypass |
 | 2 | `tx_max_inflight_bytes` (1 MiB, aiomoqt `MOQTPeer`) | one stream's `sc->tx` used over cap | park mid-stream on drain event; resume < cap/2 | per stream — fairness + binds on long-lived streams |
 | 3 | `sc->tx` ring full (4 MiB) | commit doesn't fit | `BufferError` → dual-event wait → retry | per stream, hard |
 | 4 | `tx_event_ring` pressure | > 90% → hard wait; > 50% → post-send `sleep(0)` | ring-drained event at ≤ 50% low-water | connection, command channel |
@@ -229,11 +244,11 @@ Counter signature: `*_arms = 0`, `rx_event_drops = 0`,
 
 **At saturation**, the binding constraint by direction:
 
-- **TX, unpaced producer**: the aggregate gate
+- **TX, unpaced producer**: the connection gate
   (`tx_max_queued_bytes`) parks producers at stream rollover;
   standing queue oscillates in the [cap/2, cap] band, so
   steady-state e2e latency ≈ `0.75 × cap ÷ drain rate` (4 MiB ≈ 8 ms
-  at ~3 Gbps). The floor below the aggregate cap is the rollover
+  at ~3 Gbps). The floor below the connection cap is the rollover
   overshoot `P × min(per-stream cap, bytes-per-stream)`; the
   per-stream cap (`tx_max_inflight_bytes`) governs below that floor.
 - **RX, slow consumer**: per-stream FC stalls the peer at the
@@ -254,11 +269,11 @@ Counter signature: `*_arms = 0`, `rx_event_drops = 0`,
 | `QuicConfiguration.max_data` | 16 MiB | cnx-level inbound FC (initial; picoquic auto-extends) |
 | `QuicConfiguration.max_stream_data` | 16 MiB | per-stream inbound window AND `sc->rx` size |
 | `QuicConfiguration.stream_ring_cap` | 4 MiB | per-stream `sc->tx` hard cap |
-| `QuicConfiguration.tx_max_queued_bytes` | 4 MiB (0/None off) | aggregate outbound queue, all streams |
+| `QuicConfiguration.tx_max_queued_bytes` | 4 MiB (0/None off) | outbound queue per connection (WT: per session) |
 | `QuicConfiguration.max_streams_uni/bidi` | 512 | initial MAX_STREAMS credit |
 | `QuicConfiguration.event_ring_capacity` | None → 2048/16384 | both event rings |
 | `QuicConfiguration.idle_timeout` | 30 s | QUIC idle timeout |
-| `QuicConfiguration.congestion_control_algorithm` | "bbr1" | CC algorithm |
+| `QuicConfiguration.congestion_control_algorithm` | "bbr" | CC algorithm |
 | aiomoqt `tx_max_inflight_bytes` | 1 MiB (None off) | one stream's outbound queue |
 | CLI `--max-queued-bytes` | (cfg default) | sets `tx_max_queued_bytes` |
 | CLI `--max-inflight-bytes` | (aiomoqt default) | sets `tx_max_inflight_bytes` |
@@ -275,7 +290,7 @@ Counter signature: `*_arms = 0`, `rx_event_drops = 0`,
 | Stream creation | lazy — sc created on first write; one `sleep(0)` yield per new stream | explicit worker round-trip (`create_stream` awaits WT_STREAM_CREATED) — naturally suspending |
 | sc ownership (Python) | `_stream_ctxs` — Python owns, frees at close | `_stream_tx_ctxs` — borrowed; C link owns lifetime |
 | Destroy | `stream_released` → STREAM_DESTROY event | WT_STREAM_DESTROY then LINK_RELEASE (FIFO-ordered; drain frees the link internally) |
-| Send wake | coalesced | unconditional |
+| Send wake | only to an idle worker | same |
 | Aggregate gate site | `send_stream_data_drained` new-stream branch | `create_stream` |
 | Event rings | shared per transport | same rings (`bridge` == the transport ctx) |
 
@@ -302,7 +317,7 @@ sc_alive_total growing without bound               → stream teardown starving
                                                      (drain not getting CPU) or leak
 chunks_alive_total growing without bound           → consumer pipeline retaining
                                                      memoryviews (app-side)
-tx_data_bytes_queued pinned at cap                 → gate engaged: producer at wire
+tx_data_bytes_queued pinned at cap (one cnx)       → gate engaged: producer at wire
                                                      rate (working as intended)
 sc_rx_bytes_in_flight growing                      → consumer drain lagging arrivals
 prepare_to_send_calls up, pulled_bytes flat        → nothing to send: producer-side

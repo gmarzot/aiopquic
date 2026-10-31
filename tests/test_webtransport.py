@@ -11,7 +11,8 @@ import pytest
 
 from aiopquic._binding._transport import tx_data_bytes_queued
 from aiopquic.asyncio.webtransport import (
-    WebTransportError, connect_webtransport, serve_webtransport,
+    WebTransportClient, WebTransportError, connect_webtransport,
+    serve_webtransport,
 )
 from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.events import (
@@ -38,6 +39,12 @@ pytestmark = pytest.mark.skipif(
     not (os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE)),
     reason="picoquic certs not found",
 )
+
+
+def test_connect_protocol_validated():
+    with pytest.raises(ValueError):
+        WebTransportClient(None, "127.0.0.1", 4433, "/",
+                           connect_protocol="webtransport-h2")
 
 
 async def _drain_stream(session, stream_id, *, want=None, timeout=5.0):
@@ -338,6 +345,196 @@ async def test_wt_datagram_oversize_is_refused():
         async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
             with pytest.raises(ValueError):
                 wt.send_datagram_frame(b"x" * 4096)
+    finally:
+        server.close()
+
+
+def test_varint_len_boundaries():
+    from aiopquic.asyncio.webtransport import _varint_len
+    values = (0, 63, 64, 16383, 16384, 2**30 - 1, 2**30)
+    assert [_varint_len(v) for v in values] == [1, 1, 2, 2, 4, 4, 8]
+
+
+@pytest.mark.asyncio
+async def test_wt_max_datagram_payload_both_ends():
+    """Each end's ceiling is the connection's less the session's Quarter
+    Stream ID varint; a payload of exactly that size arrives, one byte
+    more raises, and a closed session reports 0."""
+    from aiopquic.asyncio.webtransport import _varint_len
+    from aiopquic.quic.events import WebTransportDatagramReceived
+    port = next_port()
+    srv_got: asyncio.Queue = asyncio.Queue()
+    cli_got: asyncio.Queue = asyncio.Queue()
+    srv_session = asyncio.get_running_loop().create_future()
+
+    async def handler(session):
+        srv_session.set_result(session)
+        async for ev in session.events():
+            if isinstance(ev, WebTransportDatagramReceived):
+                await srv_got.put(bytes(ev.data))
+
+    async def client_recv(wt):
+        async for ev in wt.events():
+            if isinstance(ev, WebTransportDatagramReceived):
+                await cli_got.put(bytes(ev.data))
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            srv = await asyncio.wait_for(srv_session, timeout=5.0)
+            recv = asyncio.create_task(client_recv(wt))
+            for sender, got in ((wt, srv_got), (srv, cli_got)):
+                cap = sender._transport.datagram_payload_ceiling(sender.cnx_ptr)
+                assert cap == 1200
+                n = sender.max_datagram_payload()
+                assert n == cap - _varint_len(sender.control_stream_id >> 2)
+                payload = bytes(i & 0xFF for i in range(n))
+                assert sender.send_datagram_frame(payload) == n
+                assert await asyncio.wait_for(got.get(), timeout=5.0) == payload
+                with pytest.raises(ValueError):
+                    sender.send_datagram_frame(b"x" * (n + 1))
+            recv.cancel()
+        assert wt.max_datagram_payload() == 0
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_max_datagram_payload_follows_peer_tp():
+    """A peer's smaller max_datagram_frame_size lowers the ceiling; a
+    record past it would sit at the ring head forever, so it raises."""
+    from aiopquic.asyncio.webtransport import _varint_len
+    from aiopquic.quic.events import WebTransportDatagramReceived
+    port = next_port()
+    got: asyncio.Queue = asyncio.Queue()
+
+    async def handler(session):
+        async for ev in session.events():
+            if isinstance(ev, WebTransportDatagramReceived):
+                await got.put(bytes(ev.data))
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE,
+        configuration=QuicConfiguration(is_client=False,
+                                        max_datagram_frame_size=300))
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            n = wt.max_datagram_payload()
+            assert n == 300 - _varint_len(wt.control_stream_id >> 2)
+            with pytest.raises(ValueError):
+                wt.send_datagram_frame(b"p" * (n + 1))
+            for size in (n, 1):
+                assert wt.send_datagram_frame(b"p" * size) == size
+                assert await asyncio.wait_for(got.get(), timeout=5.0) == b"p" * size
+    finally:
+        server.close()
+
+
+async def _until(cond, timeout=5.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not cond():
+        assert loop.time() < deadline, "condition not reached"
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_wt_finished_streams_release_their_inboxes():
+    """A reader that returns releases its stream's inbox and the stream's
+    destroy clears its marker: a long session keeps no per-stream state
+    for streams it has read."""
+    port = next_port()
+    n = 200
+
+    async def handler(session):
+        for i in range(n):
+            sid = await session.create_stream(bidir=False)
+            session.send_stream_data(sid, b"d%d" % i, end_stream=True)
+        async for _ in session.events():
+            pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            readers = []
+            async for ev in wt.events():
+                if isinstance(ev, WebTransportNewStream):
+                    readers.append(asyncio.create_task(
+                        _drain_stream(wt, ev.stream_id)))
+                    if len(readers) == n:
+                        break
+            got = await asyncio.wait_for(asyncio.gather(*readers), 10.0)
+            assert sorted(got) == sorted(b"d%d" % i for i in range(n))
+            assert not wt._stream_inbox
+            await _until(lambda: not wt._inbox_done)
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_reader_closed_early_keeps_its_inbox():
+    """A reader closed before FIN leaves the inbox: a second reader gets
+    the rest, and taking the FIN releases it."""
+    port = next_port()
+    more = asyncio.Event()
+
+    async def handler(session):
+        sid = await session.create_stream(bidir=False)
+        session.send_stream_data(sid, b"first")
+        await more.wait()
+        session.send_stream_data(sid, b"rest", end_stream=True)
+        async for _ in session.events():
+            pass
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            async for ev in wt.events():
+                if isinstance(ev, WebTransportNewStream):
+                    sid = ev.stream_id
+                    break
+            reader = wt.receive_stream_data(sid)
+            first = await asyncio.wait_for(reader.__anext__(), 5.0)
+            assert bytes(first.data) == b"first" and not first.end_stream
+            await reader.aclose()
+            assert sid in wt._stream_inbox and sid not in wt._inbox_done
+            more.set()
+            assert await _drain_stream(wt, sid) == b"rest"
+            assert sid not in wt._stream_inbox
+            await _until(lambda: sid not in wt._inbox_done)
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_wt_empty_datagram_is_refused():
+    """An empty datagram raises instead of wedging the record ring; the
+    next one still arrives."""
+    from aiopquic.quic.events import WebTransportDatagramReceived
+    port = next_port()
+    got: asyncio.Queue = asyncio.Queue()
+
+    async def handler(session):
+        async for ev in session.events():
+            if isinstance(ev, WebTransportDatagramReceived):
+                await got.put(bytes(ev.data))
+
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt",
+        handler=handler, cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE) as wt:
+            with pytest.raises(ValueError):
+                wt.send_datagram_frame(b"")
+            assert wt.send_datagram_frame(b"after") == 5
+            assert await asyncio.wait_for(got.get(), timeout=5.0) == b"after"
     finally:
         server.close()
 
@@ -882,4 +1079,4 @@ async def test_wt_advertises_reset_stream_at_both_codepoints(tmp_path,
     for path in (server_log, client_log):
         text = path.read_text()
         assert "Extension type: 29 (reset_stream_at)" in text, path
-        assert "Extension type: 6745883625174385 (reset_stream_at)" in text, path
+        assert "Extension type: 6745883625174385 (reset_stream_at_old)" in text, path

@@ -6,6 +6,7 @@ import logging
 import os
 import socket
 import ssl
+import sys
 
 import pytest
 
@@ -226,6 +227,105 @@ async def test_ip_family_ipv4_leaves_ipv6_port_free():
         await _fetch("127.0.0.1", port, _client_cfg())
     finally:
         server.close()
+
+
+def _port_free(family, address, port):
+    """Whether a UDP socket can still bind (address, port)."""
+    with socket.socket(family, socket.SOCK_DGRAM) as probe:
+        if family == socket.AF_INET6:
+            probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        try:
+            probe.bind((address, port))
+        except OSError:
+            return False
+    return True
+
+
+async def test_bind_ipv4_literal():
+    port = next_port()
+    server = await serve("127.0.0.1", port, configuration=_server_cfg(),
+                         create_protocol=Server)
+    try:
+        await _fetch("127.0.0.1", port, _client_cfg())
+        if _ipv6_usable():
+            assert _port_free(socket.AF_INET6, "::", port)
+        if sys.platform.startswith("linux"):
+            assert _port_free(socket.AF_INET, "127.0.0.2", port)
+    finally:
+        server.close()
+
+
+@pytest.mark.skipif(not _ipv6_usable(), reason="no IPv6 on this host")
+async def test_bind_ipv6_literal():
+    port = next_port()
+    server = await serve("::1", port, configuration=_server_cfg(),
+                         create_protocol=Server)
+    try:
+        await _fetch("::1", port, _client_cfg())
+        assert _port_free(socket.AF_INET, "0.0.0.0", port)
+    finally:
+        server.close()
+
+
+async def test_bind_ipv4_wildcard():
+    port = next_port()
+    server = await serve("0.0.0.0", port, configuration=_server_cfg(),
+                         create_protocol=Server)
+    try:
+        await _fetch("127.0.0.1", port, _client_cfg())
+        if _ipv6_usable():
+            assert _port_free(socket.AF_INET6, "::", port)
+    finally:
+        server.close()
+
+
+async def test_bind_hostname_one_address_per_family():
+    port = next_port()
+    families = {info[0] for info in socket.getaddrinfo(
+        "localhost", None, type=socket.SOCK_DGRAM)}
+    server = await serve("localhost", port, configuration=_server_cfg(),
+                         create_protocol=Server)
+    try:
+        if socket.AF_INET in families:
+            await _fetch("127.0.0.1", port, _client_cfg())
+        if socket.AF_INET6 in families and _ipv6_usable():
+            await _fetch("::1", port, _client_cfg())
+    finally:
+        server.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="127.0.0.2 is only configured on Linux")
+async def test_bind_two_servers_one_port():
+    port = next_port()
+    first = await serve("127.0.0.1", port, configuration=_server_cfg(),
+                        create_protocol=Server)
+    try:
+        second = await serve("127.0.0.2", port, configuration=_server_cfg(),
+                             create_protocol=Server)
+        try:
+            await _fetch("127.0.0.1", port, _client_cfg())
+            await _fetch("127.0.0.2", port, _client_cfg())
+        finally:
+            second.close()
+    finally:
+        first.close()
+
+
+async def test_bind_failure_raises():
+    port = next_port()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as squatter:
+        squatter.bind(("127.0.0.1", port))
+        with pytest.raises(OSError):
+            await serve("127.0.0.1", port, configuration=_server_cfg(),
+                        create_protocol=Server)
+    with pytest.raises(OSError):
+        await serve("no-such-host.invalid", port, configuration=_server_cfg(),
+                    create_protocol=Server)
+    with pytest.raises(ValueError):
+        await serve("0.0.0.0", port,
+                    configuration=_server_cfg(ip_family=socket.AF_INET6),
+                    create_protocol=Server)
 
 
 def test_ip_family_and_pmtud_validation():

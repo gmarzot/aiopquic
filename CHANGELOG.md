@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.7.0
+
+- No changes since 0.7.0rc3.
+
+## v0.7.0rc3
+
+- macOS wheels are built on macOS 15 and need macOS 15.0+ (GitHub retires its macOS 14 runners);
+  macOS 14 installs from the sdist.
+- picoquic 3012b39c (1.1.54.0), picotls e446233b: fixes QUIC v2 compatible version negotiation and
+  multipath ACKs; picotls brings its audit fixes and Brotli off by default. `picoquic_get_remote_error_reason()`
+  is upstream, so its patch is gone.
+- A handshake ended by our side (e.g. a timeout) raises `ConnectionError` naming the local cause.
+- `QuicConfiguration.congestion_control_options` passes an option string to the congestion
+  controller, e.g. `"Q0.02"` for bbr's send quantum.
+- `ConnectionTerminated` and `WebTransportSessionClosed` add `local_error` and `local_reason`: a close the
+  stack made itself (idle timeout, a protocol error it raised) carries picoquic's code and its name;
+  `error_code` stays 0.
+- Connection closes log at DEBUG (were WARNING for a nonzero code); the application gets them as
+  `ConnectionTerminated`.
+- A send wakes the network thread only when it may be asleep: raw QUIC and WebTransport no longer
+  make a wake syscall per write while the thread runs (WT made one on every write).
+- `TransportContext.set_max_connections(n)` lowers the connection limit while the server runs; new
+  connections past it are refused at once with CONNECTION_REFUSED, existing ones are kept.
+- `counters["tx_wake_lost"]` counts TX events found queued after a sleep no producer woke; it stays 0
+  unless a wake was lost.
+- `ConnectionTerminated.frame_type` is None for the peer's application close and 0 for a transport
+  close (CONNECTION_REFUSED, idle timeout); `reason_phrase` is the peer's reason phrase.
+- `QuicConnection.close(error_code, reason_phrase=...)` sends the reason phrase (up to 512 bytes).
+- `WebTransportSessionClosed` adds `connection_closed` and `frame_type`; a session ended by its QUIC
+  connection's close carries that close's reason.
+- Fix: a peer's application close produced two `ConnectionTerminated` events, the second with code 0;
+  it produces one.
+
+## v0.7.0rc2
+
+- Dev builds after a pre-release tag report the next pre-release's dev version (`0.7.0rc3.devN`
+  after rc2), so source builds satisfy an `aiopquic>=0.7.0rc2` floor.
+- `reset_stream(..., reliable_size=N)` on `QuicConnection` and `WebTransportSession` sends
+  RESET_STREAM_AT, so the first N bytes (a MoQT stream header) still arrive; raw QUIC now
+  advertises it (`QuicConfiguration.reset_stream_at`), and `reset_stream_at_negotiated()` says so.
+- WebTransport `create_stream`: a cancelled or timed-out create no longer hands its stream to the
+  next caller (the stream is reset), and a full TX event ring waits for room instead of raising.
+- Cancelling a backpressured `send_stream_data_drained` no longer leaves two waiter tasks behind.
+- WebTransport: a stream's inbox is freed once its reader takes the FIN or reset, not at session close.
+- `send_datagram_frame` raises `ValueError` on an empty payload, which wedged every later datagram.
+- `connect` and `connect_webtransport` resolve host names without blocking the event loop.
+- Raw QUIC: the `tx_max_queued_bytes` gate counts the connection's own queued bytes, so a peer that
+  stops reading no longer parks new streams on every other connection in the process.
+- `WebTransportSession.max_datagram_payload()`: the connection's datagram ceiling less h3's
+  stream-ID prefix. `send_datagram_frame` raises `ValueError` above it; such a payload was accepted,
+  never sent, and held back every later datagram on the session.
+
+## v0.7.0rc1
+
+- `set_datagram_priority(p)` on `QuicConnection` and `WebTransportSession`, and
+  `set_default_datagram_priority(p)`: datagrams' send priority against streams (picoquic default 9).
+- RX: a wake is no longer lost when a late notify lands between the consumer clearing its pending
+  flag and reading the wake fd (RX stalled until the safety net); the safety net checks every 25 ms.
+- picoquic, Linux: the packet loop sleeps with `ppoll()` until the next paced send instead of spinning
+  on non-blocking receives when it is under 1 ms away; the network thread runs with 1 µs timer slack.
+- The Cython extensions compile with `-O3` even when `CFLAGS` is set in the environment.
+- The default congestion control is `"bbr"` (v3), was `"bbr1"`.
+- RX: a reader that misses its wake is drained within 0.45 s and logged with the wake-protocol
+  trace (`TransportContext.wake_trace()`), the reader history and the fd's state; RX readers have
+  one owner per transport.
+- Servers now bind the given host (0.6.x ignored it); pass `"::"` or `None` for all interfaces.
+  For `serve`, `serve_dispatch` and `serve_webtransport`, an IP literal binds only that address,
+  `"0.0.0.0"` only IPv4, a hostname at most one address per family.
+- WebTransport client: when a server that advertised SETTINGS_WT_ENABLED refuses the
+  `webtransport` CONNECT, it retries once with `webtransport-h3` on the same connection (xquic).
+- `connect_webtransport(connect_protocol=)`: send only `"webtransport"` or `"webtransport-h3"`.
+- picoquic 70b5fd5: Linux receive batches with `recvmmsg` and fewer `poll()` calls; one WebTransport
+  session per connection is enforced; `reset_stream_at` under both codepoints is now upstream.
+
 ## v0.6.1
 
 - Fix: a server created a second, empty connection and protocol for the close that picoquic reports

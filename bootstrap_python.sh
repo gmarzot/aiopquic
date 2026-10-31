@@ -77,8 +77,8 @@ uv python pin --no-config "${PYTHON_VERSION}"
 # setuptools_scm is needed in the venv (not just in build-isolation)
 # because `pip install -e . --no-build-isolation` skips the build-system
 # requires; without it the version falls back to 0.0.0 instead of being
-# derived from git tags via [tool.setuptools_scm].
-${UV_PIP_INSTALL} build wheel setuptools "setuptools_scm[toml]>=6.2"
+# derived from git tags (setup.py).
+${UV_PIP_INSTALL} build wheel setuptools "setuptools_scm[toml]>=9"
 #${UV_PIP_INSTALL} "git+https://github.com/cython/cython.git"
 ${UV_PIP_INSTALL} "cython==${CYTHON_VERSION}"
 ${UV_PIP_INSTALL} pytest pytest-asyncio pytest-cov pytest-xdist

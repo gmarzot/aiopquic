@@ -57,6 +57,9 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_MARK_WT_DATAGRAM_READY,
     SPSC_EVT_TX_SET_STREAM_PRIORITY,
     SPSC_EVT_TX_WT_SET_STREAM_PRIORITY,
+    SPSC_EVT_TX_SET_DATAGRAM_PRIORITY,
+    SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY,
+    SPSC_EVT_TX_SET_MAX_CONNECTIONS,
     SPSC_EVT_DATAGRAM_TX_DRAINED,
     SPSC_EVT_TX_CNX_REFRESH,
     SPSC_EVT_CNX_STACK, SPSC_EVT_CNX_SNAPSHOT,
@@ -84,6 +87,7 @@ cdef extern from "<netinet/in.h>":
         unsigned short sin6_family
         unsigned short sin6_port
         in6_addr sin6_addr
+        unsigned int sin6_scope_id
     unsigned short htons(unsigned short hostshort)
 
 cdef extern from "<arpa/inet.h>":
@@ -95,6 +99,8 @@ cdef extern from "picoquic.h":
         pass
     void picoquic_set_default_priority(picoquic_quic_t* quic,
                                        uint8_t default_stream_priority)
+    void picoquic_set_default_datagram_priority(picoquic_quic_t* quic,
+                                                uint8_t default_datagram_priority)
     ctypedef struct picoquic_cnx_t:
         pass
 
@@ -122,8 +128,10 @@ cdef extern from "picoquic.h":
         const uint8_t* ticket_encryption_key,
         size_t ticket_encryption_key_length)
 
-    void picoquic_set_default_congestion_algorithm_by_name(
+    int picoquic_set_default_congestion_algorithm_by_name(
         picoquic_quic_t* quic, const char* alg_name)
+    void picoquic_set_default_congestion_algorithm_ex(
+        picoquic_quic_t* quic, const void* alg, const char* alg_option_string)
 
     void picoquic_register_all_congestion_control_algorithms()
     const void* picoquic_get_congestion_algorithm(const char* alg_name)
@@ -177,6 +185,7 @@ cdef extern from *:
         unsigned int migration_disabled
         uint32_t max_datagram_frame_size
         int enable_loss_bit
+        int is_reset_stream_at_enabled
         int enable_time_stamp
         uint64_t min_ack_delay
         int do_grease_quic_bit
@@ -264,6 +273,7 @@ cdef extern from "picoquic_packet_loop.h":
         int prefer_extra_socket
         int simulate_eio
         size_t send_length_max
+        sockaddr_storage local_addr[2]
 
     ctypedef int (*picoquic_packet_loop_cb_fn)(
         picoquic_quic_t* quic, int cb_mode,
@@ -300,6 +310,19 @@ cdef extern from "c/callback.h":
         uint32_t desired_version
         uint16_t sni_len
         uint16_t alpn_len
+
+cdef extern from "c/callback.h":
+    ctypedef struct aiopquic_wake_trace_entry_t:
+        uint64_t ts_ns
+        uint32_t kind
+        uint32_t a
+        uint64_t b
+    ctypedef struct aiopquic_wake_trace_t:
+        uint64_t next
+        aiopquic_wake_trace_entry_t e[128]
+    enum:
+        AIOPQUIC_WAKE_TRACE_LEN
+        AIOPQUIC_WAKE_DRAIN
 
 cdef extern from "c/callback.h":
     # Resource defaults — single source of truth in callback.h.
@@ -340,7 +363,16 @@ cdef extern from "c/callback.h":
         uint64_t cnt_rx_data_event_coalesced
         uint64_t worker_rx_byte_ring_overflow
         uint32_t rx_notify_pending
-        uint32_t tx_wake_pending
+        uint64_t cnt_rx_notify_flips
+        uint64_t cnt_rx_notify_skips
+        uint64_t cnt_rx_notify_write_errs
+        int last_rx_notify_errno
+        uint64_t cnt_rx_clears
+        uint64_t cnt_rx_clear_read_empty
+        uint64_t cnt_rx_rearms
+        aiopquic_wake_trace_t worker_trace
+        aiopquic_wake_trace_t asyncio_trace
+        uint32_t tx_worker_idle
         uint32_t tx_event_ring_drain_pending
         uint32_t tx_event_ring_low_water
         # Observability counters (added without behavior change).
@@ -351,11 +383,13 @@ cdef extern from "c/callback.h":
         uint64_t cnt_tx_event_ring_fire_dropped
         uint64_t cnt_wake_calls
         uint64_t cnt_wake_skipped_coalesced
+        uint64_t cnt_tx_wake_lost
         uint64_t cnt_prepare_to_send_empty
         uint64_t cnt_loop_cb
         uint64_t worker_set_priority_applied
         uint64_t worker_set_priority_rejected
         uint64_t worker_set_priority_last_err
+        uint64_t worker_set_dgram_priority_applied
         uint64_t cnt_tx_event_dropped_dead_cnx
         uint64_t cnt_tx_wrong_direction_dropped
         uint64_t cnt_tx_reattach_after_close
@@ -381,8 +415,12 @@ cdef extern from "c/callback.h":
                                           uint32_t low_water_pct)
     void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx)
     void aiopquic_clear_rx(aiopquic_ctx_t* ctx)
+    uint64_t aiopquic_rx_consumed(aiopquic_ctx_t* ctx)
+    void aiopquic_wake_trace_add(aiopquic_wake_trace_t* t, uint32_t kind,
+                                 uint32_t a, uint64_t b)
+    uint64_t aiopquic_wake_trace_next(aiopquic_wake_trace_t* t)
     void aiopquic_notify_rx(aiopquic_ctx_t* ctx)
-    int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx)
+    int aiopquic_tx_wake_needed(aiopquic_ctx_t* ctx)
     int aiopquic_arm_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx)
     void aiopquic_clear_tx_event_ring_drain_pending(aiopquic_ctx_t* ctx)
     void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx, void* cnx,
@@ -604,6 +642,8 @@ cdef extern from "h3zero_common.h":
         size_t path_length
         picohttp_post_data_cb_fn path_callback
         void* path_app_ctx
+        const char* connect_protocol
+        size_t connect_protocol_length
 
     ctypedef struct picohttp_server_parameters_t:
         const char* web_folder
@@ -720,6 +760,18 @@ def check_congestion_control_algorithm(name):
         raise ValueError(
             f"unknown congestion_control_algorithm {name!r}; "
             f"expected one of {', '.join(_CC_NAMES)}")
+
+
+def check_congestion_control_options(options, name):
+    """Raise ValueError unless options is None, or a str with an algorithm
+    named to take it."""
+    if options is None:
+        return
+    if not isinstance(options, str) or "\0" in options:
+        raise ValueError("congestion_control_options must be a str")
+    if name is None:
+        raise ValueError(
+            "congestion_control_options needs a congestion_control_algorithm")
 
 
 def tx_data_bytes_queued():
@@ -1081,7 +1133,23 @@ cdef inline int _pending_fc_add(dict pending_fc, aiopquic_stream_ctx_t* sc,
     return 0
 
 
-cdef int _fill_sockaddr(str host, int port, sockaddr_storage* out) except -1:
+_WAKE_KINDS = {1: "notify", 2: "clear", 3: "drain"}
+
+
+cdef int _wake_trace_tail(aiopquic_wake_trace_t* trace, str side, int last,
+                          list out) except -1:
+    cdef uint64_t end = aiopquic_wake_trace_next(trace)
+    cdef uint64_t n = min(<uint64_t>last, end, <uint64_t>AIOPQUIC_WAKE_TRACE_LEN)
+    cdef uint64_t i
+    cdef aiopquic_wake_trace_entry_t* e
+    for i in range(end - n, end):
+        e = &trace.e[i % AIOPQUIC_WAKE_TRACE_LEN]
+        out.append((e.ts_ns, side, _WAKE_KINDS.get(e.kind, e.kind), e.a, e.b))
+    return 0
+
+
+cdef int _fill_sockaddr(str host, int port, sockaddr_storage* out,
+                        unsigned int scope_id=0) except -1:
     """IPv4 or IPv6 literal and port into a zeroed sockaddr_storage."""
     memset(out, 0, sizeof(sockaddr_storage))
     cdef bytes b_host = host.encode()
@@ -1094,6 +1162,7 @@ cdef int _fill_sockaddr(str host, int port, sockaddr_storage* out) except -1:
     if inet_pton(AF_INET6, b_host, &v6.sin6_addr) == 1:
         v6.sin6_family = AF_INET6
         v6.sin6_port = htons(<unsigned short>port)
+        v6.sin6_scope_id = scope_id
         return 0
     raise ValueError(f"Invalid IP address: {host}")
 
@@ -1126,6 +1195,46 @@ def _ipv6_usable() -> bool:
     return _ipv6_bind_error() is None
 
 
+def _bind_addresses(host, int ip_family):
+    """(local_af, [(family, address, scope_id)]) for a listener's host.
+
+    None, "" and "::" keep the wildcard over the families ip_family
+    selects; "0.0.0.0" is the IPv4 wildcard; anything else resolves to at
+    most one address per family.
+    """
+    if host is None or host in ("", "::"):
+        return ip_family, []
+    if host == "0.0.0.0":
+        if ip_family == AF_INET6:
+            raise ValueError("host '0.0.0.0' is IPv4 but ip_family is AF_INET6")
+        return AF_INET, []
+    found = {}
+    for family, _, _, _, sockaddr in _socket.getaddrinfo(
+            host, None, type=_socket.SOCK_DGRAM, flags=_socket.AI_PASSIVE):
+        if family not in (_socket.AF_INET, _socket.AF_INET6) or family in found:
+            continue
+        if ip_family > 0 and family != ip_family:
+            continue
+        scope_id = sockaddr[3] if family == _socket.AF_INET6 else 0
+        found[family] = (sockaddr[0].split("%")[0], scope_id)
+    if not found:
+        raise ValueError(f"host {host!r} has no address in the requested family")
+    addrs = [(family, address, scope_id)
+             for family, (address, scope_id) in found.items()]
+    return (addrs[0][0] if len(addrs) == 1 else 0), addrs
+
+
+def _bind_preflight(addrs, int port):
+    """Raise the OSError picoquic's own bind would hit in its thread."""
+    for family, address, scope_id in addrs:
+        with _socket.socket(family, _socket.SOCK_DGRAM) as s:
+            if family == _socket.AF_INET6:
+                s.setsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY, 1)
+                s.bind((address, port, 0, scope_id))
+            else:
+                s.bind((address, port))
+
+
 cdef class TransportContext:
     """
     Manages the picoquic context and network thread.
@@ -1153,6 +1262,7 @@ cdef class TransportContext:
     cdef picoquic_network_thread_ctx_t* _thread_ctx
     cdef picoquic_packet_loop_param_t _param
     cdef bint _started
+    cdef uint32_t _max_connections
     # WT server-mode storage; must persist for picoquic's lifetime.
     cdef bytes _wt_path_bytes
     # Server WT subprotocol allowlist (CSV). Held here so the borrowed
@@ -1163,9 +1273,10 @@ cdef class TransportContext:
     # parses it into a bridge-owned array of copies (client offer + server
     # allowlist). Retained only to keep the buffer alive across that call.
     cdef bytes _alpn_list_csv
-    # Paths picoquic keeps borrowed pointers to.
+    # Strings picoquic keeps borrowed pointers to.
     cdef bytes _ticket_file
     cdef bytes _web_folder
+    cdef bytes _cc_options
     cdef picohttp_server_path_item_t _wt_path_item
     cdef picohttp_server_parameters_t _wt_params
     # Forensic counters for the atomic send_stream_data path.
@@ -1294,6 +1405,24 @@ cdef class TransportContext:
         return spsc_ring_count(self._ctx.rx_event_ring)
 
     @property
+    def rx_clears(self):
+        """clear_rx calls so far: advances once per drain."""
+        return self._ctx.cnt_rx_clears
+
+    def wake_trace(self, int last=64):
+        """The latest wake-protocol events of both threads, oldest first:
+        (ts_ns, side, kind, a, b). side is "worker" or "asyncio"; kind is
+        "notify" (a: wake write errno, b: ring count), "drain" (a: events
+        popped, b: ring count after) or "clear" (a: flags 1 was pending,
+        2 re-armed, 4 wake fd read empty, 8 re-arm write failed; b: ring
+        left << 32 | counter read). Read without locks: diagnostic only."""
+        cdef list out = []
+        _wake_trace_tail(&self._ctx.worker_trace, "worker", last, out)
+        _wake_trace_tail(&self._ctx.asyncio_trace, "asyncio", last, out)
+        out.sort()
+        return out[-last:]
+
+    @property
     def tx_event_ring_count(self):
         """Number of events pending in the TX ring."""
         return spsc_ring_count(self._ctx.tx_event_ring)
@@ -1337,6 +1466,7 @@ cdef class TransportContext:
             'tx_event_ring_fire_dropped': self._ctx.cnt_tx_event_ring_fire_dropped,
             'wake_calls': self._ctx.cnt_wake_calls,
             'wake_skipped_coalesced': self._ctx.cnt_wake_skipped_coalesced,
+            'tx_wake_lost': self._ctx.cnt_tx_wake_lost,
             'prepare_to_send_calls': self._ctx.worker_prepare_to_send_calls,
             'prepare_to_send_pulled_bytes': self._ctx.worker_prepare_to_send_pulled_bytes,
             'prepare_to_send_empty': self._ctx.cnt_prepare_to_send_empty,
@@ -1344,6 +1474,7 @@ cdef class TransportContext:
             'set_priority_applied': self._ctx.worker_set_priority_applied,
             'set_priority_rejected': self._ctx.worker_set_priority_rejected,
             'set_priority_last_err': self._ctx.worker_set_priority_last_err,
+            'set_dgram_priority_applied': self._ctx.worker_set_dgram_priority_applied,
             'tx_event_dropped_dead_cnx': self._ctx.cnt_tx_event_dropped_dead_cnx,
             'tx_wrong_direction_dropped': self._ctx.cnt_tx_wrong_direction_dropped,
             'tx_reattach_after_close': self._ctx.cnt_tx_reattach_after_close,
@@ -1354,6 +1485,13 @@ cdef class TransportContext:
             'rx_overflow_max_depth': self._ctx.rx_overflow.max_depth,
             'rx_overflow_depth_now': self._ctx.rx_overflow.depth,
             'rx_notify_pending_now': self._ctx.rx_notify_pending,
+            'rx_notify_flips': self._ctx.cnt_rx_notify_flips,
+            'rx_notify_skips': self._ctx.cnt_rx_notify_skips,
+            'rx_notify_write_errs': self._ctx.cnt_rx_notify_write_errs,
+            'rx_notify_last_errno': self._ctx.last_rx_notify_errno,
+            'rx_clears': self._ctx.cnt_rx_clears,
+            'rx_clear_read_empty': self._ctx.cnt_rx_clear_read_empty,
+            'rx_rearms': self._ctx.cnt_rx_rearms,
             'loop_callbacks': self._ctx.cnt_loop_cb,
             'rx_data_event_coalesced': self._ctx.cnt_rx_data_event_coalesced,
             'rx_byte_ring_overflow': self._ctx.worker_rx_byte_ring_overflow,
@@ -1362,7 +1500,7 @@ cdef class TransportContext:
             'tx_event_ring_count_now': spsc_ring_count(self._ctx.tx_event_ring),
             'rx_event_ring_count_now': spsc_ring_count(self._ctx.rx_event_ring),
             'tx_event_ring_drain_pending_now': self._ctx.tx_event_ring_drain_pending,
-            'tx_wake_pending_now': self._ctx.tx_wake_pending,
+            'tx_worker_idle_now': self._ctx.tx_worker_idle,
             # RX flow-control observability (added 2026-05-25)
             'fc_credit_pushed': self._ctx.cnt_fc_credit_pushed,
             'fc_credit_handled': self._ctx.cnt_fc_credit_handled,
@@ -1686,7 +1824,7 @@ cdef class TransportContext:
             return
         self._refresh_posted.add(cnx_ptr)
         self._ctx.cnt_tx_event_ring_pushes += 1
-        if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+        if aiopquic_tx_wake_needed(self._ctx):
             picoquic_wake_up_network_thread(self._thread_ctx)
 
     cdef object _snapshot(self, uintptr_t cnx_ptr, bint refresh):
@@ -1996,6 +2134,7 @@ cdef class TransportContext:
         self._begin_drain_cycle()
         spsc_ring_refill_from_overflow(self._ctx.rx_event_ring,
                                        &self._ctx.rx_overflow)
+        cdef uint64_t consumed0 = aiopquic_rx_consumed(self._ctx)
         for i in range(max_events):
             entry = spsc_ring_peek(self._ctx.rx_event_ring)
             if entry is NULL:
@@ -2186,6 +2325,10 @@ cdef class TransportContext:
         # for the work just performed. Hysteresis inside
         # _push_fc_credit filters further.
         self._flush_pending_fc(pending_fc)
+        aiopquic_wake_trace_add(
+            &self._ctx.asyncio_trace, AIOPQUIC_WAKE_DRAIN,
+            <uint32_t>(aiopquic_rx_consumed(self._ctx) - consumed0),
+            spsc_ring_count(self._ctx.rx_event_ring))
         aiopquic_clear_rx(self._ctx)
         return events
 
@@ -2458,7 +2601,7 @@ cdef class TransportContext:
     def push_tx_event(self, uint32_t event_type, uint64_t stream_id,
                 bytes data=None, uint64_t error_code=0,
                 uintptr_t cnx_ptr=0, uintptr_t stream_ctx=0,
-                uint8_t is_fin=0):
+                uint8_t is_fin=0, uint32_t aux=0):
         """
         Push a command into the TX ring (asyncio → picoquic thread).
 
@@ -2471,6 +2614,7 @@ cdef class TransportContext:
         is_fin is also reused as a small auxiliary flag: e.g.,
         SPSC_EVT_TX_SET_APP_FLOW_CONTROL uses it as the
         `use_app_flow_control` argument to picoquic_set_app_flow_control.
+        aux is the reliable size of an SPSC_EVT_TX_STREAM_RESET.
 
         After pushing, caller should call wake_up() to signal the network thread.
         """
@@ -2484,6 +2628,7 @@ cdef class TransportContext:
         entry.cnx = <void*>cnx_ptr
         entry.stream_ctx = <void*>stream_ctx
         entry.error_code = error_code
+        entry.aux = aux
 
         if data is not None:
             data_ptr = <const uint8_t*>data
@@ -2598,15 +2743,10 @@ cdef class TransportContext:
             self._send_busy_event_ring += 1
             return 1
 
-        # Coalesce the wake_up syscall: only invoke
-        # picoquic_wake_up_network_thread on the 0→1 transition of
-        # tx_wake_pending. The worker clears the flag back to 0 on
-        # entry to its wake handler (BEFORE draining the tx ring), so
-        # any push that races against the worker drain is guaranteed
-        # to either land in the ring before the drain loop's next peek
-        # OR cause a fresh wake.
+        # Wake only an idle worker; a running one drains the ring
+        # before it waits.
         if self._thread_ctx is not NULL:
-            if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+            if aiopquic_tx_wake_needed(self._ctx):
                 picoquic_wake_up_network_thread(self._thread_ctx)
 
         return 0
@@ -2712,7 +2852,7 @@ cdef class TransportContext:
                 return 1
         self._ctx.cnt_tx_event_ring_pushes += 1
         if self._thread_ctx is not NULL:
-            if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+            if aiopquic_tx_wake_needed(self._ctx):
                 picoquic_wake_up_network_thread(self._thread_ctx)
         return 0
 
@@ -2756,7 +2896,7 @@ cdef class TransportContext:
                 return 1
         self._ctx.cnt_tx_event_ring_pushes += 1
         if self._thread_ctx is not NULL:
-            if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+            if aiopquic_tx_wake_needed(self._ctx):
                 picoquic_wake_up_network_thread(self._thread_ctx)
         return 0
 
@@ -2766,6 +2906,53 @@ cdef class TransportContext:
         if self._quic is NULL:
             raise ConnectionError("quic context not started")
         picoquic_set_default_priority(self._quic, priority)
+
+    def set_max_connections(self, uint32_t n):
+        """Refuse new connections while the context holds n or more; n is
+        at most start()'s max_connections, and 0 refuses all. A refused
+        client gets CONNECTION_REFUSED at once; existing connections are
+        kept. Returns 0 posted, 1 TX event ring full (retry)."""
+        cdef spsc_entry_t entry
+        if self._thread_ctx is NULL:
+            raise ConnectionError("network thread not running")
+        if n > self._max_connections:
+            raise ValueError(
+                f"{n} is above start()'s max_connections {self._max_connections}")
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_SET_MAX_CONNECTIONS
+        entry.error_code = n
+        while spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            if aiopquic_arm_tx_event_ring_drain_pending(self._ctx):
+                return 1
+        self._ctx.cnt_tx_event_ring_pushes += 1
+        if aiopquic_tx_wake_needed(self._ctx):
+            picoquic_wake_up_network_thread(self._thread_ctx)
+        return 0
+
+    def set_datagram_priority(self, uintptr_t cnx_ptr, uint8_t priority):
+        """Datagram send priority against this connection's streams, on
+        the stream scale (0 highest, picoquic default 9). Returns 0 posted,
+        1 TX event ring full (retry)."""
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_SET_DATAGRAM_PRIORITY
+        entry.cnx = <void*>cnx_ptr
+        entry.error_code = priority
+        while spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            if aiopquic_arm_tx_event_ring_drain_pending(self._ctx):
+                return 1
+        self._ctx.cnt_tx_event_ring_pushes += 1
+        if self._thread_ctx is not NULL:
+            if aiopquic_tx_wake_needed(self._ctx):
+                picoquic_wake_up_network_thread(self._thread_ctx)
+        return 0
+
+    def set_default_datagram_priority(self, uint8_t priority):
+        """Datagram priority new connections start at (picoquic default 9).
+        Applies to connections created after the call."""
+        if self._quic is NULL:
+            raise ConnectionError("quic context not started")
+        picoquic_set_default_datagram_priority(self._quic, priority)
 
     def dgram_push(self, uintptr_t db_ptr, bytes data):
         """Commit one datagram record WITHOUT arming a scheduler — the
@@ -2812,6 +2999,20 @@ cdef class TransportContext:
             return 0
         cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
         return s.dgram_ceiling
+
+    def reset_stream_at_negotiated(self, uintptr_t cnx_ptr):
+        """Both ends advertised reset_stream_at, so a reset keeps its
+        reliable bytes. Read from the cnx snapshot, like
+        datagram_payload_ceiling."""
+        if cnx_ptr == 0:
+            return False
+        snap = self._snapshot(cnx_ptr, False)
+        if snap is None:
+            return False
+        cdef const aiopquic_cnx_snapshot_t* s = <const aiopquic_cnx_snapshot_t*><const char*>snap
+        return bool(s.has_tp_local and s.has_tp_remote
+                    and s.tp_local.is_reset_stream_at_enabled
+                    and s.tp_remote.is_reset_stream_at_enabled)
 
     def cnx_data_counters(self, uintptr_t cnx_ptr):
         """(bytes placed on the wire, bytes received from the wire) for
@@ -2933,7 +3134,10 @@ cdef class TransportContext:
               ticket_file=None,
               web_folder=None,
               int ip_family=-1,
-              pmtud_policy=None):
+              pmtud_policy=None,
+              host=None,
+              bint reset_stream_at=True,
+              congestion_control_options=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -2973,12 +3177,22 @@ cdef class TransportContext:
             ip_family: AF_INET, AF_INET6, or 0 for both; -1 picks both when
                 an IPv6 socket can bind [::]:port, else AF_INET (with a
                 warning unless the host has no IPv6).
+            host: Listener address. None, "" or "::" bind the wildcard of
+                the families ip_family selects; "0.0.0.0" the IPv4
+                wildcard; an IP literal (IPv6 may carry a scope) only that
+                address; a hostname at most one address per family. A
+                bind failure raises OSError.
             rx_data_ring_cap: Per-stream RX byte ring, in bytes, and the
                 advertised stream window. 0: a 4 MiB ring and picoquic's
                 default window.
+            reset_stream_at: Advertise RESET_STREAM_AT
+                (draft-ietf-quic-reliable-stream-reset). WebTransport
+                always advertises it.
             congestion_control_algorithm: picoquic algorithm name, matched
                 exactly; an unknown name raises ValueError. None keeps
                 picoquic's default (newreno).
+            congestion_control_options: Option string for that algorithm,
+                passed to picoquic as is, e.g. "Q0.02" for bbr.
             max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
             wt_path: Server-mode WebTransport path (e.g. "/moq").
                 When set, uses h3zero_callback as picoquic's default
@@ -2992,6 +3206,8 @@ cdef class TransportContext:
         if self._started:
             raise RuntimeError("Transport already started")
         check_congestion_control_algorithm(congestion_control_algorithm)
+        check_congestion_control_options(congestion_control_options,
+                                         congestion_control_algorithm)
 
         # Stash per-stream RX ring capacity on the C ctx so the
         # stream_data callback sizes per-stream byte rings to match the
@@ -3056,6 +3272,10 @@ cdef class TransportContext:
             self._wt_path_item.path_length = len(self._wt_path_bytes)
             self._wt_path_item.path_callback = aiopquic_wt_server_path_callback
             self._wt_path_item.path_app_ctx = <void*>self._ctx
+            # An extended CONNECT needs a route that names its :protocol;
+            # h3zero takes either WebTransport token for this one.
+            self._wt_path_item.connect_protocol = b"webtransport-h3"
+            self._wt_path_item.connect_protocol_length = 15
             if web_folder is not None:
                 self._web_folder = (web_folder.encode() if isinstance(web_folder, str)
                                     else web_folder)
@@ -3140,8 +3360,14 @@ cdef class TransportContext:
                      if isinstance(congestion_control_algorithm, str)
                      else congestion_control_algorithm)
             _c_cc = _b_cc
-            picoquic_set_default_congestion_algorithm_by_name(
-                self._quic, _c_cc)
+            if congestion_control_options is None:
+                picoquic_set_default_congestion_algorithm_by_name(
+                    self._quic, _c_cc)
+            else:
+                self._cc_options = congestion_control_options.encode()
+                picoquic_set_default_congestion_algorithm_ex(
+                    self._quic, picoquic_get_congestion_algorithm(_c_cc),
+                    self._cc_options)
 
         cdef bytes _b_log
         # Textlog: per-cnx human-readable log of every packet, ACK, FC
@@ -3275,10 +3501,23 @@ cdef class TransportContext:
                 if initial_max_streams_bidi > 0:
                     tp.initial_max_stream_id_bidir = initial_max_streams_bidi
                 picoquic_set_default_tp(self._quic, &tp)
+        if reset_stream_at:
+            cur_tp = picoquic_get_default_tp(self._quic)
+            if cur_tp != NULL:
+                tp = cur_tp[0]
+                tp.is_reset_stream_at_enabled = 1
+                picoquic_set_default_tp(self._quic, &tp)
 
         # Configure packet loop parameters (must persist — picoquic stores a pointer)
         self._param.local_port = <unsigned short>port
-        if ip_family < 0:
+        ip_family, bind_addrs = _bind_addresses(host, ip_family)
+        if bind_addrs:
+            if port:
+                _bind_preflight(bind_addrs, port)
+            for i, (family, address, scope_id) in enumerate(bind_addrs):
+                _fill_sockaddr(address, port, &self._param.local_addr[i],
+                               scope_id)
+        elif ip_family < 0:
             v6_error = _ipv6_bind_error(port)
             if v6_error is None:
                 ip_family = 0
@@ -3351,6 +3590,7 @@ cdef class TransportContext:
         # — a type mismatch here is a silent UAF-class corruption.
         self._ctx.thread_ctx = self._thread_ctx
 
+        self._max_connections = max_connections if max_connections > 0 else 1  # picoquic's floor
         self._started = True
 
     def stop(self, double drain_timeout=0.05):
@@ -3397,15 +3637,27 @@ cdef class TransportContext:
     def wake_up(self):
         """Signal the network thread to process TX ring entries.
 
+        Writes the wake only when the thread may be asleep: a running
+        thread drains the ring before it waits.
+
         No-op when the network thread is stopped — teardown is a normal
         state for unsynchronized push_* callers (e.g. subgroup-task
         cancel handlers firing after the transport has shut down).
         """
-        if self._thread_ctx is NULL:
+        if self._thread_ctx is NULL or not aiopquic_tx_wake_needed(self._ctx):
             return
         cdef int ret = picoquic_wake_up_network_thread(self._thread_ctx)
         if ret != 0:
             raise RuntimeError(f"Failed to wake network thread (ret={ret})")
+
+    def _tx_push_unwoken(self):
+        """Queue a no-op TX event and skip the wake: a lost wake (test only)."""
+        cdef spsc_entry_t entry
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_SET_STREAM_PRIORITY
+        if spsc_ring_push(self._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            raise BufferError("TX event ring full")
+        self._ctx.cnt_tx_event_ring_pushes += 1
 
     def create_client_connection(self, str host, int port,
                                   str sni=None, str alpn=None,
@@ -3487,6 +3739,7 @@ cdef extern from "c/h3wt_callback.h":
         uint16_t sni_len
         uint16_t path_len
         uint16_t protocols_len
+        uint8_t connect_protocol
 
 
 # tp_clear would drop _transport, which __dealloc__ needs to tell whether
@@ -3587,13 +3840,16 @@ cdef class WebTransportSessionState:
         return (<bytes>self._wt.wt_protocol).decode('ascii', 'replace')
 
     def push_open(self, str host, int port, str path, str sni,
-                  str wt_protocols=""):
+                  str wt_protocols="", int connect_protocol=0):
         """Push TX_WT_OPEN to the picoquic thread. Build the params
         payload (addr + sni + path + protocols), then push entry.
 
         wt_protocols is a comma-separated string of WT-Available-Protocols
         subprotocol identifiers (empty string = none, send NULL on wire).
         aiopquic does no interpretation; verbatim handed to picoquic.
+
+        connect_protocol is AIOPQUIC_WT_CONNECT_*: 0 = "webtransport" with
+        one "webtransport-h3" retry, 1 = "webtransport", 2 = "webtransport-h3".
         """
         cdef bytes b_sni = sni.encode()
         # Empty client path → "/" (HTTP/3 root, RFC 9114 §4.3.1).
@@ -3613,6 +3869,7 @@ cdef class WebTransportSessionState:
         params.sni_len = <uint16_t>sni_len
         params.path_len = <uint16_t>path_len
         params.protocols_len = <uint16_t>protocols_len
+        params.connect_protocol = <uint8_t>connect_protocol
         memcpy(p + hdr_size, <const uint8_t*>b_sni, sni_len)
         memcpy(p + hdr_size + sni_len, <const uint8_t*>b_path, path_len)
         if protocols_len > 0:
@@ -3821,7 +4078,8 @@ cdef class WebTransportSessionState:
         self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 
-    def push_reset_stream(self, uint64_t stream_id, uint64_t error_code):
+    def push_reset_stream(self, uint64_t stream_id, uint64_t error_code,
+                          uint32_t reliable_size=0):
         cdef spsc_entry_t entry
         memset(&entry, 0, sizeof(entry))
         entry.event_type = SPSC_EVT_TX_WT_RESET_STREAM
@@ -3829,6 +4087,7 @@ cdef class WebTransportSessionState:
         entry.stream_ctx = <void*>self._wt
         entry.stream_id = stream_id
         entry.error_code = error_code
+        entry.aux = reliable_size
         cdef int ret = spsc_ring_push(
             self._transport._ctx.tx_event_ring, &entry, NULL, 0)
         if ret != 0:
@@ -3902,6 +4161,25 @@ cdef class WebTransportSessionState:
         self._transport.wake_up()
         return 0
 
+    def push_datagram_priority(self, uint8_t priority):
+        """Datagram priority for this session's connection, on the stream
+        scale. Returns 0 posted, 1 TX event ring full (retry)."""
+        cdef spsc_entry_t entry
+        if self._wt is NULL:
+            raise ConnectionError("WT session closed")
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY
+        entry.cnx = <void*>self._wt
+        entry.stream_ctx = <void*>self._wt
+        entry.error_code = priority
+        while spsc_ring_push(
+                self._transport._ctx.tx_event_ring, &entry, NULL, 0) != 0:
+            if aiopquic_arm_tx_event_ring_drain_pending(self._transport._ctx):
+                return 1
+        self._transport._ctx.cnt_tx_event_ring_pushes += 1
+        self._transport.wake_up()
+        return 0
+
     def push_stop_sending(self, uint64_t stream_id, uint64_t error_code):
         cdef spsc_entry_t entry
         memset(&entry, 0, sizeof(entry))
@@ -3940,12 +4218,53 @@ cdef class WebTransportSessionState:
 #   stream_buf_destroy(sb)
 # ---------------------------------------------------------------------------
 
+cdef extern from "c/test_access.h":
+    int aiopquic_test_cnx_datagram_priority(picoquic_cnx_t* cnx)
+    int aiopquic_test_default_datagram_priority(picoquic_quic_t* quic)
+    const char* aiopquic_test_cnx_cc_options(picoquic_cnx_t* cnx)
+
+
+def _datagram_priority(uintptr_t cnx_ptr):
+    """picoquic's datagram priority for a connection, -1 for none (test only)."""
+    return aiopquic_test_cnx_datagram_priority(<picoquic_cnx_t*>cnx_ptr)
+
+
+def _default_datagram_priority(TransportContext t):
+    """The context's default datagram priority, -1 before start (test only)."""
+    return aiopquic_test_default_datagram_priority(t._quic)
+
+
+def _wt_datagram_priority(WebTransportSessionState st):
+    """Datagram priority of a WT session's connection, -1 for none (test only)."""
+    if st._wt is NULL:
+        return -1
+    return aiopquic_test_cnx_datagram_priority(st._wt.cnx)
+
+
+cdef _cnx_cc_options(picoquic_cnx_t* cnx):
+    cdef const char* s = aiopquic_test_cnx_cc_options(cnx)
+    return None if s is NULL else s.decode()
+
+
+def _cc_options(uintptr_t cnx_ptr):
+    """picoquic's congestion-control option string for a connection, or None
+    (test only)."""
+    return _cnx_cc_options(<picoquic_cnx_t*>cnx_ptr)
+
+
+def _wt_cc_options(WebTransportSessionState st):
+    """The option string of a WT session's connection, or None (test only)."""
+    if st._wt is NULL:
+        return None
+    return _cnx_cc_options(st._wt.cnx)
+
+
 cdef extern from "c/litmus.h":
     int64_t aiopquic_litmus_run(int kind, uint64_t rounds) nogil
 
 _LITMUS_KINDS = {
     'rx_notify': 0, 'tx_wake': 1, 'rx_event': 2,
-    'tx_drain': 3, 'tx_ring': 4, 'dgram': 5,
+    'tx_drain': 3, 'tx_ring': 4, 'dgram': 5, 'rx_drained': 6,
 }
 
 
@@ -3959,6 +4278,21 @@ def _litmus(str kind, uint64_t n):
     if lost < 0:
         raise MemoryError("litmus setup failed")
     return lost
+
+
+def _tx_wake_gate(uint32_t idle, uint64_t n):
+    """Run n producer wake gates against a worker held idle (1) or running
+    (0), with no worker thread. Returns (wakes, skipped) (test only)."""
+    cdef aiopquic_ctx_t* ctx = aiopquic_ctx_create(16, 64, 50)
+    cdef uint64_t i
+    if ctx is NULL:
+        raise MemoryError("ctx create failed")
+    ctx.tx_worker_idle = idle
+    for i in range(n):
+        aiopquic_tx_wake_needed(ctx)
+    r = (ctx.cnt_wake_calls, ctx.cnt_wake_skipped_coalesced)
+    aiopquic_ctx_destroy(ctx)
+    return r
 
 
 def stream_buf_create(uint32_t capacity):

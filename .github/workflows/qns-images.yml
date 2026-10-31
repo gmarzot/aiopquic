@@ -1,7 +1,8 @@
 name: QNS images
 
-# Interop Runner endpoint images (qns/) built from a released aiopquic wheel and
-# pushed to GHCR, where the runner pulls them. `latest` follows stable releases.
+# Interop Runner endpoint images: a released aiopquic wheel and the qns/ files of
+# the same release tag, pushed to GHCR, where the runner pulls them. `latest`
+# follows stable releases.
 
 on:
   workflow_run:
@@ -28,35 +29,57 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Resolve the version
         id: version
         env:
+          GH_TOKEN: ${{ github.token }}
           REQUESTED: ${{ inputs.version }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
+          if [ -n "$RELEASE_SHA" ]; then
+            # The Release workflow tags the commit it ran on.
+            tag=$(gh api --paginate "repos/$GITHUB_REPOSITORY/tags" --jq ".[] | select(.commit.sha == \"$RELEASE_SHA\") | .name" | grep '^v' | head -1)
+            test -n "$tag" || { echo "no release tag on $RELEASE_SHA" >&2; exit 1; }
+            export REQUESTED="${tag#v}"
+          fi
           pip install -q packaging
           python - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os, urllib.request
+          import json, os, time, urllib.request
           from packaging.version import Version
-          releases = json.load(urllib.request.urlopen("https://pypi.org/pypi/aiopquic/json"))["releases"]
-          stable = max(Version(v) for v in releases if not Version(v).is_prerelease)
+          wheel = "cp312-cp312-manylinux_2_34_x86_64.whl"
           requested = os.environ["REQUESTED"].strip()
+          # A just-released version can take minutes to appear on PyPI.
+          deadline = time.time() + (1200 if os.environ["RELEASE_SHA"] else 0)
+          while True:
+              releases = json.load(urllib.request.urlopen("https://pypi.org/pypi/aiopquic/json"))["releases"]
+              if not requested or any(f["filename"].endswith(wheel) for f in releases.get(requested, [])):
+                  break
+              if time.time() >= deadline:
+                  raise SystemExit(f"aiopquic {requested} has no {wheel} on PyPI")
+              time.sleep(30)
+          stable = max(Version(v) for v in releases if releases[v] and not Version(v).is_prerelease)
           version = Version(requested) if requested else stable
-          if requested and str(version) not in releases:
-              raise SystemExit(f"aiopquic {version} is not on PyPI")
           build = Version(version.base_version) >= Version(os.environ["MIN_VERSION"])
           print(f"version={version}")
           print(f"latest={'true' if version == stable else 'false'}")
           print(f"build={'true' if build else 'false'}")
           PY
+      - uses: actions/checkout@v4
+        if: steps.version.outputs.build == 'true'
+        with:
+          ref: v${{ steps.version.outputs.version }}
       - name: Download the wheel
         if: steps.version.outputs.build == 'true'
-        run: >-
-          pip download "aiopquic==${{ steps.version.outputs.version }}" --no-deps --only-binary=:all:
-          --implementation cp --python-version 3.12 --platform manylinux_2_34_x86_64 -d qns/wheelhouse
+        run: |
+          # The simple index can trail the JSON API.
+          for attempt in 1 2 3 4 5; do
+            pip download "aiopquic==${{ steps.version.outputs.version }}" --no-deps --only-binary=:all: --implementation cp --python-version 3.12 --platform manylinux_2_34_x86_64 -d qns/wheelhouse && exit 0
+            sleep 30
+          done
+          exit 1
       - name: Build
         if: steps.version.outputs.build == 'true'
         run: |

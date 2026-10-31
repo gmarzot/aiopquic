@@ -76,5 +76,9 @@ Release workflow, weekly, and on dispatch with a version.
 ## CI
 
 `.github/workflows/interop.yml` runs aiopquic against itself and each peer in both roles, weekly,
-on dispatch, and on pull requests that touch `qns/`. `tests/interop/test_qns_endpoint.py` runs
-both endpoints against themselves over localhost.
+on dispatch, and on pull requests that touch `qns/`. Its `h3spec` job runs
+[h3spec](https://github.com/kazu-yamamoto/h3spec) (pinned in the workflow) against the `http3`
+server of `endpoint.py`; report-only. Its `report` job puts one summary on the run page:
+aiopquic's QUIC score next to aioquic's and picoquic's from the newest public run, outcome pies,
+and a pass/fail matrix per protocol and role. `tests/interop/test_qns_endpoint.py` runs both
+endpoints against themselves over localhost.

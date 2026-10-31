@@ -82,6 +82,12 @@
  * while investigating control-stream delivery regression.) */
 #define AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT 50
 
+/* A worker that planned and slept a wait at least this long, then wakes
+ * on its own and finds TX entries queued, counts a lost wake. A shorter
+ * sleep can end between a producer's push and its wake check. */
+#define AIOPQUIC_TX_WAKE_LOST_US 50000
+
+#include <errno.h>
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -177,6 +183,7 @@ static inline int aiopquic_fc_raw_enabled(void) {
 
 #ifdef __linux__
 #include <sys/eventfd.h>
+#include <sys/prctl.h>
 #endif
 
 /*
@@ -200,6 +207,48 @@ typedef struct {
     void*                 cnx;
     aiopquic_dgram_buf_t* db;
 } aiopquic_dgram_release_t;
+
+/* Wake-protocol trace: a small ring per thread (one writer each), read
+ * racily by asyncio for diagnostics only. Records the order of notify
+ * flips, drains and clears so a lost wake can be reconstructed. */
+#define AIOPQUIC_WAKE_TRACE_LEN 128
+enum {
+    AIOPQUIC_WAKE_NOTIFY = 1,   /* worker 0->1 flip; a = errno of the wake write (0 ok); b = ring count */
+    AIOPQUIC_WAKE_CLEAR = 2,    /* asyncio clear_rx; a = flags below; b = ring left << 32 | counter read */
+    AIOPQUIC_WAKE_DRAIN = 3,    /* asyncio drain_rx; a = events popped; b = ring count after */
+};
+#define AIOPQUIC_CLEAR_WAS_PENDING 1u
+#define AIOPQUIC_CLEAR_REARMED     2u
+#define AIOPQUIC_CLEAR_READ_EMPTY  4u
+#define AIOPQUIC_CLEAR_REARM_ERR   8u
+
+typedef struct {
+    uint64_t ts_ns;
+    uint32_t kind;
+    uint32_t a;
+    uint64_t b;
+} aiopquic_wake_trace_entry_t;
+
+typedef struct {
+    uint64_t next;
+    aiopquic_wake_trace_entry_t e[AIOPQUIC_WAKE_TRACE_LEN];
+} aiopquic_wake_trace_t;
+
+static inline void aiopquic_wake_trace_add(aiopquic_wake_trace_t* t,
+                                           uint32_t kind, uint32_t a,
+                                           uint64_t b) {
+    uint64_t n = t->next;
+    aiopquic_wake_trace_entry_t* e = &t->e[n % AIOPQUIC_WAKE_TRACE_LEN];
+    e->ts_ns = aiopquic_now_ns();
+    e->kind = kind;
+    e->a = a;
+    e->b = b;
+    __atomic_store_n(&t->next, n + 1, __ATOMIC_RELEASE);
+}
+
+static inline uint64_t aiopquic_wake_trace_next(aiopquic_wake_trace_t* t) {
+    return __atomic_load_n(&t->next, __ATOMIC_ACQUIRE);
+}
 
 typedef struct {
     spsc_ring_t*    rx_event_ring;
@@ -254,12 +303,22 @@ typedef struct {
      * it reads the eventfd. Producer-only-sets, single-writer
      * semantics — atomic exchange used to detect the 0→1 edge. */
     uint32_t        rx_notify_pending;
-    /* Same coalescing on TX side: skip picoquic_wake_up_network_thread
-     * unless the worker has drained since our last wake. The worker
-     * sets this back to 0 whenever it observes the tx_event_ring drained
-     * to empty (after popping all entries) so the next producer push
-     * triggers a wake. */
-    uint32_t        tx_wake_pending;
+    /* Wake-protocol forensics. Worker-written: flips, skips, write
+     * errors, worker_trace. asyncio-written: clears, empty reads,
+     * re-arms, asyncio_trace. */
+    uint64_t        cnt_rx_notify_flips;
+    uint64_t        cnt_rx_notify_skips;
+    uint64_t        cnt_rx_notify_write_errs;
+    int             last_rx_notify_errno;
+    uint64_t        cnt_rx_clears;
+    uint64_t        cnt_rx_clear_read_empty;
+    uint64_t        cnt_rx_rearms;
+    aiopquic_wake_trace_t worker_trace;
+    aiopquic_wake_trace_t asyncio_trace;
+    /* 1 while the worker may sleep: set before a wait that can block,
+     * cleared when it runs and by the producer that wakes it. Producers
+     * call picoquic_wake_up_network_thread only on that 1→0. */
+    uint32_t        tx_worker_idle;
     /* Per-stream RX byte ring overflow counter. Replaces the
      * fprintf(stderr,...) on full from the previous diagnostic —
      * libc stdio holds a global lock and stalls the picoquic worker
@@ -291,7 +350,7 @@ typedef struct {
     uint64_t        cnt_tx_event_ring_fires;             /* worker fired SPSC_EVT_TX_EVENT_RING_DRAINED */
     uint64_t        cnt_tx_event_ring_fire_dropped;      /* fire CAS won but rx_event_ring push failed → re-armed */
     uint64_t        cnt_wake_calls;                /* picoquic_wake_up_network_thread invoked */
-    uint64_t        cnt_wake_skipped_coalesced;    /* wake skipped (tx_wake_pending already 1) */
+    uint64_t        cnt_wake_skipped_coalesced;    /* wake skipped: worker not idle */
     uint64_t        cnt_prepare_to_send_empty;     /* prepare_to_send invoked with avail==0 */
     uint64_t        cnt_loop_cb;                   /* worker loop callbacks: moves while the worker runs */
     uint64_t        last_tx_event_ring_arm_ns;           /* CLOCK_MONOTONIC of last arm */
@@ -376,6 +435,7 @@ typedef struct {
     uint64_t        worker_set_priority_applied;
     uint64_t        worker_set_priority_rejected;
     uint64_t        worker_set_priority_last_err;
+    uint64_t        worker_set_dgram_priority_applied;
     /* TX events discarded because their cnx was freed between push
      * and pop. Covers every event type behind the stale-cnx guard. */
     uint64_t        cnt_tx_event_dropped_dead_cnx;
@@ -397,7 +457,148 @@ typedef struct {
     uint64_t        cnt_tx_reattach_after_close;
     /* Stream callbacks ignored because the cnx was already closing. */
     uint64_t        cnt_stream_cb_after_close;
+    /* Resets waiting for their reliable bytes to be sent (worker only). */
+    struct aiopquic_deferred_reset* deferred_resets;
+    uint64_t        deferred_resets_swept;  /* last liveness sweep, us */
+    uint64_t        tx_worker_armed_at;     /* worker only: arm time of a long wait, else 0 */
+    uint64_t        cnt_tx_wake_lost;       /* TX entries found after a long sleep no producer woke */
+    /* Reasons lent to picoquic_close_ex (worker only). */
+    struct aiopquic_close_reason* close_reasons;
 } aiopquic_ctx_t;
+
+typedef struct aiopquic_close_reason {
+    struct aiopquic_close_reason* next;
+    picoquic_cnx_t* cnx;
+    char text[];
+} aiopquic_close_reason_t;
+
+/* A RESET_STREAM_AT held until its reliable bytes are sent: picoquic
+ * takes no reliable size beyond the bytes it has sent. */
+typedef struct aiopquic_deferred_reset {
+    struct aiopquic_deferred_reset* next;
+    picoquic_cnx_t*        cnx;
+    aiopquic_stream_ctx_t* sc;          /* referenced */
+    uint64_t               stream_id;
+    uint64_t               error_code;  /* as sent */
+    uint64_t               preamble;    /* WT stream header bytes */
+    uint8_t                is_wt;
+} aiopquic_deferred_reset_t;
+
+/* Both ends advertised reset_stream_at. Worker only. */
+static inline int aiopquic_reset_stream_at_negotiated(picoquic_cnx_t* cnx) {
+    const picoquic_tp_t* lt = picoquic_get_transport_parameters(cnx, 1);
+    const picoquic_tp_t* rt = picoquic_get_transport_parameters(cnx, 0);
+    return lt && rt && lt->is_reset_stream_at_enabled
+           && rt->is_reset_stream_at_enabled;
+}
+
+/* Reliable bytes a reset of sc keeps: the requested size capped at what
+ * was written, or 0 when reset_stream_at was not negotiated. */
+static inline uint64_t aiopquic_reset_reliable_size(
+        picoquic_cnx_t* cnx, aiopquic_stream_ctx_t* sc, uint64_t requested) {
+    if (requested == 0 || !sc || !sc->tx
+            || !aiopquic_reset_stream_at_negotiated(cnx)) {
+        return 0;
+    }
+    uint64_t written = atomic_load_explicit(&sc->tx->tail, memory_order_acquire);
+    return requested < written ? requested : written;
+}
+
+/* RESET_STREAM_AT keeping the first `reliable` bytes on the wire (stream
+ * offsets); RESET_STREAM when reliable is 0 or picoquic refuses it. */
+static inline int aiopquic_reset_stream_reliable(picoquic_cnx_t* cnx,
+        uint64_t stream_id, uint64_t code, uint64_t reliable) {
+    if (reliable > 0) {
+        int rr = picoquic_reset_stream_at(cnx, stream_id, code, reliable);
+        if (rr != PICOQUIC_ERROR_OFFSET_TOO_BIG
+                && rr != PICOQUIC_ERROR_ILLEGAL_TRANSPORT_EXTENSION) {
+            return rr;
+        }
+    }
+    return picoquic_reset_stream(cnx, stream_id, code);
+}
+
+static inline void aiopquic_deferred_reset_free(aiopquic_deferred_reset_t* d) {
+    d->sc->tx_reset_pending = 0;
+    aiopquic_stream_ctx_destroy(d->sc);
+    free(d);
+}
+
+/* Forget the held resets of a closing cnx. Worker only. */
+static inline void aiopquic_deferred_resets_drop_cnx(aiopquic_ctx_t* ctx,
+                                                     picoquic_cnx_t* cnx) {
+    aiopquic_deferred_reset_t** pp = &ctx->deferred_resets;
+    while (*pp) {
+        aiopquic_deferred_reset_t* d = *pp;
+        if (d->cnx == cnx) {
+            *pp = d->next;
+            aiopquic_deferred_reset_free(d);
+        } else {
+            pp = &d->next;
+        }
+    }
+}
+
+/* cnx's close reason, held until its final callback; NULL for none. */
+static inline const char* aiopquic_close_reason_hold(aiopquic_ctx_t* ctx,
+        picoquic_cnx_t* cnx, const void* data, uint32_t len) {
+    if (len == 0 || data == NULL) {
+        return NULL;
+    }
+    for (aiopquic_close_reason_t* r = ctx->close_reasons; r; r = r->next) {
+        if (r->cnx == cnx) {
+            return r->text;
+        }
+    }
+    aiopquic_close_reason_t* r =
+        (aiopquic_close_reason_t*)malloc(sizeof(*r) + (size_t)len + 1);
+    if (!r) {
+        return NULL;
+    }
+    r->cnx = cnx;
+    memcpy(r->text, data, len);
+    r->text[len] = '\0';
+    r->next = ctx->close_reasons;
+    ctx->close_reasons = r;
+    return r->text;
+}
+
+/* Only from cnx's final callback: close or stateless reset. */
+static inline void aiopquic_close_reason_drop(aiopquic_ctx_t* ctx,
+                                              picoquic_cnx_t* cnx) {
+    aiopquic_close_reason_t** pp = &ctx->close_reasons;
+    while (*pp) {
+        aiopquic_close_reason_t* r = *pp;
+        if (r->cnx == cnx) {
+            *pp = r->next;
+            free(r);
+            return;
+        }
+        pp = &r->next;
+    }
+}
+
+/* Hold the reset of sc until its first `reliable` bytes are sent; sends
+ * stop there (aiopquic_stream_ctx_tx_sendable). Returns 0 when held. */
+static inline int aiopquic_defer_reset(aiopquic_ctx_t* ctx,
+        picoquic_cnx_t* cnx, aiopquic_stream_ctx_t* sc, uint64_t stream_id,
+        uint64_t code, uint64_t reliable, uint64_t preamble, int is_wt) {
+    aiopquic_deferred_reset_t* d =
+        (aiopquic_deferred_reset_t*)calloc(1, sizeof(*d));
+    if (!d) return -1;
+    aiopquic_stream_ctx_ref(sc);
+    sc->tx_reset_pending = 1;
+    sc->tx_reliable_size = reliable;
+    d->cnx = cnx;
+    d->sc = sc;
+    d->stream_id = stream_id;
+    d->error_code = code;
+    d->preamble = preamble;
+    d->is_wt = (uint8_t)is_wt;
+    d->next = ctx->deferred_resets;
+    ctx->deferred_resets = d;
+    return 0;
+}
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
 
@@ -488,6 +689,16 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
         spsc_ring_destroy(ctx->rx_event_ring);
         spsc_ring_destroy(ctx->tx_event_ring);
         aiopquic_dgram_table_destroy(&ctx->dgram_table);
+        while (ctx->deferred_resets) {
+            aiopquic_deferred_reset_t* d = ctx->deferred_resets;
+            ctx->deferred_resets = d->next;
+            aiopquic_deferred_reset_free(d);
+        }
+        while (ctx->close_reasons) {
+            aiopquic_close_reason_t* r = ctx->close_reasons;
+            ctx->close_reasons = r->next;
+            free(r);
+        }
         for (uint32_t i = 0; i < ctx->dgram_release_owed_n; i++) {
             aiopquic_dgram_buf_unref(ctx->dgram_release_owed[i].db);
         }
@@ -618,27 +829,29 @@ static inline void aiopquic_cnx_snapshot_fill(picoquic_cnx_t* cnx,
     aiopquic_addr_fill(sa, &s->local_addr);
 }
 
-/* TX wake-coalescing: producer-side helper. Returns 1 if a wake is
- * already pending (caller should skip the picoquic_wake_up syscall),
- * 0 if this caller should write the wake. The worker clears the flag
- * back to 0 when it finishes draining the TX ring. Single-producer
- * (asyncio thread) so atomic exchange is sufficient. */
-static inline int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx) {
-    uint32_t prev = __atomic_exchange_n(&ctx->tx_wake_pending, 1,
-                                         __ATOMIC_RELEASE);
-    if (prev == 0) {
-        ctx->cnt_wake_calls++;  /* this caller WILL invoke wake_up */
-    } else {
-        ctx->cnt_wake_skipped_coalesced++;  /* coalesced under prior wake */
+/* Producer, after a TX event ring push: 1 if the caller must wake the
+ * worker. A running worker drains the ring before it waits, so only an
+ * idle one needs the syscall. The fence pairs with the one in
+ * aiopquic_tx_worker_idle_arm: the worker sees the entry or this sees idle. */
+static inline int aiopquic_tx_wake_needed(aiopquic_ctx_t* ctx) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&ctx->tx_worker_idle, __ATOMIC_RELAXED) == 0 ||
+            __atomic_exchange_n(&ctx->tx_worker_idle, 0, __ATOMIC_ACQ_REL) == 0) {
+        ctx->cnt_wake_skipped_coalesced++;
+        return 0;
     }
-    return (int)prev;
+    ctx->cnt_wake_calls++;
+    return 1;
 }
 
-/* Worker: clear tx_wake_pending before draining the TX ring. An
- * exchange, not a store: the store could pass the ring peek that follows
- * while the producer's exchange still read 1, losing the wake. */
-static inline void aiopquic_tx_wake_clear(aiopquic_ctx_t* ctx) {
-    (void)__atomic_exchange_n(&ctx->tx_wake_pending, 0, __ATOMIC_ACQ_REL);
+/* Worker, before a wait that can block: mark idle, then re-check the TX
+ * ring. Returns 1, idle cleared, if entries are queued. */
+static inline int aiopquic_tx_worker_idle_arm(aiopquic_ctx_t* ctx) {
+    __atomic_store_n(&ctx->tx_worker_idle, 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (spsc_ring_peek(ctx->tx_event_ring) == NULL) return 0;
+    __atomic_store_n(&ctx->tx_worker_idle, 0, __ATOMIC_RELAXED);
+    return 1;
 }
 
 /* Forward decl: aiopquic_maybe_fire_tx_event_ring_drained pushes
@@ -777,8 +990,8 @@ static inline void aiopquic_clear_tx_event_ring_drain_pending(aiopquic_ctx_t* ct
  *
  * entry.stream_ctx carries the BORROWED aiopquic_stream_ctx_t* so
  * the worker can read both sc->rx_buf_free and sc->bytes_pending_release
- * when computing the effective grant. Wake is coalesced via
- * tx_wake_pending — many back-to-back pushes collapse to one wake. */
+ * when computing the effective grant. The wake is written only to an
+ * idle worker (aiopquic_tx_wake_needed). */
 static inline void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx,
                                             void* cnx,
                                             uint64_t stream_id,
@@ -800,14 +1013,12 @@ static inline void aiopquic_push_fc_credit(aiopquic_ctx_t* ctx,
     if (spsc_ring_push(ctx->tx_event_ring, &entry, NULL, 0) == 0) {
         ctx->cnt_tx_event_ring_pushes++;
         ctx->cnt_fc_credit_pushed++;
-        /* Wake only if the thread is running. Coalesced via
-         * tx_wake_pending so back-to-back pushes collapse to one
-         * syscall. CRITICAL: picoquic_wake_up_network_thread takes
+        /* Wake only a running thread, and only when idle.
+         * CRITICAL: picoquic_wake_up_network_thread takes
          * picoquic_network_thread_ctx_t*, NOT picoquic_quic_t* —
          * passing the wrong type is a UAF-class bug that silently
          * corrupts picoquic state. */
-        if (ctx->thread_ctx != NULL &&
-            aiopquic_tx_wake_set_pending(ctx) == 0) {
+        if (ctx->thread_ctx != NULL && aiopquic_tx_wake_needed(ctx)) {
             picoquic_wake_up_network_thread(ctx->thread_ctx);
         }
     } else {
@@ -840,7 +1051,7 @@ static inline int aiopquic_dgram_ring_release_post(aiopquic_ctx_t* ctx,
         return -1;
     }
     ctx->cnt_tx_event_ring_pushes++;
-    if (aiopquic_tx_wake_set_pending(ctx) == 0) {
+    if (aiopquic_tx_wake_needed(ctx)) {
         picoquic_wake_up_network_thread(ctx->thread_ctx);
     }
     return 0;
@@ -976,66 +1187,103 @@ static inline void aiopquic_tx_event_ring_drained_final(aiopquic_ctx_t* ctx) {
 /* Signal asyncio that there are RX events.
  * Coalesced: write the wake fd only on the 0→1 transition of
  * rx_notify_pending. The consumer (aiopquic_clear_rx) restores the
- * flag to 0 after it has drained its ring snapshot AND re-armed if
- * the ring is still non-empty, so any push that races against the
- * consumer's drain is guaranteed to wake asyncio at least once.
- * ACQ_REL pairs with the consumer's RELEASE store on the same flag
+ * flag to 0 after draining its ring snapshot and the wake fd, then
+ * re-arms if the ring is still non-empty, so any push that races
+ * against the consumer's drain is guaranteed to wake asyncio at least
+ * once. ACQ_REL pairs with the consumer's exchange on the same flag
  * and ACQUIRE on the ring entries. */
 static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
     if (__atomic_exchange_n(&ctx->rx_notify_pending, 1,
                               __ATOMIC_ACQ_REL) != 0) {
+        ctx->cnt_rx_notify_skips++;
         return;
     }
+    ssize_t rc;
 #ifdef __linux__
     uint64_t val = 1;
-    (void)write(ctx->wake_write_fd, &val, sizeof(val));
+    rc = write(ctx->wake_write_fd, &val, sizeof(val));
 #else
     uint8_t b = 1;
-    (void)write(ctx->wake_write_fd, &b, 1);
+    rc = write(ctx->wake_write_fd, &b, 1);
 #endif
+    int err = (rc < 0) ? errno : 0;
+    ctx->cnt_rx_notify_flips++;
+    if (err) {
+        ctx->cnt_rx_notify_write_errs++;
+        ctx->last_rx_notify_errno = err;
+    }
+    aiopquic_wake_trace_add(&ctx->worker_trace, AIOPQUIC_WAKE_NOTIFY,
+                            (uint32_t)err, spsc_ring_count(ctx->rx_event_ring));
 }
 
 /* Consumer-side wake-fd clear + re-arm. Caller (drain_rx) MUST have
  * already drained as many ring entries as it intends to consume in
  * this cycle BEFORE calling this. We then:
- *   1. RELEASE-store rx_notify_pending=0 so the NEXT producer push
- *      will write the wake fd (the producer's exchange sees 0→1).
- *   2. Drain the wake-fd counter (Linux: one read; other: read until
+ *   1. Drain the wake-fd counter (Linux: one read; other: read until
  *      EAGAIN).
+ *   2. Exchange rx_notify_pending to 0 so the NEXT producer push will
+ *      write the wake fd (the producer's exchange sees 0→1).
  *   3. Re-arm by writing the wake fd if the ring or the overflow is
  *      still non-empty.
- *      Covers the race where a producer pushed an entry between the
- *      consumer's peek-empty and pending=0, observing pending=1 and
- *      thus skipping its own wake write — without re-arm those
- *      stranded entries would never wake asyncio again. */
+ * Read before clear: a notify that flips the flag after step 2 leaves
+ * its write unread, so the reader runs again. Clearing first would let
+ * step 1 consume such a write after its entry was drained, leaving
+ * pending=1 with no wake to read and every later push skipping its
+ * write. A push that saw pending=1 before step 2 skipped its write;
+ * step 3 finds its entry. */
+/* Events the consumer has taken off the RX ring so far (consumer-owned). */
+static inline uint64_t aiopquic_rx_consumed(aiopquic_ctx_t* ctx) {
+    return atomic_load_explicit(&ctx->rx_event_ring->head, memory_order_relaxed);
+}
+
 static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
     spsc_ring_refill_from_overflow(ctx->rx_event_ring, &ctx->rx_overflow);
-    /* Exchange, so the re-check below cannot read the ring before the
-     * clear is visible to aiopquic_notify_rx's exchange. */
-    (void)__atomic_exchange_n(&ctx->rx_notify_pending, 0, __ATOMIC_ACQ_REL);
+    uint64_t got = 0;
 #ifdef __linux__
-    uint64_t val;
-    (void)read(ctx->eventfd, &val, sizeof(val));
+    uint64_t val = 0;
+    if (read(ctx->eventfd, &val, sizeof(val)) > 0) {
+        got = val;
+    }
 #else
     uint8_t buf[64];
-    while (read(ctx->eventfd, buf, sizeof(buf)) > 0) {
-        /* drain */
+    ssize_t n;
+    while ((n = read(ctx->eventfd, buf, sizeof(buf))) > 0) {
+        got += (uint64_t)n;
     }
 #endif
+    /* Exchange, so the re-check below cannot read the ring before the
+     * clear is visible to aiopquic_notify_rx's exchange. */
+    uint32_t was = __atomic_exchange_n(&ctx->rx_notify_pending, 0,
+                                       __ATOMIC_ACQ_REL);
+    uint32_t flags = was ? AIOPQUIC_CLEAR_WAS_PENDING : 0;
+    ctx->cnt_rx_clears++;
+    if (got == 0) {
+        flags |= AIOPQUIC_CLEAR_READ_EMPTY;
+        ctx->cnt_rx_clear_read_empty++;
+    }
     /* Overflow counts too: a push that decided "overflow" before the
      * refill above and counted itself after it can have its wake consumed
      * by the read above while the ring is still empty. */
-    if (!spsc_ring_empty(ctx->rx_event_ring) ||
+    uint32_t left = spsc_ring_count(ctx->rx_event_ring);
+    if (left > 0 ||
             atomic_load_explicit(&ctx->rx_overflow.depth,
                                  memory_order_seq_cst) > 0) {
+        ssize_t rc;
 #ifdef __linux__
         uint64_t one = 1;
-        (void)write(ctx->wake_write_fd, &one, sizeof(one));
+        rc = write(ctx->wake_write_fd, &one, sizeof(one));
 #else
         uint8_t b = 1;
-        (void)write(ctx->wake_write_fd, &b, 1);
+        rc = write(ctx->wake_write_fd, &b, 1);
 #endif
+        flags |= AIOPQUIC_CLEAR_REARMED;
+        ctx->cnt_rx_rearms++;
+        if (rc < 0) {
+            flags |= AIOPQUIC_CLEAR_REARM_ERR;
+        }
     }
+    aiopquic_wake_trace_add(&ctx->asyncio_trace, AIOPQUIC_WAKE_CLEAR, flags,
+                            ((uint64_t)left << 32) | (got & 0xffffffffu));
 }
 
 /* WT TX-event dispatch hook. Defined in h3wt_callback.h. The loop
@@ -1218,9 +1466,11 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
              * other order can FIN at an old tail and drop the rest. */
             int fin_after = aiopquic_stream_buf_fin_pending(sb);
             uint32_t avail = aiopquic_stream_buf_used(sb);
-            uint32_t to_send = (avail < want) ? avail : want;
-            int is_fin = (fin_after && to_send == avail) ? 1 : 0;
-            int is_still_active = (avail > to_send) ? 1 : 0;
+            uint32_t sendable = aiopquic_stream_ctx_tx_sendable(sc, avail);
+            uint32_t to_send = (sendable < want) ? sendable : want;
+            int is_fin = (fin_after && !sc->tx_reset_pending
+                          && to_send == avail) ? 1 : 0;
+            int is_still_active = (sendable > to_send) ? 1 : 0;
             uint8_t* buf = picoquic_provide_stream_data_buffer(
                 bytes, to_send, is_fin, is_still_active);
             if (buf && to_send > 0) {
@@ -1373,6 +1623,18 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         return 0;
     }
 
+    if (ctx->deferred_resets
+            && (fin_or_event == picoquic_callback_close
+                || fin_or_event == picoquic_callback_application_close
+                || fin_or_event == picoquic_callback_stateless_reset)) {
+        aiopquic_deferred_resets_drop_cnx(ctx, cnx);
+    }
+    if (ctx->close_reasons
+            && (fin_or_event == picoquic_callback_close
+                || fin_or_event == picoquic_callback_stateless_reset)) {
+        aiopquic_close_reason_drop(ctx, cnx);
+    }
+
     int evt = aiopquic_map_event(fin_or_event);
     if (evt < 0) {
         return 0;
@@ -1394,6 +1656,10 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         aiopquic_dgram_table_remove(&ctx->dgram_table, cnx);
     } else if (fin_or_event == picoquic_callback_close) {
         entry.error_code = picoquic_get_remote_error(cnx);
+        if (entry.error_code == 0 && picoquic_get_local_error(cnx) != 0) {
+            entry.error_code = picoquic_get_local_error(cnx);
+            entry.is_fin = AIOPQUIC_CLOSE_LOCAL;
+        }
         aiopquic_dgram_table_remove(&ctx->dgram_table, cnx);
     }
 
@@ -1524,6 +1790,14 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         aiopquic_cnx_snapshot_fill(cnx, &snap);
         ret = aiopquic_rx_push(ctx, &entry,
                                (const uint8_t*)&snap, sizeof(snap));
+    } else if (fin_or_event == picoquic_callback_close
+               || fin_or_event == picoquic_callback_application_close) {
+        /* The peer's reason phrase, or the local cause's name. */
+        const char* reason = (entry.is_fin & AIOPQUIC_CLOSE_LOCAL)
+            ? picoquic_error_name(entry.error_code)
+            : picoquic_get_remote_error_reason(cnx);
+        ret = aiopquic_rx_push_sc(ctx, &entry, (const uint8_t*)reason,
+                                  reason ? (uint32_t)strlen(reason) : 0);
     } else {
         ret = aiopquic_rx_push_sc(ctx, &entry, bytes, (uint32_t)length);
     }
@@ -1553,21 +1827,73 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
  * Once the cnx is closing, Python may have dropped the stream's reference
  * and only the event's keeps sc alive, so it is not handed back to
  * picoquic. Returns sc when reattached, else NULL. */
-static inline aiopquic_stream_ctx_t* aiopquic_stream_reattach(
-        aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx, const spsc_entry_t* entry,
-        int rc) {
-    aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)entry->stream_ctx;
+static inline aiopquic_stream_ctx_t* aiopquic_stream_reattach_sc(
+        aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx, uint64_t stream_id,
+        aiopquic_stream_ctx_t* sc, int rc) {
     if (sc == NULL || rc == PICOQUIC_ERROR_INVALID_STREAM_ID) return NULL;
     if (aiopquic_cnx_closing(cnx)) {
         ctx->cnt_tx_reattach_after_close++;
         return NULL;
     }
-    (void)picoquic_set_app_stream_ctx(cnx, entry->stream_id, sc);
+    (void)picoquic_set_app_stream_ctx(cnx, stream_id, sc);
     return sc;
 }
 
+static inline aiopquic_stream_ctx_t* aiopquic_stream_reattach(
+        aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx, const spsc_entry_t* entry,
+        int rc) {
+    return aiopquic_stream_reattach_sc(
+        ctx, cnx, entry->stream_id,
+        (aiopquic_stream_ctx_t*)entry->stream_ctx, rc);
+}
+
+/* WT half of a held reset. Defined in h3wt_callback.h. */
+static void aiopquic_wt_deferred_reset(aiopquic_ctx_t* ctx,
+                                       aiopquic_deferred_reset_t* d);
+
+/* After a send pass: send the held resets whose reliable bytes are out.
+ * Once a second, also drop those of cnxs that went away without a close
+ * callback. Worker only. */
+static void aiopquic_run_deferred_resets(picoquic_quic_t* quic,
+                                         aiopquic_ctx_t* ctx) {
+    uint64_t now = picoquic_get_quic_time(quic);
+    int sweep = now - ctx->deferred_resets_swept >= 1000000;
+    if (sweep) ctx->deferred_resets_swept = now;
+    aiopquic_deferred_reset_t** pp = &ctx->deferred_resets;
+    while (*pp) {
+        aiopquic_deferred_reset_t* d = *pp;
+        uint64_t head = atomic_load_explicit(&d->sc->tx->head,
+                                             memory_order_relaxed);
+        int ready = head >= d->sc->tx_reliable_size;
+        if (!ready && !sweep) {
+            pp = &d->next;
+            continue;
+        }
+        int alive = aiopquic_cnx_is_alive(quic, d->cnx);
+        if (alive && !ready) {
+            pp = &d->next;
+            continue;
+        }
+        *pp = d->next;
+        d->next = NULL;
+        if (alive && !aiopquic_cnx_closing(d->cnx)) {
+            d->sc->tx_reset_pending = 0;
+            if (d->is_wt) {
+                aiopquic_wt_deferred_reset(ctx, d);
+            } else {
+                int rr = aiopquic_reset_stream_reliable(d->cnx, d->stream_id,
+                    d->error_code, d->sc->tx_reliable_size);
+                aiopquic_stream_ctx_tx_abandon(aiopquic_stream_reattach_sc(
+                    ctx, d->cnx, d->stream_id, d->sc, rr));
+            }
+        }
+        aiopquic_deferred_reset_free(d);
+    }
+}
+
 /*
- * Packet loop callback — handles wake-up events to drain the TX ring.
+ * Packet loop callback. The TX ring drains on a wake-up and, for entries
+ * whose producers skipped the wake, before each wait.
  */
 static int aiopquic_loop_cb(picoquic_quic_t* quic,
                              picoquic_packet_loop_cb_enum cb_mode,
@@ -1575,10 +1901,31 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                              void* callback_argv) {
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)callback_ctx;
     ctx->cnt_loop_cb++;
+    /* Running: producers may skip the wake until time_check re-arms. */
+    if (__atomic_load_n(&ctx->tx_worker_idle, __ATOMIC_RELAXED) != 0) {
+        if (ctx->tx_worker_armed_at == 0) {
+            __atomic_store_n(&ctx->tx_worker_idle, 0, __ATOMIC_RELAXED);
+        } else if (__atomic_exchange_n(&ctx->tx_worker_idle, 0, __ATOMIC_RELAXED) != 0 &&
+                picoquic_current_time() - ctx->tx_worker_armed_at
+                    >= AIOPQUIC_TX_WAKE_LOST_US &&
+                spsc_ring_peek(ctx->tx_event_ring) != NULL) {
+            /* Woke on its own from a long wait with entries queued: a
+             * producer skipped the wake. */
+            ctx->cnt_tx_wake_lost++;
+        }
+    }
 
     switch (cb_mode) {
         case picoquic_packet_loop_ready:
             ctx->quic = quic;
+            if (callback_argv != NULL) {
+                ((picoquic_packet_loop_options_t*)callback_argv)->do_time_check = 1;
+            }
+#ifdef __linux__
+            /* The loop sleeps in ppoll() until the next paced send, often
+             * tens of µs away; the default 50 µs timer slack overshoots it. */
+            (void)prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);
+#endif
             {
                 spsc_entry_t ready = {0};
                 ready.event_type = SPSC_EVT_READY;
@@ -1586,18 +1933,25 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
             }
             break;
 
+        case picoquic_packet_loop_time_check: {
+            /* Runs before every wait that can block. */
+            packet_loop_time_check_arg_t* tc =
+                (packet_loop_time_check_arg_t*)callback_argv;
+            if (tc->delta_t > 0) {
+                ctx->tx_worker_armed_at = (tc->delta_t >= AIOPQUIC_TX_WAKE_LOST_US)
+                    ? tc->current_time : 0;
+            }
+            int queued = (tc->delta_t > 0)
+                ? aiopquic_tx_worker_idle_arm(ctx)
+                : spsc_ring_peek(ctx->tx_event_ring) != NULL;
+            if (!queued) {
+                break;
+            }
+            /* Drained entries can make a send due now. */
+            tc->delta_t = 0;
+        }
+            /* fall through */
         case picoquic_packet_loop_wake_up:
-            /* Clear pending BEFORE draining. Race-safe ordering:
-             * - If producer pushes BEFORE we clear: their exchange
-             *   sees 1, skips wake — but their entry is in the ring,
-             *   we'll see it on the next peek (still in the loop).
-             * - If producer pushes AFTER we clear: their exchange
-             *   sees 0, fires wake — picoquic re-enters this case.
-             * - If producer pushes between our peek-empty and clear:
-             *   their exchange could see 1 (stale) and skip — that's
-             *   why we clear FIRST. Producer always sees 0 when the
-             *   ring was actually drained. */
-            aiopquic_tx_wake_clear(ctx);
             while (1) {
                 spsc_entry_t* entry = spsc_ring_peek(ctx->tx_event_ring);
                 if (!entry) break;
@@ -1662,6 +2016,14 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     continue;
                 }
 
+                if (entry->event_type == SPSC_EVT_TX_SET_MAX_CONNECTIONS) {
+                    (void)picoquic_adjust_max_connections(
+                        quic, (uint32_t)entry->error_code);
+                    ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
+                    aiopquic_maybe_fire_tx_event_ring_drained(ctx);
+                    continue;
+                }
+
                 /* Ahead of the stale-cnx guard: the ring is released
                  * whether or not its cnx lives; cnx is only a table key. */
                 if (entry->event_type == SPSC_EVT_TX_DGRAM_RING_RELEASE) {
@@ -1690,6 +2052,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     entry->event_type == SPSC_EVT_TX_WT_SESSION_CLEANUP ||
                     entry->event_type == SPSC_EVT_TX_MARK_WT_DATAGRAM_READY ||
                     entry->event_type == SPSC_EVT_TX_WT_SET_STREAM_PRIORITY ||
+                    entry->event_type == SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY ||
                     entry->event_type == SPSC_EVT_TX_WT_FIN) {
                     (void)aiopquic_wt_handle_tx(quic, ctx, entry);
                     ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
@@ -1777,6 +2140,12 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;
                     }
+                    case SPSC_EVT_TX_SET_DATAGRAM_PRIORITY:
+                        picoquic_set_datagram_priority(cnx, (uint8_t)entry->error_code);
+                        ctx->worker_set_dgram_priority_applied++;
+                        ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
+                        aiopquic_maybe_fire_tx_event_ring_drained(ctx);
+                        break;
                     case SPSC_EVT_TX_CNX_REFRESH: {
                         /* cnx liveness already verified by the outer
                          * aiopquic_cnx_is_alive() guard above. */
@@ -1794,17 +2163,39 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     case SPSC_EVT_TX_CLOSE: {
                         /* cnx liveness already verified by the outer
                          * aiopquic_cnx_is_alive() guard above. */
-                        picoquic_close(cnx, entry->error_code);
+                        const char* reason = aiopquic_close_reason_hold(
+                            ctx, cnx, entry->data_buf, entry->data_length);
+                        if (reason) {
+                            picoquic_close_ex(cnx, entry->error_code, reason);
+                        } else {
+                            picoquic_close(cnx, entry->error_code);
+                        }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;
                     }
                     case SPSC_EVT_TX_STREAM_RESET: {
-                        if (aiopquic_stream_can_send(cnx, entry->stream_id)) {
-                            int rr = picoquic_reset_stream(cnx, entry->stream_id,
-                                                           entry->error_code);
-                            aiopquic_stream_ctx_tx_abandon(
-                                aiopquic_stream_reattach(ctx, cnx, entry, rr));
+                        aiopquic_stream_ctx_t* sc =
+                            (aiopquic_stream_ctx_t*)entry->stream_ctx;
+                        if (sc && sc->tx_reset_pending) {
+                            /* Already resetting. */
+                        } else if (aiopquic_stream_can_send(cnx, entry->stream_id)) {
+                            uint64_t reliable = aiopquic_reset_reliable_size(
+                                cnx, sc, entry->aux);
+                            if (reliable > 0 && reliable > atomic_load_explicit(
+                                    &sc->tx->head, memory_order_relaxed)
+                                    && aiopquic_defer_reset(ctx, cnx, sc,
+                                        entry->stream_id, entry->error_code,
+                                        reliable, 0, 0) == 0) {
+                                (void)picoquic_mark_active_stream(
+                                    cnx, entry->stream_id, 1, sc);
+                            } else {
+                                int rr = aiopquic_reset_stream_reliable(cnx,
+                                    entry->stream_id, entry->error_code,
+                                    reliable);
+                                aiopquic_stream_ctx_tx_abandon(
+                                    aiopquic_stream_reattach(ctx, cnx, entry, rr));
+                            }
                         } else {
                             ctx->cnt_tx_wrong_direction_dropped++;
                         }
@@ -1906,6 +2297,12 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                 }
             }
             aiopquic_tx_event_ring_drained_final(ctx);
+            break;
+
+        case picoquic_packet_loop_after_send:
+            if (ctx->deferred_resets) {
+                aiopquic_run_deferred_resets(quic, ctx);
+            }
             break;
 
         default:
