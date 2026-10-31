@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.7.0
+
+- No changes since 0.7.0rc3.
+
 ## v0.7.0rc3
 
 - macOS wheels are built on macOS 15 and need macOS 15.0+ (GitHub retires its macOS 14 runners);
