@@ -1,19 +1,23 @@
 diff --git a/picohttp/h3zero_common.c b/picohttp/h3zero_common.c
+index 6205c5c4..b5a0cac7 100644
 --- a/picohttp/h3zero_common.c
 +++ b/picohttp/h3zero_common.c
-@@ -1253,14 +1253,20 @@
- 					o_bytes = h3zero_create_error_frame(o_bytes, o_bytes_max, error_code, H3ZERO_USER_AGENT_STRING);
+@@ -1281,15 +1281,22 @@ int h3zero_process_request_frame(
  				}
  				else {
-+					int connect_ret;
+ 					int is_wt = h3zero_is_wt_connect_protocol(item);
++					int connect_ret = -1;
  					stream_ctx->path_callback = item->path_callback;
  					stream_ctx->path_callback_ctx = item->path_app_ctx;
--					if (stream_ctx->path_callback(cnx, (uint8_t*)stream_ctx->ps.stream_state.header.path, stream_ctx->ps.stream_state.header.path_length, picohttp_callback_connect,
+-					if ((is_wt && app_ctx->nb_wt_connections > 0) ||
+-						stream_ctx->path_callback(cnx, (uint8_t*)stream_ctx->ps.stream_state.header.path, stream_ctx->ps.stream_state.header.path_length, picohttp_callback_connect,
 -						stream_ctx, item->path_app_ctx) != 0) {
 -						/* This callback is not supported */
 -						picoquic_log_app_message(cnx, "Unsupported callback on stream: %"PRIu64 ", path:%s", stream_ctx->stream_id, item->path);
-+					connect_ret = stream_ctx->path_callback(cnx, (uint8_t*)stream_ctx->ps.stream_state.header.path, stream_ctx->ps.stream_state.header.path_length, picohttp_callback_connect,
-+						stream_ctx, item->path_app_ctx);
++					if (!(is_wt && app_ctx->nb_wt_connections > 0)) {
++						connect_ret = stream_ctx->path_callback(cnx, (uint8_t*)stream_ctx->ps.stream_state.header.path, stream_ctx->ps.stream_state.header.path_length, picohttp_callback_connect,
++							stream_ctx, item->path_app_ctx);
++					}
 +					if (connect_ret != 0) {
 +						/* A return of 400..599 is the response status; anything else is 501. */
 +						char connect_status[4] = "501";

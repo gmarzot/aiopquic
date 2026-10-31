@@ -8,7 +8,8 @@ WebTransport session and opens one server-to-client uni stream with data.
 
 Usage:
   python aioquic_wt.py --port 4433 --cert PATH --key PATH [--lifetime 10]
-                       [--late-uni MS]
+                       [--late-uni MS] [--strict-protocol]
+                       [--reject-legacy status|reset] [--wt-enabled-setting]
 
 --late-uni opens another uni stream MS milliseconds after accepting the
 session.
@@ -19,6 +20,7 @@ Stdout, one JSON line per event:
   {"event": "stream_reset", "stream_id": N, "error_code": N}
   {"event": "stop_sending", "stream_id": N, "error_code": N}
   {"event": "late_uni", "stream_id": N}
+  {"event": "connect", "stream_id": N, "protocol": "..."}
   {"event": "terminated", "error_code": N, "frame_type": N, "reason": "..."}
 Exits when the connection terminates or after --lifetime seconds.
 """
@@ -54,12 +56,13 @@ class _H3WithWtEnabled(H3Connection):
 
 class WebTransportPeer(QuicConnectionProtocol):
     def __init__(self, *args, done: asyncio.Event, late_uni_ms: float,
-                 strict_protocol: bool = False,
+                 strict_protocol: bool = False, reject_legacy: str = "",
                  wt_enabled_setting: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self._done = done
         self._late_uni_ms = late_uni_ms
         self._strict_protocol = strict_protocol
+        self._reject_legacy = reject_legacy
         self._wt_enabled_setting = wt_enabled_setting
         self._h3 = None
         self._seen = set()
@@ -92,13 +95,24 @@ class WebTransportPeer(QuicConnectionProtocol):
             if isinstance(ev, HeadersReceived):
                 if dict(ev.headers).get(b":method") == b"CONNECT":
                     token = dict(ev.headers).get(b":protocol", b"")
-                    emit(event="connect",
+                    emit(event="connect", stream_id=ev.stream_id,
                          protocol=token.decode(errors="replace"))
                     if self._strict_protocol and token != b"webtransport":
                         # the token browsers send and proxygen requires
                         self._h3.send_headers(
                             ev.stream_id, [(b":status", b"400")],
                             end_stream=True)
+                        self.transmit()
+                        continue
+                    if self._reject_legacy and token != b"webtransport-h3":
+                        if self._reject_legacy == "reset":
+                            # as xquic does once draft-16 is negotiated
+                            self._quic.stop_stream(ev.stream_id, 0x10B)
+                            self._quic.reset_stream(ev.stream_id, 0x10B)
+                        else:
+                            self._h3.send_headers(
+                                ev.stream_id, [(b":status", b"400")],
+                                end_stream=True)
                         self.transmit()
                         continue
                     self._h3.send_headers(ev.stream_id, [
@@ -129,6 +143,7 @@ async def main(args):
         create_protocol=lambda *a, **kw: WebTransportPeer(
             *a, done=done, late_uni_ms=args.late_uni,
             strict_protocol=args.strict_protocol,
+            reject_legacy=args.reject_legacy,
             wt_enabled_setting=args.wt_enabled_setting, **kw))
     sys.stderr.write(f"serving on 127.0.0.1:{args.port}\n")
     sys.stderr.flush()
@@ -149,6 +164,9 @@ if __name__ == "__main__":
     p.add_argument("--late-uni", type=float, default=0.0)
     p.add_argument("--strict-protocol", action="store_true",
                    help="400 unless :protocol is webtransport")
+    p.add_argument("--reject-legacy", choices=("status", "reset"), default="",
+                   help="refuse :protocol other than webtransport-h3 with "
+                        "a 400 or with STOP_SENDING + RESET_STREAM")
     p.add_argument("--wt-enabled-setting", action="store_true",
                    help="advertise SETTINGS_WT_ENABLED (draft-16)")
     asyncio.run(main(p.parse_args()))

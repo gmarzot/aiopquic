@@ -32,8 +32,10 @@ import time
 
 import pytest
 
+from aiopquic._binding._transport import TransportContext
 from aiopquic.asyncio.client import connect
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
+from aiopquic.asyncio.server import serve
 from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.connection import QuicConnection, _EVT_STREAM_DESTROY
 from aiopquic.quic.events import StreamDataReceived
@@ -244,3 +246,47 @@ async def test_stream_destroy_releases_a_parked_drained_writer():
     quic._enqueue_raw(_EVT_STREAM_DESTROY, stream_id, None, False, 0, 0)
     await asyncio.wait_for(writer, 1.0)
     assert sends == [stream_id]
+
+
+@pytest.mark.asyncio
+async def test_queued_bytes_gate_is_per_connection():
+    """A peer that stops reading parks new streams on its own connection
+    only; another connection in the process opens streams freely."""
+    stalled_port, healthy_port = next_port(), next_port()
+    stalled = TransportContext()
+    stalled.start(port=stalled_port, cert_file=CERT_FILE, key_file=KEY_FILE,
+                  is_client=False, rx_data_ring_cap=65536, alpn="hq-interop")
+    got: asyncio.Queue = asyncio.Queue()
+
+    class Receiver(QuicConnectionProtocol):
+        def quic_event_received(self, event):
+            if isinstance(event, StreamDataReceived):
+                got.put_nowait(bytes(event.data))
+
+    healthy = await serve("127.0.0.1", healthy_port,
+                          configuration=_server_cfg(healthy_port),
+                          create_protocol=Receiver)
+    try:
+        async with connect("127.0.0.1", stalled_port,
+                           configuration=_client_cfg()) as a:
+            async with connect("127.0.0.1", healthy_port,
+                               configuration=_client_cfg()) as b:
+                qa, qb = a._quic, b._quic
+                cap = qa.configuration.tx_max_queued_bytes
+                for _ in range(2):
+                    sid = qa.get_next_available_stream_id(is_unidirectional=True)
+                    await qa.send_stream_data_drained(sid, b"x" * (3 * 1024 * 1024))
+                assert qa._tx_backlog() > cap
+
+                fresh = qb.get_next_available_stream_id(is_unidirectional=True)
+                await asyncio.wait_for(qb.send_stream_data_drained(
+                    fresh, b"healthy", end_stream=True), 1.0)
+                assert await asyncio.wait_for(got.get(), 2.0) == b"healthy"
+
+                own = qa.get_next_available_stream_id(is_unidirectional=True)
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(
+                        qa.send_stream_data_drained(own, b"y"), 0.2)
+    finally:
+        healthy.close()
+        stalled.stop()

@@ -24,8 +24,16 @@ the `KEX_*` ids and `counters`; everything else there, and raw pointers, are tes
   `QuicConnectionProtocol` and overrides `quic_event_received`.
 - WebTransport: `async with connect_webtransport(host, port, path, sni=..., configuration=cfg) as
   wt:`, then `create_stream()`, `send_stream_data()`, `receive_stream_data(sid)`, `events()`.
+  Once `receive_stream_data(sid)` has yielded a stream's FIN or reset, the stream's inbox is freed
+  and a later call returns at once; a reader closed earlier can be resumed by calling it again.
   `serve_webtransport(host, port, path, handler=h, cert_file=..., key_file=..., configuration=cfg)`
-  calls `h(session)` per CONNECT. `WebTransportError` is a `ConnectionError`.
+  calls `h(session)` per CONNECT. `WebTransportError` is a `ConnectionError`. The CONNECT sends
+  `:protocol webtransport`, then `webtransport-h3` once on the same connection if a server that
+  advertised SETTINGS_WT_ENABLED refuses it; `connect_protocol=` pins one token.
+- `reset_stream(sid, code, reliable_size=N)` (raw and WT) keeps the stream's first N bytes, for
+  example a MoQT stream header, when both ends advertise RESET_STREAM_AT: on by default, raw QUIC
+  can turn it off with `QuicConfiguration.reset_stream_at=False`; `reset_stream_at_negotiated()`
+  reports it. Bytes not yet sent are sent first and nothing after them; without it, RESET_STREAM.
 - `serve(..., retry=True)` validates client addresses with a Retry. `QuicConfiguration`:
   `cipher_suite`, `key_update_interval`, `supported_versions` (QUIC v2 by compatible version
   negotiation), `session_ticket_file` (resumption; with `connect(wait_connected=False)` writes
@@ -42,6 +50,10 @@ WebTransport session built directly instead of through `connect_webtransport()` 
 `await session.detach()` after `aclose()` and before `transport.stop()`, or its transport's
 event dispatcher (and the wake fd) is held for the life of the process.
 
+**Close events.** One `ConnectionTerminated` per connection; `frame_type` None = peer application
+close, 0 = transport close; `reason_phrase` is the peer's. `WebTransportSessionClosed.connection_closed`
+is True when the QUIC connection closed, not just the session.
+
 **Threading.** One network thread per `TransportContext`. Call everything on a transport, `stop()`
 included, from its event loop's thread: each TX ring has one producer and the producer side relies
 on the GIL.
@@ -50,16 +62,24 @@ on the GIL.
 CA: `QuicConfiguration.cafile` or `connect_webtransport(ca_file=)`. Accept anything:
 `verify_mode=ssl.CERT_NONE` or `verify_peer=False`. Servers never verify clients.
 
-**Congestion control.** Default `"bbr1"`; `None` is picoquic's `newreno`. Names, matched exactly:
+**Congestion control.** Default `"bbr"` (v3); `None` is picoquic's `newreno`. Names, matched exactly:
 `newreno` (alias `reno`), `cubic`, `dcubic`, `fast`, `bbr` (v3), `bbr1`, `prague`, `c4`. An unknown
 name (`"BBR1"` among them) raises `ValueError` from `QuicConfiguration` and at transport start.
 
 **Datagrams** are on by default. `send_datagram_frame(data)` returns `len(data)`, or 0 when the
-record ring is full: wait on `get_datagram_tx_drain_event()` and resend the same payload.
+record ring is full: wait on `get_datagram_tx_drain_event()` and resend the same payload. An empty
+payload raises `ValueError`.
+`max_datagram_payload()` is the largest payload one datagram carries (0 = not negotiated). On
+`WebTransportSession` it is the connection's less the session's stream-ID prefix (1 byte while the
+session's stream ID is under 256), and `send_datagram_frame` raises `ValueError` above it.
 
 **Priority.** `set_stream_priority(sid, p)`: 0 highest, 255 lowest, picoquic default 9; the low bit
 picks round robin (even) or FIFO by stream id (odd) among equal priorities. A return of 1 means the
-TX event ring was full and nothing applied.
+TX event ring was full and nothing applied. `set_datagram_priority(p)` (on `QuicConnection` and
+`WebTransportSession`, per connection) places datagrams on the same scale: higher-priority streams go
+first, lower ones only when no datagram waits, equal ones take turns. Defaults:
+`set_default_stream_priority` / `set_default_datagram_priority`, for connections or streams created
+after the call.
 
 **Addresses.** `peer_address()` / `local_address()` on `QuicConnection` and
 `WebTransportSession` return `(host, port)` (IPv4-mapped IPv6 as IPv4), or None before the
@@ -99,6 +119,8 @@ has left the ring once it is exceeded.
   `OPENSSL_ROOT_DIR`; binding sources always relink.
 - `AIOPQUIC_PERF=1` (default) is host-tuned and not portable; `AIOPQUIC_WHEEL_BUILD=1` is portable
   (CI, wheels).
+- The Cython extensions add `-O3` after `$CFLAGS`, because setuptools replaces Python's CFLAGS
+  with the environment's; `AIOPQUIC_PERF=0` leaves the caller's flags alone.
 - OpenSSL is the main performance variable. Linux wheels bundle 3.5; for parity build with
   `OPENSSL_ROOT_DIR=<3.5 prefix> ./build.sh`.
 - Submodules are `ignore = dirty` because the build patches picoquic in place.
@@ -129,9 +151,16 @@ has left the ring once it is exceeded.
 - `release.yml` (`workflow_dispatch`, `version` = `N.N.N[{a,b,rc}N]`) tags the dispatched ref's
   HEAD, tests the tag, builds the sdist and wheels, publishes to TestPyPI then PyPI, and creates
   the GitHub release.
-- Flow: work lands on `gmarzot-X.Y.Z`; the release PR is squash-merged to `main`, `release.yml`
-  runs on `main` so the tag is the squash commit, then `main` is merged back into the working
-  branch. Check what shipped with `git diff <commit> <tag>`, not ancestry.
+- Flow: work lands on the minor branch `gmarzot-X.Y.Z`; release candidates are tagged on it
+  (`release.yml` dispatched on that branch). A final release squash-merges the branch's tracking
+  PR to `main`, one commit per release, and `release.yml` tags it there. `main` is then merged
+  back into the working branches, and the next minor branch starts from the release tag.
+- Versions: release tags are squash commits outside the branches' history, so check what shipped
+  with `git diff <commit> <tag>`, not ancestry. Dev builds version from the nearest tag
+  (`setup.py`): after `vX.Y.ZrcN` they report `X.Y.Zrc(N+1).devM`, after `vX.Y.Z`
+  `X.(Y+1).0.devM`. A minor branch keeps its rc numbering after its final release, so new work
+  goes on the next minor branch. `python -m setuptools_scm` skips `setup.py`; use
+  `python setup.py --version`.
 
 ## Conventions
 
@@ -150,6 +179,11 @@ has left the ring once it is exceeded.
   reached through a TX event. picoquic's thread checks are compiled out: a cross-thread call is a
   silent race. `stop()` and `__dealloc__` act only after the join.
 - asyncio never dereferences a cnx; accessors read snapshots the worker sends.
+- Every asyncio RX reader is registered through `asyncio/_rxwatch.py` (`set_reader`/`clear_reader`):
+  one owner per transport, removals by others refused, fd-number reuse detected. Its timer drains
+  a ring that held events through two checks without a drain and logs a "rx wake lost" report:
+  `wake_trace()` (notify flips, drains, clears, ages in ms), wake counters, the reader history,
+  whether the eventfd was readable and which callback the loop held.
 - asyncio alone produces `tx_event_ring`, each `sc->tx` and each datagram ring, and alone consumes
   `rx_event_ring` and `sc->rx`. Stream bytes never ride the event rings: TX posts MARK_ACTIVE and
   the worker pulls `sc->tx`; RX fills `sc->rx`. A full RX event ring spills to an order-preserving
@@ -165,10 +199,15 @@ has left the ring once it is exceeded.
   `stream_released`. Every raw-QUIC event carrying an `sc` holds a reference while queued (RX data,
   FIN, reset, stop-sending; TX reset, stop-sending, mark-active, flow-control): push through
   `aiopquic_rx_push_sc` / `aiopquic_tx_push_sc`, and release on every consume or drop path.
+- `picoquic_close_ex` borrows its reason: `ctx->close_reasons` holds it until the cnx's close or
+  stateless-reset callback (not application close).
 - picoquic may free a cnx any time after its close callback. The dead-connection guard
   (`aiopquic_cnx_is_alive()`) runs before any TX event that names a cnx and drops the event on a
   miss; it compares addresses, so a new cnx at a freed one's address passes. WT TX events carry a
   session and test `s->cnx` instead; ring releases bypass the guard (the cnx is only a table key).
+- picoquic refuses a reliable size past what it has sent, so a reset with one still in `sc->tx` is
+  held on `ctx->deferred_resets` and sent after the send pass that clears it; sends stop at the
+  size. A cnx's held resets are dropped in its close callback, or by a once-a-second sweep.
 - Cython does not None-check typed `cdef` attributes, and `tp_clear` can clear them before
   `__dealloc__`: check first. New `aiopquic_ctx_t` fields go at the tail.
 
@@ -179,12 +218,11 @@ applies nor reverse-applies stops the build: drop or regenerate it.
 
 | Patch | What it does | Fate |
 |---|---|---|
-| `picoquic-wt-connect-protocol` | CONNECT `:protocol` is always `webtransport`; picowt sends `webtransport-h3` once the server advertises SETTINGS_WT_ENABLED, which proxygen and browsers refuse | Temporary: remove once they accept `webtransport-h3` |
+| `picoquic-wt-connect-protocol` | CONNECT `:protocol` is chosen per connection (`h3_ctx->wt_connect_protocol`), default `webtransport`: upstream sends `webtransport-h3` once the server advertises SETTINGS_WT_ENABLED, which upstream moxygen refuses with 400 | Temporary: remove once upstream moxygen accepts `webtransport-h3` |
 | `picoquic-wt-connect-lenient` | A client sends CONNECT once the server's SETTINGS arrive, dropping vetoes deployed relays fail; `AIOPQUIC_WT_STRICT_CONNECT=1` restores the gate | Local |
 | `picoquic-alpn-null-guard` | negotiated-ALPN lookup tolerates a NULL cnx | Upstream candidate |
 | `picoquic-batch-wake` | A send call that sent packets wakes the connection at once: later packets of a GSO batch take a fast path that sets no loss or PTO timer, so a lost tail waited for the idle timeout | Upstream candidate |
 | `picoquic-path-response-each` | Every PATH_CHALLENGE gets a PATH_RESPONSE (RFC 9000 §8.2.2); a second challenge before the next send overwrote the first | Upstream candidate |
-| `picoquic-reset-stream-at-tp` | `reset_stream_at` is advertised and accepted under 0x1d (reliable-stream-reset-10) as well as the draft-07 codepoint | Temporary: until upstream moves to 0x1d |
 | `picoquic-h3zero-null-file-guard` | h3zero's client skips `fwrite` on a NULL `FILE*` | Upstream candidate |
 | `picoquic-reset-at-ack-delete` | The ack of a RESET_STREAM_AT retires a stream we only sent on; picoquic gated it on the receive-side `consumed_offset`, so the stream stayed until the connection closed | Local |
 | `picoquic-stop-sending-error-getter` | `picoquic_get_remote_stop_sending_error()` returns the code of a received STOP_SENDING | Local |
@@ -199,10 +237,11 @@ applies nor reverse-applies stops the build: drop or regenerate it.
 - The key-exchange order is process-wide: the last `start()` wins. ML-KEM shares need OpenSSL 3.5.
 - Servers bind the IPv4 and IPv6 wildcards when an IPv6 socket can bind `[::]:port`, else IPv4
   only (with a warning unless the host has no IPv6); `QuicConfiguration.ip_family` pins one family.
-  The `host` argument is ignored. Clients take IPv4 or IPv6 literals and prefer a name's IPv4
-  address. `QuicConfiguration.pmtud="delayed"` keeps a mostly-receiving client from probing.
-- The raw-QUIC `tx_max_queued_bytes` gate reads the process-wide queued total, so one stalled peer
-  parks new streams on every raw connection; the WebTransport gate is per session.
+  The `host` of `serve`, `serve_dispatch` and `serve_webtransport` narrows that: `None`, `""` or
+  `"::"` keep the wildcards, `"0.0.0.0"` is the IPv4 wildcard only, an IP literal binds just that
+  address, and a hostname at most one address per family. A bind failure raises `OSError`.
+  Clients take IPv4 or IPv6 literals and prefer a name's IPv4 address.
+  `QuicConfiguration.pmtud="delayed"` keeps a mostly-receiving client from probing.
 - `max_stream_data` (16 MiB) is both the advertised window and the per-stream RX ring.
 - A stalled consumer back-pressures the peer to silence and the connection idles out; set
   `keep_alive_interval`. On a closed raw connection `send_stream_data()` silently does nothing;

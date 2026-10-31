@@ -15,6 +15,7 @@ ROUNDS = int(os.environ.get("AIOPQUIC_LITMUS_N", "200000"))
 
 @pytest.mark.parametrize("kind", [
     "rx_notify", "tx_wake", "rx_event", "tx_drain", "tx_ring", "dgram",
+    "rx_drained",
 ])
 def test_no_lost_wake(kind):
     assert _litmus(kind, ROUNDS) == 0

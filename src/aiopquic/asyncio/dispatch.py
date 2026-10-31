@@ -18,6 +18,7 @@ from aiopquic.quic.connection import (
     QuicEngine, _EVT_CLOSE, _EVT_APP_CLOSE, _EVT_CNX_STACK, drain_and_route,
 )
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
+from aiopquic.asyncio._rxwatch import clear_reader, set_reader
 from aiopquic.asyncio.webtransport import (
     serve_webtransport, _EVT_WT_SESSION_READY,
 )
@@ -32,7 +33,7 @@ class _DualRouter:
         self._engine = engine
         self._wt = wt_dispatcher
         self._is_h3: dict[int, bool] = {}
-        loop.add_reader(transport.eventfd, self._drain)
+        set_reader(loop, transport, self._drain, self)
 
     def _drain(self) -> None:
         drain_and_route(self._transport, self.route_event)
@@ -63,17 +64,15 @@ class DualStackServer:
     """Handle returned by serve_dispatch. close() tears down both
     stacks; the shared transport is stopped by the engine."""
 
-    def __init__(self, engine, wt_server, loop, transport):
+    def __init__(self, engine, wt_server, loop, transport, router=None):
         self._engine = engine
         self._wt_server = wt_server
         self._loop = loop
         self._transport = transport
+        self._router = router
 
     def close(self) -> None:
-        try:
-            self._loop.remove_reader(self._transport.eventfd)
-        except Exception:
-            pass
+        clear_reader(self._loop, self._transport, self._router)
         self._wt_server.close()   # detaches dispatcher; transport not owned
         self._engine.close()      # stops the shared transport
 
@@ -102,6 +101,7 @@ async def serve_dispatch(host: str, port: int, *,
     engine = QuicEngine(configuration=cfg, create_protocol=create_protocol)
     engine._start_transport(
         port=port,
+        host=host,
         alpn=None,
         alpn_list=["h3"] + list(cfg.alpn_protocols or []),
         dual=True,
@@ -123,5 +123,5 @@ async def serve_dispatch(host: str, port: int, *,
     )
 
     loop = asyncio.get_event_loop()
-    _DualRouter(loop, transport, engine, wt_server._dispatcher)
-    return DualStackServer(engine, wt_server, loop, transport)
+    router = _DualRouter(loop, transport, engine, wt_server._dispatcher)
+    return DualStackServer(engine, wt_server, loop, transport, router)

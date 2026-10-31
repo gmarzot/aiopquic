@@ -176,6 +176,11 @@ if platform.system() == "Linux":
 if os.environ.get("AIOPQUIC_IO_URING", "0") == "1" and platform.system() == "Linux":
     define_macros.append(("PICOQUIC_WITH_IO_URING", "1"))
 
+# setuptools replaces Python's CFLAGS (which carry -O3) with $CFLAGS, so
+# an environment CFLAGS would build the extensions unoptimized. AIOPQUIC_PERF=0
+# keeps a debug build's own flags.
+opt_args = [] if os.environ.get("AIOPQUIC_PERF") == "0" else ["-O3"]
+
 print(f"Linking against: {extra_objects}")
 if library_dirs:
     print(f"Library dirs: {library_dirs}")
@@ -197,6 +202,7 @@ extensions = [
         libraries=libraries,
         language="c",
         define_macros=define_macros,
+        extra_compile_args=opt_args,
     ),
     # StreamChain — pure-Cython, no picoquic deps. Used by aiomoqt's
     # parser as the per-stream byte accumulator. Ships in aiopquic so
@@ -207,12 +213,14 @@ extensions = [
         sources=[os.path.join(
             "src", "aiopquic", "_binding", "_streamchain.pyx")],
         language="c",
+        extra_compile_args=opt_args,
     ),
     Extension(
         "aiopquic._binding._buffer",
         sources=[os.path.join(
             "src", "aiopquic", "_binding", "_buffer.pyx")],
         language="c",
+        extra_compile_args=opt_args,
     ),
 ]
 
@@ -307,7 +315,20 @@ with open(_build_info_path, "w") as _f:
     )
 
 
+def _version_scheme(version):
+    """Pre-release tag: the next pre-release's dev (0.7.0rc2 -> 0.7.0rc3.devN).
+    Final tag: release-branch-semver (0.7.0 -> 0.8.0.devN)."""
+    from setuptools_scm.version import guess_next_dev_version, release_branch_semver_version
+    if version.tag.is_prerelease:
+        return guess_next_dev_version(version)
+    return release_branch_semver_version(version)
+
+
 setup(
+    use_scm_version={
+        "version_scheme": _version_scheme,
+        "scm": {"git": {"describe_command": "git describe --dirty --tags --long --match v[0-9]*"}},
+    },
     ext_modules=cythonize(
         extensions,
         compiler_directives={
