@@ -47,6 +47,7 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_CLOSE,
     SPSC_EVT_TX_MARK_ACTIVE, SPSC_EVT_TX_CONNECT,
     SPSC_EVT_TX_WT_OPEN, SPSC_EVT_TX_WT_CREATE_STREAM,
+    AIOPQUIC_WT_CREATE_BIDIR, AIOPQUIC_WT_CREATE_FIN,
     SPSC_EVT_TX_WT_CLOSE, SPSC_EVT_TX_WT_DRAIN, SPSC_EVT_TX_WT_FIN,
     SPSC_EVT_TX_WT_RESET_STREAM, SPSC_EVT_TX_WT_DEREGISTER,
     SPSC_EVT_TX_WT_STOP_SENDING,
@@ -132,6 +133,7 @@ cdef extern from "picoquic.h":
         picoquic_quic_t* quic, const char* alg_name)
     void picoquic_set_default_congestion_algorithm_ex(
         picoquic_quic_t* quic, const void* alg, const char* alg_option_string)
+    void picoquic_set_packet_train_mode(picoquic_quic_t* quic, int train_mode)
 
     void picoquic_register_all_congestion_control_algorithms()
     const void* picoquic_get_congestion_algorithm(const char* alg_name)
@@ -3137,7 +3139,8 @@ cdef class TransportContext:
               pmtud_policy=None,
               host=None,
               bint reset_stream_at=True,
-              congestion_control_options=None):
+              congestion_control_options=None,
+              bint packet_train_mode=False):
         """
         Create the picoquic context and start the network thread.
 
@@ -3193,6 +3196,8 @@ cdef class TransportContext:
                 picoquic's default (newreno).
             congestion_control_options: Option string for that algorithm,
                 passed to picoquic as is, e.g. "Q0.02" for bbr.
+            packet_train_mode: When pacing holds a connection back, wait
+                for up to 10 packets of credit and send them together.
             max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
             wt_path: Server-mode WebTransport path (e.g. "/moq").
                 When set, uses h3zero_callback as picoquic's default
@@ -3368,6 +3373,8 @@ cdef class TransportContext:
                 picoquic_set_default_congestion_algorithm_ex(
                     self._quic, picoquic_get_congestion_algorithm(_c_cc),
                     self._cc_options)
+        if packet_train_mode:
+            picoquic_set_packet_train_mode(self._quic, 1)
 
         cdef bytes _b_log
         # Textlog: per-cnx human-readable log of every packet, ACK, FC
@@ -3891,17 +3898,33 @@ cdef class WebTransportSessionState:
         self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 
-    def push_create_stream(self, bint bidir):
+    def push_create_stream(self, bint bidir, bytes initial=b"",
+                           bint end_stream=False,
+                           uint32_t stream_ring_cap=AIOPQUIC_TX_DATA_RING_CAP_DEFAULT,
+                           int priority=-1):
         """Push TX_WT_CREATE_STREAM. Reply event WT_STREAM_CREATED
-        carries the assigned stream_id in stream_id field."""
+        carries the assigned stream_id in stream_id field. initial and
+        end_stream queue behind the stream header; priority (0-255, -1
+        for none) applies first."""
         cdef spsc_entry_t entry
         memset(&entry, 0, sizeof(entry))
         entry.event_type = SPSC_EVT_TX_WT_CREATE_STREAM
         entry.cnx = <void*>self._wt
         entry.stream_ctx = <void*>self._wt
-        entry.is_fin = 1 if bidir else 0
+        entry.is_fin = ((AIOPQUIC_WT_CREATE_BIDIR if bidir else 0)
+                        | (AIOPQUIC_WT_CREATE_FIN if end_stream else 0))
+        entry.aux = stream_ring_cap
+        if priority >= 0:
+            entry.error_code = <uint64_t>priority + 1
+        cdef const uint8_t* data_ptr = NULL
+        cdef uint32_t data_len = 0
+        if initial:
+            data_ptr = <const uint8_t*>initial
+            data_len = <uint32_t>len(initial)
         cdef int ret = spsc_ring_push(
-            self._transport._ctx.tx_event_ring, &entry, NULL, 0)
+            self._transport._ctx.tx_event_ring, &entry, data_ptr, data_len)
+        if ret == -2:
+            raise MemoryError("WT_CREATE_STREAM data alloc failed")
         if ret != 0:
             raise BufferError("TX ring full (WT_CREATE_STREAM)")
         self._transport._ctx.cnt_tx_event_ring_pushes += 1
@@ -4222,6 +4245,7 @@ cdef extern from "c/test_access.h":
     int aiopquic_test_cnx_datagram_priority(picoquic_cnx_t* cnx)
     int aiopquic_test_default_datagram_priority(picoquic_quic_t* quic)
     const char* aiopquic_test_cnx_cc_options(picoquic_cnx_t* cnx)
+    int aiopquic_test_cnx_packet_train_mode(picoquic_cnx_t* cnx)
 
 
 def _datagram_priority(uintptr_t cnx_ptr):
@@ -4257,6 +4281,18 @@ def _wt_cc_options(WebTransportSessionState st):
     if st._wt is NULL:
         return None
     return _cnx_cc_options(st._wt.cnx)
+
+
+def _packet_train_mode(uintptr_t cnx_ptr):
+    """1 if a connection's context paces in packet trains, else 0 (test only)."""
+    return aiopquic_test_cnx_packet_train_mode(<picoquic_cnx_t*>cnx_ptr)
+
+
+def _wt_packet_train_mode(WebTransportSessionState st):
+    """Packet train mode of a WT session's context, -1 for none (test only)."""
+    if st._wt is NULL:
+        return -1
+    return aiopquic_test_cnx_packet_train_mode(st._wt.cnx)
 
 
 cdef extern from "c/litmus.h":

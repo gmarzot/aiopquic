@@ -19,4 +19,8 @@ static inline const char* aiopquic_test_cnx_cc_options(picoquic_cnx_t* cnx) {
     return cnx == NULL ? NULL : cnx->congestion_alg_option_string;
 }
 
+static inline int aiopquic_test_cnx_packet_train_mode(picoquic_cnx_t* cnx) {
+    return cnx == NULL ? -1 : (int)cnx->quic->packet_train_mode;
+}
+
 #endif /* AIOPQUIC_TEST_ACCESS_H */

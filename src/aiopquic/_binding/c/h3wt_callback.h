@@ -1572,7 +1572,7 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
             aiopquic_wt_push_stream_created(s, 0, NULL, 1);
             return 1;
         }
-        int is_bidir = entry->is_fin;
+        int is_bidir = (entry->is_fin & AIOPQUIC_WT_CREATE_BIDIR) != 0;
         h3zero_stream_ctx_t* new_stream = picowt_create_local_stream(
             s->cnx, is_bidir, s->h3_ctx, s->control_stream_id);
         if (!new_stream) {
@@ -1591,6 +1591,31 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         }
         new_stream->path_callback = aiopquic_wt_path_callback;
         new_stream->path_callback_ctx = link;
+        if (entry->error_code != 0) {
+            int pri_ret = picoquic_set_stream_priority(
+                s->cnx, new_stream->stream_id, (uint8_t)(entry->error_code - 1));
+            if (pri_ret == 0) {
+                ctx->worker_set_priority_applied++;
+            } else {
+                ctx->worker_set_priority_rejected++;
+                ctx->worker_set_priority_last_err = (uint64_t)pri_ret;
+            }
+        }
+        /* The first bytes queue behind the stream header, so one send
+         * carries both. */
+        uint8_t fin = (entry->is_fin & AIOPQUIC_WT_CREATE_FIN) != 0;
+        if (entry->data_length > 0 || fin) {
+            if (aiopquic_stream_ctx_send_data(
+                    link->sc, (const uint8_t*)entry->data_buf,
+                    entry->data_length, entry->aux, fin) != 1) {
+                /* A nonzero code makes Python retire the stream. */
+                aiopquic_wt_push_stream_created(s, new_stream->stream_id,
+                                                  NULL, 3);
+                return 1;
+            }
+            aiopquic_tx_data_bytes_pushed_add(entry->data_length);
+            picoquic_mark_active_stream_v2(s->cnx, new_stream->stream_id, 1);
+        }
         aiopquic_wt_push_stream_created(s, new_stream->stream_id,
                                           link->sc, 0);
         return 1;
