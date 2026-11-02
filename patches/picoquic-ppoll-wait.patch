@@ -1,5 +1,5 @@
 diff --git a/picoquic/sockloop.c b/picoquic/sockloop.c
-index 35c925f2..c2929428 100644
+index 35c925f2..571d3940 100644
 --- a/picoquic/sockloop.c
 +++ b/picoquic/sockloop.c
 @@ -2175,7 +2175,17 @@ int picoquic_packet_loop_poll(
@@ -20,7 +20,7 @@ index 35c925f2..c2929428 100644
  
      if (received_ecn != NULL) {
          *received_ecn = 0;
-@@ -3142,12 +3152,18 @@ void* picoquic_packet_loop_v3(void* v_ctx)
+@@ -3142,12 +3152,17 @@ void* picoquic_packet_loop_v3(void* v_ctx)
              &addr_from, &addr_to, &if_index_to, &received_ecn,
              &received_buffer, &action, &socket_rank);
  #elif defined(PICOQUIC_WITH_POLL)
@@ -30,18 +30,17 @@ index 35c925f2..c2929428 100644
 -         * its timeout is a timeval in microseconds, so a sub-millisecond delta_t
 -         * is already exact. QMux still needs poll for TCP events. */
 -        if (delta_t < 1000 && nb_qmux_sockets == 0) {
-+        /* When a send is due sooner than the wait can resolve, skip the wait
-+         * and try a nonblocking recv so ACKs still land while we keep sending.
-+         * Linux waits with ppoll() in microseconds, so only "due now" skips it;
-+         * poll() elsewhere is millisecond resolution, so anything under 1 ms
-+         * does. Skipping for a later send spins until it is due. QMux still
-+         * needs poll for TCP events. */
++        /* poll() rounds to milliseconds: when a send is due within 1 ms, skip
++         * it and try a nonblocking recv so ACKs still land while we keep
++         * sending. Linux waits with ppoll() in microseconds; a send due now
++         * polls with a zero timeout, which reads only the ready fds. QMux
++         * still needs poll for TCP events. */
 +#if defined(__linux__)
-+        const int64_t poll_min_delta = 1;
++        const int skip_poll = 0;
 +#else
-+        const int64_t poll_min_delta = 1000;
++        const int skip_poll = (delta_t < 1000);
 +#endif
-+        if (delta_t < poll_min_delta && nb_qmux_sockets == 0) {
++        if (skip_poll && nb_qmux_sockets == 0) {
              bytes_recv = picoquic_packet_loop_try_recv(
                  s_ctx, nb_sockets_available,
                  &addr_from, &addr_to, &if_index_to, &received_ecn,
