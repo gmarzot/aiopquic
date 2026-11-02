@@ -823,9 +823,14 @@ static inline void aiopquic_live_cnx_attach(aiopquic_ctx_t* ctx,
 }
 
 /* A cnx joins live_cnxs on its first confirmed walk and leaves it when
- * picoquic deletes it, so a hit is live. */
+ * picoquic deletes it, so a hit is live. A perflog set after attach (e.g.
+ * picoquic_perflog_setup) stops the delete hook, so the set is dropped. */
 static inline int aiopquic_cnx_live(aiopquic_ctx_t* ctx, picoquic_quic_t* quic,
                                     picoquic_cnx_t* cnx) {
+    if (ctx->live_cnxs_hooked && quic->perflog_fn != aiopquic_cnx_delete_hook) {
+        aiopquic_cnx_set_clear(&ctx->live_cnxs);
+        ctx->live_cnxs_hooked = 0;
+    }
     if (aiopquic_cnx_set_has(&ctx->live_cnxs, cnx)) {
         return 1;
     }

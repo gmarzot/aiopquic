@@ -36,7 +36,9 @@ except ImportError:
     )
     from _ports import next_port
 
-from aiopquic._binding._transport import TransportContext
+from aiopquic._binding._transport import (
+    TransportContext, _live_cnx_attach, _take_perflog,
+)
 
 pytestmark = pytest.mark.skipif(not os.path.exists(CERT_FILE),
                                 reason="picoquic certs not found")
@@ -175,54 +177,95 @@ def _popped(ctx, target):
     return _wait(lambda: ctx.counters["tx_event_ring_pops"] >= target)
 
 
-def test_liveness_walks_once_per_cnx_and_drops_deleted():
+def _server_cnxs(server, client, port, n):
+    """Open n connections from client; return the server's cnx pointers."""
+    for _ in range(n):
+        client.create_client_connection("127.0.0.1", port, sni=SNI, alpn=ALPN)
+    cnxs = set()
+
+    def ready():
+        cnxs.update(e[5] for e in server.drain_rx()
+                    if e[0] in (SPSC_EVT_ALMOST_READY, SPSC_EVT_READY) and e[5])
+        client.drain_rx()
+        return len(cnxs) >= n
+    assert _wait(ready), f"{len(cnxs)} of {n} server cnxs"
+    return cnxs
+
+
+def _close_until_dropped(server, closed):
+    """Close cnxs from the server; picoquic deletes each once it disconnects,
+    and from then on its events are dropped instead of answered."""
+    for c in closed:
+        server.push_tx_event(SPSC_EVT_TX_CLOSE, 0, cnx_ptr=c)
+    server.wake_up()
+
+    def all_dropped():
+        dropped = server.counters["tx_event_dropped_dead_cnx"]
+        _refresh(server, closed)
+        return _wait(lambda: server.counters["tx_event_dropped_dead_cnx"]
+                     - dropped >= len(closed), timeout=0.2)
+    return _wait(all_dropped, timeout=15.0)
+
+
+def _refreshed(server, cnxs, times=1):
+    """Refresh each cnx `times` times; return the counter deltas."""
+    c0 = server.counters
+    for _ in range(times):
+        _refresh(server, cnxs)
+    assert _popped(server, c0["tx_event_ring_pops"] + times * len(cnxs))
+    c1 = server.counters
+    return {k: c1[k] - c0[k] for k in ("cnx_live_walks", "tx_event_dropped_dead_cnx")}
+
+
+@pytest.fixture
+def pair():
     port = next_port()
     server = start_server(port)
     client = TransportContext()
+    client.start(port=0, alpn=ALPN, is_client=True, ca_file=CA_FILE)
+    assert wait_for_ready(client)
     try:
-        client.start(port=0, alpn=ALPN, is_client=True, ca_file=CA_FILE)
-        assert wait_for_ready(client)
-        for _ in range(CNXS):
-            client.create_client_connection("127.0.0.1", port, sni=SNI, alpn=ALPN)
-
-        cnxs = set()
-
-        def ready():
-            cnxs.update(e[5] for e in server.drain_rx()
-                        if e[0] in (SPSC_EVT_ALMOST_READY, SPSC_EVT_READY) and e[5])
-            client.drain_rx()
-            return len(cnxs) >= CNXS
-        assert _wait(ready), f"{len(cnxs)} of {CNXS} server cnxs"
-
-        c0 = server.counters
-        for _ in range(4):
-            _refresh(server, cnxs)
-        assert _popped(server, c0["tx_event_ring_pops"] + 4 * CNXS)
-        c1 = server.counters
-        assert c1["tx_event_dropped_dead_cnx"] == c0["tx_event_dropped_dead_cnx"]
-        assert c1["cnx_live_walks"] - c0["cnx_live_walks"] <= CNXS
-
-        closed = set(sorted(cnxs)[:CNXS // 2])
-        live = cnxs - closed
-        for c in closed:
-            server.push_tx_event(SPSC_EVT_TX_CLOSE, 0, cnx_ptr=c)
-        server.wake_up()
-
-        # picoquic deletes a server cnx once it disconnects; from then on
-        # its events are dropped instead of answered.
-        def all_dropped():
-            dropped = server.counters["tx_event_dropped_dead_cnx"]
-            _refresh(server, closed)
-            return _wait(lambda: server.counters["tx_event_dropped_dead_cnx"]
-                         - dropped >= len(closed), timeout=0.2)
-        assert _wait(all_dropped, timeout=15.0), "closed cnxs still answered"
-
-        c2 = server.counters
-        _refresh(server, live)
-        assert _popped(server, c2["tx_event_ring_pops"] + len(live))
-        c3 = server.counters
-        assert c3["tx_event_dropped_dead_cnx"] == c2["tx_event_dropped_dead_cnx"]
-        assert c3["cnx_live_walks"] == c2["cnx_live_walks"]
+        yield server, client, port
     finally:
         client.stop()
         server.stop()
+
+
+def test_liveness_walks_once_per_cnx_and_drops_deleted(pair):
+    server, client, port = pair
+    assert server.counters["live_cnxs_hooked"] == 1
+    cnxs = _server_cnxs(server, client, port, CNXS)
+    d = _refreshed(server, cnxs, times=4)
+    assert d["tx_event_dropped_dead_cnx"] == 0
+    assert d["cnx_live_walks"] <= CNXS
+
+    closed = set(sorted(cnxs)[:CNXS // 2])
+    live = cnxs - closed
+    assert _close_until_dropped(server, closed), "closed cnxs still answered"
+    assert _refreshed(server, live) == {"cnx_live_walks": 0,
+                                        "tx_event_dropped_dead_cnx": 0}
+
+
+def test_attach_leaves_a_set_perflog_alone(pair):
+    server, client, port = pair
+    _take_perflog(server)
+    _live_cnx_attach(server)
+    assert server.counters["live_cnxs_hooked"] == 0
+    cnxs = _server_cnxs(server, client, port, 8)
+    d = _refreshed(server, cnxs, times=3)
+    assert d["cnx_live_walks"] >= 3 * len(cnxs)
+    assert d["tx_event_dropped_dead_cnx"] == 0
+
+
+def test_perflog_taken_after_attach_drops_the_set(pair):
+    server, client, port = pair
+    cnxs = _server_cnxs(server, client, port, 16)
+    assert _refreshed(server, cnxs, times=2)["cnx_live_walks"] <= 16
+    _take_perflog(server)
+    d = _refreshed(server, cnxs)
+    assert d["cnx_live_walks"] >= len(cnxs)
+    assert d["tx_event_dropped_dead_cnx"] == 0
+    assert server.counters["live_cnxs_hooked"] == 0
+    closed = set(sorted(cnxs)[:8])
+    assert _close_until_dropped(server, closed), "closed cnxs still answered"
+    assert _refreshed(server, cnxs - closed)["tx_event_dropped_dead_cnx"] == 0

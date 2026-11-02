@@ -412,6 +412,7 @@ cdef extern from "c/callback.h":
         uint64_t cnt_sc_destroy_fc_credit_dead_cnx
         uint64_t cnt_wt_control_released
         uint64_t cnt_cnx_live_walks
+        uint8_t live_cnxs_hooked
         uint64_t cnt_tx_park_kept_active
         uint64_t cnt_tx_mark_active_skipped
 
@@ -1485,6 +1486,7 @@ cdef class TransportContext:
             'set_dgram_priority_applied': self._ctx.worker_set_dgram_priority_applied,
             'tx_event_dropped_dead_cnx': self._ctx.cnt_tx_event_dropped_dead_cnx,
             'cnx_live_walks': self._ctx.cnt_cnx_live_walks,
+            'live_cnxs_hooked': self._ctx.live_cnxs_hooked,
             'tx_park_kept_active': self._ctx.cnt_tx_park_kept_active,
             'tx_mark_active_skipped': self._ctx.cnt_tx_mark_active_skipped,
             'tx_wrong_direction_dropped': self._ctx.cnt_tx_wrong_direction_dropped,
@@ -4268,11 +4270,22 @@ cdef extern from "c/test_access.h":
     int aiopquic_test_default_datagram_priority(picoquic_quic_t* quic)
     const char* aiopquic_test_cnx_cc_options(picoquic_cnx_t* cnx)
     int aiopquic_test_cnx_packet_train_mode(picoquic_cnx_t* cnx)
+    void aiopquic_test_take_perflog(picoquic_quic_t* quic)
 
 
 def _datagram_priority(uintptr_t cnx_ptr):
     """picoquic's datagram priority for a connection, -1 for none (test only)."""
     return aiopquic_test_cnx_datagram_priority(<picoquic_cnx_t*>cnx_ptr)
+
+
+def _take_perflog(TransportContext t):
+    """Set the quic's perflog slot as picoquic_perflog_setup would (test only)."""
+    aiopquic_test_take_perflog(t._quic)
+
+
+def _live_cnx_attach(TransportContext t):
+    """Re-run the delete-hook attach; only safe with no cnx (test only)."""
+    aiopquic_live_cnx_attach(t._ctx, t._quic)
 
 
 def _default_datagram_priority(TransportContext t):
