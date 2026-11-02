@@ -850,14 +850,19 @@ class TestLoopback:
         try:
             import builtins
             # Push until the ring overflows: the network thread drains
-            # it concurrently, so a fixed count can fall short.
+            # it concurrently, so a fixed count can fall short. Only a
+            # stream's first write posts a MARK_ACTIVE, so each write
+            # opens a new stream.
             err = None
+            sid = 0
             deadline = time.monotonic() + 2.0
             while err is None and time.monotonic() < deadline:
                 try:
-                    client.tx_send_stream(0, 0, b"x" * 256)
+                    client.tx_send_stream(0, sid, b"x" * 256,
+                                          stream_ring_cap=4096)
                 except builtins.BufferError as e:
                     err = e
+                sid += 4
             assert err is not None, "TX ring overflow did not surface BufferError"
             assert "TX event ring full" in str(err), err
         finally:
