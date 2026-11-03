@@ -2,6 +2,8 @@
 
 ## v0.8.0 (unreleased)
 
+- picoquic b9893f28: wake scheduling uses a uint64 splay tree (picoquic #2328) and packet setup no longer
+  clears the payload buffer (#2327).
 - A stream write posts a TX event only when picoquic has parked the stream, and a TX event checks its
   connection's liveness in O(1) instead of walking every connection, so the network thread's cost per
   event no longer grows with the connection count. New counters: `tx_mark_active_skipped`,
