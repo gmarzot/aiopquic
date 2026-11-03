@@ -4271,6 +4271,7 @@ cdef extern from "c/test_access.h":
     const char* aiopquic_test_cnx_cc_options(picoquic_cnx_t* cnx)
     int aiopquic_test_cnx_packet_train_mode(picoquic_cnx_t* cnx)
     void aiopquic_test_take_perflog(picoquic_quic_t* quic)
+    int aiopquic_test_hold_tx_wake(aiopquic_ctx_t* ctx)
 
 
 def _datagram_priority(uintptr_t cnx_ptr):
@@ -4281,6 +4282,12 @@ def _datagram_priority(uintptr_t cnx_ptr):
 def _take_perflog(TransportContext t):
     """Set the quic's perflog slot as picoquic_perflog_setup would (test only)."""
     aiopquic_test_take_perflog(t._quic)
+
+
+def _hold_tx_wake(TransportContext t):
+    """Take an idle worker's wake so TX pushes stay queued; True if the
+    worker was idle (test only)."""
+    return aiopquic_test_hold_tx_wake(t._ctx) != 0
 
 
 def _live_cnx_attach(TransportContext t):
