@@ -1,6 +1,7 @@
 """TX wake gate: a write wakes the network thread only when it may be
 asleep. The gate is checked against a worker held running or idle; live
-bursts check that every write goes through it and is delivered; a write
+bursts check that every write goes through it, or lands on a stream
+still active in picoquic, and is delivered; a write
 after a quiet spell must reach the peer promptly, and a skipped wake is
 counted as tx_wake_lost."""
 import asyncio
@@ -65,13 +66,16 @@ def _wakes(transport):
 
 async def _burst(transport, send, sent):
     calls0, skipped0 = _wakes(transport)
+    armed0 = transport.counters["tx_mark_active_skipped"]
     for _ in range(WRITES):
         send(CHUNK)
     total = WRITES * len(CHUNK)
     assert await _until(lambda: sent() == total), f"{sent()} of {total} bytes sent"
     calls1, skipped1 = _wakes(transport)
     gated = (calls1 + skipped1) - (calls0 + skipped0)
-    assert gated >= WRITES, f"{gated} of {WRITES} writes went through the wake gate"
+    armed = transport.counters["tx_mark_active_skipped"] - armed0
+    assert gated + armed >= WRITES, (
+        f"{gated} of {WRITES} writes went through the wake gate, {armed} hit an armed stream")
 
 
 async def test_raw_writes_go_through_wake_gate():

@@ -1046,6 +1046,11 @@ static int aiopquic_wt_path_callback(
         int is_fin = (fin_after && !sc->tx_reset_pending
                       && to_send == avail) ? 1 : 0;
         int still_active = (sendable > to_send) ? 1 : 0;
+        if (!still_active && !is_fin
+                && aiopquic_stream_ctx_tx_park(sc, to_send, fin_after)) {
+            still_active = 1;
+            s->bridge->cnt_tx_park_kept_active++;
+        }
         uint8_t* buf = picoquic_provide_stream_data_buffer(
             bytes, to_send, is_fin, still_active);
         if (buf && to_send > 0) {

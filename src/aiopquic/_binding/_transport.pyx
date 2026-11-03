@@ -411,11 +411,16 @@ cdef extern from "c/callback.h":
         uint64_t cnt_sc_destroy_fc_credit_worker
         uint64_t cnt_sc_destroy_fc_credit_dead_cnx
         uint64_t cnt_wt_control_released
+        uint64_t cnt_cnx_live_walks
+        uint8_t live_cnxs_hooked
+        uint64_t cnt_tx_park_kept_active
+        uint64_t cnt_tx_mark_active_skipped
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
                                           uint32_t rx_cap,
                                           uint32_t low_water_pct)
     void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx)
+    void aiopquic_live_cnx_attach(aiopquic_ctx_t* ctx, picoquic_quic_t* quic)
     void aiopquic_clear_rx(aiopquic_ctx_t* ctx)
     uint64_t aiopquic_rx_consumed(aiopquic_ctx_t* ctx)
     void aiopquic_wake_trace_add(aiopquic_wake_trace_t* t, uint32_t kind,
@@ -594,6 +599,8 @@ cdef extern from "c/stream_ctx.h":
         aiopquic_stream_ctx_t* sc,
         const uint8_t* data, uint32_t length,
         uint32_t capacity, uint8_t set_fin)
+    int aiopquic_stream_ctx_tx_arm(aiopquic_stream_ctx_t* sc)
+    void aiopquic_stream_ctx_tx_disarm(aiopquic_stream_ctx_t* sc)
     void aiopquic_set_tx_data_drain_pending(
         aiopquic_stream_ctx_t* sc)
     void aiopquic_clear_tx_data_drain_pending(
@@ -1478,6 +1485,10 @@ cdef class TransportContext:
             'set_priority_last_err': self._ctx.worker_set_priority_last_err,
             'set_dgram_priority_applied': self._ctx.worker_set_dgram_priority_applied,
             'tx_event_dropped_dead_cnx': self._ctx.cnt_tx_event_dropped_dead_cnx,
+            'cnx_live_walks': self._ctx.cnt_cnx_live_walks,
+            'live_cnxs_hooked': self._ctx.live_cnxs_hooked,
+            'tx_park_kept_active': self._ctx.cnt_tx_park_kept_active,
+            'tx_mark_active_skipped': self._ctx.cnt_tx_mark_active_skipped,
             'tx_wrong_direction_dropped': self._ctx.cnt_tx_wrong_direction_dropped,
             'tx_reattach_after_close': self._ctx.cnt_tx_reattach_after_close,
             'stream_cb_after_close': self._ctx.cnt_stream_cb_after_close,
@@ -2724,6 +2735,12 @@ cdef class TransportContext:
         if data_len > 0:
             aiopquic_tx_data_bytes_pushed_add(<uint64_t>data_len)
 
+        # An armed stream is active in picoquic, which pulls these bytes
+        # without a MARK_ACTIVE or a wake.
+        if not aiopquic_stream_ctx_tx_arm(sc):
+            self._ctx.cnt_tx_mark_active_skipped += 1
+            return 0
+
         # Push MARK_ACTIVE event. Pre-check above guarantees room
         # under the single-producer asyncio invariant. The post-check
         # below catches invariant violations rather than masking them.
@@ -2736,6 +2753,7 @@ cdef class TransportContext:
         if rc == 0:
             self._ctx.cnt_tx_event_ring_pushes += 1
         else:
+            aiopquic_stream_ctx_tx_disarm(sc)
             # Single-producer invariant violated — bytes are committed
             # to sc->tx but MARK_ACTIVE didn't post. Caller's retry
             # would re-commit and duplicate bytes. Arm the drain
@@ -3348,6 +3366,7 @@ cdef class TransportContext:
             raise RuntimeError("Failed to create picoquic context")
 
         self._ctx.quic = self._quic
+        aiopquic_live_cnx_attach(self._ctx, self._quic)
 
         # Multi-ALPN server: install the selector so picoquic picks the
         # highest mutual ALPN from the client's offer (default_alpn is
@@ -4073,6 +4092,10 @@ cdef class WebTransportSessionState:
         if data_len > 0:
             aiopquic_tx_data_bytes_pushed_add(<uint64_t>data_len)
 
+        if not aiopquic_stream_ctx_tx_arm(sc):
+            self._transport._ctx.cnt_tx_mark_active_skipped += 1
+            return
+
         # MARK_ACTIVE: stream_ctx=NULL preserves h3zero's lookup-by-
         # sid behavior. h3zero handles NULL app_stream_ctx safely on
         # both prepare_to_send (h3zero_common.c:1640) and stream_data
@@ -4086,6 +4109,7 @@ cdef class WebTransportSessionState:
         cdef int ret = spsc_ring_push(
             self._transport._ctx.tx_event_ring, &entry, NULL, 0)
         if ret != 0:
+            aiopquic_stream_ctx_tx_disarm(sc)
             # Single-producer invariant violated. Arm the connection-
             # global drain signal so the caller's BufferError handler
             # waking on tx_event_ring_drain_event will fire when the ring
@@ -4246,11 +4270,29 @@ cdef extern from "c/test_access.h":
     int aiopquic_test_default_datagram_priority(picoquic_quic_t* quic)
     const char* aiopquic_test_cnx_cc_options(picoquic_cnx_t* cnx)
     int aiopquic_test_cnx_packet_train_mode(picoquic_cnx_t* cnx)
+    void aiopquic_test_take_perflog(picoquic_quic_t* quic)
+    int aiopquic_test_hold_tx_wake(aiopquic_ctx_t* ctx)
 
 
 def _datagram_priority(uintptr_t cnx_ptr):
     """picoquic's datagram priority for a connection, -1 for none (test only)."""
     return aiopquic_test_cnx_datagram_priority(<picoquic_cnx_t*>cnx_ptr)
+
+
+def _take_perflog(TransportContext t):
+    """Set the quic's perflog slot as picoquic_perflog_setup would (test only)."""
+    aiopquic_test_take_perflog(t._quic)
+
+
+def _hold_tx_wake(TransportContext t):
+    """Take an idle worker's wake so TX pushes stay queued; True if the
+    worker was idle (test only)."""
+    return aiopquic_test_hold_tx_wake(t._ctx) != 0
+
+
+def _live_cnx_attach(TransportContext t):
+    """Re-run the delete-hook attach; only safe with no cnx (test only)."""
+    aiopquic_live_cnx_attach(t._ctx, t._quic)
 
 
 def _default_datagram_priority(TransportContext t):
