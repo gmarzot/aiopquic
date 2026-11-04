@@ -2,6 +2,9 @@
 
 ## v0.8.0 (unreleased)
 
+- `max_data` is now a fixed connection window (picoquic_set_max_data_control) instead of growing with
+  the congestion window, which bounds out-of-order fragment memory at about 6x `max_data` (picoquic
+  #2333). Inbound per connection is capped at about `max_data` per RTT.
 - picoquic 36e1418c: a crafted version-upgrade request no longer hangs the network thread (picoquic
   #2331), and the lost-feedback signal no longer drops BBR's or C4's window on an app-limited path (#2337).
 - picoquic dropped fusion AES-GCM (#2326), so AES-GCM always comes from the linked OpenSSL. On 3.5 a relay

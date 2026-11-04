@@ -5,6 +5,7 @@
   - No MAX_STREAM_DATA once a stream's FIN arrived (RFC 9000 §3.3).
   - A raw bidi stream we open gets application flow control on its
     first byte received: its window stays within the RX ring.
+  - MAX_DATA never runs more than max_data ahead of data received.
 """
 import asyncio
 import glob
@@ -64,7 +65,8 @@ def _client_config(**kw):
                              server_name=SNI, cafile=CA_FILE, **kw)
 
 
-async def _run_raw(qlog_dir, n_streams, size, max_stream_data=None):
+async def _run_raw(qlog_dir, n_streams, size, max_stream_data=None,
+                   max_data=None):
     port = next_port()
     got = {"fins": 0, "bytes": 0}
     done = asyncio.Event()
@@ -82,6 +84,8 @@ async def _run_raw(qlog_dir, n_streams, size, max_stream_data=None):
                              qlog_dir=qlog_dir)
     if max_stream_data is not None:
         scfg.max_stream_data = max_stream_data
+    if max_data is not None:
+        scfg.max_data = max_data
     scfg.load_cert_chain(CERT_FILE, KEY_FILE)
     server = await serve("127.0.0.1", port, configuration=scfg,
                          create_protocol=Sink)
@@ -98,7 +102,7 @@ async def _run_raw(qlog_dir, n_streams, size, max_stream_data=None):
     return got
 
 
-async def _run_wt(qlog_dir, n_streams, size):
+async def _run_wt(qlog_dir, n_streams, size, max_data=None):
     port = next_port()
     got = {"fins": 0, "bytes": 0}
     done = asyncio.Event()
@@ -121,6 +125,8 @@ async def _run_wt(qlog_dir, n_streams, size):
                 t.add_done_callback(tasks.discard)
 
     scfg = QuicConfiguration(is_client=False, qlog_dir=qlog_dir)
+    if max_data is not None:
+        scfg.max_data = max_data
     server = await serve_webtransport("127.0.0.1", port, "/wt", handler=handler,
                                       cert_file=CERT_FILE, key_file=KEY_FILE,
                                       configuration=scfg)
@@ -251,3 +257,36 @@ async def test_raw_local_bidi_window_stays_within_ring(tmp_path):
     assert overflow == 0
     lead = _stream_window_lead(str(tmp_path), sid)
     assert lead <= ring, f"window ran {lead} B ahead of data received"
+
+
+def _cnx_window_lead(qlog_dir):
+    """(largest MAX_DATA sent less the stream bytes received by then,
+    number of MAX_DATA frames sent)."""
+    paths = glob.glob(os.path.join(qlog_dir, "*.qlog"))
+    assert len(paths) == 1, paths
+    with open(paths[0]) as f:
+        events = json.load(f)["traces"][0]["events"]
+    top, received, lead, n = {}, 0, 0, 0
+    for ev in events:
+        for fr in ev[3].get("frames") or []:
+            if ev[2] == "packet_received" and fr["frame_type"] == "stream":
+                end = fr["offset"] + fr["length"]
+                if end > top.get(fr["id"], 0):
+                    received += end - top.get(fr["id"], 0)
+                    top[fr["id"]] = end
+            elif ev[2] == "packet_sent" and fr["frame_type"] == "max_data":
+                n += 1
+                lead = max(lead, fr["maximum"] - received)
+    return lead, n
+
+
+@pytest.mark.parametrize("stack", ["raw", "wt"])
+async def test_connection_window_stays_within_max_data(stack, tmp_path):
+    """The connection window slides at max_data past data received.
+    Left to picoquic, it grows geometrically."""
+    window = 256 * 1024
+    got = await RUNNERS[stack](str(tmp_path), 8, window, max_data=window)
+    assert got == {"fins": 8, "bytes": 8 * window}
+    lead, n = _cnx_window_lead(str(tmp_path))
+    assert n > 0
+    assert lead <= window, f"MAX_DATA ran {lead} B ahead of data received"

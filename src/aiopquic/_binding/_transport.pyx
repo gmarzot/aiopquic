@@ -142,6 +142,7 @@ cdef extern from "picoquic.h":
     uint64_t picoquic_current_time()
     void picoquic_set_null_verifier(picoquic_quic_t* quic)
     void picoquic_set_default_idle_timeout(picoquic_quic_t* quic, uint64_t idle_timeout_ms)
+    void picoquic_set_max_data_control(picoquic_quic_t* quic, uint64_t max_data)
     void picoquic_set_cookie_mode(picoquic_quic_t* quic, int cookie_mode)
     ctypedef enum picoquic_pmtud_policy_enum:
         picoquic_pmtud_basic
@@ -3527,6 +3528,10 @@ cdef class TransportContext:
                 if initial_max_streams_bidi > 0:
                     tp.initial_max_stream_id_bidir = initial_max_streams_bidi
                 picoquic_set_default_tp(self._quic, &tp)
+        if initial_max_data > 0:
+            # MAX_DATA slides at initial_max_data past bytes received
+            # instead of growing with cwnd; bounds reorder memory (~6x).
+            picoquic_set_max_data_control(self._quic, initial_max_data)
         if reset_stream_at:
             cur_tp = picoquic_get_default_tp(self._quic)
             if cur_tp != NULL:
