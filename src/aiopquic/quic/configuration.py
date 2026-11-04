@@ -51,7 +51,9 @@ class QuicConfiguration:
     # consumer drains bytes the picoquic worker thread extends the
     # cap via picoquic_open_flow_control. Higher caps tolerate larger
     # peer bursts before backpressure kicks in; lower caps reduce
-    # per-stream memory and bufferbloat.
+    # per-stream memory and bufferbloat. max_data stays a fixed window
+    # past bytes received (picoquic_set_max_data_control), so it caps
+    # inbound at ~max_data per RTT and out-of-order memory at ~6x.
     max_data: int = 16 * 1024 * 1024
     max_stream_data: int = 16 * 1024 * 1024
     # 65535: the QUIC max for the DATAGRAM frame extension (RFC 9221).
