@@ -65,11 +65,6 @@ for lib_name in ("libpicotls-core.a", "libpicotls-openssl.a",
     p = find_lib(lib_name, PTLS_LIB_DIRS)
     if p is not None:
         extra_objects.append(p)
-# Optional/architecture-specific picotls backends — link if present.
-for lib_name in ("libpicotls-fusion.a",):
-    p = find_lib(lib_name, PTLS_LIB_DIRS)
-    if p is not None:
-        extra_objects.append(p)
 
 # io_uring: when AIOPQUIC_IO_URING=1 was set at picoquic-build time,
 # libpicoquic-core.a has undefined references to io_uring_* symbols
