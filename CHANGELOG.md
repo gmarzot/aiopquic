@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.7.1
+
+- picoquic: a crafted version-upgrade request no longer hangs the network thread (picoquic #2331, fix
+  #2332 carried as a patch).
+
 ## v0.7.0
 
 - No changes since 0.7.0rc3.
