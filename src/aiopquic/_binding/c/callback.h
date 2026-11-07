@@ -342,6 +342,8 @@ typedef struct {
      * a UAF-class bug — the function dereferences fields that don't
      * exist at the same offsets. */
     picoquic_network_thread_ctx_t* thread_ctx;
+    /* Sockets of the client loop (client_loop.h); 0 when the packet loop runs. */
+    uint32_t client_sockets;
     /* Per-stream RX byte ring capacity. Set at start() time from the
      * QuicConfiguration's max_stream_data so the ring can hold the
      * full peer-allowed in-flight window (the spec promises peer
@@ -2454,6 +2456,8 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
 
     return 0;
 }
+
+#include "client_loop.h"
 
 #ifdef __cplusplus
 }
