@@ -2,6 +2,7 @@
 
 ## v0.8.0 (unreleased)
 
+- Carries picoquic #2354 until it merges: BBR's `inflight_hi` starts unset, so a viewer that leaves Startup while application-limited is no longer capped below BDP. In a local fan-out overload, peak viewers rose from about 350 to 500, and backlog drains instead of staying stuck.
 - `max_data` is now a fixed connection window (picoquic_set_max_data_control) instead of growing with
   the congestion window, which bounds out-of-order fragment memory at about 6x `max_data` (picoquic
   #2333). Inbound per connection is capped at about `max_data` per RTT.
