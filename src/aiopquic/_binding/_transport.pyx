@@ -347,6 +347,7 @@ cdef extern from "c/callback.h":
         int eventfd
         picoquic_quic_t* quic
         picoquic_network_thread_ctx_t* thread_ctx
+        uint32_t client_sockets
         uint32_t rx_data_ring_cap
         uint64_t keep_alive_us
         char* wt_supported_protocols
@@ -473,6 +474,11 @@ cdef extern from "c/callback.h":
         aiopquic_addr_t peer_addr
         aiopquic_addr_t local_addr
         uint8_t session_resumed
+
+cdef extern from "c/callback.h":
+    picoquic_network_thread_ctx_t* aiopquic_start_client_loop(
+        picoquic_quic_t* quic, picoquic_packet_loop_param_t* param,
+        aiopquic_ctx_t* ctx, uint32_t nb_sockets, int* ret)
 
 cdef extern from "c/stream_buf.h":
     ctypedef struct aiopquic_stream_buf_t:
@@ -3158,6 +3164,7 @@ cdef class TransportContext:
               pmtud_policy=None,
               host=None,
               bint reset_stream_at=True,
+              uint32_t client_sockets=0,
               congestion_control_options=None,
               bint packet_train_mode=False):
         """
@@ -3169,6 +3176,8 @@ cdef class TransportContext:
             key_file: Path to TLS private key (server mode).
             alpn: Default ALPN string (e.g. "h3", "moq-chat").
             is_client: Client mode; servers do not verify peers.
+            client_sockets: Above 1, on a client with no fixed port or host,
+                connections send from that many sockets in turn, on Linux.
             verify_peer: Client mode: verify the server's certificate chain
                 and its name against the SNI. False accepts any
                 certificate.
@@ -3601,10 +3610,14 @@ cdef class TransportContext:
 
         # Start the network thread
         cdef int ret = 0
-        self._thread_ctx = picoquic_start_network_thread(
-            self._quic, &self._param,
-            aiopquic_loop_cb, <void*>self._ctx,
-            &ret)
+        if client_sockets > 1 and is_client and port == 0 and host is None:
+            self._thread_ctx = aiopquic_start_client_loop(
+                self._quic, &self._param, self._ctx, client_sockets, &ret)
+        else:
+            self._thread_ctx = picoquic_start_network_thread(
+                self._quic, &self._param,
+                aiopquic_loop_cb, <void*>self._ctx,
+                &ret)
 
         if self._thread_ctx is NULL or ret != 0:
             picoquic_free(self._quic)

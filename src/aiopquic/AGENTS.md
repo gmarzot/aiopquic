@@ -21,7 +21,9 @@ the `KEX_*` ids and `counters`; everything else there, and raw pointers, are tes
 
 - Raw QUIC: `async with connect(host, port, configuration=cfg, create_protocol=P) as p:`;
   `await serve(host, port, configuration=cfg, create_protocol=P)`. `P` subclasses
-  `QuicConnectionProtocol` and overrides `quic_event_received`.
+  `QuicConnectionProtocol` and overrides `quic_event_received`. `connect(..., engine=e)` with one
+  `QuicClientEngine(sockets=N)` shares one network thread and RX ring across connections, each sending from
+  one of N sockets on Linux (without `sockets`, or elsewhere, they share one); `e.close()` stops it.
 - WebTransport: `async with connect_webtransport(host, port, path, sni=..., configuration=cfg) as
   wt:`, then `create_stream()`, `send_stream_data()`, `receive_stream_data(sid)`, `events()`.
   Once `receive_stream_data(sid)` has yielded a stream's FIN or reset, the stream's inbox is freed
@@ -100,7 +102,7 @@ has left the ring once it is exceeded.
 | `src/aiopquic/asyncio/` | `connect`, `serve`, the protocol class, `dispatch.py` (one-port dual stack), `webtransport.py` |
 | `src/aiopquic/buffer.py`, `streamchain.py` | re-exports of the Cython codecs: varint, draft-18 vi64, MoQT subgroup objects |
 | `src/aiopquic/_binding/_transport.pyx` | `TransportContext`, `StreamChunk`, `WebTransportSessionState`, the RX drain loops |
-| `src/aiopquic/_binding/c/` | worker-thread C: `callback.h` (raw callback, TX dispatch), `h3wt_callback.h` (WebTransport), ring and stream-context headers |
+| `src/aiopquic/_binding/c/` | worker-thread C: `client_loop.h` (client loop with many sockets), `callback.h` (raw callback, TX dispatch), `h3wt_callback.h` (WebTransport), ring and stream-context headers |
 | `third_party/`, `patches/` | submodules picoquic, picotls, liburing; picoquic patches |
 | `tests/` | pytest suite; `interop/` peer stacks; `bench/` opt-in |
 | `DATAFLOW.md`, `PERFORMANCE.md` | TX/RX/flow-control model, counters; numbers, build flags, tuning |
