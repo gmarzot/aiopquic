@@ -2,6 +2,7 @@
 
 ## v0.8.0 (unreleased)
 
+- Carries picoquic #2354 until it merges: BBR's `inflight_hi` starts unset, so a viewer that leaves Startup while application-limited is no longer capped below BDP. In a local fan-out overload, peak viewers rose from about 350 to 500, and backlog drains instead of staying stuck.
 - `QuicClientEngine`: raw QUIC client connections can share one network thread via `connect(engine=)`, as WebTransport sessions already could with `transport=`.
 - `TransportContext.start(client_sockets=N)` and `QuicClientEngine(sockets=N)`: a client's connections on one network thread send from N sockets (Linux), so a relay hashing source ports to worker threads spreads them.
 - `max_data` is now a fixed connection window (picoquic_set_max_data_control) instead of growing with
