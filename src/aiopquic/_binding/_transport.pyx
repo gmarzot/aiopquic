@@ -390,6 +390,8 @@ cdef extern from "c/callback.h":
         uint64_t cnt_tx_wake_lost
         uint64_t cnt_prepare_to_send_empty
         uint64_t cnt_loop_cb
+        uint64_t cnt_loop_late_checks
+        uint64_t cnt_loop_late_us
         uint64_t worker_set_priority_applied
         uint64_t worker_set_priority_rejected
         uint64_t worker_set_priority_last_err
@@ -1464,6 +1466,9 @@ cdef class TransportContext:
             on a stream without that direction; dropped
           tx_event_ring_fire_dropped > 0: rx_event_ring full at fire time (re-arm path)
           wake_calls vs wake_skipped_coalesced: wake-coalescing efficiency
+          loop_late_us / loop_late_checks: how overdue the next connection's
+            wake was, on average, before each wait: the network thread falling
+            behind its own schedule, whatever is taking its CPU
           rx_notify_pending_now 1 with events queued (rx_event_ring_count_now
             or rx_overflow_depth_now) while asyncio sleeps: a lost RX wake.
             loop_callbacks still moving: the worker is running
@@ -1513,6 +1518,8 @@ cdef class TransportContext:
             'rx_clear_read_empty': self._ctx.cnt_rx_clear_read_empty,
             'rx_rearms': self._ctx.cnt_rx_rearms,
             'loop_callbacks': self._ctx.cnt_loop_cb,
+            'loop_late_checks': self._ctx.cnt_loop_late_checks,
+            'loop_late_us': self._ctx.cnt_loop_late_us,
             'rx_data_event_coalesced': self._ctx.cnt_rx_data_event_coalesced,
             'rx_byte_ring_overflow': self._ctx.worker_rx_byte_ring_overflow,
             'last_tx_event_ring_arm_ns': self._ctx.last_tx_event_ring_arm_ns,

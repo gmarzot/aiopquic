@@ -228,3 +228,23 @@ async def test_lost_wake_is_counted():
             assert await _until(lambda: st.counters["tx_event_ring_count_now"] == 0)
     finally:
         server.close()
+
+
+async def test_lateness_is_counted():
+    port = next_port()
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt", handler=lambda session: None,
+        cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI,
+                                        ca_file=CA_FILE) as wt:
+            before = wt._transport.counters["loop_late_checks"]
+            sid = await wt.create_stream(bidir=False)
+            await _burst(wt._transport,
+                         lambda d: wt.send_stream_data(sid, d),
+                         lambda: wt.tx_sent_bytes(sid))
+            c = wt._transport.counters
+            assert c["loop_late_checks"] > before, c
+            assert c["loop_late_us"] >= 0, c
+    finally:
+        server.close()
