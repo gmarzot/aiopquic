@@ -124,13 +124,16 @@ class QuicConnection:
     Presents the same public API as qh3.quic.connection.QuicConnection
     so that higher layers (H3Connection, aiomoqt) can use it unchanged.
 
-    Two construction modes:
+    Three construction modes:
     - Client / standalone: QuicConnection(configuration=cfg). Owns its
       own TransportContext; calls _start_transport() then connect().
     - Engine-spawned (server side): QuicConnection(configuration=cfg,
       engine=engine, cnx_ptr=cnx). Shares engine's transport; cnx_ptr
       is the picoquic cnx pointer for this peer. Engine routes events
       to this connection's _events queue; no own drain.
+    - Client on a shared engine: QuicConnection(configuration=cfg,
+      engine=engine), then connect(). As above, but it learns its cnx
+      from the first event routed to it.
     """
 
     def __init__(self, *, configuration: QuicConfiguration,
@@ -142,7 +145,7 @@ class QuicConnection:
             # Engine-spawned: share engine's transport, no own drain
             self._transport = engine._transport
             self._cnx_ptr = cnx_ptr
-            self._connected = True
+            self._connected = cnx_ptr != 0
             self._closed = False
         else:
             self._transport: TransportContext | None = None
@@ -200,7 +203,7 @@ class QuicConnection:
         self._stream_tx_drain_events: dict[int, asyncio.Event] = {}
         # Set once the worker has created the picoquic cnx (ALMOST_READY).
         self._created = asyncio.Event()
-        if engine is not None:
+        if cnx_ptr != 0:
             self._created.set()
 
     @property
