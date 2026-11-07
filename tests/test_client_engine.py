@@ -164,3 +164,112 @@ async def test_ring_capacity_reaches_the_transport():
     finally:
         engine.close()
         server.close()
+
+
+def _local_port(client) -> int:
+    return client._quic.local_address()[1]
+
+
+async def test_connections_take_their_own_source_ports():
+    port, server = await _server()
+    engine = QuicClientEngine(sockets=4)
+    held = []
+    try:
+        for i in range(4):
+            cm = _open(port, engine)
+            client = await cm.__aenter__()
+            held.append((cm, client))
+            payload = bytes([i]) * 50_000
+            assert await client.echo(payload) == payload
+        ports = {_local_port(c) for _, c in held}
+        assert len(ports) == (4 if sys.platform == "linux" else 1)
+    finally:
+        for cm, _ in reversed(held):
+            await cm.__aexit__(None, None, None)
+        engine.close()
+        server.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the socket pool is Linux only")
+async def test_more_connections_than_sockets_share_them():
+    port, server = await _server()
+    engine = QuicClientEngine(sockets=3)
+    held = []
+    try:
+        for i in range(7):
+            cm = _open(port, engine)
+            client = await cm.__aenter__()
+            held.append((cm, client))
+            assert await client.echo(bytes([i])) == bytes([i])
+        assert len({_local_port(c) for _, c in held}) == 3
+        for i, (_, client) in enumerate(held):
+            assert await client.echo(bytes([i + 100])) == bytes([i + 100])
+    finally:
+        for cm, _ in reversed(held):
+            await cm.__aexit__(None, None, None)
+        engine.close()
+        server.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="counts /proc threads")
+async def test_socket_pool_adds_no_thread():
+    port, server = await _server()
+    engine = QuicClientEngine(sockets=8)
+    held = []
+    try:
+        held.append(_open(port, engine))
+        await held[0].__aenter__()
+        threads = _thread_count()
+        for _ in range(7):
+            held.append(_open(port, engine))
+            await held[-1].__aenter__()
+        assert _thread_count() == threads
+    finally:
+        for cm in reversed(held):
+            await cm.__aexit__(None, None, None)
+        engine.close()
+        server.close()
+
+
+async def test_socket_pool_carries_large_transfers_at_once():
+    port, server = await _server()
+    engine = QuicClientEngine(sockets=4)
+
+    async def one(i):
+        async with _open(port, engine) as c:
+            payload = bytes([i]) * 4_000_000
+            assert await c.echo(payload) == payload
+
+    try:
+        await asyncio.gather(*(one(i) for i in range(4)))
+    finally:
+        engine.close()
+        server.close()
+
+
+async def test_socket_pool_closes_with_connections_open():
+    port, server = await _server()
+    engine = QuicClientEngine(sockets=4)
+    try:
+        async with _open(port, engine) as first, _open(port, engine) as second:
+            assert await first.echo(b"a") == b"a"
+            assert await second.echo(b"b") == b"b"
+            engine.close()
+            assert first._quic.closed and second._quic.closed
+    finally:
+        engine.close()
+        server.close()
+
+
+async def test_socket_pool_leaves_no_wake_lost():
+    port, server = await _server()
+    engine = QuicClientEngine(sockets=4)
+    try:
+        async with _open(port, engine) as c:
+            for i in range(50):
+                assert await c.echo(bytes([i])) == bytes([i])
+                await asyncio.sleep(0.01)
+            assert c._quic._transport.counters["tx_wake_lost"] == 0
+    finally:
+        engine.close()
+        server.close()

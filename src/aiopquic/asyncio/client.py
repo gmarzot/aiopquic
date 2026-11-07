@@ -34,19 +34,24 @@ async def _resolve_host(host: str, port: int | None = None) -> str:
 
 
 class QuicClientEngine(QuicEngine):
-    """Client connections sharing one picoquic thread, socket and RX ring.
+    """Client connections sharing one picoquic thread and RX ring.
 
     Pass it to connect(engine=...), from one event loop. The first
     connection's configuration sets the transport-wide settings, so give
     every connection the same one. close() ends any open connections and
     stops the thread.
+
+    `sockets` above 1 gives connections that many source ports in turn, on
+    Linux, so a relay hashing them to worker threads spreads them. Otherwise
+    they share one socket.
     """
 
     def __init__(self, *, ring_capacity: int | None = None,
-                 max_connections: int = 4096):
+                 max_connections: int = 4096, sockets: int = 0):
         super().__init__(configuration=None, create_protocol=None)
         self._ring_capacity = ring_capacity
         self._max_connections = max_connections
+        self._sockets = sockets
         self._pending: deque[QuicConnectionProtocol] = deque()
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -59,7 +64,7 @@ class QuicClientEngine(QuicEngine):
             cfg.event_ring_capacity = self._ring_capacity
         cfg.max_connections = self._max_connections
         self._configuration = cfg
-        self._start_transport(port=port)
+        self._start_transport(port=port, client_sockets=self._sockets)
         self._loop = asyncio.get_running_loop()
         set_reader(self._loop, self._transport, self.drain_and_route, self)
 
