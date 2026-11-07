@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.8.0 (unreleased)
+
+- `max_data` is now a fixed connection window (picoquic_set_max_data_control) instead of growing with
+  the congestion window, which bounds out-of-order fragment memory at about 6x `max_data` (picoquic
+  #2333). Inbound per connection is capped at about `max_data` per RTT.
+- picoquic a6f85e8a: connection wake times use a red-black tree (picoquic #2347), and stream receive
+  caches its first buffered segment (#2349).
+- picoquic 36e1418c: a crafted version-upgrade request no longer hangs the network thread (picoquic
+  #2331), and the lost-feedback signal no longer drops BBR's or C4's window on an app-limited path (#2337).
+- picoquic dropped fusion AES-GCM (#2326), so AES-GCM always comes from the linked OpenSSL. On 3.5 a relay
+  runs about 2% fewer instructions per send than with fusion, on 3.0 about 8% more; `build.sh` warns
+  below 3.5.
+- picoquic b9893f28: wake scheduling uses a uint64 splay tree (picoquic #2328) and packet setup no longer
+  clears the payload buffer (#2327).
+- A stream write posts a TX event only when picoquic has parked the stream, and a TX event checks its
+  connection's liveness in O(1) instead of walking every connection, so the network thread's cost per
+  event no longer grows with the connection count. New counters: `tx_mark_active_skipped`,
+  `tx_park_kept_active`, `cnx_live_walks`.
+- Linux: when a send is due now, the network thread checks for received packets with one zero-timeout
+  `ppoll()` that reads only the ready sockets, instead of reading the wake pipe and every socket.
+- Dev builds after a final release report the next version (`0.8.0.devN` on the 0.8.0 branch,
+  `0.7.1.devN` on 0.7.0) instead of the last rc's (`0.7.0rc4.devN`), so source builds satisfy an
+  `aiopquic>=0.7.0` floor.
+- `WebTransportSession.create_stream()` takes `initial`, `end_stream` and `priority`: the stream's first
+  bytes, FIN and priority travel with the create, so the stream header and the first data leave in one
+  send instead of two.
+- `QuicConfiguration.packet_train_mode` (off by default): when pacing holds a connection back,
+  picoquic sends up to 10 packets in one train instead of one or two, so fewer sends per packet.
+
 ## v0.7.1
 
 - picoquic: a crafted version-upgrade request no longer hangs the network thread (picoquic #2331, fix

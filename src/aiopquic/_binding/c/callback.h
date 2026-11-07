@@ -21,6 +21,7 @@
 #include "datagram_buf.h"
 #include <picoquic.h>
 #include <picoquic_packet_loop.h>
+#include "picoquic_internal.h"
 
 /* =====================================================================
  * Resource defaults — single source of truth for aiopquic tunables.
@@ -94,19 +95,10 @@
 #include <string.h>
 #include <unistd.h>
 
-/* O(N_connections) walk over picoquic's live-cnx list. Used as the
- * guard before dispatching any TX_* SPSC event into a `cnx*` from
- * the entry — the cnx may have been freed between the Python push
- * and our pop (peer CLOSE_CONNECTION, app-side close, timeout). Any
- * deref into a freed cnx is a UAF, surfacing as a NULL-page fault
- * inside picoquic when a struct field is loaded.
- *
- * TODO: replace with a generation-counter lookup if aiomoqt
- * grows into a relay role with many concurrent cnxs. For the
- * current publisher/client shape (1–2 cnxs) the walk is one or two
- * pointer compares per event — effectively free. Cost scales O(N)
- * and starts to matter past ~50 cnxs at megapacket-per-second
- * event rates. */
+/* O(N_connections) walk over picoquic's live-cnx list: the cnx of a TX
+ * event may have been freed between the Python push and our pop, and any
+ * deref into a freed cnx is a UAF. aiopquic_cnx_live() answers from
+ * ctx->live_cnxs first and walks only on a miss. */
 static inline int aiopquic_cnx_is_alive(picoquic_quic_t* quic,
                                          picoquic_cnx_t* cnx) {
     picoquic_cnx_t* cur = picoquic_get_first_cnx(quic);
@@ -117,6 +109,85 @@ static inline int aiopquic_cnx_is_alive(picoquic_quic_t* quic,
         cur = picoquic_get_next_cnx(cur);
     }
     return 0;
+}
+
+/* Open-addressed pointer set (linear probing), worker thread only. */
+typedef struct {
+    picoquic_cnx_t** slots;
+    uint32_t mask;      /* capacity - 1; 0 while unallocated */
+    uint32_t count;
+} aiopquic_cnx_set_t;
+
+static inline uint32_t aiopquic_cnx_set_slot(const aiopquic_cnx_set_t* s,
+                                             const picoquic_cnx_t* cnx) {
+    uint64_t h = (uint64_t)(uintptr_t)cnx * 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(h >> 32) & s->mask;
+}
+
+static inline int aiopquic_cnx_set_has(const aiopquic_cnx_set_t* s,
+                                       const picoquic_cnx_t* cnx) {
+    if (s->mask == 0 || cnx == NULL) return 0;
+    for (uint32_t i = aiopquic_cnx_set_slot(s, cnx);; i = (i + 1) & s->mask) {
+        if (s->slots[i] == cnx) return 1;
+        if (s->slots[i] == NULL) return 0;
+    }
+}
+
+static inline void aiopquic_cnx_set_put_slot(aiopquic_cnx_set_t* s,
+                                             picoquic_cnx_t* cnx) {
+    uint32_t i = aiopquic_cnx_set_slot(s, cnx);
+    while (s->slots[i] != NULL) i = (i + 1) & s->mask;
+    s->slots[i] = cnx;
+    s->count++;
+}
+
+/* Keeps the load at or under 1/2. A failed grow leaves cnx out, which only
+ * costs the walk. */
+static void aiopquic_cnx_set_add(aiopquic_cnx_set_t* s, picoquic_cnx_t* cnx) {
+    if (cnx == NULL || aiopquic_cnx_set_has(s, cnx)) return;
+    if (s->mask == 0 || (s->count + 1) * 2 > s->mask + 1) {
+        uint32_t old_cap = s->mask ? s->mask + 1 : 0;
+        uint32_t cap = old_cap ? old_cap * 2 : 64;
+        picoquic_cnx_t** old = s->slots;
+        picoquic_cnx_t** slots = (picoquic_cnx_t**)calloc(cap, sizeof(*slots));
+        if (slots == NULL) return;
+        s->slots = slots;
+        s->mask = cap - 1;
+        s->count = 0;
+        for (uint32_t i = 0; i < old_cap; i++) {
+            if (old[i] != NULL) aiopquic_cnx_set_put_slot(s, old[i]);
+        }
+        free(old);
+    }
+    aiopquic_cnx_set_put_slot(s, cnx);
+}
+
+/* Backward-shift delete keeps every probe chain unbroken. */
+static void aiopquic_cnx_set_del(aiopquic_cnx_set_t* s, const picoquic_cnx_t* cnx) {
+    if (s->mask == 0 || cnx == NULL) return;
+    uint32_t i = aiopquic_cnx_set_slot(s, cnx);
+    while (s->slots[i] != cnx) {
+        if (s->slots[i] == NULL) return;
+        i = (i + 1) & s->mask;
+    }
+    s->slots[i] = NULL;
+    s->count--;
+    for (uint32_t j = (i + 1) & s->mask; s->slots[j] != NULL; j = (j + 1) & s->mask) {
+        uint32_t home = aiopquic_cnx_set_slot(s, s->slots[j]);
+        /* Move j into the hole unless its home lies cyclically in (i, j]. */
+        if (((j - home) & s->mask) >= ((j - i) & s->mask)) {
+            s->slots[i] = s->slots[j];
+            s->slots[j] = NULL;
+            i = j;
+        }
+    }
+}
+
+static void aiopquic_cnx_set_clear(aiopquic_cnx_set_t* s) {
+    free(s->slots);
+    s->slots = NULL;
+    s->mask = 0;
+    s->count = 0;
 }
 
 /* RFC 9000 §2.1: a unidirectional stream carries data only from its
@@ -464,6 +535,13 @@ typedef struct {
     uint64_t        cnt_tx_wake_lost;       /* TX entries found after a long sleep no producer woke */
     /* Reasons lent to picoquic_close_ex (worker only). */
     struct aiopquic_close_reason* close_reasons;
+    /* Cnxs a liveness walk confirmed, until picoquic deletes them (worker
+     * only; unused unless live_cnxs_hooked). */
+    aiopquic_cnx_set_t live_cnxs;
+    uint8_t         live_cnxs_hooked;
+    uint64_t        cnt_cnx_live_walks;     /* liveness checks that missed live_cnxs */
+    uint64_t        cnt_tx_park_kept_active; /* parks a racing commit kept active */
+    uint64_t        cnt_tx_mark_active_skipped; /* commits that needed no MARK_ACTIVE (Python) */
 } aiopquic_ctx_t;
 
 typedef struct aiopquic_close_reason {
@@ -703,6 +781,7 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
             aiopquic_dgram_buf_unref(ctx->dgram_release_owed[i].db);
         }
         free(ctx->dgram_release_owed);
+        aiopquic_cnx_set_clear(&ctx->live_cnxs);
         if (ctx->alpn_list) {
             for (size_t i = 0; i < ctx->alpn_list_count; i++)
                 free(ctx->alpn_list[i]);
@@ -710,6 +789,59 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
         }
         free(ctx);
     }
+}
+
+/* picoquic calls perflog_fn from picoquic_delete_cnx (cnx, 0) and from
+ * picoquic_free (NULL, 1), on the thread that owns the quic. */
+static int aiopquic_cnx_delete_hook(picoquic_quic_t* quic, picoquic_cnx_t* cnx,
+                                    int should_delete) {
+    aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)quic->v_perflog_ctx;
+    if (ctx != NULL) {
+        if (cnx != NULL) {
+            aiopquic_cnx_set_del(&ctx->live_cnxs, cnx);
+        }
+        if (should_delete) {
+            aiopquic_cnx_set_clear(&ctx->live_cnxs);
+            ctx->live_cnxs_hooked = 0;
+            quic->perflog_fn = NULL;
+            quic->v_perflog_ctx = NULL;
+        }
+    }
+    return 0;
+}
+
+/* Call before the quic has a cnx. A quic with its own perflog only walks. */
+static inline void aiopquic_live_cnx_attach(aiopquic_ctx_t* ctx,
+                                            picoquic_quic_t* quic) {
+    aiopquic_cnx_set_clear(&ctx->live_cnxs);
+    ctx->live_cnxs_hooked = 0;
+    if (quic->perflog_fn == NULL) {
+        quic->perflog_fn = aiopquic_cnx_delete_hook;
+        quic->v_perflog_ctx = ctx;
+        ctx->live_cnxs_hooked = 1;
+    }
+}
+
+/* A cnx joins live_cnxs on its first confirmed walk and leaves it when
+ * picoquic deletes it, so a hit is live. A perflog set after attach (e.g.
+ * picoquic_perflog_setup) stops the delete hook, so the set is dropped. */
+static inline int aiopquic_cnx_live(aiopquic_ctx_t* ctx, picoquic_quic_t* quic,
+                                    picoquic_cnx_t* cnx) {
+    if (ctx->live_cnxs_hooked && quic->perflog_fn != aiopquic_cnx_delete_hook) {
+        aiopquic_cnx_set_clear(&ctx->live_cnxs);
+        ctx->live_cnxs_hooked = 0;
+    }
+    if (aiopquic_cnx_set_has(&ctx->live_cnxs, cnx)) {
+        return 1;
+    }
+    ctx->cnt_cnx_live_walks++;
+    if (!aiopquic_cnx_is_alive(quic, cnx)) {
+        return 0;
+    }
+    if (ctx->live_cnxs_hooked) {
+        aiopquic_cnx_set_add(&ctx->live_cnxs, cnx);
+    }
+    return 1;
 }
 
 /* Usable datagram payload ceiling for this cnx: min(local TP, remote
@@ -1471,6 +1603,11 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             int is_fin = (fin_after && !sc->tx_reset_pending
                           && to_send == avail) ? 1 : 0;
             int is_still_active = (sendable > to_send) ? 1 : 0;
+            if (!is_still_active && !is_fin
+                    && aiopquic_stream_ctx_tx_park(sc, to_send, fin_after)) {
+                is_still_active = 1;
+                ctx->cnt_tx_park_kept_active++;
+            }
             uint8_t* buf = picoquic_provide_stream_data_buffer(
                 bytes, to_send, is_fin, is_still_active);
             if (buf && to_send > 0) {
@@ -1869,7 +2006,7 @@ static void aiopquic_run_deferred_resets(picoquic_quic_t* quic,
             pp = &d->next;
             continue;
         }
-        int alive = aiopquic_cnx_is_alive(quic, d->cnx);
+        int alive = aiopquic_cnx_live(ctx, quic, d->cnx);
         if (alive && !ready) {
             pp = &d->next;
             continue;
@@ -2062,9 +2199,8 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
 
                 /* Stale-cnx guard. Drops events whose cnx was freed
                  * between the Python push and this pop. Without this,
-                 * any picoquic_* call below UAFs. See
-                 * aiopquic_cnx_is_alive() comment for cost notes. */
-                if (!cnx || !aiopquic_cnx_is_alive(quic, cnx)) {
+                 * any picoquic_* call below UAFs. */
+                if (!cnx || !aiopquic_cnx_live(ctx, quic, cnx)) {
                     ctx->cnt_tx_event_dropped_dead_cnx++;
                     if (entry->event_type == SPSC_EVT_TX_OPEN_FLOW_CONTROL &&
                         entry->stream_ctx != NULL) {
@@ -2148,7 +2284,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     case SPSC_EVT_TX_CNX_REFRESH: {
                         /* cnx liveness already verified by the outer
-                         * aiopquic_cnx_is_alive() guard above. */
+                         * aiopquic_cnx_live() guard above. */
                         aiopquic_cnx_snapshot_t snap;
                         aiopquic_cnx_snapshot_fill(cnx, &snap);
                         spsc_entry_t out = {0};
@@ -2162,7 +2298,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     }
                     case SPSC_EVT_TX_CLOSE: {
                         /* cnx liveness already verified by the outer
-                         * aiopquic_cnx_is_alive() guard above. */
+                         * aiopquic_cnx_live() guard above. */
                         const char* reason = aiopquic_close_reason_hold(
                             ctx, cnx, entry->data_buf, entry->data_length);
                         if (reason) {

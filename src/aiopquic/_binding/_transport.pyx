@@ -47,6 +47,7 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_TX_CLOSE,
     SPSC_EVT_TX_MARK_ACTIVE, SPSC_EVT_TX_CONNECT,
     SPSC_EVT_TX_WT_OPEN, SPSC_EVT_TX_WT_CREATE_STREAM,
+    AIOPQUIC_WT_CREATE_BIDIR, AIOPQUIC_WT_CREATE_FIN,
     SPSC_EVT_TX_WT_CLOSE, SPSC_EVT_TX_WT_DRAIN, SPSC_EVT_TX_WT_FIN,
     SPSC_EVT_TX_WT_RESET_STREAM, SPSC_EVT_TX_WT_DEREGISTER,
     SPSC_EVT_TX_WT_STOP_SENDING,
@@ -132,6 +133,7 @@ cdef extern from "picoquic.h":
         picoquic_quic_t* quic, const char* alg_name)
     void picoquic_set_default_congestion_algorithm_ex(
         picoquic_quic_t* quic, const void* alg, const char* alg_option_string)
+    void picoquic_set_packet_train_mode(picoquic_quic_t* quic, int train_mode)
 
     void picoquic_register_all_congestion_control_algorithms()
     const void* picoquic_get_congestion_algorithm(const char* alg_name)
@@ -140,6 +142,7 @@ cdef extern from "picoquic.h":
     uint64_t picoquic_current_time()
     void picoquic_set_null_verifier(picoquic_quic_t* quic)
     void picoquic_set_default_idle_timeout(picoquic_quic_t* quic, uint64_t idle_timeout_ms)
+    void picoquic_set_max_data_control(picoquic_quic_t* quic, uint64_t max_data)
     void picoquic_set_cookie_mode(picoquic_quic_t* quic, int cookie_mode)
     ctypedef enum picoquic_pmtud_policy_enum:
         picoquic_pmtud_basic
@@ -175,8 +178,8 @@ cdef extern from *:
         uint64_t initial_max_stream_data_bidi_remote
         uint64_t initial_max_stream_data_uni
         uint64_t initial_max_data
-        uint64_t initial_max_stream_id_bidir
-        uint64_t initial_max_stream_id_unidir
+        uint64_t initial_max_streams_bidi
+        uint64_t initial_max_streams_uni
         uint64_t max_idle_timeout
         uint32_t max_packet_size
         uint32_t max_ack_delay
@@ -409,11 +412,16 @@ cdef extern from "c/callback.h":
         uint64_t cnt_sc_destroy_fc_credit_worker
         uint64_t cnt_sc_destroy_fc_credit_dead_cnx
         uint64_t cnt_wt_control_released
+        uint64_t cnt_cnx_live_walks
+        uint8_t live_cnxs_hooked
+        uint64_t cnt_tx_park_kept_active
+        uint64_t cnt_tx_mark_active_skipped
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
                                           uint32_t rx_cap,
                                           uint32_t low_water_pct)
     void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx)
+    void aiopquic_live_cnx_attach(aiopquic_ctx_t* ctx, picoquic_quic_t* quic)
     void aiopquic_clear_rx(aiopquic_ctx_t* ctx)
     uint64_t aiopquic_rx_consumed(aiopquic_ctx_t* ctx)
     void aiopquic_wake_trace_add(aiopquic_wake_trace_t* t, uint32_t kind,
@@ -592,6 +600,8 @@ cdef extern from "c/stream_ctx.h":
         aiopquic_stream_ctx_t* sc,
         const uint8_t* data, uint32_t length,
         uint32_t capacity, uint8_t set_fin)
+    int aiopquic_stream_ctx_tx_arm(aiopquic_stream_ctx_t* sc)
+    void aiopquic_stream_ctx_tx_disarm(aiopquic_stream_ctx_t* sc)
     void aiopquic_set_tx_data_drain_pending(
         aiopquic_stream_ctx_t* sc)
     void aiopquic_clear_tx_data_drain_pending(
@@ -1476,6 +1486,10 @@ cdef class TransportContext:
             'set_priority_last_err': self._ctx.worker_set_priority_last_err,
             'set_dgram_priority_applied': self._ctx.worker_set_dgram_priority_applied,
             'tx_event_dropped_dead_cnx': self._ctx.cnt_tx_event_dropped_dead_cnx,
+            'cnx_live_walks': self._ctx.cnt_cnx_live_walks,
+            'live_cnxs_hooked': self._ctx.live_cnxs_hooked,
+            'tx_park_kept_active': self._ctx.cnt_tx_park_kept_active,
+            'tx_mark_active_skipped': self._ctx.cnt_tx_mark_active_skipped,
             'tx_wrong_direction_dropped': self._ctx.cnt_tx_wrong_direction_dropped,
             'tx_reattach_after_close': self._ctx.cnt_tx_reattach_after_close,
             'stream_cb_after_close': self._ctx.cnt_stream_cb_after_close,
@@ -1891,8 +1905,8 @@ cdef class TransportContext:
             'initial_max_stream_data_bidi_remote':
                 tp.initial_max_stream_data_bidi_remote,
             'initial_max_stream_data_uni': tp.initial_max_stream_data_uni,
-            'initial_max_streams_bidi': tp.initial_max_stream_id_bidir,
-            'initial_max_streams_uni': tp.initial_max_stream_id_unidir,
+            'initial_max_streams_bidi': tp.initial_max_streams_bidi,
+            'initial_max_streams_uni': tp.initial_max_streams_uni,
             'max_idle_timeout': tp.max_idle_timeout,
             'max_udp_payload_size': tp.max_packet_size,
             'max_ack_delay': tp.max_ack_delay,
@@ -2722,6 +2736,12 @@ cdef class TransportContext:
         if data_len > 0:
             aiopquic_tx_data_bytes_pushed_add(<uint64_t>data_len)
 
+        # An armed stream is active in picoquic, which pulls these bytes
+        # without a MARK_ACTIVE or a wake.
+        if not aiopquic_stream_ctx_tx_arm(sc):
+            self._ctx.cnt_tx_mark_active_skipped += 1
+            return 0
+
         # Push MARK_ACTIVE event. Pre-check above guarantees room
         # under the single-producer asyncio invariant. The post-check
         # below catches invariant violations rather than masking them.
@@ -2734,6 +2754,7 @@ cdef class TransportContext:
         if rc == 0:
             self._ctx.cnt_tx_event_ring_pushes += 1
         else:
+            aiopquic_stream_ctx_tx_disarm(sc)
             # Single-producer invariant violated — bytes are committed
             # to sc->tx but MARK_ACTIVE didn't post. Caller's retry
             # would re-commit and duplicate bytes. Arm the drain
@@ -3137,7 +3158,8 @@ cdef class TransportContext:
               pmtud_policy=None,
               host=None,
               bint reset_stream_at=True,
-              congestion_control_options=None):
+              congestion_control_options=None,
+              bint packet_train_mode=False):
         """
         Create the picoquic context and start the network thread.
 
@@ -3193,6 +3215,8 @@ cdef class TransportContext:
                 picoquic's default (newreno).
             congestion_control_options: Option string for that algorithm,
                 passed to picoquic as is, e.g. "Q0.02" for bbr.
+            packet_train_mode: When pacing holds a connection back, wait
+                for up to 10 packets of credit and send them together.
             max_datagram_frame_size: Max DATAGRAM frame size (0 = disabled).
             wt_path: Server-mode WebTransport path (e.g. "/moq").
                 When set, uses h3zero_callback as picoquic's default
@@ -3343,6 +3367,7 @@ cdef class TransportContext:
             raise RuntimeError("Failed to create picoquic context")
 
         self._ctx.quic = self._quic
+        aiopquic_live_cnx_attach(self._ctx, self._quic)
 
         # Multi-ALPN server: install the selector so picoquic picks the
         # highest mutual ALPN from the client's offer (default_alpn is
@@ -3368,6 +3393,8 @@ cdef class TransportContext:
                 picoquic_set_default_congestion_algorithm_ex(
                     self._quic, picoquic_get_congestion_algorithm(_c_cc),
                     self._cc_options)
+        if packet_train_mode:
+            picoquic_set_packet_train_mode(self._quic, 1)
 
         cdef bytes _b_log
         # Textlog: per-cnx human-readable log of every packet, ACK, FC
@@ -3489,18 +3516,19 @@ cdef class TransportContext:
                     # the connection window for sustained workloads.
                     tp.initial_max_data = initial_max_data
                 if initial_max_streams_uni > 0:
-                    # Per RFC 9000 §4.6 / §18.2: initial_max_streams_uni
-                    # advertised to peer. Picoquic's struct uses
-                    # initial_max_stream_id_unidir which is the
-                    # equivalent field (max concurrent uni streams the
-                    # peer may open against us). Picoquic enforces our
-                    # outbound stream count against the peer's
-                    # reciprocal advertisement, so this also indirectly
-                    # bounds our open_uni_stream success rate.
-                    tp.initial_max_stream_id_unidir = initial_max_streams_uni
+                    # Per RFC 9000 §4.6 / §18.2: max concurrent uni streams
+                    # the peer may open against us. Picoquic enforces our
+                    # outbound stream count against the peer's reciprocal
+                    # advertisement, so this also indirectly bounds our
+                    # open_uni_stream success rate.
+                    tp.initial_max_streams_uni = initial_max_streams_uni
                 if initial_max_streams_bidi > 0:
-                    tp.initial_max_stream_id_bidir = initial_max_streams_bidi
+                    tp.initial_max_streams_bidi = initial_max_streams_bidi
                 picoquic_set_default_tp(self._quic, &tp)
+        if initial_max_data > 0:
+            # MAX_DATA slides at initial_max_data past bytes received
+            # instead of growing with cwnd; bounds reorder memory (~6x).
+            picoquic_set_max_data_control(self._quic, initial_max_data)
         if reset_stream_at:
             cur_tp = picoquic_get_default_tp(self._quic)
             if cur_tp != NULL:
@@ -3891,17 +3919,33 @@ cdef class WebTransportSessionState:
         self._transport._ctx.cnt_tx_event_ring_pushes += 1
         self._transport.wake_up()
 
-    def push_create_stream(self, bint bidir):
+    def push_create_stream(self, bint bidir, bytes initial=b"",
+                           bint end_stream=False,
+                           uint32_t stream_ring_cap=AIOPQUIC_TX_DATA_RING_CAP_DEFAULT,
+                           int priority=-1):
         """Push TX_WT_CREATE_STREAM. Reply event WT_STREAM_CREATED
-        carries the assigned stream_id in stream_id field."""
+        carries the assigned stream_id in stream_id field. initial and
+        end_stream queue behind the stream header; priority (0-255, -1
+        for none) applies first."""
         cdef spsc_entry_t entry
         memset(&entry, 0, sizeof(entry))
         entry.event_type = SPSC_EVT_TX_WT_CREATE_STREAM
         entry.cnx = <void*>self._wt
         entry.stream_ctx = <void*>self._wt
-        entry.is_fin = 1 if bidir else 0
+        entry.is_fin = ((AIOPQUIC_WT_CREATE_BIDIR if bidir else 0)
+                        | (AIOPQUIC_WT_CREATE_FIN if end_stream else 0))
+        entry.aux = stream_ring_cap
+        if priority >= 0:
+            entry.error_code = <uint64_t>priority + 1
+        cdef const uint8_t* data_ptr = NULL
+        cdef uint32_t data_len = 0
+        if initial:
+            data_ptr = <const uint8_t*>initial
+            data_len = <uint32_t>len(initial)
         cdef int ret = spsc_ring_push(
-            self._transport._ctx.tx_event_ring, &entry, NULL, 0)
+            self._transport._ctx.tx_event_ring, &entry, data_ptr, data_len)
+        if ret == -2:
+            raise MemoryError("WT_CREATE_STREAM data alloc failed")
         if ret != 0:
             raise BufferError("TX ring full (WT_CREATE_STREAM)")
         self._transport._ctx.cnt_tx_event_ring_pushes += 1
@@ -4050,6 +4094,10 @@ cdef class WebTransportSessionState:
         if data_len > 0:
             aiopquic_tx_data_bytes_pushed_add(<uint64_t>data_len)
 
+        if not aiopquic_stream_ctx_tx_arm(sc):
+            self._transport._ctx.cnt_tx_mark_active_skipped += 1
+            return
+
         # MARK_ACTIVE: stream_ctx=NULL preserves h3zero's lookup-by-
         # sid behavior. h3zero handles NULL app_stream_ctx safely on
         # both prepare_to_send (h3zero_common.c:1640) and stream_data
@@ -4063,6 +4111,7 @@ cdef class WebTransportSessionState:
         cdef int ret = spsc_ring_push(
             self._transport._ctx.tx_event_ring, &entry, NULL, 0)
         if ret != 0:
+            aiopquic_stream_ctx_tx_disarm(sc)
             # Single-producer invariant violated. Arm the connection-
             # global drain signal so the caller's BufferError handler
             # waking on tx_event_ring_drain_event will fire when the ring
@@ -4222,11 +4271,30 @@ cdef extern from "c/test_access.h":
     int aiopquic_test_cnx_datagram_priority(picoquic_cnx_t* cnx)
     int aiopquic_test_default_datagram_priority(picoquic_quic_t* quic)
     const char* aiopquic_test_cnx_cc_options(picoquic_cnx_t* cnx)
+    int aiopquic_test_cnx_packet_train_mode(picoquic_cnx_t* cnx)
+    void aiopquic_test_take_perflog(picoquic_quic_t* quic)
+    int aiopquic_test_hold_tx_wake(aiopquic_ctx_t* ctx)
 
 
 def _datagram_priority(uintptr_t cnx_ptr):
     """picoquic's datagram priority for a connection, -1 for none (test only)."""
     return aiopquic_test_cnx_datagram_priority(<picoquic_cnx_t*>cnx_ptr)
+
+
+def _take_perflog(TransportContext t):
+    """Set the quic's perflog slot as picoquic_perflog_setup would (test only)."""
+    aiopquic_test_take_perflog(t._quic)
+
+
+def _hold_tx_wake(TransportContext t):
+    """Take an idle worker's wake so TX pushes stay queued; True if the
+    worker was idle (test only)."""
+    return aiopquic_test_hold_tx_wake(t._ctx) != 0
+
+
+def _live_cnx_attach(TransportContext t):
+    """Re-run the delete-hook attach; only safe with no cnx (test only)."""
+    aiopquic_live_cnx_attach(t._ctx, t._quic)
 
 
 def _default_datagram_priority(TransportContext t):
@@ -4257,6 +4325,18 @@ def _wt_cc_options(WebTransportSessionState st):
     if st._wt is NULL:
         return None
     return _cnx_cc_options(st._wt.cnx)
+
+
+def _packet_train_mode(uintptr_t cnx_ptr):
+    """1 if a connection's context paces in packet trains, else 0 (test only)."""
+    return aiopquic_test_cnx_packet_train_mode(<picoquic_cnx_t*>cnx_ptr)
+
+
+def _wt_packet_train_mode(WebTransportSessionState st):
+    """Packet train mode of a WT session's context, -1 for none (test only)."""
+    if st._wt is NULL:
+        return -1
+    return aiopquic_test_cnx_packet_train_mode(st._wt.cnx)
 
 
 cdef extern from "c/litmus.h":

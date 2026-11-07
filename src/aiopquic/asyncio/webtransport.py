@@ -270,8 +270,14 @@ class WebTransportSession:
             await asyncio.sleep(0.002)
 
     async def create_stream(self, bidir: bool = True,
-                              timeout: float = 5.0) -> int:
+                              timeout: float = 5.0, *,
+                              initial: bytes = b"", end_stream: bool = False,
+                              priority: int | None = None) -> int:
         """Open a new WT stream. Returns the assigned stream_id.
+
+        initial and end_stream are the stream's first bytes and FIN: they
+        travel with the create and leave in the same send as the stream
+        header. priority, as in set_stream_priority, applies before them.
 
         Round-trips to the picoquic thread because picowt allocates
         the id internally. Multiple concurrent callers are safe:
@@ -286,6 +292,12 @@ class WebTransportSession:
             raise WebTransportError("WT session closed")
         if not self.session_ready:
             raise WebTransportError("session not ready")
+        if len(initial) > self.stream_ring_cap:
+            raise ValueError(
+                f"initial write of {len(initial)} bytes exceeds the stream "
+                f"ring (cap={self.stream_ring_cap})")
+        if priority is not None and not 0 <= priority <= 255:
+            raise ValueError(f"priority {priority} outside 0-255")
         await self._await_tx_data_capacity()
         # Do not submit more creates while abandoned streams await retirement.
         while self._orphan_cleanup_task is not None:
@@ -297,7 +309,9 @@ class WebTransportSession:
         while True:
             ring_event.clear()
             try:
-                self._state.push_create_stream(bidir)
+                self._state.push_create_stream(
+                    bidir, initial, end_stream, self.stream_ring_cap,
+                    -1 if priority is None else priority)
                 break
             except BufferError:
                 if self._transport.arm_tx_event_ring_drain_pending():
@@ -1509,6 +1523,7 @@ async def connect_webtransport(
                     configuration.congestion_control_algorithm),
                 congestion_control_options=(
                     configuration.congestion_control_options),
+                packet_train_mode=configuration.packet_train_mode,
                 keep_alive_interval_ms=int(
                     (configuration.keep_alive_interval or 0) * 1000),
                 socket_buffer_size=(
@@ -1640,6 +1655,7 @@ async def serve_webtransport(
                     configuration.congestion_control_algorithm),
                 congestion_control_options=(
                     configuration.congestion_control_options),
+                packet_train_mode=configuration.packet_train_mode,
                 keep_alive_interval_ms=int(
                     (configuration.keep_alive_interval or 0) * 1000),
                 socket_buffer_size=(
