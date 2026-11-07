@@ -21,7 +21,8 @@ the `KEX_*` ids and `counters`; everything else there, and raw pointers, are tes
 
 - Raw QUIC: `async with connect(host, port, configuration=cfg, create_protocol=P) as p:`;
   `await serve(host, port, configuration=cfg, create_protocol=P)`. `P` subclasses
-  `QuicConnectionProtocol` and overrides `quic_event_received`.
+  `QuicConnectionProtocol` and overrides `quic_event_received`. `connect(..., engine=e)` with one
+  `QuicClientEngine` shares one network thread, socket and RX ring across connections; `e.close()` stops it.
 - WebTransport: `async with connect_webtransport(host, port, path, sni=..., configuration=cfg) as
   wt:`, then `create_stream()`, `send_stream_data()`, `receive_stream_data(sid)`, `events()`.
   Once `receive_stream_data(sid)` has yielded a stream's FIN or reset, the stream's inbox is freed

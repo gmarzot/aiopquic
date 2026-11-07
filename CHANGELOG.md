@@ -2,6 +2,7 @@
 
 ## v0.8.0 (unreleased)
 
+- `QuicClientEngine`: raw QUIC client connections can share one network thread via `connect(engine=)`, as WebTransport sessions already could with `transport=`.
 - `max_data` is now a fixed connection window (picoquic_set_max_data_control) instead of growing with
   the congestion window, which bounds out-of-order fragment memory at about 6x `max_data` (picoquic
   #2333). Inbound per connection is capped at about `max_data` per RTT.
