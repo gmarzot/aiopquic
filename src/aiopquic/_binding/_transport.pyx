@@ -178,8 +178,8 @@ cdef extern from *:
         uint64_t initial_max_stream_data_bidi_remote
         uint64_t initial_max_stream_data_uni
         uint64_t initial_max_data
-        uint64_t initial_max_stream_id_bidir
-        uint64_t initial_max_stream_id_unidir
+        uint64_t initial_max_streams_bidi
+        uint64_t initial_max_streams_uni
         uint64_t max_idle_timeout
         uint32_t max_packet_size
         uint32_t max_ack_delay
@@ -1905,8 +1905,8 @@ cdef class TransportContext:
             'initial_max_stream_data_bidi_remote':
                 tp.initial_max_stream_data_bidi_remote,
             'initial_max_stream_data_uni': tp.initial_max_stream_data_uni,
-            'initial_max_streams_bidi': tp.initial_max_stream_id_bidir,
-            'initial_max_streams_uni': tp.initial_max_stream_id_unidir,
+            'initial_max_streams_bidi': tp.initial_max_streams_bidi,
+            'initial_max_streams_uni': tp.initial_max_streams_uni,
             'max_idle_timeout': tp.max_idle_timeout,
             'max_udp_payload_size': tp.max_packet_size,
             'max_ack_delay': tp.max_ack_delay,
@@ -3516,17 +3516,14 @@ cdef class TransportContext:
                     # the connection window for sustained workloads.
                     tp.initial_max_data = initial_max_data
                 if initial_max_streams_uni > 0:
-                    # Per RFC 9000 §4.6 / §18.2: initial_max_streams_uni
-                    # advertised to peer. Picoquic's struct uses
-                    # initial_max_stream_id_unidir which is the
-                    # equivalent field (max concurrent uni streams the
-                    # peer may open against us). Picoquic enforces our
-                    # outbound stream count against the peer's
-                    # reciprocal advertisement, so this also indirectly
-                    # bounds our open_uni_stream success rate.
-                    tp.initial_max_stream_id_unidir = initial_max_streams_uni
+                    # Per RFC 9000 §4.6 / §18.2: max concurrent uni streams
+                    # the peer may open against us. Picoquic enforces our
+                    # outbound stream count against the peer's reciprocal
+                    # advertisement, so this also indirectly bounds our
+                    # open_uni_stream success rate.
+                    tp.initial_max_streams_uni = initial_max_streams_uni
                 if initial_max_streams_bidi > 0:
-                    tp.initial_max_stream_id_bidir = initial_max_streams_bidi
+                    tp.initial_max_streams_bidi = initial_max_streams_bidi
                 picoquic_set_default_tp(self._quic, &tp)
         if initial_max_data > 0:
             # MAX_DATA slides at initial_max_data past bytes received
