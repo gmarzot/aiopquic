@@ -423,6 +423,8 @@ typedef struct {
     uint64_t        cnt_wake_calls;                /* picoquic_wake_up_network_thread invoked */
     uint64_t        cnt_wake_skipped_coalesced;    /* wake skipped: worker not idle */
     uint64_t        cnt_prepare_to_send_empty;     /* prepare_to_send invoked with avail==0 */
+    uint64_t        cnt_loop_late_checks;          /* waits checked for lateness */
+    uint64_t        cnt_loop_late_us;              /* sum of how overdue the next wake was */
     uint64_t        cnt_loop_cb;                   /* worker loop callbacks: moves while the worker runs */
     uint64_t        last_tx_event_ring_arm_ns;           /* CLOCK_MONOTONIC of last arm */
     uint64_t        last_tx_event_ring_fire_ns;          /* CLOCK_MONOTONIC of last fire */
@@ -2074,6 +2076,11 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
             /* Runs before every wait that can block. */
             packet_loop_time_check_arg_t* tc =
                 (packet_loop_time_check_arg_t*)callback_argv;
+            uint64_t next_wake = picoquic_get_next_wake_time(quic, tc->current_time);
+            ctx->cnt_loop_late_checks++;
+            if (next_wake < tc->current_time) {
+                ctx->cnt_loop_late_us += tc->current_time - next_wake;
+            }
             if (tc->delta_t > 0) {
                 ctx->tx_worker_armed_at = (tc->delta_t >= AIOPQUIC_TX_WAKE_LOST_US)
                     ? tc->current_time : 0;

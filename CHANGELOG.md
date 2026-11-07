@@ -2,6 +2,7 @@
 
 ## v0.8.0 (unreleased)
 
+- `TransportContext.counters` gains `loop_late_checks` and `loop_late_us`: how overdue the next connection's wake was before each wait, the network thread falling behind its own schedule.
 - `max_data` is now a fixed connection window (picoquic_set_max_data_control) instead of growing with
   the congestion window, which bounds out-of-order fragment memory at about 6x `max_data` (picoquic
   #2333). Inbound per connection is capped at about `max_data` per RTT.
