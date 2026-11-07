@@ -5,13 +5,13 @@
 - `max_data` is now a fixed connection window (picoquic_set_max_data_control) instead of growing with
   the congestion window, which bounds out-of-order fragment memory at about 6x `max_data` (picoquic
   #2333). Inbound per connection is capped at about `max_data` per RTT.
+- picoquic a6f85e8a: connection wake times use a red-black tree (picoquic #2347), and stream receive
+  caches its first buffered segment (#2349).
 - picoquic 36e1418c: a crafted version-upgrade request no longer hangs the network thread (picoquic
   #2331), and the lost-feedback signal no longer drops BBR's or C4's window on an app-limited path (#2337).
 - picoquic dropped fusion AES-GCM (#2326), so AES-GCM always comes from the linked OpenSSL. On 3.5 a relay
   runs about 2% fewer instructions per send than with fusion, on 3.0 about 8% more; `build.sh` warns
   below 3.5.
-- Carries picoquic #2330 until it merges: deleting a splay node with two children no longer rescans
-  the successor path, which made successive root deletes quadratic.
 - picoquic b9893f28: wake scheduling uses a uint64 splay tree (picoquic #2328) and packet setup no longer
   clears the payload buffer (#2327).
 - A stream write posts a TX event only when picoquic has parked the stream, and a TX event checks its
