@@ -2,6 +2,7 @@
 
 ## v0.8.0 (unreleased)
 
+- `QuicConfiguration.use_af_xdp`, `TransportContext.start(use_af_xdp=)` and `AIOPQUIC_AF_XDP`: opt-in AF_XDP copy-mode TX through picoquic (Linux, CAP_NET_ADMIN and BPF), with sendmsg fallback per datagram. `TransportContext.tx_method` reports the method in use and why AF_XDP is off; `af_xdp_kick_failures` counts failed TX wakeups. The TX method is logged at start when AF_XDP is requested.
 - `TransportContext.counters` gains `loop_late_checks` and `loop_late_us`: how overdue the next connection's wake was before each wait, the network thread falling behind its own schedule.
 - Carries picoquic #2354 until it merges: BBR's `inflight_hi` starts unset, so a viewer that leaves Startup while application-limited is no longer capped below BDP. In a local fan-out overload, peak viewers rose from about 350 to 500, and backlog drains instead of staying stuck.
 - `QuicClientEngine`: raw QUIC client connections can share one network thread via `connect(engine=)`, as WebTransport sessions already could with `transport=`.

@@ -18,6 +18,7 @@ import logging as _logging
 import os
 import socket as _socket
 import sys
+import time as _time
 
 cimport cython
 from cpython.buffer cimport PyBuffer_FillInfo
@@ -259,6 +260,10 @@ cdef extern from *:
     void picoquic_get_default_path_quality(
         picoquic_cnx_t* cnx, picoquic_path_quality_t* quality)
 
+cdef extern from "picoquic_af_xdp.h":
+    const char* picoquic_tx_method_to_string(int method)
+    uint32_t picoquic_af_xdp_kick_failures(void* xdp)
+
 cdef extern from "tls_api.h":
     void picoquic_sort_key_exchange_algorithms(
         uint16_t* ordered_key_exchange, size_t nb_ordered_key_exchange)
@@ -272,6 +277,7 @@ cdef extern from "picoquic_packet_loop.h":
         int is_port_shared
         int socket_buffer_size
         int do_not_use_gso
+        int use_af_xdp
         int extra_socket_required
         int prefer_extra_socket
         int simulate_eio
@@ -288,6 +294,9 @@ cdef extern from "picoquic_packet_loop.h":
         int thread_should_close
         int thread_is_closed
         int return_code
+        int tx_method
+        char tx_method_reason[160]
+        void* af_xdp
 
     picoquic_network_thread_ctx_t* picoquic_start_network_thread(
         picoquic_quic_t* quic,
@@ -3173,7 +3182,8 @@ cdef class TransportContext:
               bint reset_stream_at=True,
               uint32_t client_sockets=0,
               congestion_control_options=None,
-              bint packet_train_mode=False):
+              bint packet_train_mode=False,
+              use_af_xdp=None):
         """
         Create the picoquic context and start the network thread.
 
@@ -3185,6 +3195,11 @@ cdef class TransportContext:
             is_client: Client mode; servers do not verify peers.
             client_sockets: Above 1, on a client with no fixed port or host,
                 connections send from that many sockets in turn, on Linux.
+            use_af_xdp: Linux: send through picoquic's AF_XDP copy mode
+                (needs CAP_NET_ADMIN and BPF); a datagram it can't take,
+                or every datagram if it can't open, goes out by sendmsg.
+                None: the AIOPQUIC_AF_XDP environment variable decides.
+                Not used by the multi-socket client loop.
             verify_peer: Client mode: verify the server's certificate chain
                 and its name against the SNI. False accepts any
                 certificate.
@@ -3614,6 +3629,10 @@ cdef class TransportContext:
                 pass
         self._param.do_not_use_gso = 0 if _gso_default else 1
         self._param.send_length_max = _slm_default
+        if use_af_xdp is None:
+            use_af_xdp = os.environ.get("AIOPQUIC_AF_XDP", "0") not in (
+                "", "0", "false", "False")
+        self._param.use_af_xdp = 1 if use_af_xdp else 0
 
         # Start the network thread
         cdef int ret = 0
@@ -3637,6 +3656,8 @@ cdef class TransportContext:
         # requires picoquic_network_thread_ctx_t*, NOT picoquic_quic_t*
         # — a type mismatch here is a silent UAF-class corruption.
         self._ctx.thread_ctx = self._thread_ctx
+        if use_af_xdp:
+            self._log_tx_method()
 
         self._max_connections = max_connections if max_connections > 0 else 1  # picoquic's floor
         self._started = True
@@ -3681,6 +3702,32 @@ cdef class TransportContext:
         if self._thread_ctx is NULL:
             return False
         return self._thread_ctx.thread_is_ready != 0
+
+    @property
+    def tx_method(self):
+        """(method, reason): how the network thread sends, and why
+        AF_XDP is off when it is. Valid once thread_ready."""
+        if self._thread_ctx is NULL:
+            return ("sendmsg", "")
+        cdef const char* name = picoquic_tx_method_to_string(
+            self._thread_ctx.tx_method)
+        return (name.decode(),
+                self._thread_ctx.tx_method_reason.decode(errors="replace"))
+
+    @property
+    def af_xdp_kick_failures(self):
+        """AF_XDP TX wakeups that failed after a frame was queued; the
+        frame stays queued. 0 without AF_XDP."""
+        if self._thread_ctx is NULL or self._thread_ctx.af_xdp is NULL:
+            return 0
+        return picoquic_af_xdp_kick_failures(self._thread_ctx.af_xdp)
+
+    def _log_tx_method(self):
+        deadline = _time.monotonic() + 1.0
+        while not self.thread_ready and _time.monotonic() < deadline:
+            _time.sleep(0.001)
+        method, reason = self.tx_method
+        _log.info("TX method: %s%s", method, f" ({reason})" if reason else "")
 
     def wake_up(self):
         """Signal the network thread to process TX ring entries.

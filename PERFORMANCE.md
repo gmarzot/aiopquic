@@ -263,6 +263,19 @@ AIOPQUIC_GSO=0                  # force off (diagnostic only)
 AIOPQUIC_SEND_LENGTH_MAX=8192   # cap kernel-coalesced buffer (Linux GSO on)
 ```
 
+### AF_XDP transmit (Linux, opt-in)
+
+`QuicConfiguration.use_af_xdp=True`, `TransportContext.start(use_af_xdp=True)`
+or `AIOPQUIC_AF_XDP=1` asks picoquic's network thread for AF_XDP copy-mode
+TX. It needs CAP_NET_ADMIN and BPF: picoquic attaches a pass-through XDP
+program to the interface. Egress then bypasses the UDP stack and netfilter,
+so UDP `OutDatagrams` stops counting it. Receive stays on the UDP socket. A
+datagram AF_XDP can't take (loopback, unknown neighbor, full TX ring) goes
+out by sendmsg, and if AF_XDP can't open at all every datagram does.
+`TransportContext.tx_method` gives `(method, reason)` once `thread_ready`;
+`af_xdp_kick_failures` counts failed TX wakeups. The multi-socket client
+loop (`client_sockets` > 1) does not use it.
+
 ### qlog / textlog tracing
 
 Off by default — at multi-Gbps rates, writing qlog roughly halves

@@ -1528,6 +1528,7 @@ async def connect_webtransport(
                     (configuration.keep_alive_interval or 0) * 1000),
                 socket_buffer_size=(
                     configuration.socket_buffer_size or 0),
+                use_af_xdp=configuration.use_af_xdp,
                 qlog_dir=configuration.qlog_dir,
                 key_exchange_groups=getattr(
                     configuration, 'key_exchange_groups', None),
@@ -1660,6 +1661,7 @@ async def serve_webtransport(
                     (configuration.keep_alive_interval or 0) * 1000),
                 socket_buffer_size=(
                     configuration.socket_buffer_size or 0),
+                use_af_xdp=configuration.use_af_xdp,
                 qlog_dir=configuration.qlog_dir,
                 key_exchange_groups=getattr(
                     configuration, 'key_exchange_groups', None),
