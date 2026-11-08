@@ -40,6 +40,10 @@ class QuicConfiguration:
     # memory when running many sockets (e.g. high subscriber-process
     # fan-out, where N × clamped-buffer adds up).
     socket_buffer_size: int | None = None
+    # Linux: send through picoquic's AF_XDP copy mode (needs CAP_NET_ADMIN
+    # and BPF), falling back to sendmsg per datagram. None: the
+    # AIOPQUIC_AF_XDP environment variable decides.
+    use_af_xdp: bool | None = None
     is_client: bool = True
     # Initial flow-control windows advertised to the peer at handshake.
     # The peer is bound by spec to never send more than max_stream_data

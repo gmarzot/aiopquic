@@ -273,6 +273,7 @@ class QuicConnection:
             keep_alive_interval_ms=int((cfg.keep_alive_interval or 0)
                                         * 1000),
             socket_buffer_size=(cfg.socket_buffer_size or 0),
+            use_af_xdp=getattr(cfg, 'use_af_xdp', None),
             qlog_dir=cfg.qlog_dir,
             cipher_suite=cfg.cipher_suite or 0,
             key_update_interval=cfg.key_update_interval or 0,
@@ -1340,6 +1341,7 @@ class QuicEngine:
             keep_alive_interval_ms=int((cfg.keep_alive_interval or 0)
                                         * 1000),
             socket_buffer_size=(cfg.socket_buffer_size or 0),
+            use_af_xdp=getattr(cfg, 'use_af_xdp', None),
             qlog_dir=cfg.qlog_dir,
             max_connections=getattr(cfg, 'max_connections', 256),
             cipher_suite=cfg.cipher_suite or 0,
