@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.8.0 (unreleased)
+## v0.8.0rc1
 
 - `QuicConnection.send_stream_data` and `send_stream_data_drained` take `priority=`, applied with a stream's first write in one TX event.
 - `TransportContext.counters` gains `loop_late_checks` and `loop_late_us`: how overdue the next connection's wake was before each wait, the network thread falling behind its own schedule.
