@@ -2036,6 +2036,19 @@ static void aiopquic_run_deferred_resets(picoquic_quic_t* quic,
  * Packet loop callback. The TX ring drains on a wake-up and, for entries
  * whose producers skipped the wake, before each wait.
  */
+static inline void aiopquic_apply_stream_priority(aiopquic_ctx_t* ctx,
+                                                  picoquic_cnx_t* cnx,
+                                                  uint64_t stream_id,
+                                                  uint8_t priority) {
+    int ret = picoquic_set_stream_priority(cnx, stream_id, priority);
+    if (ret == 0) {
+        ctx->worker_set_priority_applied++;
+    } else {
+        ctx->worker_set_priority_rejected++;
+        ctx->worker_set_priority_last_err = (uint64_t)ret;
+    }
+}
+
 static int aiopquic_loop_cb(picoquic_quic_t* quic,
                              picoquic_packet_loop_cb_enum cb_mode,
                              void* callback_ctx,
@@ -2228,6 +2241,11 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                          * stream callbacks. WT pushes stream_ctx = NULL
                          * (h3zero owns app_stream_ctx) — use v2 so the
                          * h3zero pointer isn't clobbered. */
+                        if (entry->error_code != 0) {
+                            aiopquic_apply_stream_priority(
+                                ctx, cnx, entry->stream_id,
+                                (uint8_t)(entry->error_code - 1));
+                        }
                         if (entry->stream_ctx != NULL) {
                             if (aiopquic_cnx_closing(cnx)) {
                                 ctx->cnt_tx_reattach_after_close++;
@@ -2271,16 +2289,9 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         break;
                     }
                     case SPSC_EVT_TX_SET_STREAM_PRIORITY: {
-                        int pri_ret = picoquic_set_stream_priority(
-                            cnx, entry->stream_id,
+                        aiopquic_apply_stream_priority(
+                            ctx, cnx, entry->stream_id,
                             (uint8_t)entry->error_code);
-                        if (pri_ret == 0) {
-                            ctx->worker_set_priority_applied++;
-                        } else {
-                            ctx->worker_set_priority_rejected++;
-                            ctx->worker_set_priority_last_err =
-                                (uint64_t)pri_ret;
-                        }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;

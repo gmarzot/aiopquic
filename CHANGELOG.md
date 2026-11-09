@@ -2,6 +2,7 @@
 
 ## v0.8.0 (unreleased)
 
+- `QuicConnection.send_stream_data` and `send_stream_data_drained` take `priority=`, applied with a stream's first write in one TX event.
 - `TransportContext.counters` gains `loop_late_checks` and `loop_late_us`: how overdue the next connection's wake was before each wait, the network thread falling behind its own schedule.
 - Carries picoquic #2354 until it merges: BBR's `inflight_hi` starts unset, so a viewer that leaves Startup while application-limited is no longer capped below BDP. In a local fan-out overload, peak viewers rose from about 350 to 500, and backlog drains instead of staying stuck.
 - `QuicClientEngine`: raw QUIC client connections can share one network thread via `connect(engine=)`, as WebTransport sessions already could with `transport=`.
