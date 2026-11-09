@@ -32,6 +32,7 @@ must reach the worker behind every MARK queued before it.
         event is never routed. Exits 0 when no ring is left.
 """
 import asyncio
+import contextlib
 import gc
 import os
 import sys
@@ -256,7 +257,9 @@ async def raw_engine_close(port, cert, key):
         client._quic.send_datagram_frame(PAYLOAD)
         await asyncio.wait_for(echoed.wait(), timeout=5.0)
         server.close()
-        await asyncio.wait_for(client.wait_closed(), timeout=5.0)
+        # A stopping server may not get its close out.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(client.wait_closed(), timeout=5.0)
     gc.collect()
     left = TransportContext().counters["dgram_rings_alive_total"] - base
     if left:
