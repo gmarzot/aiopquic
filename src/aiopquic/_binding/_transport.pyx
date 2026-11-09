@@ -2709,7 +2709,8 @@ cdef class TransportContext:
     def tx_send_atomic(self, uint64_t stream_id, bytes data,
                         bint end_stream, uintptr_t cnx_ptr,
                         uintptr_t stream_ctx,
-                        uint32_t stream_ring_cap):
+                        uint32_t stream_ring_cap,
+                        int priority=-1):
         """Atomic send_stream_data primitive — all-or-nothing.
 
         Composes ensure-tx-ring + tx-event-ring capacity check + per-
@@ -2729,12 +2730,18 @@ cdef class TransportContext:
             1   TX event ring full (caller retries)
             2   per-stream send ring full (caller retries)
            -1   allocation failure (sc->tx couldn't be created)
+
+        priority (0-255, -1 for none) is applied ahead of the bytes,
+        in the same event when this write activates the stream.
         """
         cdef aiopquic_stream_ctx_t* sc = <aiopquic_stream_ctx_t*>stream_ctx
         cdef const uint8_t* data_ptr = NULL
         cdef uint32_t data_len = 0
         cdef spsc_entry_t entry
         cdef int rc
+
+        if not -1 <= priority <= 255:
+            raise OverflowError(f"stream priority out of range: {priority}")
 
         self._send_calls += 1
 
@@ -2775,6 +2782,8 @@ cdef class TransportContext:
         # without a MARK_ACTIVE or a wake.
         if not aiopquic_stream_ctx_tx_arm(sc):
             self._ctx.cnt_tx_mark_active_skipped += 1
+            if priority >= 0:
+                self.set_stream_priority(cnx_ptr, stream_id, priority)
             return 0
 
         # Push MARK_ACTIVE event. Pre-check above guarantees room
@@ -2785,6 +2794,7 @@ cdef class TransportContext:
         entry.stream_id = stream_id
         entry.cnx = <void*>cnx_ptr
         entry.stream_ctx = <void*>sc
+        entry.error_code = <uint64_t>(priority + 1)
         rc = aiopquic_tx_push_sc(self._ctx, &entry, NULL, 0)
         if rc == 0:
             self._ctx.cnt_tx_event_ring_pushes += 1
@@ -2809,7 +2819,8 @@ cdef class TransportContext:
 
     def tx_send_stream(self, uintptr_t cnx_ptr, uint64_t stream_id,
                         bytes data, bint end_stream=False,
-                        uint32_t stream_ring_cap=AIOPQUIC_TX_DATA_RING_CAP_DEFAULT):
+                        uint32_t stream_ring_cap=AIOPQUIC_TX_DATA_RING_CAP_DEFAULT,
+                        int priority=-1):
         """Test-friendly low-level pull-model send primitive.
 
         Wraps tx_send_atomic with per-(cnx, sid) stream-context lifecycle
@@ -2847,7 +2858,7 @@ cdef class TransportContext:
         else:
             sc_ptr = <uintptr_t>cached
         rc = self.tx_send_atomic(stream_id, data, end_stream,
-                                  cnx_ptr, sc_ptr, stream_ring_cap)
+                                  cnx_ptr, sc_ptr, stream_ring_cap, priority)
         if rc == 1:
             raise BufferError(
                 f"TX event ring full (stream={stream_id})"

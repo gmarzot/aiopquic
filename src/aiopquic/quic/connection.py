@@ -823,7 +823,8 @@ class QuicConnection:
         self._sc_owned.clear()
 
     def send_stream_data(self, stream_id: int, data: bytes,
-                         end_stream: bool = False) -> None:
+                         end_stream: bool = False,
+                         priority: int | None = None) -> None:
         """Send data on a stream — PULL-model with real backpressure.
 
         Calls the atomic Cython send primitive that bundles per-stream-
@@ -834,7 +835,8 @@ class QuicConnection:
 
         Raises BufferError on any retryable backpressure (TX event ring
         full or per-stream send ring full); raises MemoryError on
-        allocation failure.
+        allocation failure. `priority` is set_stream_priority() ahead of
+        these bytes, in one event on a stream's first write.
 
         Post-close: returns cleanly without committing or raising.
         Mirrors the WT-side self-protective gate so producers racing
@@ -853,6 +855,7 @@ class QuicConnection:
             sc,
             getattr(self._configuration, 'stream_ring_cap',
                     _STREAM_RING_CAP),
+            -1 if priority is None else priority,
         )
         if rc == 1:
             raise BufferError(
@@ -872,7 +875,8 @@ class QuicConnection:
                                          end_stream: bool = False,
                                          *,
                                          soft_yield_at: float = 0.5,
-                                         hard_wait_at: float = 0.9) -> None:
+                                         hard_wait_at: float = 0.9,
+                                         priority: int | None = None) -> None:
         """Send with built-in TX-ring backpressure for raw QUIC.
 
         Composes send_stream_data + get_tx_data_drain_event + tx_event_ring_fill
@@ -982,7 +986,8 @@ class QuicConnection:
             sc_event.clear()
             ring_event.clear()
             try:
-                self.send_stream_data(stream_id, data, end_stream=end_stream)
+                self.send_stream_data(stream_id, data, end_stream=end_stream,
+                                      priority=priority)
                 if self.tx_event_ring_fill() > soft_yield_at:
                     await asyncio.sleep(0)
                 return
