@@ -12,7 +12,7 @@ from aiopquic.asyncio.protocol import QuicConnectionProtocol
 from aiopquic.asyncio.server import serve
 from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.connection import _EVT_ALMOST_READY, _TX_CONNECT
-from aiopquic.quic.events import StreamDataReceived
+from aiopquic.quic.events import ConnectionTerminated, StreamDataReceived
 
 from ._ports import next_port
 
@@ -405,3 +405,80 @@ async def test_failed_creation_fails_a_standalone_dial():
         assert time.monotonic() - started < 3
     finally:
         server_a.close()
+
+
+class Recorded(Client):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.terminated = []
+
+    def quic_event_received(self, event):
+        super().quic_event_received(event)
+        if isinstance(event, ConnectionTerminated):
+            self.terminated.append(event)
+
+
+class RecordedEcho(Echo):
+    seen: list = []
+
+    def quic_event_received(self, event):
+        super().quic_event_received(event)
+        if isinstance(event, ConnectionTerminated):
+            RecordedEcho.seen.append(self)
+
+
+async def test_engine_close_gives_every_protocol_its_terminal_event():
+    port, server = await _server()
+    engine = QuicClientEngine()
+    cms = [connect("127.0.0.1", port, configuration=_client_cfg(),
+                   create_protocol=Recorded, engine=engine) for _ in range(2)]
+    try:
+        clients = [await cm.__aenter__() for cm in cms]
+        for i, c in enumerate(clients):
+            assert await c.echo(bytes([i])) == bytes([i])
+        engine.close()
+        for c in clients:
+            assert len(c.terminated) == 1
+            assert c.terminated[0].frame_type == 0
+            await asyncio.wait_for(c.wait_closed(), 0.2)
+        started = time.monotonic()
+        for cm in reversed(cms):
+            await cm.__aexit__(None, None, None)
+        assert time.monotonic() - started < 0.5
+    finally:
+        engine.close()
+        server.close()
+
+
+async def test_engine_close_fails_a_dial_waiting_for_its_connection():
+    port, server = await _server()
+    engine = GatedEngine()
+    try:
+        dial = asyncio.create_task(_open(port, engine).__aenter__())
+        await asyncio.wait_for(engine.created.wait(), 5)
+        started = time.monotonic()
+        engine.close()
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(dial, 1)
+        assert time.monotonic() - started < 1
+        assert not engine._pending
+    finally:
+        engine.close()
+        server.close()
+
+
+async def test_server_close_gives_its_protocols_a_terminal_event():
+    port = next_port()
+    cfg = QuicConfiguration(is_client=False, alpn_protocols=[ALPN])
+    cfg.load_cert_chain(CERT_FILE, KEY_FILE)
+    RecordedEcho.seen = []
+    server = await serve("127.0.0.1", port, configuration=cfg,
+                         create_protocol=RecordedEcho)
+    try:
+        async with _open(port, None) as c:
+            assert await c.echo(b"s") == b"s"
+            server.close()
+            assert len(RecordedEcho.seen) == 1
+            assert RecordedEcho.seen[0]._closed.is_set()
+    finally:
+        server.close()

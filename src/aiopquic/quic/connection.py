@@ -663,6 +663,18 @@ class QuicConnection:
             return 0.0
         return self._transport.tx_event_ring_count / cap
 
+    def _engine_closed(self) -> None:
+        """The engine stopped under this connection: end it as a local
+        close and wake parked writers. The worker is already joined."""
+        self._closed = True
+        self._append_terminated(_EVT_CLOSE, 0, b"engine closed", _CLOSE_LOCAL)
+        for ev in self._stream_tx_drain_events.values():
+            ev.set()
+        self._dgram_tx_drain_event.set()
+        self._destroy_stream_ctxs()
+        self._release_dgram_ring()
+        self._cnx_ptr = 0
+
     def _fail_create(self, reason: str) -> None:
         """The cnx was never created: end the connection as a local close."""
         self._create_failed = True
@@ -1454,9 +1466,13 @@ class QuicEngine:
         if self._transport is not None:
             self._transport.stop()
             self._transport = None
-        # CLOSE events still queued are never routed; release their rings.
-        for conn in self._connections.values():
-            conn._release_dgram_ring()
+        # CLOSE events still queued are never routed: end each connection
+        # here, so its protocol sees ConnectionTerminated.
+        for cnx_ptr, conn in list(self._connections.items()):
+            conn._engine_closed()
+            proto = self._protocols.get(cnx_ptr)
+            if proto is not None:
+                proto._process_events()
         # Now safe to drop Python state; picoquic is fully torn down.
         self._connections.clear()
         self._protocols.clear()

@@ -107,6 +107,12 @@ class QuicClientEngine(QuicEngine):
         if self._transport is not None:
             clear_reader(self._loop, self._transport, self)
         super().close()
+        # Dials still waiting for their connection fail now.
+        while self._pending:
+            protocol = self._pending.popleft()
+            if protocol is not None:
+                protocol._quic._fail_create("engine closed")
+                protocol._process_events()
 
 
 @asynccontextmanager

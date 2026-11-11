@@ -2,6 +2,7 @@
 
 ## v0.8.0 (unreleased)
 
+- `QuicEngine.close()` (a server, or a `QuicClientEngine`) gives every open connection's protocol a local `ConnectionTerminated`, so `wait_closed()` returns and `connect(engine=)` exits at once instead of after its 2 s close timeout; dials still waiting for a connection fail.
 - `QuicClientEngine`: a dial cancelled before its connection exists no longer hands that connection to the next dial (it is closed), and a connection the network thread fails to create fails its own dial at once instead of shifting later ones.
 
 ## v0.8.0rc1
