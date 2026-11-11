@@ -1079,9 +1079,18 @@ class QuicConnection:
             return 0
         if rc == 2:
             # Record committed but the mark didn't post (TX event ring
-            # full). Re-posted at the next send or drained-ring event.
+            # full). Re-posted at the next send or ring drain.
             self._dgram_mark_owed = True
+            self._transport._owe_dgram_mark(self)
         return len(data)
+
+    def _repost_dgram_mark(self) -> None:
+        if not (self._dgram_mark_owed and self._dgram_ring and self._cnx_ptr):
+            return
+        if self._transport.dgram_mark_ready(self._cnx_ptr, self._dgram_ring) == 0:
+            self._dgram_mark_owed = False
+        else:
+            self._transport._owe_dgram_mark(self)
 
     def get_datagram_tx_drain_event(self) -> asyncio.Event:
         """Event set when the worker drains room in the datagram record

@@ -750,10 +750,20 @@ class WebTransportSession:
                 f"datagram payload {len(data)} exceeds "
                 f"max_datagram_payload() = {self._dgram_max_payload}")
         # Records are committed. A full TX event ring leaves the mark
-        # owed; it is re-posted at the next send or drain.
+        # owed; it is re-posted at the next send or ring drain.
         if self._state.push_dgram_ready(self._dgram_ring) != 0:
             self._dgram_mark_owed = True
+            self._transport._owe_dgram_mark(self)
         return len(data)
+
+    def _repost_dgram_mark(self) -> None:
+        if not (self._dgram_mark_owed and self._dgram_ring
+                and not self._session_closed.is_set()):
+            return
+        if self._state.push_dgram_ready(self._dgram_ring) == 0:
+            self._dgram_mark_owed = False
+        else:
+            self._transport._owe_dgram_mark(self)
 
     def get_datagram_tx_drain_event(self) -> asyncio.Event:
         """Event set when the worker drains room in the datagram record
