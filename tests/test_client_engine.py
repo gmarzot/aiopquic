@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import os
 import sys
+import tempfile
 import time
 
 import pytest
@@ -481,4 +482,21 @@ async def test_server_close_gives_its_protocols_a_terminal_event():
             assert len(RecordedEcho.seen) == 1
             assert RecordedEcho.seen[0]._closed.is_set()
     finally:
+        server.close()
+
+
+async def test_shared_engine_writes_the_session_ticket_file():
+    port, server = await _server()
+    engine = QuicClientEngine()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tickets = os.path.join(td, "tickets.bin")
+            cfg = _client_cfg(session_ticket_file=tickets)
+            async with connect("127.0.0.1", port, configuration=cfg,
+                               create_protocol=Client, engine=engine) as c:
+                assert await c.echo(b"t") == b"t"
+            engine.close()
+            assert os.path.getsize(tickets) > 0
+    finally:
+        engine.close()
         server.close()
