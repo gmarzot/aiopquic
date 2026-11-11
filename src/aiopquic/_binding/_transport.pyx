@@ -1329,6 +1329,9 @@ cdef class TransportContext:
     # Connection-global TX-ring drain wakeup. Lazy-allocated on first
     # access (needs a running event loop); see tx_event_ring_drain_event.
     cdef object _tx_event_ring_drain_event
+    # Datagram senders whose MARK the full TX event ring refused; each
+    # re-posts it on the next ring drain.
+    cdef set _dgram_mark_owers
     # Test-friendly low-level pull primitive: per-(cnx, sid) sc_ptr
     # tracker for tx_send_stream(). Production code uses
     # QuicConnection.send_stream_data which manages its own per-cnx
@@ -1372,6 +1375,7 @@ cdef class TransportContext:
         self._send_busy_stream_ring = 0
         self._send_alloc_fail = 0
         self._tx_event_ring_drain_event = None
+        self._dgram_mark_owers = set()
         self._test_stream_ctxs = {}
         self._cnx_snapshots = {}
         self._snapshot_drops = []
@@ -2249,6 +2253,8 @@ cdef class TransportContext:
                 if self._tx_event_ring_drain_event is not None:
                     self._tx_event_ring_drain_event.set()
                 spsc_ring_pop(self._ctx.rx_event_ring)
+                if self._dgram_mark_owers:
+                    self._repost_dgram_marks()
                 continue
 
             # A cnx snapshot answering a refresh: cache it, never deliver.
@@ -2536,6 +2542,8 @@ cdef class TransportContext:
                     self._tx_event_ring_drain_event.set()
                 spsc_ring_pop(self._ctx.rx_event_ring)
                 count += 1
+                if self._dgram_mark_owers:
+                    self._repost_dgram_marks()
                 continue
 
             if entry.event_type == SPSC_EVT_CNX_SNAPSHOT:
@@ -2922,6 +2930,20 @@ cdef class TransportContext:
             if aiopquic_tx_wake_needed(self._ctx):
                 picoquic_wake_up_network_thread(self._thread_ctx)
         return 0
+
+    def _owe_dgram_mark(self, owner):
+        """owner._repost_dgram_mark() runs at the next TX event ring drain."""
+        self._dgram_mark_owers.add(owner)
+        aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
+
+    def _repost_dgram_marks(self):
+        owers = self._dgram_mark_owers
+        self._dgram_mark_owers = set()
+        for owner in owers:
+            try:
+                owner._repost_dgram_mark()
+            except Exception:
+                _log.exception("datagram MARK re-post failed")
 
     def dgram_send(self, uintptr_t cnx_ptr, uintptr_t db_ptr, bytes data):
         """Commit one datagram record and arm the scheduler.

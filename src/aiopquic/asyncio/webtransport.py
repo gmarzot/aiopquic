@@ -137,7 +137,10 @@ class WebTransportSession:
         # call appends a future; the WT_STREAM_CREATED handler popleft's
         # and resolves it. Picoquic processes the TX ring serially and
         # emits responses in the same order, so 1:1 pairing is correct.
-        self._pending_creates: deque[asyncio.Future] = deque()
+        # Submitted creates awaiting their reply, each with the initial
+        # bytes it reserves against the TX budget until then.
+        self._pending_creates: deque[tuple[asyncio.Future, int]] = deque()
+        self._tx_reserved = 0
         self._orphan_stream_commands: deque[tuple[int, bool]] = deque()
         self._orphan_cleanup_task: asyncio.Task | None = None
         self._ring_parked_creates = 0
@@ -263,7 +266,7 @@ class WebTransportSession:
         a 2 ms poll, since the producer is far ahead of the wire
         whenever this engages. Session close exits the park."""
         cap = self.tx_max_queued_bytes
-        if (not cap or tx_data_bytes_queued() <= cap
+        if (not cap or tx_data_bytes_queued() + self._tx_reserved <= cap
                 or self._tx_backlog() <= cap):
             return
         low = cap // 2
@@ -328,7 +331,8 @@ class WebTransportSession:
                 raise WebTransportError("WT session closed")
         # No await between the push and the append: replies pair in order.
         fut = self._loop.create_future()
-        self._pending_creates.append(fut)
+        self._pending_creates.append((fut, len(initial)))
+        self._tx_reserved += len(initial)
         try:
             sid = await asyncio.wait_for(
                 fut, timeout=max(deadline - self._loop.time(), 0))
@@ -457,9 +461,19 @@ class WebTransportSession:
         return self._transport.tx_data_ring_sent(sc_ptr)
 
     def _tx_backlog(self) -> int:
-        """Bytes queued in this session's stream rings, not yet pulled."""
-        return sum(self._transport.tx_data_ring_used(sc_ptr)
-                   for sc_ptr in list(self._stream_tx_ctxs.values()))
+        """Bytes queued in this session's stream rings, not yet pulled,
+        plus the initial bytes of creates not yet answered."""
+        return self._tx_reserved + sum(
+            self._transport.tx_data_ring_used(sc_ptr)
+            for sc_ptr in list(self._stream_tx_ctxs.values()))
+
+    def _pop_pending_create(self) -> asyncio.Future | None:
+        """Take the oldest submitted create, releasing its reservation."""
+        if not self._pending_creates:
+            return None
+        fut, reserved = self._pending_creates.popleft()
+        self._tx_reserved -= reserved
+        return fut
 
     def set_tx_data_drain_pending(self, stream_id: int) -> None:
         """Arm the per-stream sc->tx_drain_pending flag so the next
@@ -750,10 +764,20 @@ class WebTransportSession:
                 f"datagram payload {len(data)} exceeds "
                 f"max_datagram_payload() = {self._dgram_max_payload}")
         # Records are committed. A full TX event ring leaves the mark
-        # owed; it is re-posted at the next send or drain.
+        # owed; it is re-posted at the next send or ring drain.
         if self._state.push_dgram_ready(self._dgram_ring) != 0:
             self._dgram_mark_owed = True
+            self._transport._owe_dgram_mark(self)
         return len(data)
+
+    def _repost_dgram_mark(self) -> None:
+        if not (self._dgram_mark_owed and self._dgram_ring
+                and not self._session_closed.is_set()):
+            return
+        if self._state.push_dgram_ready(self._dgram_ring) == 0:
+            self._dgram_mark_owed = False
+        else:
+            self._transport._owe_dgram_mark(self)
 
     def get_datagram_tx_drain_event(self) -> asyncio.Event:
         """Event set when the worker drains room in the datagram record
@@ -820,8 +844,7 @@ class WebTransportSession:
         if self._orphan_cleanup_task is not None or self._ring_parked_creates:
             self._transport.tx_event_ring_drain_event.set()
         self._orphan_stream_commands.clear()
-        while self._pending_creates:
-            fut = self._pending_creates.popleft()
+        while (fut := self._pop_pending_create()) is not None:
             if not fut.done():
                 fut.set_exception(WebTransportError("WT session closed"))
         # Wake any producer parked in send_stream_data_drained awaiting a
@@ -1079,7 +1102,8 @@ class WebTransportSession:
                         pass
                 return
             # Every native reply consumes exactly one submitted request.
-            fut = self._pending_creates.popleft() if self._pending_creates else None
+            # The reply's ring, registered below, takes over the reservation.
+            fut = self._pop_pending_create()
             if error_code != 0 or fut is None or fut.done():
                 if sid:
                     self._retire_orphan_stream(sid)
