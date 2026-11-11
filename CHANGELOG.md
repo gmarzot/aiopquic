@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.0 (unreleased)
+
+- `QuicClientEngine`: a dial cancelled before its connection exists no longer hands that connection to the next dial (it is closed), and a connection the network thread fails to create fails its own dial at once instead of shifting later ones.
+
 ## v0.8.0rc1
 
 - `QuicConnection.send_stream_data` and `send_stream_data_drained` take `priority=`, applied with a stream's first write in one TX event.

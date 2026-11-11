@@ -201,8 +201,10 @@ class QuicConnection:
         # awaited by aiomoqt's stream_write_drain on BufferError.
         # Lazy-created on first reference from either side.
         self._stream_tx_drain_events: dict[int, asyncio.Event] = {}
-        # Set once the worker has created the picoquic cnx (ALMOST_READY).
+        # Set once the worker has answered connect() (ALMOST_READY);
+        # _create_failed when it could not create the cnx.
         self._created = asyncio.Event()
+        self._create_failed = False
         if cnx_ptr != 0:
             self._created.set()
 
@@ -496,6 +498,8 @@ class QuicConnection:
             if cnx_ptr != 0:
                 self._cnx_ptr = cnx_ptr
                 self._created.set()
+            elif not self._created.is_set():
+                self._fail_create("connection not created")
         elif evt_type == _EVT_DATAGRAM:
             self._events.append(DatagramFrameReceived(
                 data=data if data is not None else memoryview(b""),
@@ -658,6 +662,14 @@ class QuicConnection:
         if not cap:
             return 0.0
         return self._transport.tx_event_ring_count / cap
+
+    def _fail_create(self, reason: str) -> None:
+        """The cnx was never created: end the connection as a local close."""
+        self._create_failed = True
+        self._closed = True
+        self._append_terminated(_EVT_CLOSE, QuicErrorCode.INTERNAL_ERROR,
+                                reason.encode(), _CLOSE_LOCAL)
+        self._created.set()
 
     def _append_terminated(self, evt_type: int, error_code: int, data,
                            flags: int = 0) -> None:

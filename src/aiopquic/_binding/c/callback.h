@@ -2119,6 +2119,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
 
                 if (entry->event_type == SPSC_EVT_TX_CONNECT) {
                     const uint8_t* raw = (const uint8_t*)entry->data_buf;
+                    picoquic_cnx_t* new_cnx = NULL;
                     if (raw && entry->data_length >=
                             sizeof(aiopquic_connect_params_t)) {
                         const aiopquic_connect_params_t* p =
@@ -2145,7 +2146,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
 
                         /* picoquic_create_client_cnx, with the desired version
                          * set before the first Initial goes out. */
-                        picoquic_cnx_t* new_cnx = picoquic_create_cnx(
+                        new_cnx = picoquic_create_cnx(
                             quic, picoquic_null_connection_id,
                             picoquic_null_connection_id,
                             (struct sockaddr*)&p->addr,
@@ -2163,12 +2164,13 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                                 new_cnx = NULL;
                             }
                         }
-                        if (new_cnx) {
-                            spsc_entry_t resp = {0};
-                            resp.event_type = SPSC_EVT_ALMOST_READY;
-                            resp.cnx = new_cnx;
-                            (void)aiopquic_rx_push(ctx, &resp, NULL, 0);
-                        }
+                    }
+                    /* One reply per CONNECT, in order; cnx NULL = not created. */
+                    {
+                        spsc_entry_t resp = {0};
+                        resp.event_type = SPSC_EVT_ALMOST_READY;
+                        resp.cnx = new_cnx;
+                        (void)aiopquic_rx_push(ctx, &resp, NULL, 0);
                     }
                     ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                     aiopquic_maybe_fire_tx_event_ring_drained(ctx);

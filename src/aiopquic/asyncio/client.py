@@ -52,7 +52,9 @@ class QuicClientEngine(QuicEngine):
         self._ring_capacity = ring_capacity
         self._max_connections = max_connections
         self._sockets = sockets
-        self._pending: deque[QuicConnectionProtocol] = deque()
+        # One entry per CONNECT submitted, in order; None for a dial that
+        # gave up before its reply.
+        self._pending: deque[QuicConnectionProtocol | None] = deque()
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def _ensure_started(self, configuration: QuicConfiguration,
@@ -72,12 +74,18 @@ class QuicClientEngine(QuicEngine):
         evt_type, cnx_ptr = ev[0], ev[5]
         protocol = self._protocols.get(cnx_ptr)
         if protocol is None:
-            # The worker creates connections in connect() order and pushes
-            # ALMOST_READY for each before any other event of it.
-            if (cnx_ptr == 0 or evt_type != _EVT_ALMOST_READY
-                    or not self._pending):
+            # The worker answers each CONNECT in order with an ALMOST_READY
+            # ahead of any other event of it; cnx 0 when creation failed.
+            if evt_type != _EVT_ALMOST_READY or not self._pending:
                 return
             protocol = self._pending.popleft()
+            if cnx_ptr == 0:
+                if protocol is not None:
+                    protocol._quic._handle_raw_event(*ev)
+                    protocol._process_events()
+                return
+            if protocol is None:
+                protocol = self._close_abandoned(cnx_ptr)
             self._protocols[cnx_ptr] = protocol
             self._connections[cnx_ptr] = protocol._quic
         protocol._quic._handle_raw_event(*ev)
@@ -85,6 +93,15 @@ class QuicClientEngine(QuicEngine):
         if evt_type in (_EVT_CLOSE, _EVT_APP_CLOSE):
             self._connections.pop(cnx_ptr, None)
             self._protocols.pop(cnx_ptr, None)
+
+    def _close_abandoned(self, cnx_ptr: int) -> QuicConnectionProtocol:
+        """Bind the cnx of a dial that gave up to a bare protocol, closed."""
+        quic = QuicConnection(configuration=self._configuration, engine=self,
+                              cnx_ptr=cnx_ptr)
+        protocol = QuicConnectionProtocol(quic)
+        protocol._loop = self._loop
+        quic.close()
+        return protocol
 
     def close(self) -> None:
         if self._transport is not None:
@@ -139,8 +156,10 @@ async def connect(
         protocol._loop = loop
         engine._pending.append(protocol)
 
+    submitted = False
     try:
         protocol.connect((addr, port))
+        submitted = True
         if engine is not None:
             await protocol.wait_created()
         if wait_connected:
@@ -152,8 +171,13 @@ async def connect(
         yield protocol
     finally:
         if engine is not None and protocol in engine._pending:
-            # Never created: a stale entry would take the next connection's cnx.
-            engine._pending.remove(protocol)
+            # No reply yet. A submitted dial keeps its slot, so the next dial
+            # gets its own reply and the late cnx is closed.
+            i = engine._pending.index(protocol)
+            if submitted:
+                engine._pending[i] = None
+            else:
+                del engine._pending[i]
         try:
             await protocol.aclose()
         finally:

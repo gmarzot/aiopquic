@@ -142,6 +142,8 @@ class QuicConnectionProtocol:
             await asyncio.wait_for(self._quic._created.wait(), timeout)
         except asyncio.TimeoutError:
             raise ConnectionError("client connection was not created") from None
+        if self._quic._create_failed:
+            raise ConnectionError("client connection was not created")
 
     async def wait_closed(self) -> None:
         """Wait for connection to be fully closed."""
