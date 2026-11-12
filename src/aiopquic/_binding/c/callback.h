@@ -957,7 +957,7 @@ static inline void aiopquic_cnx_snapshot_fill(picoquic_cnx_t* cnx,
     s->cid_remote = picoquic_get_remote_cnxid(cnx);
     s->cid_initial = picoquic_get_initial_cnxid(cnx);
     picoquic_get_default_path_quality(cnx, &s->path_quality);
-    if (0 && cnx->nb_paths > 0 && cnx->path[0]->congestion_alg_state != NULL
+    if (cnx->nb_paths > 0 && cnx->path[0]->congestion_alg_state != NULL
             && cnx->congestion_alg != NULL
             && cnx->congestion_alg->alg_observe != NULL) {
         cnx->congestion_alg->alg_observe(cnx->path[0], &s->cc_state,
