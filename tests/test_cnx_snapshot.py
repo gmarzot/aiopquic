@@ -119,6 +119,29 @@ async def test_handshake_values_at_ready_and_live_values_refresh():
         server.close()
 
 
+@pytest.mark.parametrize("algo,states", [("bbr", range(9)),
+                                          ("cubic", range(3))])
+async def test_path_quality_reports_the_congestion_controller(algo, states):
+    port = next_port()
+    server = await serve("127.0.0.1", port, configuration=_server_cfg())
+    cfg = _client_cfg()
+    cfg.congestion_control_algorithm = algo
+    try:
+        async with connect("127.0.0.1", port, configuration=cfg) as client:
+            quic = client._quic
+            sid = quic.get_next_available_stream_id()
+            quic.send_stream_data(sid, b"y" * 200_000, end_stream=True)
+            await _eventually(
+                lambda: quic.path_quality()["bytes_sent"] > 100_000)
+            q = quic.path_quality()
+            assert q["cc_state"] & 0xff in states, q["cc_state"]
+            if algo == "bbr":
+                # The model bandwidth, bytes per second.
+                assert q["cc_param"] > 0, q
+    finally:
+        server.close()
+
+
 class _EchoServer(QuicConnectionProtocol):
     alpns = []
 

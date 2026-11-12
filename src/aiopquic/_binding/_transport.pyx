@@ -471,6 +471,8 @@ cdef extern from "c/callback.h":
         picoquic_connection_id_t cid_remote
         picoquic_connection_id_t cid_initial
         picoquic_path_quality_t path_quality
+        uint64_t cc_state
+        uint64_t cc_param
         uint64_t data_sent
         uint64_t data_received
         aiopquic_addr_t peer_addr
@@ -2017,6 +2019,14 @@ cdef class TransportContext:
         diagnostic signature of the BBR Startup-exit freeze observed
         on raw-QUIC P=1 loopback).
 
+        `cc_state` and `cc_param` are the congestion controller's own
+        report (picoquic alg_observe). bbr: the state in the low byte
+        (0 Startup, 1 Drain, 2-5 ProbeBW DOWN/CRUISE/REFILL/UP, 6
+        ProbeRTT), then the ack phase (bits 8-15) and the filled-pipe,
+        recovery, PTO-recovery, packet-conservation and idle-restart
+        flags (bits 16-20); the model bandwidth in bytes per second.
+        cubic: the state and W_max in packets.
+
         Values are as of the last worker snapshot; each call asks for a
         fresh one. Returns an empty dict on NULL cnx_ptr (cnx torn down
         or never opened) or before the first snapshot; callers should
@@ -2048,6 +2058,8 @@ cdef class TransportContext:
             'bytes_in_transit': q.bytes_in_transit,
             'bytes_sent': q.bytes_sent,
             'bytes_received': q.bytes_received,
+            'cc_state': s.cc_state,
+            'cc_param': s.cc_param,
         }
 
     @property

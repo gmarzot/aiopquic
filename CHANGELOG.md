@@ -4,6 +4,7 @@
 
 - Carries picoquic #2363 until it merges: h3zero parses an HTTP/3 frame type split across packets. A peer that sent a WebTransport stream's first byte on its own had the stream misread or the connection closed with H3_FRAME_UNEXPECTED, and a split reserved frame type after HEADERS dropped the DATA frame that followed.
 - Carries a picoquic Cubic fix until it merges upstream: a spurious-loss undo no longer sets cwin from the cubic curve over all the time since the last recovery, which grew cwin past 1e13 bytes on long low-loss sessions and left them unpaced.
+- `path_quality()` gains `cc_state` and `cc_param`, the congestion controller's own report: for bbr its state, substate flags and model bandwidth; for cubic its state and W_max.
 - WebTransport: a `create_stream(initial=...)` awaiting its reply counts its initial bytes against the session's `tx_max_queued_bytes`, so a burst of concurrent creates parks instead of queueing many times the budget.
 - A datagram whose ready signal a full TX event ring refused is re-signalled when that ring drains (raw QUIC and WebTransport), instead of waiting for the next datagram send.
 - `QuicClientEngine` honours `QuicConfiguration.session_ticket_file`: tickets load at engine start and are saved when it closes, as on a standalone client.

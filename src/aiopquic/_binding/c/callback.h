@@ -924,6 +924,9 @@ typedef struct {
     picoquic_connection_id_t cid_remote;
     picoquic_connection_id_t cid_initial;
     picoquic_path_quality_t path_quality;
+    /* The congestion controller's alg_observe on the default path. */
+    uint64_t cc_state;
+    uint64_t cc_param;
     uint64_t data_sent;
     uint64_t data_received;
     aiopquic_addr_t peer_addr;
@@ -954,6 +957,12 @@ static inline void aiopquic_cnx_snapshot_fill(picoquic_cnx_t* cnx,
     s->cid_remote = picoquic_get_remote_cnxid(cnx);
     s->cid_initial = picoquic_get_initial_cnxid(cnx);
     picoquic_get_default_path_quality(cnx, &s->path_quality);
+    if (cnx->nb_paths > 0 && cnx->path[0]->congestion_alg_state != NULL
+            && cnx->congestion_alg != NULL
+            && cnx->congestion_alg->alg_observe != NULL) {
+        cnx->congestion_alg->alg_observe(cnx->path[0], &s->cc_state,
+                                         &s->cc_param);
+    }
     s->data_sent = picoquic_get_data_sent(cnx);
     s->data_received = picoquic_get_data_received(cnx);
     s->session_resumed = picoquic_tls_is_psk_handshake(cnx) ? 1 : 0;
