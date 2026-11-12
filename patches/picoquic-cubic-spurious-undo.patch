@@ -1,0 +1,166 @@
+diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
+index b4bfe5d6..227a9f30 100644
+--- a/UnitTest1/unittest1.cpp
++++ b/UnitTest1/unittest1.cpp
+@@ -3192,6 +3192,13 @@ namespace UnitTest1
+             Assert::AreEqual(ret, 0);
+         }
+ 
++        TEST_METHOD(cubic_spurious_undo)
++        {
++            int ret = cubic_spurious_undo_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
+         TEST_METHOD(c4)
+         {
+             int ret = c4_test();
+diff --git a/picoquic/cubic.c b/picoquic/cubic.c
+index 17feead4..f6129c95 100644
+--- a/picoquic/cubic.c
++++ b/picoquic/cubic.c
+@@ -223,6 +223,10 @@ static void cubic_correct_spurious(picoquic_path_t* path_x,
+             cubic_enter_avoidance(cubic_state, cubic_state->previous_start_of_epoch);
+             double W_cubic = cubic_W_cubic(cubic_state, current_time);
+             cubic_state->W_reno = W_cubic * (double)path_x->send_mtu;
++            /* No more than the window before the recovery being undone. */
++            if (cubic_state->W_reno > (double)cubic_state->previous_cwin) {
++                cubic_state->W_reno = (double)cubic_state->previous_cwin;
++            }
+             cubic_state->ssthresh = (uint64_t)(cubic_state->W_max * PICOQUIC_CUBIC_BETA * (double)path_x->send_mtu);
+             path_x->cwin = (uint64_t)cubic_state->W_reno;
+         }
+@@ -340,8 +344,10 @@ static void cubic_notify(
+                 }
+                 break;
+             case picoquic_congestion_notification_spurious_repeat:
+-                /* Reset CWIN based on ssthresh, not based on current value. */
+-                cubic_correct_spurious(path_x, cubic_state, current_time);
++                /* Undo only a recovery this packet's loss could have started. */
++                if (ack_state->lost_packet_number < cubic_state->recovery_sequence) {
++                    cubic_correct_spurious(path_x, cubic_state, current_time);
++                }
+                 break;
+             case picoquic_congestion_notification_rtt_measurement:
+                 if (cubic_state->alg_state == picoquic_cubic_alg_slow_start &&
+diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
+index 851aa3eb..401fec76 100644
+--- a/picoquic_t/picoquic_t.c
++++ b/picoquic_t/picoquic_t.c
+@@ -587,6 +587,7 @@ static const picoquic_test_def_t test_table[] = {
+     { "crypto_hs_offset", crypto_hs_offset_test },
+     { "cubic", cubic_test },
+     { "cubic_jitter", cubic_jitter_test },
++    { "cubic_spurious_undo", cubic_spurious_undo_test },
+     { "c4", c4_test },
+     { "c4_jitter", c4_jitter_test },
+     { "fastcc", fastcc_test },
+diff --git a/picoquictest/congestion_test.c b/picoquictest/congestion_test.c
+index 26367e67..d3ecbce9 100644
+--- a/picoquictest/congestion_test.c
++++ b/picoquictest/congestion_test.c
+@@ -116,6 +116,91 @@ int cubic_jitter_test(void)
+     return congestion_control_test(picoquic_cubic_algorithm, 3550000, 5000, 5);
+ }
+ 
++static void cubic_spurious_notify(picoquic_cnx_t* cnx, picoquic_congestion_notification_t notification,
++    uint64_t nb_bytes_acknowledged, uint64_t lost_packet_number, uint64_t current_time)
++{
++    picoquic_per_ack_state_t ack_state = { 0 };
++
++    ack_state.nb_bytes_acknowledged = nb_bytes_acknowledged;
++    ack_state.lost_packet_number = lost_packet_number;
++    ack_state.rtt_measurement = 90000;
++    ack_state.pc = picoquic_packet_context_application;
++    cnx->congestion_alg->alg_notify(cnx, cnx->path[0], notification, &ack_state, current_time);
++}
++
++/* Application limited for `duration`: 10 packets sent every 50 ms, each
++ * acked packet sent before the last sender limited time. */
++static uint64_t cubic_spurious_app_limited(picoquic_cnx_t* cnx, uint64_t current_time, uint64_t duration)
++{
++    uint64_t end_time = current_time + duration;
++    picoquic_path_t* path_x = cnx->path[0];
++
++    while ((current_time += 50000) < end_time) {
++        cnx->pkt_ctx[picoquic_packet_context_application].send_sequence += 10;
++        path_x->last_sender_limited_time = current_time - 10000;
++        path_x->last_time_acked_data_frame_sent = current_time - 90000;
++        cubic_spurious_notify(cnx, picoquic_congestion_notification_acknowledgement, 10000, 0, current_time);
++    }
++    return current_time;
++}
++
++/* An hour after a recovery, a spurious repeat leaves the window alone when
++ * the packet was sent after that recovery, and restores at most the window
++ * from before it when the packet's loss started it. */
++static int cubic_spurious_undo_one(int is_recovery_packet)
++{
++    picoquic_cnx_t* cnx = NULL;
++    picoquic_quic_t* quic = NULL;
++    uint64_t current_time = 2000000;
++    int ret = picoquic_test_set_minimal_cnx(&quic, &cnx);
++
++    if (ret == 0) {
++        picoquic_path_t* path_x = cnx->path[0];
++        uint64_t* send_sequence = &cnx->pkt_ctx[picoquic_packet_context_application].send_sequence;
++        uint64_t cwin_before_recovery;
++        uint64_t cwin_before_spurious;
++        uint64_t lost_packet_number;
++
++        picoquic_set_congestion_algorithm(cnx, picoquic_cubic_algorithm);
++        path_x->smoothed_rtt = 90000;
++        path_x->rtt_min = 90000;
++        path_x->cwin = 200000;
++        *send_sequence = 100;
++        /* A first recovery from slow start, a second in congestion avoidance. */
++        cubic_spurious_notify(cnx, picoquic_congestion_notification_ecn_ec, 0, *send_sequence - 5, current_time);
++        current_time = cubic_spurious_app_limited(cnx, current_time, 1000000);
++        cwin_before_recovery = path_x->cwin;
++        lost_packet_number = *send_sequence - 5;
++        cubic_spurious_notify(cnx, picoquic_congestion_notification_ecn_ec, 0, lost_packet_number, current_time);
++        current_time = cubic_spurious_app_limited(cnx, current_time, 3600000000ull);
++        cwin_before_spurious = path_x->cwin;
++        if (!is_recovery_packet) {
++            lost_packet_number = *send_sequence - 5;
++        }
++        cubic_spurious_notify(cnx, picoquic_congestion_notification_spurious_repeat, 0, lost_packet_number, current_time);
++        if (is_recovery_packet ? (path_x->cwin < cwin_before_spurious || path_x->cwin > cwin_before_recovery) :
++            path_x->cwin != cwin_before_spurious) {
++            DBG_PRINTF("Spurious repeat, %s packet: cwin %" PRIu64 ", %" PRIu64 " before the recovery, %" PRIu64 " before the repeat",
++                is_recovery_packet ? "recovery" : "later", path_x->cwin, cwin_before_recovery, cwin_before_spurious);
++            ret = -1;
++        }
++    }
++    if (cnx != NULL) {
++        picoquic_test_delete_minimal_cnx(&quic, &cnx);
++    }
++    return ret;
++}
++
++int cubic_spurious_undo_test(void)
++{
++    int ret = cubic_spurious_undo_one(0);
++
++    if (ret == 0) {
++        ret = cubic_spurious_undo_one(1);
++    }
++    return ret;
++}
++
+ int c4_test(void)
+ {
+     return congestion_control_test(c4_algorithm, 3600000, 0, 0);
+diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
+index 2f1283ea..16a29cc6 100644
+--- a/picoquictest/picoquictest.h
++++ b/picoquictest/picoquictest.h
+@@ -448,6 +448,7 @@ int ready_to_zfin_test(void);
+ int crypto_hs_offset_test(void);
+ int cubic_test(void);
+ int cubic_jitter_test(void);
++int cubic_spurious_undo_test(void);
+ int c4_test(void);
+ int c4_jitter_test(void);
+ int cc_compete_cubic2_test(void);
