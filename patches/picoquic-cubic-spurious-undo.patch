@@ -17,20 +17,20 @@ index b4bfe5d6..227a9f30 100644
          {
              int ret = c4_test();
 diff --git a/picoquic/cubic.c b/picoquic/cubic.c
-index 17feead4..f6129c95 100644
+index 17feead4..8feacfd0 100644
 --- a/picoquic/cubic.c
 +++ b/picoquic/cubic.c
-@@ -223,6 +223,10 @@ static void cubic_correct_spurious(picoquic_path_t* path_x,
+@@ -221,6 +221,10 @@ static void cubic_correct_spurious(picoquic_path_t* path_x,
+         cubic_state->alg_state = cubic_state->previous_alg_state;
+         if (cubic_state->alg_state != picoquic_cubic_alg_slow_start) {
              cubic_enter_avoidance(cubic_state, cubic_state->previous_start_of_epoch);
++            /* As on ACKs: no growth over time the sender was limited. */
++            if (cubic_state->start_of_epoch < path_x->last_sender_limited_time) {
++                cubic_state->start_of_epoch = path_x->last_sender_limited_time;
++            }
              double W_cubic = cubic_W_cubic(cubic_state, current_time);
              cubic_state->W_reno = W_cubic * (double)path_x->send_mtu;
-+            /* No more than the window before the recovery being undone. */
-+            if (cubic_state->W_reno > (double)cubic_state->previous_cwin) {
-+                cubic_state->W_reno = (double)cubic_state->previous_cwin;
-+            }
              cubic_state->ssthresh = (uint64_t)(cubic_state->W_max * PICOQUIC_CUBIC_BETA * (double)path_x->send_mtu);
-             path_x->cwin = (uint64_t)cubic_state->W_reno;
-         }
 @@ -340,8 +344,10 @@ static void cubic_notify(
                  }
                  break;
