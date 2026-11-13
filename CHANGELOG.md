@@ -2,6 +2,7 @@
 
 ## v0.8.0 (unreleased)
 
+- Carries a picoquic loss-detection fix: a path that has shown packet reordering no longer declares a packet lost on the 3-packet threshold while the gap is within the largest reordering seen; picoquic's time threshold (about 30 ms) decides instead. Browser viewers behind reordering home paths took ~5 spurious losses a second, which held BBR's window near 100 KB.
 - Carries picoquic #2363 until it merges: h3zero parses an HTTP/3 frame type split across packets. A peer that sent a WebTransport stream's first byte on its own had the stream misread or the connection closed with H3_FRAME_UNEXPECTED, and a split reserved frame type after HEADERS dropped the DATA frame that followed.
 - Carries a picoquic Cubic fix until it merges upstream: a spurious-loss undo no longer sets cwin from the cubic curve over all the time since the last recovery, which grew cwin past 1e13 bytes on long low-loss sessions and left them unpaced.
 - `path_quality()` gains `cc_state` and `cc_param`, the congestion controller's own report: for bbr its state, substate flags and model bandwidth; for cubic its state and W_max.

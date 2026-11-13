@@ -1,0 +1,17 @@
+diff --git a/picoquic/loss_recovery.c b/picoquic/loss_recovery.c
+index d4f8197b..20aa8c8f 100644
+--- a/picoquic/loss_recovery.c
++++ b/picoquic/loss_recovery.c
+@@ -569,9 +569,9 @@ static int picoquic_is_packet_probably_lost(picoquic_cnx_t* cnx,
+             &old_p->send_path->pkt_ctx : &cnx->pkt_ctx[old_p->pc];
+         delta_seq = pkt_ctx->highest_acknowledged - old_p->sequence_number;
+ 
+-        if (delta_seq >= 3) {
+-            /* Last acknowledged packet is ways ahead. That means this packet
+-            * is most probably lost.
++        if (delta_seq >= 3 && (uint64_t)delta_seq > old_p->send_path->max_reorder_gap) {
++            /* Last acknowledged packet is further ahead than any reordering
++            * seen on this path. That means this packet is most probably lost.
+             */
+             retransmit_time = current_time;
+             is_probably_lost = 1;
