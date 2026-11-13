@@ -4,8 +4,8 @@ description: >
   aiopquic in editable mode with the requested extras. Centralizes the
   env-setup dance every aiopquic CI job repeats: submodule SHA capture,
   platform-conditional system deps (cmake + openssl), picoquic build
-  cache keyed on submodule HEADs + patches, conditional picoquic build,
-  and editable pip install.
+  cache keyed on submodule HEADs, patches and OpenSSL version,
+  conditional picoquic build, and editable pip install.
 
   IMPORTANT: callers must run actions/checkout with `submodules: recursive`
   and `fetch-depth: 0` before invoking this action — checkout itself
@@ -60,12 +60,21 @@ runs:
         # runners; idempotent install for hardness.
         brew list cmake >/dev/null 2>&1 || brew install cmake
         brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+    # The cached build is only valid against the OpenSSL headers it compiled with.
+    - name: Capture OpenSSL version for cache key
+      id: ossl
+      shell: bash
+      run: |
+        inc=/usr/include
+        if [ "${{ runner.os }}" = "macOS" ]; then inc="$(brew --prefix openssl@3)/include"; fi
+        ver=$(sed -n 's/^# *define OPENSSL_VERSION_STR "\(.*\)"/\1/p' "$inc/openssl/opensslv.h")
+        echo "ver=${ver:-unknown}" >> "$GITHUB_OUTPUT"
     - name: Cache picoquic build
       id: picoquic-cache
       uses: actions/cache@v4
       with:
         path: third_party/picoquic/build
-        key: picoquic-build${{ inputs.with-native-tests == 'true' && '-native' || '' }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build.sh', 'patches/*.patch') }}
+        key: picoquic-build${{ inputs.with-native-tests == 'true' && '-native' || '' }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-ossl${{ steps.ossl.outputs.ver }}-${{ hashFiles('build.sh', 'patches/*.patch') }}
     - name: Build picoquic
       if: steps.picoquic-cache.outputs.cache-hit != 'true'
       shell: bash
