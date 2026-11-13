@@ -134,7 +134,7 @@ typedef enum {
      * carries aiopquic_wt_session_t* for these; the loop callback
      * downcasts and invokes the appropriate picowt_* function. */
     SPSC_EVT_TX_WT_OPEN = 136,          /* picowt_prepare_client_cnx + picowt_connect */
-    SPSC_EVT_TX_WT_CREATE_STREAM = 137, /* picowt_create_local_stream(bidir flag in is_fin) */
+    SPSC_EVT_TX_WT_CREATE_STREAM = 137, /* picowt_create_local_stream; see AIOPQUIC_WT_CREATE_* */
     SPSC_EVT_TX_WT_CLOSE = 138,         /* picowt_send_close_session_message */
     SPSC_EVT_TX_WT_DRAIN = 139,         /* picowt_send_drain_session_message */
     SPSC_EVT_TX_WT_RESET_STREAM = 140,  /* picowt_reset_stream, else picoquic_reset_stream; send side only */
@@ -254,6 +254,11 @@ typedef enum {
  * the connection itself (idle timeout, a protocol error it raised) and the
  * peer sent no code; error_code = picoquic's local error, data = its name. */
 #define AIOPQUIC_CLOSE_LOCAL 0x80
+
+/* TX_WT_CREATE_STREAM: is_fin carries these flags, aux the stream ring capacity,
+ * error_code the priority + 1 (0 for none), data the stream's first bytes. */
+#define AIOPQUIC_WT_CREATE_BIDIR 0x01
+#define AIOPQUIC_WT_CREATE_FIN   0x02
 
 typedef struct {
     uint64_t    stream_id;

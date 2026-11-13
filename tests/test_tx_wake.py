@@ -1,6 +1,7 @@
 """TX wake gate: a write wakes the network thread only when it may be
 asleep. The gate is checked against a worker held running or idle; live
-bursts check that every write goes through it and is delivered; a write
+bursts check that every write goes through it, or lands on a stream
+still active in picoquic, and is delivered; a write
 after a quiet spell must reach the peer promptly, and a skipped wake is
 counted as tx_wake_lost."""
 import asyncio
@@ -65,13 +66,16 @@ def _wakes(transport):
 
 async def _burst(transport, send, sent):
     calls0, skipped0 = _wakes(transport)
+    armed0 = transport.counters["tx_mark_active_skipped"]
     for _ in range(WRITES):
         send(CHUNK)
     total = WRITES * len(CHUNK)
     assert await _until(lambda: sent() == total), f"{sent()} of {total} bytes sent"
     calls1, skipped1 = _wakes(transport)
     gated = (calls1 + skipped1) - (calls0 + skipped0)
-    assert gated >= WRITES, f"{gated} of {WRITES} writes went through the wake gate"
+    armed = transport.counters["tx_mark_active_skipped"] - armed0
+    assert gated + armed >= WRITES, (
+        f"{gated} of {WRITES} writes went through the wake gate, {armed} hit an armed stream")
 
 
 async def test_raw_writes_go_through_wake_gate():
@@ -222,5 +226,25 @@ async def test_lost_wake_is_counted():
             assert await _until(lambda: bytes(_Sink.got.get(sid, b"")) == b"rx")
             assert st.counters["tx_wake_lost"] == 1
             assert await _until(lambda: st.counters["tx_event_ring_count_now"] == 0)
+    finally:
+        server.close()
+
+
+async def test_lateness_is_counted():
+    port = next_port()
+    server = await serve_webtransport(
+        "127.0.0.1", port, "/wt", handler=lambda session: None,
+        cert_file=CERT_FILE, key_file=KEY_FILE)
+    try:
+        async with connect_webtransport("127.0.0.1", port, "/wt", sni=SNI,
+                                        ca_file=CA_FILE) as wt:
+            before = wt._transport.counters["loop_late_checks"]
+            sid = await wt.create_stream(bidir=False)
+            await _burst(wt._transport,
+                         lambda d: wt.send_stream_data(sid, d),
+                         lambda: wt.tx_sent_bytes(sid))
+            c = wt._transport.counters
+            assert c["loop_late_checks"] > before, c
+            assert c["loop_late_us"] >= 0, c
     finally:
         server.close()

@@ -21,7 +21,9 @@ the `KEX_*` ids and `counters`; everything else there, and raw pointers, are tes
 
 - Raw QUIC: `async with connect(host, port, configuration=cfg, create_protocol=P) as p:`;
   `await serve(host, port, configuration=cfg, create_protocol=P)`. `P` subclasses
-  `QuicConnectionProtocol` and overrides `quic_event_received`.
+  `QuicConnectionProtocol` and overrides `quic_event_received`. `connect(..., engine=e)` with one
+  `QuicClientEngine(sockets=N)` shares one network thread and RX ring across connections, each sending from
+  one of N sockets on Linux (without `sockets`, or elsewhere, they share one); `e.close()` stops it.
 - WebTransport: `async with connect_webtransport(host, port, path, sni=..., configuration=cfg) as
   wt:`, then `create_stream()`, `send_stream_data()`, `receive_stream_data(sid)`, `events()`.
   Once `receive_stream_data(sid)` has yielded a stream's FIN or reset, the stream's inbox is freed
@@ -38,6 +40,12 @@ the `KEX_*` ids and `counters`; everything else there, and raw pointers, are tes
   `cipher_suite`, `key_update_interval`, `supported_versions` (QUIC v2 by compatible version
   negotiation), `session_ticket_file` (resumption; with `connect(wait_connected=False)` writes
   before the handshake go out as 0-RTT). `serve_webtransport(web_folder=)` serves files over HTTP/3.
+- `serve`, `serve_dispatch` and `serve_webtransport(..., workers=N)` (Linux, fixed port) run N
+  picoquic contexts on one port with SO_REUSEPORT; the kernel spreads connections by 4-tuple and
+  each stays on its worker. Workers share the reset seed and ticket key, so tickets, NEW_TOKEN
+  and Retry tokens verify on any worker. A client whose 4-tuple changes (NAT rebinding,
+  migration) may land on another worker and is closed by its stateless reset. `.transports`
+  lists the workers.
 - `serve_dispatch(...)` serves both on one UDP port by ALPN (`h3` is added to `alpn_protocols`).
   WebTransport subprotocols: `wt_available_protocols=` / `wt_supported_protocols=`. The server
   picks the client's first offer on its allowlist; an offer with no match is refused with HTTP 400.
@@ -100,7 +108,7 @@ has left the ring once it is exceeded.
 | `src/aiopquic/asyncio/` | `connect`, `serve`, the protocol class, `dispatch.py` (one-port dual stack), `webtransport.py` |
 | `src/aiopquic/buffer.py`, `streamchain.py` | re-exports of the Cython codecs: varint, draft-18 vi64, MoQT subgroup objects |
 | `src/aiopquic/_binding/_transport.pyx` | `TransportContext`, `StreamChunk`, `WebTransportSessionState`, the RX drain loops |
-| `src/aiopquic/_binding/c/` | worker-thread C: `callback.h` (raw callback, TX dispatch), `h3wt_callback.h` (WebTransport), ring and stream-context headers |
+| `src/aiopquic/_binding/c/` | worker-thread C: `client_loop.h` (client loop with many sockets), `callback.h` (raw callback, TX dispatch), `h3wt_callback.h` (WebTransport), ring and stream-context headers |
 | `third_party/`, `patches/` | submodules picoquic, picotls, liburing; picoquic patches |
 | `tests/` | pytest suite; `interop/` peer stacks; `bench/` opt-in |
 | `DATAFLOW.md`, `PERFORMANCE.md` | TX/RX/flow-control model, counters; numbers, build flags, tuning |
@@ -184,6 +192,8 @@ has left the ring once it is exceeded.
   a ring that held events through two checks without a drain and logs a "rx wake lost" report:
   `wake_trace()` (notify flips, drains, clears, ages in ms), wake counters, the reader history,
   whether the eventfd was readable and which callback the loop held.
+- Several contexts (workers) share nothing but read-only keys and the port. Each ring keeps one
+  producer and one consumer. The CC table is registered once per process: workers read it.
 - asyncio alone produces `tx_event_ring`, each `sc->tx` and each datagram ring, and alone consumes
   `rx_event_ring` and `sc->rx`. Stream bytes never ride the event rings: TX posts MARK_ACTIVE and
   the worker pulls `sc->tx`; RX fills `sc->rx`. A full RX event ring spills to an order-preserving

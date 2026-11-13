@@ -30,6 +30,8 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_TX_CONNECT
         SPSC_EVT_TX_WT_OPEN
         SPSC_EVT_TX_WT_CREATE_STREAM
+        AIOPQUIC_WT_CREATE_BIDIR
+        AIOPQUIC_WT_CREATE_FIN
         SPSC_EVT_TX_WT_CLOSE
         SPSC_EVT_TX_WT_DRAIN
         SPSC_EVT_TX_WT_RESET_STREAM

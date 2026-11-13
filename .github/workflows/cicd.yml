@@ -131,12 +131,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake libssl-dev
+      - name: Capture OpenSSL version for cache key
+        id: ossl
+        run: |
+          ver=$(sed -n 's/^# *define OPENSSL_VERSION_STR "\(.*\)"/\1/p' /usr/include/openssl/opensslv.h)
+          echo "ver=${ver:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Cache sanitized picoquic build
         id: picoquic-cache
         uses: actions/cache@v4
         with:
           path: third_party/picoquic/build
-          key: picoquic-build-san-${{ runner.os }}-${{ runner.arch }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build.sh', 'patches/*.patch', '.github/workflows/cicd.yml') }}
+          key: picoquic-build-san-${{ runner.os }}-${{ runner.arch }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-ossl${{ steps.ossl.outputs.ver }}-${{ hashFiles('build.sh', 'patches/*.patch', '.github/workflows/cicd.yml') }}
       - name: Build picoquic with sanitizers
         if: steps.picoquic-cache.outputs.cache-hit != 'true'
         env:
