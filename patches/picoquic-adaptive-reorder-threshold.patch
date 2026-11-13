@@ -1,3 +1,21 @@
+diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
+index b4bfe5d6..c5aea515 100644
+--- a/UnitTest1/unittest1.cpp
++++ b/UnitTest1/unittest1.cpp
+@@ -3491,6 +3491,13 @@ namespace UnitTest1
+             Assert::AreEqual(ret, 0);
+         }
+ 
++        TEST_METHOD(reorder_threshold)
++        {
++            int ret = reorder_threshold_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
+         TEST_METHOD(bbr1)
+         {
+             int ret = bbr1_test();
 diff --git a/picoquic/loss_recovery.c b/picoquic/loss_recovery.c
 index d4f8197b..20aa8c8f 100644
 --- a/picoquic/loss_recovery.c
@@ -15,3 +33,106 @@ index d4f8197b..20aa8c8f 100644
              */
              retransmit_time = current_time;
              is_probably_lost = 1;
+diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
+index 851aa3eb..32dd1052 100644
+--- a/picoquic_t/picoquic_t.c
++++ b/picoquic_t/picoquic_t.c
+@@ -608,6 +608,7 @@ static const picoquic_test_def_t test_table[] = {
+     { "bbr_asym100_nodelay", bbr_asym100_nodelay_test },
+     { "bbr_asym400", bbr_asym400_test },
+     { "cc_lost_feedback_ack_only", cc_lost_feedback_ack_only_test },
++    { "reorder_threshold", reorder_threshold_test },
+     { "bbr1", bbr1_test },
+     { "bbr1_long", bbr1_long_test },
+     { "l4s_reno", l4s_reno_test },
+diff --git a/picoquictest/congestion_test.c b/picoquictest/congestion_test.c
+index 26367e67..290d23b0 100644
+--- a/picoquictest/congestion_test.c
++++ b/picoquictest/congestion_test.c
+@@ -1743,3 +1743,74 @@ int cc_lost_feedback_ack_only_test(void)
+     }
+     return ret;
+ }
++
++/* A packet within the largest reorder gap seen on its path is not lost on the
++ * packet threshold: a larger gap or the RACK timer declares it. */
++static int reorder_threshold_one(uint64_t max_reorder_gap, uint64_t delta_seq, uint64_t wait, int expect_lost)
++{
++    picoquic_cnx_t* cnx = NULL;
++    picoquic_quic_t* quic = NULL;
++    uint64_t send_time = 1000000;
++    uint64_t ack_time = send_time + 90000;
++    uint64_t next_wake_time = UINT64_MAX;
++    size_t header_length = 0;
++    int ret = picoquic_test_set_minimal_cnx(&quic, &cnx);
++
++    if (ret == 0) {
++        picoquic_packet_context_t* pkt_ctx = &cnx->pkt_ctx[picoquic_packet_context_application];
++        picoquic_packet_t* packet = cc_lost_feedback_queue(cnx, 1, send_time);
++
++        if (packet == NULL) {
++            ret = -1;
++        }
++        else {
++            memset(packet->bytes, 0, packet->length);
++            packet->sequence_number = 100;
++            cnx->cnx_state = picoquic_state_ready;
++            cnx->path[0]->smoothed_rtt = 90000;
++            cnx->path[0]->retransmit_timer = 1000000;
++            cnx->path[0]->max_reorder_gap = max_reorder_gap;
++            cnx->remote_parameters.max_ack_delay = PICOQUIC_ACK_DELAY_MAX_DEFAULT;
++            pkt_ctx->send_sequence = 101 + delta_seq;
++            pkt_ctx->highest_acknowledged = 100 + delta_seq;
++            pkt_ctx->highest_acknowledged_time = ack_time;
++            pkt_ctx->latest_time_acknowledged = send_time;
++            (void)picoquic_retransmit_needed(cnx, picoquic_packet_context_application, cnx->path[0],
++                ack_time + wait, &next_wake_time, NULL, 0, &header_length);
++            if ((cnx->nb_retransmission_total > 0) != expect_lost) {
++                DBG_PRINTF("Gap %" PRIu64 ", delta %" PRIu64 ", wait %" PRIu64 ": lost %d, expected %d",
++                    max_reorder_gap, delta_seq, wait, cnx->nb_retransmission_total > 0, expect_lost);
++                ret = -1;
++            }
++            else if (!expect_lost && next_wake_time != ack_time + PICOQUIC_RACK_DELAY / 2 + PICOQUIC_ACK_DELAY_MAX_DEFAULT) {
++                DBG_PRINTF("Gap %" PRIu64 ", delta %" PRIu64 ": wake time %" PRIu64 ", expected the RACK timer",
++                    max_reorder_gap, delta_seq, next_wake_time);
++                ret = -1;
++            }
++        }
++    }
++    if (cnx != NULL) {
++        picoquic_test_delete_minimal_cnx(&quic, &cnx);
++    }
++    return ret;
++}
++
++int reorder_threshold_test(void)
++{
++    /* No reordering seen: 3 later packets declare the loss. */
++    int ret = reorder_threshold_one(0, 3, 0, 1);
++
++    if (ret == 0) {
++        ret = reorder_threshold_one(5, 3, 0, 0);
++    }
++    if (ret == 0) {
++        ret = reorder_threshold_one(5, 5, 0, 0);
++    }
++    if (ret == 0) {
++        ret = reorder_threshold_one(5, 6, 0, 1);
++    }
++    if (ret == 0) {
++        ret = reorder_threshold_one(5, 3, PICOQUIC_RACK_DELAY / 2 + PICOQUIC_ACK_DELAY_MAX_DEFAULT, 1);
++    }
++    return ret;
++}
+diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
+index 2f1283ea..23a5f9ca 100644
+--- a/picoquictest/picoquictest.h
++++ b/picoquictest/picoquictest.h
+@@ -612,6 +612,7 @@ int bbr_asym100_test(void);
+ int bbr_asym100_nodelay_test(void);
+ int bbr_asym400_test(void);
+ int cc_lost_feedback_ack_only_test(void);
++int reorder_threshold_test(void);
+ int l4s_reno_test(void);
+ int l4s_prague_test(void);
+ int l4s_prague_updown_test(void);
