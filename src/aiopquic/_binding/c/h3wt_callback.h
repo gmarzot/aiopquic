@@ -1606,19 +1606,28 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                 ctx->worker_set_priority_last_err = (uint64_t)pri_ret;
             }
         }
+        const uint8_t* data = (const uint8_t*)entry->data_buf;
+        uint32_t data_length = entry->data_length;
+        if ((entry->is_fin & AIOPQUIC_WT_CREATE_CHAIN) != 0
+                && data_length >= sizeof(aiopquic_stream_chain_arg_t)) {
+            aiopquic_stream_chain_arg_t chain;
+            memcpy(&chain, data, sizeof(chain));
+            aiopquic_apply_stream_chain(ctx, s->cnx, new_stream->stream_id, &chain);
+            data += sizeof(chain);
+            data_length -= (uint32_t)sizeof(chain);
+        }
         /* The first bytes queue behind the stream header, so one send
          * carries both. */
         uint8_t fin = (entry->is_fin & AIOPQUIC_WT_CREATE_FIN) != 0;
-        if (entry->data_length > 0 || fin) {
+        if (data_length > 0 || fin) {
             if (aiopquic_stream_ctx_send_data(
-                    link->sc, (const uint8_t*)entry->data_buf,
-                    entry->data_length, entry->aux, fin) != 1) {
+                    link->sc, data, data_length, entry->aux, fin) != 1) {
                 /* A nonzero code makes Python retire the stream. */
                 aiopquic_wt_push_stream_created(s, new_stream->stream_id,
                                                   NULL, 3);
                 return 1;
             }
-            aiopquic_tx_data_bytes_pushed_add(entry->data_length);
+            aiopquic_tx_data_bytes_pushed_add(data_length);
             picoquic_mark_active_stream_v2(s->cnx, new_stream->stream_id, 1);
         }
         aiopquic_wt_push_stream_created(s, new_stream->stream_id,
@@ -1759,6 +1768,18 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         } else {
             ctx->worker_set_priority_rejected++;
             ctx->worker_set_priority_last_err = (uint64_t)pri_ret;
+        }
+        return 1;
+    }
+
+    case SPSC_EVT_TX_WT_SET_STREAM_CHAIN: {
+        if (!s || !s->cnx) {
+            ctx->cnt_tx_event_dropped_dead_cnx++;
+            return 1;
+        }
+        const aiopquic_stream_chain_arg_t* chain = aiopquic_tx_chain_arg(entry);
+        if (chain != NULL) {
+            aiopquic_apply_stream_chain(ctx, s->cnx, entry->stream_id, chain);
         }
         return 1;
     }

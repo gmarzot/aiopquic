@@ -546,6 +546,10 @@ typedef struct {
     uint64_t        cnt_cnx_live_walks;     /* liveness checks that missed live_cnxs */
     uint64_t        cnt_tx_park_kept_active; /* parks a racing commit kept active */
     uint64_t        cnt_tx_mark_active_skipped; /* commits that needed no MARK_ACTIVE (Python) */
+    /* Stream chain outcomes, as the priority ones. */
+    uint64_t        worker_set_chain_applied;
+    uint64_t        worker_set_chain_rejected;
+    uint64_t        worker_set_chain_last_err;
 } aiopquic_ctx_t;
 
 typedef struct aiopquic_close_reason {
@@ -2058,6 +2062,28 @@ static inline void aiopquic_apply_stream_priority(aiopquic_ctx_t* ctx,
     }
 }
 
+static inline void aiopquic_apply_stream_chain(aiopquic_ctx_t* ctx,
+                                               picoquic_cnx_t* cnx,
+                                               uint64_t stream_id,
+                                               const aiopquic_stream_chain_arg_t* arg) {
+    int ret = picoquic_set_stream_chain(cnx, stream_id, arg->chain_id,
+                                        arg->chain_order);
+    if (ret == 0) {
+        ctx->worker_set_chain_applied++;
+    } else {
+        ctx->worker_set_chain_rejected++;
+        ctx->worker_set_chain_last_err = (uint64_t)ret;
+    }
+}
+
+/* The chain argument of a TX event, or NULL if it carries none. */
+static inline const aiopquic_stream_chain_arg_t* aiopquic_tx_chain_arg(
+        const spsc_entry_t* entry) {
+    return (entry->data_buf != NULL
+            && entry->data_length == sizeof(aiopquic_stream_chain_arg_t))
+        ? (const aiopquic_stream_chain_arg_t*)entry->data_buf : NULL;
+}
+
 static int aiopquic_loop_cb(picoquic_quic_t* quic,
                              picoquic_packet_loop_cb_enum cb_mode,
                              void* callback_ctx,
@@ -2222,6 +2248,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     entry->event_type == SPSC_EVT_TX_WT_SESSION_CLEANUP ||
                     entry->event_type == SPSC_EVT_TX_MARK_WT_DATAGRAM_READY ||
                     entry->event_type == SPSC_EVT_TX_WT_SET_STREAM_PRIORITY ||
+                    entry->event_type == SPSC_EVT_TX_WT_SET_STREAM_CHAIN ||
                     entry->event_type == SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY ||
                     entry->event_type == SPSC_EVT_TX_WT_FIN) {
                     (void)aiopquic_wt_handle_tx(quic, ctx, entry);
@@ -2256,6 +2283,12 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                             aiopquic_apply_stream_priority(
                                 ctx, cnx, entry->stream_id,
                                 (uint8_t)(entry->error_code - 1));
+                        }
+                        const aiopquic_stream_chain_arg_t* chain =
+                            aiopquic_tx_chain_arg(entry);
+                        if (chain != NULL) {
+                            aiopquic_apply_stream_chain(ctx, cnx,
+                                                        entry->stream_id, chain);
                         }
                         if (entry->stream_ctx != NULL) {
                             if (aiopquic_cnx_closing(cnx)) {
@@ -2303,6 +2336,17 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         aiopquic_apply_stream_priority(
                             ctx, cnx, entry->stream_id,
                             (uint8_t)entry->error_code);
+                        ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
+                        aiopquic_maybe_fire_tx_event_ring_drained(ctx);
+                        break;
+                    }
+                    case SPSC_EVT_TX_SET_STREAM_CHAIN: {
+                        const aiopquic_stream_chain_arg_t* chain =
+                            aiopquic_tx_chain_arg(entry);
+                        if (chain != NULL) {
+                            aiopquic_apply_stream_chain(ctx, cnx,
+                                                        entry->stream_id, chain);
+                        }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
                         break;

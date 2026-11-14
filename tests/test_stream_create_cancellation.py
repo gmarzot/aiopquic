@@ -35,7 +35,7 @@ class State:
         self.retire_errors = deque()
 
     def push_create_stream(self, bidir, initial=b"", end_stream=False,
-                           stream_ring_cap=0, priority=-1):
+                           stream_ring_cap=0, priority=-1, chain=None, order=None):
         if self.create_error:
             raise self.create_error
         self.submitted.put_nowait(bidir)
