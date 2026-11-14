@@ -1,0 +1,1128 @@
+diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
+index 6e6003ea..a7f921e6 100644
+--- a/UnitTest1/unittest1.cpp
++++ b/UnitTest1/unittest1.cpp
+@@ -702,6 +702,13 @@ namespace UnitTest1
+ 
+             Assert::AreEqual(ret, 0);
+         }
++
++        TEST_METHOD(stream_chain)
++        {
++            int ret = stream_chain_test();
++
++            Assert::AreEqual(ret, 0);
++        }
+         TEST_METHOD(stream_retransmit_copy)
+         {
+             int ret = test_copy_for_retransmit();
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index 1b0f8948..6fb01a29 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -1986,6 +1986,8 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
+                         stream->fin_sent = 1;
+                         bytes0[start_index] |= 1;
+ 
++                        picoquic_remove_output_stream(cnx, stream);
++
+                         picoquic_update_max_stream_ID_local(cnx, stream);
+                         may_close = 1;
+                     }
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+index 7e45123a..7b4c0a0b 100644
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -1574,6 +1574,17 @@ int picoquic_set_stream_not_coalesced(picoquic_cnx_t* cnx,
+  * 
+  * Individual stream priority can be set using `picoquic_set_stream_priority`.
+  * 
++ * Streams can also be grouped in chains, using `picoquic_set_stream_chain`.
++ * A chain is identified by a chain id and a priority level. Streams of a
++ * chain are sent one at a time, by increasing chain order, then stream id:
++ * the first stream of the chain that has data to send is the only one
++ * scheduled, and it competes with the other streams of its priority level
++ * as described above. At a round robin level it takes the turn of its
++ * chain, so a chain's turn does not change when it moves to its next
++ * stream. This lets an application send several sequences of streams,
++ * e.g., the successive groups of several media tracks, sharing the
++ * bandwidth of one priority level, while each sequence stays in order.
++ *
+  * The API `picoquic_mark_high_priority_stream` is a legacy of the previous
+  * versions. It is equivalent to setting the priority of the specified
+  * stream to zero if "is_high_priority" is true, or to the default
+@@ -1584,9 +1595,14 @@ int picoquic_set_stream_not_coalesced(picoquic_cnx_t* cnx,
+ #define PICOQUIC_DEFAULT_STREAM_PRIORITY 9
+ void picoquic_set_default_priority(picoquic_quic_t* quic, uint8_t default_stream_priority);
+ 
+-/* Set the priority level of a stream. */
++/* Set the priority level of a stream. A chained stream moves to the chain
++ * with the same chain id at the new level. */
+ int picoquic_set_stream_priority(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t stream_priority);
+ 
++/* Place a stream in the chain `chain_id` of its priority level, at rank
++ * `chain_order`. Chain id 0 removes the stream from its chain. */
++int picoquic_set_stream_chain(picoquic_cnx_t* cnx, uint64_t stream_id, uint64_t chain_id, uint64_t chain_order);
++
+ int picoquic_mark_high_priority_stream(picoquic_cnx_t* cnx,
+     uint64_t stream_id, int is_high_priority);
+ 
+diff --git a/picoquic/picoquic_internal.h b/picoquic/picoquic_internal.h
+index b603004d..c6da1687 100644
+--- a/picoquic/picoquic_internal.h
++++ b/picoquic/picoquic_internal.h
+@@ -755,6 +755,8 @@ typedef struct st_picoquic_sack_list_t {
+  * The stream structure holds a variety of parameters about the state of the stream.
+  */
+ 
++struct st_picoquic_stream_chain_t;
++
+ typedef struct st_picoquic_stream_head_t {
+     picosplay_node_t stream_node; /* splay of streams in connection context */
+     struct st_picoquic_stream_head_t * next_output_stream; /* link in the list of output streams */
+@@ -772,7 +774,7 @@ typedef struct st_picoquic_stream_head_t {
+     uint64_t remote_error;
+     uint64_t local_stop_error;
+     uint64_t remote_stop_error;
+-    uint64_t last_time_data_sent;
++    uint64_t last_time_data_sent; /* For the head of a chain, the chain's last send time */
+     picosplay_tree_t stream_data_tree; /* splay of received stream segments */
+     uint64_t sent_offset; /* Amount of data sent in the stream */
+     uint64_t reliable_size; /* Length guaranteed when sending "reset at" */
+@@ -781,6 +783,11 @@ typedef struct st_picoquic_stream_head_t {
+     picoquic_stream_direct_receive_fn direct_receive_fn; /* direct receive function, if not NULL */
+     void* direct_receive_ctx; /* direct receive context */
+     picoquic_sack_list_t sack_list; /* Track which parts of the stream were acknowledged by the peer */
++    /* Stream chain, set with `picoquic_set_stream_chain`. */
++    struct st_picoquic_stream_chain_t* stream_chain; /* Chain of the stream, or NULL */
++    uint64_t chain_order; /* Rank in the chain; ties broken by stream id */
++    struct st_picoquic_stream_head_t* next_chain_stream; /* link in the chain's waiting list */
++    struct st_picoquic_stream_head_t* previous_chain_stream;
+     /* Stream priority -- lowest is most urgent.
+     * The stream priority should only be modified through the `picoquic_set_stream_priority` API.
+     * Uncontrolled manipulation will lead to errors.
+@@ -808,8 +815,29 @@ typedef struct st_picoquic_stream_head_t {
+     unsigned int is_discarded : 1; /* There should be no more callback for that stream, the application has discarded it */
+     unsigned int use_app_flow_control : 1; /* Do not automatically increment the flow control window, wait for app calls. */
+     unsigned int is_not_coalesced : 1; /* do not mix data for this stream with data from other stream in same packet */
++    unsigned int is_chain_waiting : 1; /* Ready, but waiting behind the head of its chain */
+ } picoquic_stream_head_t;
+ 
++/*
++ * Stream chain: the streams with the same chain id and the same priority
++ * on a connection. Only one stream of a chain, the head, is listed in
++ * the output streams: the ready stream with the lowest (chain_order,
++ * stream_id). The chain's other ready streams wait in a list sorted the
++ * same way. At round robin priority levels, the head takes its place in
++ * the output list by the chain's last send time, so that changing head
++ * does not change the chain's turn.
++ */
++typedef struct st_picoquic_stream_chain_t {
++    picosplay_node_t chain_node; /* splay of chains in connection context */
++    uint64_t chain_id;
++    uint8_t stream_priority;
++    uint64_t nb_streams; /* Number of streams in the chain, ready or not */
++    uint64_t last_time_data_sent; /* Held by the head while the chain has one */
++    picoquic_stream_head_t* head; /* Chain stream in the output list, or NULL */
++    picoquic_stream_head_t* first_waiting;
++    picoquic_stream_head_t* last_waiting;
++} picoquic_stream_chain_t;
++
+ #define IS_CLIENT_STREAM_ID(id) (unsigned int)(((id) & 1) == 0)
+ #define IS_BIDIR_STREAM_ID(id)  (unsigned int)(((id) & 2) == 0)
+ #define IS_LOCAL_STREAM_ID(id, client_mode)  (unsigned int)(((id)^(client_mode)) & 1)
+@@ -1507,6 +1535,7 @@ typedef struct st_picoquic_cnx_t {
+     picosplay_tree_t stream_tree;
+     uint64_t nb_stream_data_nodes; /* Sum of stream_data_tree.size over all data streams */
+     picoquic_output_stream_t output_streams;
++    picosplay_tree_t stream_chain_tree;
+     uint64_t high_priority_stream_id;
+     uint64_t next_stream_id[4];
+     uint64_t priority_limit_for_bypass; /* Bypass CC if datagram or stream priority lower than this, 0 means never */
+@@ -1981,6 +2010,9 @@ void picoquic_add_output_streams(picoquic_cnx_t * cnx, uint64_t old_limit, uint6
+ picoquic_stream_head_t* picoquic_find_ready_stream_path(picoquic_cnx_t* cnx, picoquic_path_t* path_x, int is_coalesced);
+ picoquic_stream_head_t* picoquic_find_ready_stream(picoquic_cnx_t* cnx);
+ void picoquic_reorder_output_stream_after_send(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream, uint64_t old_time_sent);
++int picoquic_move_stream_to_chain(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream,
++    uint64_t chain_id, uint8_t stream_priority, uint64_t chain_order);
++void picoquic_stream_chain_detach(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream);
+ int picoquic_is_tls_stream_ready(picoquic_cnx_t* cnx);
+ const uint8_t* picoquic_decode_stream_frame(picoquic_cnx_t* cnx, const uint8_t* bytes,
+     const uint8_t* bytes_max, picoquic_stream_data_node_t* received_data, uint64_t current_time);
+diff --git a/picoquic/quicctx.c b/picoquic/quicctx.c
+index 6a7663ba..74fec252 100644
+--- a/picoquic/quicctx.c
++++ b/picoquic/quicctx.c
+@@ -5012,6 +5012,7 @@ void picoquic_delete_cnx(picoquic_cnx_t* cnx)
+         }
+ 
+         picosplay_empty_tree(&cnx->stream_tree);
++        picosplay_empty_tree(&cnx->stream_chain_tree);
+ 
+         if (cnx->tls_ctx != NULL) {
+             picoquic_tlscontext_free(cnx->tls_ctx, cnx->client_mode);
+diff --git a/picoquic/streams.c b/picoquic/streams.c
+index 8ec8e35e..9df07b19 100644
+--- a/picoquic/streams.c
++++ b/picoquic/streams.c
+@@ -153,6 +153,9 @@ static void picoquic_stream_node_delete(void* tree, picosplay_node_t* node)
+ 
+     /* Only application streams are counted and scheduled for output. */
+     cnx->nb_stream_data_nodes -= (uint64_t)stream->stream_data_tree.size;
++    if (stream->stream_chain != NULL) {
++        picoquic_stream_chain_detach(cnx, stream);
++    }
+     picoquic_remove_output_stream(cnx, stream);
+     picoquic_clear_stream(stream);
+ 
+@@ -163,9 +166,41 @@ void picoquic_init_tls_tree(picoquic_cnx_t* cnx, int epoch) {
+     picosplay_init_tree(&cnx->tls_stream[epoch].stream_data_tree, picoquic_stream_data_node_compare, picoquic_stream_data_node_create, picoquic_stream_data_node_delete, picoquic_stream_data_node_value);
+ }
+ 
++/* Stream chain splay management. Chains are identified by chain id and priority. */
++
++static int64_t picoquic_stream_chain_node_compare(void* l, void* r)
++{
++    picoquic_stream_chain_t* left = (picoquic_stream_chain_t*)l;
++    picoquic_stream_chain_t* right = (picoquic_stream_chain_t*)r;
++
++    if (left->chain_id != right->chain_id) {
++        return (left->chain_id < right->chain_id) ? -1 : 1;
++    }
++    return (int64_t)left->stream_priority - (int64_t)right->stream_priority;
++}
++
++static picosplay_node_t* picoquic_stream_chain_node_create(void* value)
++{
++    return &((picoquic_stream_chain_t*)value)->chain_node;
++}
++
++static void* picoquic_stream_chain_node_value(picosplay_node_t* node)
++{
++    return (void*)((char*)node - offsetof(struct st_picoquic_stream_chain_t, chain_node));
++}
++
++static void picoquic_stream_chain_node_delete(void* UNUSED(tree), picosplay_node_t* node)
++{
++#ifdef _WINDOWS
++    UNREFERENCED_PARAMETER(tree);
++#endif
++    free(picoquic_stream_chain_node_value(node));
++}
++
+ void picoquic_init_stream_tree(picoquic_cnx_t* cnx)
+ {
+     picosplay_init_tree(&cnx->stream_tree, picoquic_stream_node_compare, picoquic_stream_node_create, picoquic_stream_node_delete, picoquic_stream_node_value);
++    picosplay_init_tree(&cnx->stream_chain_tree, picoquic_stream_chain_node_compare, picoquic_stream_chain_node_create, picoquic_stream_chain_node_delete, picoquic_stream_chain_node_value);
+ }
+ 
+ /* Adding data to stream, managing priorities, etc. */
+@@ -322,8 +357,28 @@ int picoquic_set_stream_priority(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_
+ 
+     stream = picoquic_find_stream_for_writing(cnx, stream_id, &ret);
+     if (ret == 0) {
+-        stream->stream_priority = stream_priority;
+-        picoquic_reorder_output_stream(cnx, stream);
++        if (stream->stream_chain != NULL) {
++            ret = picoquic_move_stream_to_chain(cnx, stream, stream->stream_chain->chain_id,
++                stream_priority, stream->chain_order);
++        }
++        else {
++            stream->stream_priority = stream_priority;
++            picoquic_reorder_output_stream(cnx, stream);
++        }
++    }
++
++    return ret;
++}
++
++int picoquic_set_stream_chain(picoquic_cnx_t* cnx, uint64_t stream_id, uint64_t chain_id, uint64_t chain_order)
++{
++    int ret = 0;
++    picoquic_stream_head_t* stream;
++    PICOQUIC_THREAD_CHECK(cnx->quic);
++
++    stream = picoquic_find_stream_for_writing(cnx, stream_id, &ret);
++    if (ret == 0) {
++        ret = picoquic_move_stream_to_chain(cnx, stream, chain_id, stream->stream_priority, chain_order);
+     }
+ 
+     return ret;
+@@ -663,7 +718,211 @@ int picoquic_compare_stream_priority(picoquic_stream_head_t* stream, picoquic_st
+     return ret;
+ }
+ 
++/* Unlink a stream from the output list, without changing its chain's head. */
++static void picoquic_unlink_output_stream(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream)
++{
++    stream->is_output_stream = 0;
++
++    if (stream->previous_output_stream == NULL) {
++        cnx->output_streams.first_output_stream = stream->next_output_stream;
++    }
++    else {
++        stream->previous_output_stream->next_output_stream = stream->next_output_stream;
++    }
++
++    if (stream->next_output_stream == NULL) {
++        cnx->output_streams.last_output_stream = stream->previous_output_stream;
++    }
++    else {
++        stream->next_output_stream->previous_output_stream = stream->previous_output_stream;
++    }
++    stream->previous_output_stream = NULL;
++    stream->next_output_stream = NULL;
++}
++
++/* Order of streams within a chain */
++static int picoquic_compare_chain_order(picoquic_stream_head_t* stream, picoquic_stream_head_t* other)
++{
++    int ret = 0;
++
++    if (stream->chain_order != other->chain_order) {
++        ret = (stream->chain_order < other->chain_order) ? -1 : 1;
++    }
++    else if (stream->stream_id != other->stream_id) {
++        ret = (stream->stream_id < other->stream_id) ? -1 : 1;
++    }
++    return ret;
++}
++
++/* Insert a stream in the chain's waiting list. A new stream usually goes
++ * last, and a stream that loses the head usually goes first: both are O(1). */
++static void picoquic_stream_chain_wait(picoquic_stream_chain_t* chain, picoquic_stream_head_t* stream)
++{
++    picoquic_stream_head_t* previous = NULL;
++    picoquic_stream_head_t* next = chain->first_waiting;
++
++    if (next != NULL && picoquic_compare_chain_order(stream, next) > 0) {
++        next = NULL;
++        previous = chain->last_waiting;
++        while (picoquic_compare_chain_order(stream, previous) < 0) {
++            next = previous;
++            previous = previous->previous_chain_stream;
++        }
++    }
++    stream->previous_chain_stream = previous;
++    stream->next_chain_stream = next;
++    if (previous == NULL) {
++        chain->first_waiting = stream;
++    }
++    else {
++        previous->next_chain_stream = stream;
++    }
++    if (next == NULL) {
++        chain->last_waiting = stream;
++    }
++    else {
++        next->previous_chain_stream = stream;
++    }
++    stream->is_chain_waiting = 1;
++}
++
++static void picoquic_stream_chain_unwait(picoquic_stream_chain_t* chain, picoquic_stream_head_t* stream)
++{
++    if (stream->previous_chain_stream == NULL) {
++        chain->first_waiting = stream->next_chain_stream;
++    }
++    else {
++        stream->previous_chain_stream->next_chain_stream = stream->next_chain_stream;
++    }
++    if (stream->next_chain_stream == NULL) {
++        chain->last_waiting = stream->previous_chain_stream;
++    }
++    else {
++        stream->next_chain_stream->previous_chain_stream = stream->previous_chain_stream;
++    }
++    stream->previous_chain_stream = NULL;
++    stream->next_chain_stream = NULL;
++    stream->is_chain_waiting = 0;
++}
++
++/* A ready chained stream becomes the head of its chain if it orders before
++ * the current head, which then waits. Returns 1 if the stream is the head. */
++static int picoquic_stream_chain_take_head(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream)
++{
++    picoquic_stream_chain_t* chain = stream->stream_chain;
++    picoquic_stream_head_t* head = chain->head;
++
++    if (stream->is_chain_waiting) {
++        return 0;
++    }
++    if (head != NULL) {
++        if (picoquic_compare_chain_order(stream, head) > 0) {
++            picoquic_stream_chain_wait(chain, stream);
++            return 0;
++        }
++        picoquic_unlink_output_stream(cnx, head);
++        chain->last_time_data_sent = head->last_time_data_sent;
++        picoquic_stream_chain_wait(chain, head);
++    }
++    chain->head = stream;
++    stream->last_time_data_sent = chain->last_time_data_sent;
++    return 1;
++}
++
++/* The head left the output list: insert the chain's first waiting stream
++ * that is ready, dropping from the waiting list those that are not. */
++static void picoquic_stream_chain_next_head(picoquic_cnx_t* cnx, picoquic_stream_chain_t* chain)
++{
++    picoquic_stream_head_t* stream;
++
++    chain->head = NULL;
++    while (chain->head == NULL && (stream = chain->first_waiting) != NULL) {
++        picoquic_stream_chain_unwait(chain, stream);
++        picoquic_insert_output_stream(cnx, stream);
++    }
++}
++
++/* Take a stream out of the output list or out of its chain's waiting list. */
++static void picoquic_stream_chain_leave(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream)
++{
++    if (stream->is_chain_waiting) {
++        picoquic_stream_chain_unwait(stream->stream_chain, stream);
++    }
++    else {
++        picoquic_remove_output_stream(cnx, stream);
++    }
++}
++
++/* Drop a stream from its chain's count, freeing the chain with its last stream. */
++static void picoquic_stream_chain_release(picoquic_cnx_t* cnx, picoquic_stream_chain_t* chain)
++{
++    chain->nb_streams--;
++    if (chain->nb_streams == 0) {
++        picosplay_delete_hint(&cnx->stream_chain_tree, &chain->chain_node);
++    }
++}
++
++void picoquic_stream_chain_detach(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream)
++{
++    picoquic_stream_chain_t* chain = stream->stream_chain;
++
++    picoquic_stream_chain_leave(cnx, stream);
++    stream->stream_chain = NULL;
++    picoquic_stream_chain_release(cnx, chain);
++}
++
++/* Set the chain and priority of a stream. Chain id 0 means no chain. */
++int picoquic_move_stream_to_chain(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream,
++    uint64_t chain_id, uint8_t stream_priority, uint64_t chain_order)
++{
++    picoquic_stream_chain_t* old_chain = stream->stream_chain;
++    picoquic_stream_chain_t* chain = NULL;
++
++    if (chain_id == 0) {
++        chain_order = 0;
++    }
++    else {
++        picoquic_stream_chain_t target;
++        picosplay_node_t* node;
++
++        target.chain_id = chain_id;
++        target.stream_priority = stream_priority;
++        if ((node = picosplay_find(&cnx->stream_chain_tree, &target)) != NULL) {
++            chain = (picoquic_stream_chain_t*)picoquic_stream_chain_node_value(node);
++        }
++        else if ((chain = (picoquic_stream_chain_t*)malloc(sizeof(picoquic_stream_chain_t))) == NULL) {
++            return PICOQUIC_ERROR_MEMORY;
++        }
++        else {
++            memset(chain, 0, sizeof(picoquic_stream_chain_t));
++            chain->chain_id = chain_id;
++            chain->stream_priority = stream_priority;
++            chain->last_time_data_sent = stream->last_time_data_sent;
++            picosplay_insert(&cnx->stream_chain_tree, chain);
++        }
++    }
++
++    if (chain != old_chain || stream->stream_priority != stream_priority || stream->chain_order != chain_order) {
++        picoquic_stream_chain_leave(cnx, stream);
++        if (chain != old_chain) {
++            if (chain != NULL) {
++                chain->nb_streams++;
++            }
++            stream->stream_chain = chain;
++            if (old_chain != NULL) {
++                picoquic_stream_chain_release(cnx, old_chain);
++            }
++        }
++        stream->stream_priority = stream_priority;
++        stream->chain_order = chain_order;
++        picoquic_insert_output_stream(cnx, stream);
++    }
++
++    return 0;
++}
++
+ /* This code assumes that the stream is not currently present in the output stream.
++ * A chained stream is only inserted if it becomes the head of its chain.
+  */
+ void picoquic_insert_output_stream(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream)
+ {
+@@ -696,6 +955,10 @@ void picoquic_insert_output_stream(picoquic_cnx_t* cnx, picoquic_stream_head_t*
+             return;
+         }
+ 
++        if (stream->stream_chain != NULL && !picoquic_stream_chain_take_head(cnx, stream)) {
++            return;
++        }
++
+         if (cnx->output_streams.last_output_stream == NULL) {
+             /* insert first stream */
+             cnx->output_streams.last_output_stream = stream;
+@@ -746,26 +1009,15 @@ void picoquic_insert_output_stream(picoquic_cnx_t* cnx, picoquic_stream_head_t*
+     }
+ }
+ 
++/* Removing the head of a chain inserts the chain's next ready stream. */
+ void picoquic_remove_output_stream(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream)
+ {
+     if (stream->is_output_stream) {
+-        stream->is_output_stream = 0;
+-
+-        if (stream->previous_output_stream == NULL) {
+-            cnx->output_streams.first_output_stream = stream->next_output_stream;
+-        }
+-        else {
+-            stream->previous_output_stream->next_output_stream = stream->next_output_stream;
+-        }
+-
+-        if (stream->next_output_stream == NULL) {
+-            cnx->output_streams.last_output_stream = stream->previous_output_stream;
+-        }
+-        else {
+-            stream->next_output_stream->previous_output_stream = stream->previous_output_stream;
++        picoquic_unlink_output_stream(cnx, stream);
++        if (stream->stream_chain != NULL) {
++            stream->stream_chain->last_time_data_sent = stream->last_time_data_sent;
++            picoquic_stream_chain_next_head(cnx, stream->stream_chain);
+         }
+-        stream->previous_output_stream = NULL;
+-        stream->next_output_stream = NULL;
+     }
+ }
+ 
+diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
+index 7b253f9a..3ab6edbe 100644
+--- a/picoquic_t/picoquic_t.c
++++ b/picoquic_t/picoquic_t.c
+@@ -208,6 +208,7 @@ static const picoquic_test_def_t test_table[] = {
+     { "StreamZeroFrame", StreamZeroFrameTest },
+     { "stream_splay", stream_splay_test },
+     { "stream_output", stream_output_test },
++    { "stream_chain", stream_chain_test },
+     { "stream_retransmit_copy", test_copy_for_retransmit },
+     { "dataqueue_copy", dataqueue_copy_test },
+     { "dataqueue_packet", dataqueue_packet_test },
+diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
+index 3aec0647..f32b8a90 100644
+--- a/picoquictest/picoquictest.h
++++ b/picoquictest/picoquictest.h
+@@ -575,6 +575,7 @@ int bad_coalesce_test(void);
+ int bad_cnxid_test(void);
+ int stream_splay_test(void);
+ int stream_output_test(void);
++int stream_chain_test(void);
+ int stream_rank_test(void);
+ int stream_id_limit_test(void);
+ int provide_stream_buffer_test(void);
+diff --git a/picoquictest/stream0_frame_test.c b/picoquictest/stream0_frame_test.c
+index cbf38141..2fc7949b 100644
+--- a/picoquictest/stream0_frame_test.c
++++ b/picoquictest/stream0_frame_test.c
+@@ -1108,6 +1108,594 @@ int stream_output_test(void)
+     return ret;
+ }
+ 
++/* Test stream chains: one stream of a chain at a time is scheduled, in
++ * chain order, and the chain competes with other streams as one stream.
++ * Active streams send one 10 byte frame per call to the packet scheduler.
++ */
++
++#define STREAM_CHAIN_TEST_NB_STREAMS 8
++#define STREAM_CHAIN_TEST_MAX_LOG 64
++
++typedef struct st_stream_chain_test_t {
++    uint64_t simulated_time;
++    picoquic_quic_t* quic;
++    picoquic_cnx_t* cnx;
++    size_t frames_left[STREAM_CHAIN_TEST_NB_STREAMS];
++    int is_fin[STREAM_CHAIN_TEST_NB_STREAMS];
++    uint64_t sent[STREAM_CHAIN_TEST_MAX_LOG];
++    size_t nb_sent;
++} stream_chain_test_t;
++
++static int stream_chain_test_callback(picoquic_cnx_t* UNUSED(cnx),
++    uint64_t stream_id, uint8_t* bytes, size_t UNUSED(length),
++    picoquic_call_back_event_t fin_or_event, void* callback_ctx, void* UNUSED(v_stream_ctx))
++{
++    stream_chain_test_t* ctx = (stream_chain_test_t*)callback_ctx;
++#ifdef _WINDOWS
++    UNREFERENCED_PARAMETER(cnx);
++    UNREFERENCED_PARAMETER(length);
++    UNREFERENCED_PARAMETER(v_stream_ctx);
++#endif
++
++    if (fin_or_event == picoquic_callback_prepare_to_send && stream_id / 4 < STREAM_CHAIN_TEST_NB_STREAMS) {
++        size_t index = (size_t)(stream_id / 4);
++        size_t nb_frames = ctx->frames_left[index];
++        uint8_t* buffer;
++
++        if (nb_frames > 0) {
++            buffer = picoquic_provide_stream_data_buffer(bytes, 10,
++                (nb_frames == 1) ? ctx->is_fin[index] : 0, nb_frames > 1);
++            if (buffer != NULL) {
++                memset(buffer, (int)stream_id, 10);
++                ctx->frames_left[index]--;
++            }
++        }
++        else {
++            (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
++        }
++    }
++    return 0;
++}
++
++static int stream_chain_test_init(stream_chain_test_t* ctx)
++{
++    int ret = 0;
++    struct sockaddr_in saddr;
++
++    memset(ctx, 0, sizeof(stream_chain_test_t));
++    ctx->simulated_time = 1000;
++    memset(&saddr, 0, sizeof(struct sockaddr_in));
++    saddr.sin_family = AF_INET;
++    saddr.sin_port = 1000;
++
++    ctx->quic = picoquic_create(8, NULL, NULL, NULL, NULL, NULL,
++        NULL, NULL, NULL, NULL, ctx->simulated_time,
++        &ctx->simulated_time, NULL, NULL, 0);
++    if (ctx->quic == NULL) {
++        DBG_PRINTF("%s", "Cannot create QUIC context\n");
++        ret = -1;
++    }
++    else if ((ctx->cnx = picoquic_create_cnx(ctx->quic,
++        picoquic_null_connection_id, picoquic_null_connection_id, (struct sockaddr*)&saddr,
++        ctx->simulated_time, 0, "test-sni", "test-alpn", 1)) == NULL) {
++        DBG_PRINTF("%s", "Cannot create connection\n");
++        ret = -1;
++    }
++    else {
++        picoquic_set_callback(ctx->cnx, stream_chain_test_callback, ctx);
++        ctx->cnx->maxdata_remote = 0x100000;
++        ctx->cnx->remote_parameters.initial_max_stream_data_bidi_remote = 0x10000;
++        ctx->cnx->remote_parameters.initial_max_stream_data_uni = 0x10000;
++        ctx->cnx->max_streams_bidir_remote = 16;
++        ctx->cnx->max_streams_unidir_remote = 16;
++    }
++    return ret;
++}
++
++static void stream_chain_test_free(stream_chain_test_t* ctx)
++{
++    if (ctx->cnx != NULL) {
++        picoquic_delete_cnx(ctx->cnx);
++        ctx->cnx = NULL;
++    }
++    if (ctx->quic != NULL) {
++        picoquic_free(ctx->quic);
++        ctx->quic = NULL;
++    }
++}
++
++/* Create an active stream at a priority level, in a chain unless chain_id is 0 */
++static int stream_chain_test_add(stream_chain_test_t* ctx, uint64_t stream_id, uint8_t priority,
++    uint64_t chain_id, uint64_t chain_order, size_t nb_frames, int is_fin)
++{
++    int ret = picoquic_set_stream_priority(ctx->cnx, stream_id, priority);
++
++    if (ret == 0 && chain_id != 0) {
++        ret = picoquic_set_stream_chain(ctx->cnx, stream_id, chain_id, chain_order);
++    }
++    if (ret == 0) {
++        ctx->frames_left[stream_id / 4] = nb_frames;
++        ctx->is_fin[stream_id / 4] = is_fin;
++        ret = picoquic_mark_active_stream(ctx->cnx, stream_id, 1, NULL);
++    }
++    if (ret != 0) {
++        DBG_PRINTF("Cannot add stream %" PRIu64 ", ret = %d\n", stream_id, ret);
++    }
++    return ret;
++}
++
++/* Record the stream id of each stream frame in a packet */
++static int stream_chain_test_log(stream_chain_test_t* ctx, const uint8_t* bytes, const uint8_t* bytes_max)
++{
++    int ret = 0;
++
++    while (ret == 0 && bytes < bytes_max) {
++        uint8_t frame_type = *bytes;
++        uint64_t stream_id = 0;
++        uint64_t offset = 0;
++        uint64_t length = 0;
++
++        if (frame_type < 0x08 || frame_type > 0x0f ||
++            (bytes = picoquic_frames_varint_decode(bytes + 1, bytes_max, &stream_id)) == NULL ||
++            ((frame_type & 4) != 0 && (bytes = picoquic_frames_varint_decode(bytes, bytes_max, &offset)) == NULL) ||
++            ((frame_type & 2) != 0 && (bytes = picoquic_frames_varint_decode(bytes, bytes_max, &length)) == NULL)) {
++            ret = -1;
++        }
++        else {
++            if ((frame_type & 2) == 0) {
++                length = bytes_max - bytes;
++            }
++            if (length > (uint64_t)(bytes_max - bytes) || ctx->nb_sent >= STREAM_CHAIN_TEST_MAX_LOG) {
++                ret = -1;
++            }
++            else {
++                bytes += length;
++                ctx->sent[ctx->nb_sent++] = stream_id;
++            }
++        }
++    }
++    if (ret != 0) {
++        DBG_PRINTF("%s", "Cannot parse the stream frames\n");
++    }
++    return ret;
++}
++
++/* Prepare packets of `packet_size` bytes until `nb_expected` stream frames
++ * are sent or nothing is ready, and check the order of the frames. */
++static int stream_chain_test_send(stream_chain_test_t* ctx, size_t packet_size,
++    const uint64_t* expected, size_t nb_expected)
++{
++    int ret = 0;
++    uint8_t buffer[256];
++
++    ctx->nb_sent = 0;
++    while (ret == 0 && ctx->nb_sent < nb_expected) {
++        int more_data = 0;
++        int is_pure_ack = 1;
++        int no_data_to_send = 0;
++        uint8_t* bytes_next = picoquic_prepare_stream_and_datagrams(ctx->cnx, ctx->cnx->path[0],
++            buffer, buffer + packet_size, 1, UINT64_MAX, &more_data, &is_pure_ack, &no_data_to_send, &ret);
++
++        if (ret == 0 && bytes_next == buffer) {
++            break;
++        }
++        else if (ret == 0) {
++            ret = stream_chain_test_log(ctx, buffer, bytes_next);
++        }
++        ctx->simulated_time += 1000;
++    }
++    if (ret == 0 && ctx->nb_sent != nb_expected) {
++        DBG_PRINTF("Sent %d frames, expected %d\n", (int)ctx->nb_sent, (int)nb_expected);
++        ret = -1;
++    }
++    for (size_t i = 0; ret == 0 && i < nb_expected; i++) {
++        if (ctx->sent[i] != expected[i]) {
++            DBG_PRINTF("Frame %d on stream %" PRIu64 ", expected %" PRIu64 "\n", (int)i, ctx->sent[i], expected[i]);
++            ret = -1;
++        }
++    }
++    return ret;
++}
++
++static int stream_chain_test_done(stream_chain_test_t* ctx)
++{
++    int ret = 0;
++    picoquic_stream_head_t* stream = picoquic_find_ready_stream(ctx->cnx);
++
++    if (stream != NULL) {
++        DBG_PRINTF("Stream %" PRIu64 " still ready\n", stream->stream_id);
++        ret = -1;
++    }
++    return ret;
++}
++
++static int stream_chain_test_nb_chains(stream_chain_test_t* ctx, int nb_chains)
++{
++    int ret = 0;
++
++    if (ctx->cnx->stream_chain_tree.size != nb_chains) {
++        DBG_PRINTF("Found %d chains, expected %d\n", ctx->cnx->stream_chain_tree.size, nb_chains);
++        ret = -1;
++    }
++    return ret;
++}
++
++/* Two chains at a round robin level take turns, each in order. A chain
++ * keeps its turn when it moves to its next stream, and a new stream does
++ * not go before the partly sent stream ahead of it. */
++static int stream_chain_test_round_robin(void)
++{
++    stream_chain_test_t ctx;
++    uint64_t heads[] = { 0, 8 };
++    uint64_t expected[] = { 0, 8, 0, 12, 0, 12, 4, 12, 4 };
++    int ret = stream_chain_test_init(&ctx);
++
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 0, 8, 1, 1, 3, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 4, 8, 1, 2, 2, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 8, 8, 2, 1, 1, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 12, 8, 2, 2, 3, 1);
++    }
++    if (ret == 0) {
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads) / sizeof(uint64_t), heads);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_nb_chains(&ctx, 2);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_send(&ctx, 20, expected, sizeof(expected) / sizeof(uint64_t));
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_done(&ctx);
++    }
++    stream_chain_test_free(&ctx);
++
++    return ret;
++}
++
++/* A stream that gets data again retakes the head from a later stream of its chain. */
++static int stream_chain_test_retake(void)
++{
++    stream_chain_test_t ctx;
++    uint64_t heads_after[] = { 0, 8 };
++    uint64_t expected1[] = { 0, 8, 0, 8 };
++    uint64_t expected2[] = { 0, 8, 0, 8, 4, 8, 4, 8, 4 };
++    picoquic_stream_head_t* stream;
++    int ret = stream_chain_test_init(&ctx);
++
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 0, 8, 1, 1, 2, 0);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 4, 8, 1, 2, 3, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 8, 8, 2, 1, 6, 0);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_send(&ctx, 20, expected1, sizeof(expected1) / sizeof(uint64_t));
++    }
++    if (ret == 0) {
++        ctx.frames_left[0] = 2;
++        ret = picoquic_mark_active_stream(ctx.cnx, 0, 1, NULL);
++    }
++    if (ret == 0) {
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads_after) / sizeof(uint64_t), heads_after);
++    }
++    if (ret == 0 && ((stream = picoquic_find_stream(ctx.cnx, 4)) == NULL || !stream->is_chain_waiting)) {
++        DBG_PRINTF("%s", "Stream 4 should wait behind stream 0\n");
++        ret = -1;
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_send(&ctx, 20, expected2, sizeof(expected2) / sizeof(uint64_t));
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_done(&ctx);
++    }
++    stream_chain_test_free(&ctx);
++
++    return ret;
++}
++
++/* At a FIFO level, the heads of chains are sent by stream id. */
++static int stream_chain_test_fifo(void)
++{
++    stream_chain_test_t ctx;
++    uint64_t heads[] = { 4, 8, 12 };
++    uint64_t expected[] = { 4, 4, 0, 8, 8, 12 };
++    int ret = stream_chain_test_init(&ctx);
++
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 4, 9, 1, 1, 2, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 0, 9, 1, 2, 1, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 8, 9, 2, 1, 2, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 12, 9, 0, 0, 1, 1);
++    }
++    if (ret == 0) {
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads) / sizeof(uint64_t), heads);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_send(&ctx, 20, expected, sizeof(expected) / sizeof(uint64_t));
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_done(&ctx);
++    }
++    stream_chain_test_free(&ctx);
++
++    return ret;
++}
++
++/* Queued data at a FIFO level: a head that sends its FIN is replaced at
++ * once, so the next stream of its chain goes in the same packet, before a
++ * later stream. */
++static int stream_chain_test_queued(void)
++{
++    stream_chain_test_t ctx;
++    uint8_t data[10];
++    uint64_t heads[] = { 2, 10 };
++    uint64_t expected[] = { 2, 6, 10 };
++    uint64_t stream_id[] = { 2, 6, 10 };
++    uint64_t chain_id[] = { 1, 1, 0 };
++    int ret = stream_chain_test_init(&ctx);
++
++    memset(data, 0, sizeof(data));
++    for (int i = 0; ret == 0 && i < 3; i++) {
++        ret = picoquic_set_stream_priority(ctx.cnx, stream_id[i], 9);
++        if (ret == 0 && chain_id[i] != 0) {
++            ret = picoquic_set_stream_chain(ctx.cnx, stream_id[i], chain_id[i], (uint64_t)i);
++        }
++        if (ret == 0) {
++            ret = picoquic_add_to_stream(ctx.cnx, stream_id[i], data, sizeof(data), 1);
++        }
++    }
++    if (ret == 0) {
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads) / sizeof(uint64_t), heads);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_send(&ctx, 64, expected, sizeof(expected) / sizeof(uint64_t));
++    }
++    if (ret == 0 && ctx.simulated_time != 2000) {
++        DBG_PRINTF("%s", "Expected all streams in one packet\n");
++        ret = -1;
++    }
++    stream_chain_test_free(&ctx);
++
++    return ret;
++}
++
++/* Changing the priority of a chained stream moves it to the chain with
++ * the same id at the new level; changing its order moves it in its chain;
++ * chain id 0 takes it out of the chain. */
++static int stream_chain_test_move(void)
++{
++    stream_chain_test_t ctx;
++    uint64_t heads1[] = { 0, 4 };
++    uint64_t expected1[] = { 0, 0, 0, 4, 4 };
++    uint64_t heads2[] = { 12 };
++    uint64_t heads3[] = { 16 };
++    uint64_t heads4[] = { 12, 16 };
++    uint64_t heads5[] = { 12, 16, 20 };
++    uint64_t expected2[] = { 12, 16, 20, 12, 16 };
++    int ret = stream_chain_test_init(&ctx);
++
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 0, 8, 1, 1, 3, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 4, 8, 1, 2, 2, 1);
++    }
++    if (ret == 0) {
++        ret = picoquic_set_stream_priority(ctx.cnx, 0, 6);
++    }
++    if (ret == 0) {
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads1) / sizeof(uint64_t), heads1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_nb_chains(&ctx, 2);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_send(&ctx, 20, expected1, sizeof(expected1) / sizeof(uint64_t));
++    }
++    /* Chain 3 at level 8: 12, 16, 20 */
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 12, 8, 3, 1, 2, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 16, 8, 3, 2, 2, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 20, 8, 3, 3, 1, 1);
++    }
++    if (ret == 0) {
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads2) / sizeof(uint64_t), heads2);
++    }
++    /* A lower order takes the head, a higher one gives it back. */
++    if (ret == 0) {
++        ret = picoquic_set_stream_chain(ctx.cnx, 16, 3, 0);
++    }
++    if (ret == 0) {
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads3) / sizeof(uint64_t), heads3);
++    }
++    if (ret == 0) {
++        ret = picoquic_set_stream_chain(ctx.cnx, 16, 3, 2);
++    }
++    if (ret == 0) {
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads2) / sizeof(uint64_t), heads2);
++    }
++    /* Out of the chain: a waiting stream, the head, then the last stream, which frees the chain. */
++    if (ret == 0) {
++        ret = picoquic_set_stream_chain(ctx.cnx, 16, 0, 0);
++    }
++    if (ret == 0) {
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads4) / sizeof(uint64_t), heads4);
++    }
++    if (ret == 0) {
++        ret = picoquic_set_stream_chain(ctx.cnx, 12, 0, 0);
++    }
++    if (ret == 0) {
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads5) / sizeof(uint64_t), heads5);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_nb_chains(&ctx, 3);
++    }
++    if (ret == 0) {
++        ret = picoquic_set_stream_chain(ctx.cnx, 20, 0, 0);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_nb_chains(&ctx, 2);
++    }
++    if (ret == 0) {
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads5) / sizeof(uint64_t), heads5);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_send(&ctx, 20, expected2, sizeof(expected2) / sizeof(uint64_t));
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_done(&ctx);
++    }
++    stream_chain_test_free(&ctx);
++
++    return ret;
++}
++
++/* Deleting a waiting stream or a head keeps the chain consistent, and
++ * the chain is freed with its last stream, including at teardown. */
++static int stream_chain_test_delete(void)
++{
++    stream_chain_test_t ctx;
++    uint64_t heads1[] = { 0, 12 };
++    uint64_t heads2[] = { 8, 12 };
++    uint64_t heads3[] = { 12 };
++    uint64_t heads4[] = { 12, 16 };
++    picoquic_stream_head_t* stream;
++    int ret = stream_chain_test_init(&ctx);
++
++    for (int i = 0; ret == 0 && i < 3; i++) {
++        ret = stream_chain_test_add(&ctx, (uint64_t)(4 * i), 8, 1, (uint64_t)i, 1, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 12, 8, 2, 1, 1, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_nb_chains(&ctx, 2);
++    }
++    if (ret == 0) {
++        picoquic_delete_stream(ctx.cnx, picoquic_find_stream(ctx.cnx, 4));
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads1) / sizeof(uint64_t), heads1);
++    }
++    if (ret == 0) {
++        picoquic_delete_stream(ctx.cnx, picoquic_find_stream(ctx.cnx, 0));
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads2) / sizeof(uint64_t), heads2);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_nb_chains(&ctx, 2);
++    }
++    if (ret == 0) {
++        picoquic_delete_stream(ctx.cnx, picoquic_find_stream(ctx.cnx, 8));
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads3) / sizeof(uint64_t), heads3);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_nb_chains(&ctx, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 16, 8, 3, 1, 1, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 20, 8, 3, 2, 1, 1);
++    }
++    if (ret == 0) {
++        ret = stream_output_test_list(ctx.cnx, sizeof(heads4) / sizeof(uint64_t), heads4);
++    }
++    if (ret == 0 && ((stream = picoquic_find_stream(ctx.cnx, 20)) == NULL || !stream->is_chain_waiting)) {
++        DBG_PRINTF("%s", "Stream 20 should wait behind stream 16\n");
++        ret = -1;
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_nb_chains(&ctx, 2);
++    }
++    if (ret == 0) {
++        /* As in picoquic_delete_cnx */
++        picosplay_empty_tree(&ctx.cnx->stream_tree);
++        ret = stream_chain_test_nb_chains(&ctx, 0);
++        if (ret == 0 && ctx.cnx->output_streams.first_output_stream != NULL) {
++            DBG_PRINTF("%s", "Output list not empty after deleting all streams\n");
++            ret = -1;
++        }
++    }
++    if (ret == 0) {
++        /* Teardown with chains in place */
++        ret = stream_chain_test_add(&ctx, 24, 8, 4, 1, 1, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_add(&ctx, 28, 8, 4, 2, 1, 1);
++    }
++    stream_chain_test_free(&ctx);
++
++    return ret;
++}
++
++/* Waiting streams are kept sorted by order, then stream id, whatever the
++ * order in which they become ready. */
++static int stream_chain_test_wait_order(void)
++{
++    stream_chain_test_t ctx;
++    uint64_t stream_id[] = { 0, 4, 8, 12, 16 };
++    uint64_t chain_order[] = { 1, 4, 3, 2, 2 };
++    uint64_t expected[] = { 0, 12, 16, 8, 4 };
++    int ret = stream_chain_test_init(&ctx);
++
++    for (int i = 0; ret == 0 && i < 5; i++) {
++        ret = stream_chain_test_add(&ctx, stream_id[i], 8, 1, chain_order[i], 1, 1);
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_send(&ctx, 20, expected, sizeof(expected) / sizeof(uint64_t));
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_done(&ctx);
++    }
++    stream_chain_test_free(&ctx);
++
++    return ret;
++}
++
++int stream_chain_test(void)
++{
++    int ret = stream_chain_test_round_robin();
++
++    if (ret == 0) {
++        ret = stream_chain_test_retake();
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_fifo();
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_wait_order();
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_queued();
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_move();
++    }
++    if (ret == 0) {
++        ret = stream_chain_test_delete();
++    }
++
++    return ret;
++}
++
+ /* Test the STREAM ID and STREAM RANK macros
+  */
+ 

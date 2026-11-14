@@ -236,6 +236,7 @@ applies nor reverse-applies stops the build: drop or regenerate it.
 | `picoquic-h3zero-null-file-guard` | h3zero's client skips `fwrite` on a NULL `FILE*` | Upstream candidate |
 | `picoquic-reset-at-ack-delete` | The ack of a RESET_STREAM_AT retires a stream we only sent on; picoquic gated it on the receive-side `consumed_offset`, so the stream stayed until the connection closed | Local |
 | `picoquic-stop-sending-error-getter` | `picoquic_get_remote_stop_sending_error()` returns the code of a received STOP_SENDING | Local |
+| `picoquic-stream-chains` | `picoquic_set_stream_chain()`: only the first ready stream of a chain is in the output list, and it competes as one stream; a stream that sends its FIN from queued data leaves the output list at once | Upstream candidate |
 
 ## Known traps
 
