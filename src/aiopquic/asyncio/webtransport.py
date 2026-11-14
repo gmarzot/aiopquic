@@ -276,12 +276,15 @@ class WebTransportSession:
     async def create_stream(self, bidir: bool = True,
                               timeout: float = 5.0, *,
                               initial: bytes = b"", end_stream: bool = False,
-                              priority: int | None = None) -> int:
+                              priority: int | None = None,
+                              chain: int | None = None,
+                              order: int | None = None) -> int:
         """Open a new WT stream. Returns the assigned stream_id.
 
         initial and end_stream are the stream's first bytes and FIN: they
         travel with the create and leave in the same send as the stream
-        header. priority, as in set_stream_priority, applies before them.
+        header. priority, as in set_stream_priority, then chain and order
+        (default 0), as in set_stream_chain, apply before them.
 
         Round-trips to the picoquic thread because picowt allocates
         the id internally. Multiple concurrent callers are safe:
@@ -302,6 +305,8 @@ class WebTransportSession:
                 f"ring (cap={self.stream_ring_cap})")
         if priority is not None and not 0 <= priority <= 255:
             raise ValueError(f"priority {priority} outside 0-255")
+        if chain is None and order is not None:
+            raise ValueError("order without chain")
         await self._await_tx_data_capacity()
         # Do not submit more creates while abandoned streams await retirement.
         while self._orphan_cleanup_task is not None:
@@ -315,7 +320,7 @@ class WebTransportSession:
             try:
                 self._state.push_create_stream(
                     bidir, initial, end_stream, self.stream_ring_cap,
-                    -1 if priority is None else priority)
+                    -1 if priority is None else priority, chain, order)
                 break
             except BufferError:
                 if self._transport.arm_tx_event_ring_drain_pending():
@@ -693,6 +698,21 @@ class WebTransportSession:
         if self._state is None or self._session_closed.is_set():
             raise ConnectionError("set_stream_priority: session closed")
         return self._state.push_stream_priority(stream_id, priority)
+
+    def set_stream_chain(self, stream_id: int, chain: int, order: int) -> int:
+        """Send a WT stream as part of `chain`, at rank `order` in it.
+
+        Same rules and return as QuicConnection.set_stream_chain(): the
+        chain's streams go one at a time by (order, stream id), and the
+        chain shares its priority level with other streams as one stream.
+        Chain ids are per connection, shared by the sessions on it.
+
+        Raises:
+            ConnectionError: session closed.
+        """
+        if self._state is None or self._session_closed.is_set():
+            raise ConnectionError("set_stream_chain: session closed")
+        return self._state.push_stream_chain(stream_id, chain, order)
 
     def set_datagram_priority(self, priority: int) -> int:
         """Send priority of this session's datagrams against its streams.

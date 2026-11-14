@@ -87,7 +87,11 @@ TX event ring was full and nothing applied. `set_datagram_priority(p)` (on `Quic
 `WebTransportSession`, per connection) places datagrams on the same scale: higher-priority streams go
 first, lower ones only when no datagram waits, equal ones take turns. Defaults:
 `set_default_stream_priority` / `set_default_datagram_priority`, for connections or streams created
-after the call.
+after the call. `set_stream_chain(sid, chain, order)` (`QuicConnection`, `WebTransportSession`; also
+`chain=`/`order=` on `send_stream_data` and `create_stream`) sends the streams of a chain one at a
+time by (order, stream id); the chain shares its priority level with other streams as one stream, and
+at an even level keeps its turn when it moves to its next stream. A chain is its id at one priority;
+chain 0 takes a stream out. Same return as `set_stream_priority`.
 
 **Addresses.** `peer_address()` / `local_address()` on `QuicConnection` and
 `WebTransportSession` return `(host, port)` (IPv4-mapped IPv6 as IPv4), or None before the

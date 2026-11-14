@@ -32,6 +32,7 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_TX_WT_CREATE_STREAM
         AIOPQUIC_WT_CREATE_BIDIR
         AIOPQUIC_WT_CREATE_FIN
+        AIOPQUIC_WT_CREATE_CHAIN
         SPSC_EVT_TX_WT_CLOSE
         SPSC_EVT_TX_WT_DRAIN
         SPSC_EVT_TX_WT_RESET_STREAM
@@ -48,6 +49,8 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_TX_SET_DATAGRAM_PRIORITY
         SPSC_EVT_TX_WT_SET_DATAGRAM_PRIORITY
         SPSC_EVT_TX_SET_MAX_CONNECTIONS
+        SPSC_EVT_TX_SET_STREAM_CHAIN
+        SPSC_EVT_TX_WT_SET_STREAM_CHAIN
         SPSC_EVT_TX_CNX_REFRESH
         SPSC_EVT_DATAGRAM_TX_DRAINED
         SPSC_EVT_CNX_STACK
@@ -64,6 +67,10 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_WT_STREAM_CREATED
         SPSC_EVT_WT_STREAM_LINK_RELEASE
         SPSC_EVT_WT_CNX_CLOSED
+
+    ctypedef struct aiopquic_stream_chain_arg_t:
+        uint64_t    chain_id
+        uint64_t    chain_order
 
     ctypedef struct spsc_entry_t:
         uint64_t    stream_id

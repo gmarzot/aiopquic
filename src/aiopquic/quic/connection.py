@@ -848,7 +848,9 @@ class QuicConnection:
 
     def send_stream_data(self, stream_id: int, data: bytes,
                          end_stream: bool = False,
-                         priority: int | None = None) -> None:
+                         priority: int | None = None,
+                         chain: int | None = None,
+                         order: int | None = None) -> None:
         """Send data on a stream — PULL-model with real backpressure.
 
         Calls the atomic Cython send primitive that bundles per-stream-
@@ -859,7 +861,8 @@ class QuicConnection:
 
         Raises BufferError on any retryable backpressure (TX event ring
         full or per-stream send ring full); raises MemoryError on
-        allocation failure. `priority` is set_stream_priority() ahead of
+        allocation failure. `priority` is set_stream_priority() and
+        `chain` (with `order`, default 0) set_stream_chain() ahead of
         these bytes, in one event on a stream's first write.
 
         Post-close: returns cleanly without committing or raising.
@@ -880,6 +883,8 @@ class QuicConnection:
             getattr(self._configuration, 'stream_ring_cap',
                     _STREAM_RING_CAP),
             -1 if priority is None else priority,
+            chain,
+            order,
         )
         if rc == 1:
             raise BufferError(
@@ -900,7 +905,9 @@ class QuicConnection:
                                          *,
                                          soft_yield_at: float = 0.5,
                                          hard_wait_at: float = 0.9,
-                                         priority: int | None = None) -> None:
+                                         priority: int | None = None,
+                                         chain: int | None = None,
+                                         order: int | None = None) -> None:
         """Send with built-in TX-ring backpressure for raw QUIC.
 
         Composes send_stream_data + get_tx_data_drain_event + tx_event_ring_fill
@@ -1011,7 +1018,8 @@ class QuicConnection:
             ring_event.clear()
             try:
                 self.send_stream_data(stream_id, data, end_stream=end_stream,
-                                      priority=priority)
+                                      priority=priority, chain=chain,
+                                      order=order)
                 if self.tx_event_ring_fill() > soft_yield_at:
                     await asyncio.sleep(0)
                 return
@@ -1233,6 +1241,34 @@ class QuicConnection:
             raise ConnectionError("set_stream_priority: cnx not open")
         return self._transport.set_stream_priority(
             self._cnx_ptr, stream_id, priority)
+
+    def set_stream_chain(self, stream_id: int, chain: int, order: int) -> int:
+        """Send a stream as part of `chain`, at rank `order` in it.
+
+        A chain is identified by `chain` and the stream's priority. Its
+        streams are sent one at a time, by increasing (order, stream id):
+        the first one with data to send is scheduled, the others wait.
+        The chain competes with the other streams of its priority level
+        as one stream: round robin at an even level, where it keeps its
+        turn when it moves to its next stream, lowest stream id at an odd
+        level. Typical use, at an even level: one chain per track, the
+        group number as order, so groups go in order and tracks share the
+        bandwidth.
+        Changing the stream's priority moves it to the chain with the
+        same id at the new level; chain 0 takes it out of its chain.
+
+        Returns 0 when the event was posted, 1 when the TX event ring is
+        full (nothing applied; wait on tx_event_ring_drain_event and
+        retry). picoquic's refusals are counted in the transport's
+        set_chain_rejected and set_chain_last_err counters.
+
+        Raises:
+            ConnectionError: no transport, or the cnx is not open.
+        """
+        if self._cnx_ptr == 0 or self._transport is None:
+            raise ConnectionError("set_stream_chain: cnx not open")
+        return self._transport.set_stream_chain(
+            self._cnx_ptr, stream_id, chain, order)
 
     def set_default_stream_priority(self, priority: int) -> None:
         """Priority that newly created streams start at.

@@ -210,6 +210,12 @@ typedef enum {
      * the limit; no cnx. */
     SPSC_EVT_TX_SET_MAX_CONNECTIONS = 155,
 
+    /* Stream chain (asyncio → picoquic worker): picoquic_set_stream_chain
+     * with the aiopquic_stream_chain_arg_t in data_buf. The WT twin
+     * carries a wt_session pointer in entry.cnx. */
+    SPSC_EVT_TX_SET_STREAM_CHAIN = 156,
+    SPSC_EVT_TX_WT_SET_STREAM_CHAIN = 157,
+
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
      * WT control stream for session events, or the WT stream for
@@ -256,9 +262,17 @@ typedef enum {
 #define AIOPQUIC_CLOSE_LOCAL 0x80
 
 /* TX_WT_CREATE_STREAM: is_fin carries these flags, aux the stream ring capacity,
- * error_code the priority + 1 (0 for none), data the stream's first bytes. */
+ * error_code the priority + 1 (0 for none), data the stream's first bytes,
+ * behind an aiopquic_stream_chain_arg_t with AIOPQUIC_WT_CREATE_CHAIN. */
 #define AIOPQUIC_WT_CREATE_BIDIR 0x01
 #define AIOPQUIC_WT_CREATE_FIN   0x02
+#define AIOPQUIC_WT_CREATE_CHAIN 0x04
+
+/* Payload of SET_STREAM_CHAIN; also of a MARK_ACTIVE that sets the chain. */
+typedef struct {
+    uint64_t chain_id;
+    uint64_t chain_order;
+} aiopquic_stream_chain_arg_t;
 
 typedef struct {
     uint64_t    stream_id;
