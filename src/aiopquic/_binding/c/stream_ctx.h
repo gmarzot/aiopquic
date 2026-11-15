@@ -117,6 +117,15 @@ typedef struct {
      * sends stop at tx_reliable_size, then the reset goes out. */
     uint8_t  tx_reset_pending;
     uint64_t tx_reliable_size;
+    /* Stream chain membership (worker only): the chain, the next member
+     * in (order, stream id) order, and whether this stream has data held
+     * inactive behind the chain's active stream. */
+    void*    chain;
+    void*    chain_next;
+    uint64_t chain_order;
+    uint64_t chain_sid;
+    uint8_t  chain_wt;
+    uint8_t  chain_waiting;
     /* Observability counters (single-writer; relaxed semantics).
      * Aligned with the connection-global ring_event counters in
      * aiopquic_ctx_t so the SIGUSR2 dump can correlate per-stream

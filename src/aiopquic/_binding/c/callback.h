@@ -550,7 +550,19 @@ typedef struct {
     uint64_t        worker_set_chain_applied;
     uint64_t        worker_set_chain_rejected;
     uint64_t        worker_set_chain_last_err;
+    /* Stream chains (worker only): buckets of aiopquic_chain_t, and how
+     * often a member was held, handed the chain, or took it back. */
+    void*           chains;
+    void*           chain_pending;   /* joins for raw streams not yet active */
+    uint64_t        cnt_chain_holds;
+    uint64_t        cnt_chain_promotes;
+    uint64_t        cnt_chain_preempts;
 } aiopquic_ctx_t;
+
+static void aiopquic_chain_drop_cnx(aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx);
+/* The sc behind WT stream sid of cnx, or NULL. Defined in h3wt_callback.h. */
+static aiopquic_stream_ctx_t* aiopquic_wt_sc_of_stream(picoquic_cnx_t* cnx,
+                                                       uint64_t sid);
 
 typedef struct aiopquic_close_reason {
     struct aiopquic_close_reason* next;
@@ -790,6 +802,7 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
         }
         free(ctx->dgram_release_owed);
         aiopquic_cnx_set_clear(&ctx->live_cnxs);
+        aiopquic_chain_drop_cnx(ctx, NULL);
         if (ctx->alpn_list) {
             for (size_t i = 0; i < ctx->alpn_list_count; i++)
                 free(ctx->alpn_list[i]);
@@ -807,6 +820,7 @@ static int aiopquic_cnx_delete_hook(picoquic_quic_t* quic, picoquic_cnx_t* cnx,
     if (ctx != NULL) {
         if (cnx != NULL) {
             aiopquic_cnx_set_del(&ctx->live_cnxs, cnx);
+            aiopquic_chain_drop_cnx(ctx, cnx);
         }
         if (should_delete) {
             aiopquic_cnx_set_clear(&ctx->live_cnxs);
@@ -1557,6 +1571,275 @@ static inline int aiopquic_cnx_closing(picoquic_cnx_t* cnx) {
     return picoquic_get_cnx_state(cnx) >= picoquic_state_disconnecting;
 }
 
+/* Stream chains on stock picoquic. Of a chain's streams only one, the
+ * lowest (order, stream id) with data, is active in picoquic; the others
+ * keep their data in sc->tx, inactive, until it drains, ends or resets.
+ * A lower one that gets data takes the chain back. Chains of one level
+ * share it as single streams do. Worker thread only. */
+#define AIOPQUIC_CHAIN_BUCKETS 1024
+
+typedef struct aiopquic_chain {
+    struct aiopquic_chain* next;
+    picoquic_cnx_t* cnx;
+    uint64_t id;
+    aiopquic_stream_ctx_t* members;   /* by (order, stream id) */
+    aiopquic_stream_ctx_t* active;    /* the member active in picoquic */
+} aiopquic_chain_t;
+
+static inline uint32_t aiopquic_chain_bucket(picoquic_cnx_t* cnx, uint64_t id) {
+    uint64_t h = ((uint64_t)(uintptr_t)cnx >> 4) ^ (id * 0x9E3779B97F4A7C15ull);
+    return (uint32_t)(h ^ (h >> 29)) & (AIOPQUIC_CHAIN_BUCKETS - 1);
+}
+
+static aiopquic_chain_t* aiopquic_chain_get(aiopquic_ctx_t* ctx,
+                                            picoquic_cnx_t* cnx, uint64_t id) {
+    if (ctx->chains == NULL) {
+        ctx->chains = calloc(AIOPQUIC_CHAIN_BUCKETS, sizeof(aiopquic_chain_t*));
+        if (ctx->chains == NULL) return NULL;
+    }
+    aiopquic_chain_t** b =
+        &((aiopquic_chain_t**)ctx->chains)[aiopquic_chain_bucket(cnx, id)];
+    for (aiopquic_chain_t* c = *b; c != NULL; c = c->next) {
+        if (c->cnx == cnx && c->id == id) return c;
+    }
+    aiopquic_chain_t* c = (aiopquic_chain_t*)calloc(1, sizeof(*c));
+    if (c == NULL) return NULL;
+    c->cnx = cnx;
+    c->id = id;
+    c->next = *b;
+    *b = c;
+    return c;
+}
+
+static inline int aiopquic_chain_before(const aiopquic_stream_ctx_t* a,
+                                        const aiopquic_stream_ctx_t* b) {
+    return a->chain_order < b->chain_order
+        || (a->chain_order == b->chain_order && a->chain_sid < b->chain_sid);
+}
+
+static inline void aiopquic_chain_mark(picoquic_cnx_t* cnx,
+                                       aiopquic_stream_ctx_t* sc, int on) {
+    if (on && aiopquic_cnx_closing(cnx)) return;
+    if (sc->chain_wt) {
+        (void)picoquic_mark_active_stream_v2(cnx, sc->chain_sid, on);
+    } else {
+        (void)picoquic_mark_active_stream(cnx, sc->chain_sid, on, sc);
+    }
+}
+
+/* Activate the first waiting member, if any. */
+static void aiopquic_chain_promote(aiopquic_ctx_t* ctx, aiopquic_chain_t* c) {
+    for (aiopquic_stream_ctx_t* m = c->members; m != NULL;
+         m = (aiopquic_stream_ctx_t*)m->chain_next) {
+        if (m->chain_waiting) {
+            m->chain_waiting = 0;
+            c->active = m;
+            ctx->cnt_chain_promotes++;
+            aiopquic_chain_mark(c->cnx, m, 1);
+            return;
+        }
+    }
+}
+
+/* sc has data to send: activate it, or hold it behind the active member.
+ * `live` says picoquic may already hold sc active. */
+static void aiopquic_chain_ready(aiopquic_ctx_t* ctx, aiopquic_stream_ctx_t* sc,
+                                 int live) {
+    aiopquic_chain_t* c = (aiopquic_chain_t*)sc->chain;
+    aiopquic_stream_ctx_t* a = c->active;
+    if (a == sc) {
+        aiopquic_chain_mark(c->cnx, sc, 1);
+        return;
+    }
+    if (a == NULL || aiopquic_chain_before(sc, a)) {
+        if (a != NULL) {
+            a->chain_waiting = 1;
+            aiopquic_chain_mark(c->cnx, a, 0);
+            ctx->cnt_chain_preempts++;
+        }
+        sc->chain_waiting = 0;
+        c->active = sc;
+        aiopquic_chain_mark(c->cnx, sc, 1);
+        return;
+    }
+    sc->chain_waiting = 1;
+    ctx->cnt_chain_holds++;
+    if (live) aiopquic_chain_mark(c->cnx, sc, 0);
+}
+
+/* Take sc out of its chain, handing the chain on if sc held it. Returns 1
+ * when sc had data held, which the caller must now activate. */
+static int aiopquic_chain_leave(aiopquic_ctx_t* ctx, aiopquic_stream_ctx_t* sc) {
+    aiopquic_chain_t* c = (aiopquic_chain_t*)sc->chain;
+    if (c == NULL) return 0;
+    for (aiopquic_stream_ctx_t** p = &c->members; *p != NULL;
+         p = (aiopquic_stream_ctx_t**)&(*p)->chain_next) {
+        if (*p == sc) {
+            *p = (aiopquic_stream_ctx_t*)sc->chain_next;
+            break;
+        }
+    }
+    int waiting = sc->chain_waiting;
+    sc->chain = NULL;
+    sc->chain_next = NULL;
+    sc->chain_waiting = 0;
+    if (c->active == sc) {
+        c->active = NULL;
+        aiopquic_chain_promote(ctx, c);
+    }
+    aiopquic_stream_ctx_destroy(sc);   /* the chain's reference */
+    return waiting;
+}
+
+/* After a pull from the active member: a FIN ends its membership, a drain
+ * hands the chain to the next member with data. */
+static inline void aiopquic_chain_pulled(aiopquic_ctx_t* ctx,
+                                         aiopquic_stream_ctx_t* sc,
+                                         int is_fin, int still_active) {
+    aiopquic_chain_t* c = (aiopquic_chain_t*)sc->chain;
+    if (is_fin) {
+        (void)aiopquic_chain_leave(ctx, sc);
+    } else if (!still_active && c->active == sc) {
+        c->active = NULL;
+        aiopquic_chain_promote(ctx, c);
+    }
+}
+
+/* Put sc (stream `sid`) in chain `id` at `order`; id 0 takes it out.
+ * Returns 0, or -1 when the chain could not be allocated. */
+static int aiopquic_chain_join(aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx,
+                               aiopquic_stream_ctx_t* sc, uint64_t sid,
+                               int is_wt, uint64_t id, uint64_t order) {
+    aiopquic_chain_t* old = (aiopquic_chain_t*)sc->chain;
+    if (old != NULL && old->id == id && sc->chain_order == order) return 0;
+    int had_data = 0;
+    if (old != NULL) {
+        had_data = aiopquic_chain_leave(ctx, sc);
+    }
+    if (id == 0) {
+        if (had_data) aiopquic_chain_mark(cnx, sc, 1);
+        return 0;
+    }
+    aiopquic_chain_t* c = aiopquic_chain_get(ctx, cnx, id);
+    if (c == NULL) {
+        if (had_data) aiopquic_chain_mark(cnx, sc, 1);
+        return -1;
+    }
+    aiopquic_stream_ctx_ref(sc);
+    sc->chain = c;
+    sc->chain_order = order;
+    sc->chain_sid = sid;
+    sc->chain_wt = (uint8_t)(is_wt != 0);
+    aiopquic_stream_ctx_t** p = &c->members;
+    while (*p != NULL && aiopquic_chain_before(*p, sc)) {
+        p = (aiopquic_stream_ctx_t**)&(*p)->chain_next;
+    }
+    sc->chain_next = *p;
+    *p = sc;
+    picoquic_stream_head_t* st = picoquic_find_stream(cnx, sid);
+    if (had_data || (st != NULL && st->is_active)) {
+        aiopquic_chain_ready(ctx, sc, 1);
+    }
+    return 0;
+}
+
+/* A chain set on a raw stream before its first write, when the worker has
+ * no sc for it yet: applied by the MARK_ACTIVE that brings the sc. */
+typedef struct aiopquic_chain_pending {
+    struct aiopquic_chain_pending* next;
+    picoquic_cnx_t* cnx;
+    uint64_t sid;
+    uint64_t id;
+    uint64_t order;
+} aiopquic_chain_pending_t;
+
+/* Record (or with id 0 forget) a pending join. Returns 0, or -1. */
+static int aiopquic_chain_pend(aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx,
+                               uint64_t sid, uint64_t id, uint64_t order) {
+    aiopquic_chain_pending_t** p = (aiopquic_chain_pending_t**)&ctx->chain_pending;
+    for (; *p != NULL; p = &(*p)->next) {
+        if ((*p)->cnx == cnx && (*p)->sid == sid) break;
+    }
+    if (id == 0) {
+        if (*p != NULL) {
+            aiopquic_chain_pending_t* d = *p;
+            *p = d->next;
+            free(d);
+        }
+        return 0;
+    }
+    if (*p == NULL) {
+        *p = (aiopquic_chain_pending_t*)calloc(1, sizeof(**p));
+        if (*p == NULL) return -1;
+        (*p)->cnx = cnx;
+        (*p)->sid = sid;
+    }
+    (*p)->id = id;
+    (*p)->order = order;
+    return 0;
+}
+
+/* Apply a pending join for stream sid of cnx, now that its sc is known. */
+static void aiopquic_chain_unpend(aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx,
+                                  uint64_t sid, aiopquic_stream_ctx_t* sc,
+                                  int is_wt);
+
+/* Drop the chains of cnx, or every chain when cnx is NULL. */
+static void aiopquic_chain_drop_cnx(aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx) {
+    aiopquic_chain_pending_t** q = (aiopquic_chain_pending_t**)&ctx->chain_pending;
+    while (*q != NULL) {
+        if (cnx == NULL || (*q)->cnx == cnx) {
+            aiopquic_chain_pending_t* d = *q;
+            *q = d->next;
+            free(d);
+        } else {
+            q = &(*q)->next;
+        }
+    }
+    if (ctx->chains == NULL) return;
+    aiopquic_chain_t** buckets = (aiopquic_chain_t**)ctx->chains;
+    for (uint32_t i = 0; i < AIOPQUIC_CHAIN_BUCKETS; i++) {
+        aiopquic_chain_t** p = &buckets[i];
+        while (*p != NULL) {
+            aiopquic_chain_t* c = *p;
+            if (cnx != NULL && c->cnx != cnx) {
+                p = &c->next;
+                continue;
+            }
+            *p = c->next;
+            aiopquic_stream_ctx_t* m = c->members;
+            while (m != NULL) {
+                aiopquic_stream_ctx_t* next = (aiopquic_stream_ctx_t*)m->chain_next;
+                m->chain = NULL;
+                m->chain_next = NULL;
+                m->chain_waiting = 0;
+                aiopquic_stream_ctx_destroy(m);
+                m = next;
+            }
+            free(c);
+        }
+    }
+    if (cnx == NULL) {
+        free(ctx->chains);
+        ctx->chains = NULL;
+    }
+}
+
+static void aiopquic_chain_unpend(aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx,
+                                  uint64_t sid, aiopquic_stream_ctx_t* sc,
+                                  int is_wt) {
+    aiopquic_chain_pending_t** p = (aiopquic_chain_pending_t**)&ctx->chain_pending;
+    for (; *p != NULL; p = &(*p)->next) {
+        if ((*p)->cnx == cnx && (*p)->sid == sid) {
+            aiopquic_chain_pending_t* d = *p;
+            *p = d->next;
+            (void)aiopquic_chain_join(ctx, cnx, sc, sid, is_wt, d->id, d->order);
+            free(d);
+            return;
+        }
+    }
+}
+
 /*
  * Picoquic stream/connection callback. Runs in the picoquic network thread.
  * Mandatory copy-out happens here: picoquic's stream-callback bytes have
@@ -1673,6 +1956,9 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                         &sc->tx_drain_pending, 1,
                         memory_order_release);
                 }
+            }
+            if (sc->chain != NULL) {
+                aiopquic_chain_pulled(ctx, sc, is_fin, is_still_active);
             }
             return 0;
         }
@@ -2065,9 +2351,21 @@ static inline void aiopquic_apply_stream_priority(aiopquic_ctx_t* ctx,
 static inline void aiopquic_apply_stream_chain(aiopquic_ctx_t* ctx,
                                                picoquic_cnx_t* cnx,
                                                uint64_t stream_id,
+                                               aiopquic_stream_ctx_t* sc,
+                                               int is_wt,
                                                const aiopquic_stream_chain_arg_t* arg) {
-    int ret = picoquic_set_stream_chain(cnx, stream_id, arg->chain_id,
-                                        arg->chain_order);
+    int ret;
+    if (sc != NULL) {
+        ret = aiopquic_chain_join(ctx, cnx, sc, stream_id, is_wt,
+                                  arg->chain_id, arg->chain_order);
+    } else if (is_wt || !aiopquic_stream_can_send(cnx, stream_id)
+               || (!aiopquic_stream_is_local(cnx, stream_id)
+                   && picoquic_find_stream(cnx, stream_id) == NULL)) {
+        ret = -1;   /* not a stream this end can send on */
+    } else {
+        ret = aiopquic_chain_pend(ctx, cnx, stream_id, arg->chain_id,
+                                  arg->chain_order);
+    }
     if (ret == 0) {
         ctx->worker_set_chain_applied++;
     } else {
@@ -2284,13 +2582,27 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                                 ctx, cnx, entry->stream_id,
                                 (uint8_t)(entry->error_code - 1));
                         }
+                        /* WT posts no sc; find it only when chains exist. */
+                        aiopquic_stream_ctx_t* csc =
+                            (aiopquic_stream_ctx_t*)entry->stream_ctx;
+                        if (csc == NULL && ctx->chains != NULL) {
+                            csc = aiopquic_wt_sc_of_stream(cnx, entry->stream_id);
+                        }
                         const aiopquic_stream_chain_arg_t* chain =
                             aiopquic_tx_chain_arg(entry);
                         if (chain != NULL) {
                             aiopquic_apply_stream_chain(ctx, cnx,
-                                                        entry->stream_id, chain);
+                                                        entry->stream_id, csc,
+                                                        entry->stream_ctx == NULL,
+                                                        chain);
                         }
-                        if (entry->stream_ctx != NULL) {
+                        if (csc != NULL && ctx->chain_pending != NULL) {
+                            aiopquic_chain_unpend(ctx, cnx, entry->stream_id, csc,
+                                                  entry->stream_ctx == NULL);
+                        }
+                        if (csc != NULL && csc->chain != NULL) {
+                            aiopquic_chain_ready(ctx, csc, 0);
+                        } else if (entry->stream_ctx != NULL) {
                             if (aiopquic_cnx_closing(cnx)) {
                                 ctx->cnt_tx_reattach_after_close++;
                             } else {
@@ -2344,8 +2656,14 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         const aiopquic_stream_chain_arg_t* chain =
                             aiopquic_tx_chain_arg(entry);
                         if (chain != NULL) {
-                            aiopquic_apply_stream_chain(ctx, cnx,
-                                                        entry->stream_id, chain);
+                            /* A raw stream's sc is its app_stream_ctx once
+                             * it has been marked active. */
+                            picoquic_stream_head_t* st =
+                                picoquic_find_stream(cnx, entry->stream_id);
+                            aiopquic_apply_stream_chain(
+                                ctx, cnx, entry->stream_id,
+                                st ? (aiopquic_stream_ctx_t*)st->app_stream_ctx : NULL,
+                                0, chain);
                         }
                         ctx->cnt_tx_event_ring_pops++; spsc_ring_pop(ctx->tx_event_ring);
                         aiopquic_maybe_fire_tx_event_ring_drained(ctx);
@@ -2388,6 +2706,9 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     case SPSC_EVT_TX_STREAM_RESET: {
                         aiopquic_stream_ctx_t* sc =
                             (aiopquic_stream_ctx_t*)entry->stream_ctx;
+                        if (sc != NULL && sc->chain != NULL) {
+                            (void)aiopquic_chain_leave(ctx, sc);
+                        }
                         if (sc && sc->tx_reset_pending) {
                             /* Already resetting. */
                         } else if (aiopquic_stream_can_send(cnx, entry->stream_id)) {

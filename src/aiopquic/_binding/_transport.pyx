@@ -425,6 +425,9 @@ cdef extern from "c/callback.h":
         uint64_t worker_set_chain_applied
         uint64_t worker_set_chain_rejected
         uint64_t worker_set_chain_last_err
+        uint64_t cnt_chain_holds
+        uint64_t cnt_chain_promotes
+        uint64_t cnt_chain_preempts
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
                                           uint32_t rx_cap,
@@ -1534,6 +1537,9 @@ cdef class TransportContext:
             'set_chain_applied': self._ctx.worker_set_chain_applied,
             'set_chain_rejected': self._ctx.worker_set_chain_rejected,
             'set_chain_last_err': self._ctx.worker_set_chain_last_err,
+            'chain_holds': self._ctx.cnt_chain_holds,
+            'chain_promotes': self._ctx.cnt_chain_promotes,
+            'chain_preempts': self._ctx.cnt_chain_preempts,
             'set_dgram_priority_applied': self._ctx.worker_set_dgram_priority_applied,
             'tx_event_dropped_dead_cnx': self._ctx.cnt_tx_event_dropped_dead_cnx,
             'cnx_live_walks': self._ctx.cnt_cnx_live_walks,
@@ -3057,7 +3063,7 @@ cdef class TransportContext:
     def set_stream_chain(self, uintptr_t cnx_ptr, uint64_t stream_id,
                          uint64_t chain, uint64_t order):
         """Place a stream in chain `chain` of its priority level at rank
-        `order` (picoquic_set_stream_chain); chain 0 takes it out. Returns
+        `order`; chain 0 takes it out. Returns
         0 posted, 1 TX event ring full (retry)."""
         cdef aiopquic_stream_chain_arg_t arg
         arg.chain_id = chain

@@ -1095,6 +1095,9 @@ static int aiopquic_wt_path_callback(
                 }
             }
         }
+        if (sc->chain != NULL) {
+            aiopquic_chain_pulled(s->bridge, sc, is_fin, still_active);
+        }
         /* On FIN we don't free the link here — picoquic still owns
          * the stream until h3zero fires picohttp_callback_free. */
         break;
@@ -1413,6 +1416,18 @@ static void aiopquic_wt_stream_reattach(picoquic_cnx_t* cnx,
     (void)picoquic_set_app_stream_ctx(cnx, st->stream_id, st);
 }
 
+static aiopquic_stream_ctx_t* aiopquic_wt_sc_of_stream(picoquic_cnx_t* cnx,
+                                                       uint64_t sid) {
+    h3zero_callback_ctx_t* h3_ctx =
+        (h3zero_callback_ctx_t*)picoquic_get_callback_context(cnx);
+    h3zero_stream_ctx_t* st = h3_ctx ? h3zero_find_stream(h3_ctx, sid) : NULL;
+    if (st != NULL && st->path_callback_ctx != NULL
+            && *(uint32_t*)st->path_callback_ctx == AIOPQUIC_WT_CTX_LINK) {
+        return ((aiopquic_wt_stream_link_t*)st->path_callback_ctx)->sc;
+    }
+    return NULL;
+}
+
 /* The sc of session s behind h3zero stream st, or NULL. */
 static aiopquic_stream_ctx_t* aiopquic_wt_stream_sc(aiopquic_wt_session_t* s,
                                                     h3zero_stream_ctx_t* st) {
@@ -1612,7 +1627,8 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                 && data_length >= sizeof(aiopquic_stream_chain_arg_t)) {
             aiopquic_stream_chain_arg_t chain;
             memcpy(&chain, data, sizeof(chain));
-            aiopquic_apply_stream_chain(ctx, s->cnx, new_stream->stream_id, &chain);
+            aiopquic_apply_stream_chain(ctx, s->cnx, new_stream->stream_id,
+                                        link->sc, 1, &chain);
             data += sizeof(chain);
             data_length -= (uint32_t)sizeof(chain);
         }
@@ -1628,7 +1644,11 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                 return 1;
             }
             aiopquic_tx_data_bytes_pushed_add(data_length);
-            picoquic_mark_active_stream_v2(s->cnx, new_stream->stream_id, 1);
+            if (link->sc->chain != NULL) {
+                aiopquic_chain_ready(ctx, link->sc, 0);
+            } else {
+                picoquic_mark_active_stream_v2(s->cnx, new_stream->stream_id, 1);
+            }
         }
         aiopquic_wt_push_stream_created(s, new_stream->stream_id,
                                           link->sc, 0);
@@ -1709,6 +1729,9 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (sc && sc->tx_reset_pending) {
             return 1;   /* already resetting */
         }
+        if (sc && sc->chain != NULL) {
+            (void)aiopquic_chain_leave(ctx, sc);
+        }
         uint64_t reliable = aiopquic_reset_reliable_size(s->cnx, sc, entry->aux);
         int rr;
         if (reliable == 0) {
@@ -1779,7 +1802,13 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         }
         const aiopquic_stream_chain_arg_t* chain = aiopquic_tx_chain_arg(entry);
         if (chain != NULL) {
-            aiopquic_apply_stream_chain(ctx, s->cnx, entry->stream_id, chain);
+            h3zero_callback_ctx_t* h3_ctx =
+                (h3zero_callback_ctx_t*)picoquic_get_callback_context(s->cnx);
+            h3zero_stream_ctx_t* st = h3_ctx
+                ? h3zero_find_stream(h3_ctx, entry->stream_id) : NULL;
+            aiopquic_apply_stream_chain(ctx, s->cnx, entry->stream_id,
+                                        st ? aiopquic_wt_stream_sc(s, st) : NULL,
+                                        1, chain);
         }
         return 1;
     }

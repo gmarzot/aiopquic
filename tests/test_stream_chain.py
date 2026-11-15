@@ -1,6 +1,6 @@
-"""Stream chains (picoquic_set_stream_chain) over raw QUIC and WebTransport.
+"""Stream chains over raw QUIC and WebTransport.
 
-The binding tests assert on set_chain_applied, which counts picoquic
+The binding tests assert on set_chain_applied, which counts the worker
 accepting the call, as test_stream_priority does for priorities.
 
 The scheduling tests read the receiver's qlog: the sender's leaves out the
@@ -215,26 +215,28 @@ class TestBinding:
 
 
 def _first_sends(qlog_dir, sids):
-    """(stream id, new bytes) of each stream frame on `sids` that carries
-    new bytes, in arrival order."""
+    """(stream id, new payload bytes) of each stream frame on `sids` that
+    carries new payload, in arrival order. A WT stream's header, which
+    h3zero queues apart from the payload, is not counted."""
     paths = glob.glob(os.path.join(qlog_dir, "*.qlog"))
     assert len(paths) == 1, paths
     with open(paths[0]) as f:
         events = json.load(f)["traces"][0]["events"]
-    sent = {sid: 0 for sid in sids}
-    out = []
-    for ev in events:
-        if ev[2] != "packet_received":
-            continue
-        for fr in ev[3].get("frames") or []:
-            if fr.get("frame_type") != "stream" or fr["id"] not in sent:
-                continue
-            end = fr["offset"] + fr["length"]
-            if end > sent[fr["id"]]:
-                out.append((fr["id"], end - max(fr["offset"], sent[fr["id"]])))
-                sent[fr["id"]] = end
-    short = {sid: n for sid, n in sent.items() if n < STREAM_BYTES}
+    frames = [fr for ev in events if ev[2] == "packet_received"
+              for fr in ev[3].get("frames") or []
+              if fr.get("frame_type") == "stream" and fr["id"] in sids]
+    total = {sid: 0 for sid in sids}
+    for fr in frames:
+        total[fr["id"]] = max(total[fr["id"]], fr["offset"] + fr["length"])
+    short = {sid: n for sid, n in total.items() if n < STREAM_BYTES}
     assert not short, f"qlog misses stream bytes: {short}"
+    sent = {sid: n - STREAM_BYTES for sid, n in total.items()}
+    out = []
+    for fr in frames:
+        end = fr["offset"] + fr["length"]
+        if end > sent[fr["id"]]:
+            out.append((fr["id"], end - max(fr["offset"], sent[fr["id"]])))
+            sent[fr["id"]] = end
     return out
 
 
