@@ -1583,6 +1583,7 @@ typedef struct aiopquic_chain {
     picoquic_cnx_t* cnx;
     uint64_t id;
     aiopquic_stream_ctx_t* members;   /* by (order, stream id) */
+    aiopquic_stream_ctx_t* tail;      /* the last member */
     aiopquic_stream_ctx_t* active;    /* the member active in picoquic */
 } aiopquic_chain_t;
 
@@ -1672,12 +1673,15 @@ static void aiopquic_chain_ready(aiopquic_ctx_t* ctx, aiopquic_stream_ctx_t* sc,
 static int aiopquic_chain_leave(aiopquic_ctx_t* ctx, aiopquic_stream_ctx_t* sc) {
     aiopquic_chain_t* c = (aiopquic_chain_t*)sc->chain;
     if (c == NULL) return 0;
+    aiopquic_stream_ctx_t* prev = NULL;
     for (aiopquic_stream_ctx_t** p = &c->members; *p != NULL;
          p = (aiopquic_stream_ctx_t**)&(*p)->chain_next) {
         if (*p == sc) {
             *p = (aiopquic_stream_ctx_t*)sc->chain_next;
+            if (c->tail == sc) c->tail = prev;
             break;
         }
+        prev = *p;
     }
     int waiting = sc->chain_waiting;
     sc->chain = NULL;
@@ -1730,12 +1734,20 @@ static int aiopquic_chain_join(aiopquic_ctx_t* ctx, picoquic_cnx_t* cnx,
     sc->chain_order = order;
     sc->chain_sid = sid;
     sc->chain_wt = (uint8_t)(is_wt != 0);
-    aiopquic_stream_ctx_t** p = &c->members;
-    while (*p != NULL && aiopquic_chain_before(*p, sc)) {
-        p = (aiopquic_stream_ctx_t**)&(*p)->chain_next;
+    if (c->tail == NULL || aiopquic_chain_before(c->tail, sc)) {
+        /* Usual case: each new group ranks after the last. */
+        sc->chain_next = NULL;
+        if (c->tail != NULL) c->tail->chain_next = sc;
+        else c->members = sc;
+        c->tail = sc;
+    } else {
+        aiopquic_stream_ctx_t** p = &c->members;
+        while (*p != NULL && aiopquic_chain_before(*p, sc)) {
+            p = (aiopquic_stream_ctx_t**)&(*p)->chain_next;
+        }
+        sc->chain_next = *p;
+        *p = sc;
     }
-    sc->chain_next = *p;
-    *p = sc;
     picoquic_stream_head_t* st = picoquic_find_stream(cnx, sid);
     if (had_data || (st != NULL && st->is_active)) {
         aiopquic_chain_ready(ctx, sc, 1);
