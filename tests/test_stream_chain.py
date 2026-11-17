@@ -3,18 +3,22 @@
 The binding tests assert on set_chain_applied, which counts the worker
 accepting the call, as test_stream_priority does for priorities.
 
-The scheduling tests read the receiver's qlog: the sender's leaves out the
-later packets of a send batch. A priority 0 stream, written first, holds the
-connection while every other stream is queued behind it, so the order in
-which the other streams' bytes arrive is the scheduler's choice, whatever
-the host's speed. Loopback neither drops nor reorders at these rates.
+The scheduling tests read the sender's qlog, the order the scheduler sent
+in: the receiver's shows arrival, which loss and retransmission reorder on a
+loaded host. A priority 0 stream, written first, holds the connection while
+every other stream is queued behind it, so the order of the other streams'
+bytes is the scheduler's choice, whatever the host's speed. A run where the
+blocker drained before the last write reached the worker is repeated.
 """
 
 import asyncio
+import contextlib
+import functools
 import glob
 import json
 import os
 import time
+import warnings
 
 import pytest
 
@@ -139,18 +143,28 @@ class TestBinding:
             server.stop()
 
     def test_write_on_an_active_stream_applies_it(self):
+        """A write that finds its stream still active posts no MARK_ACTIVE;
+        its chain rides a SET_STREAM_CHAIN. A stream that drained before its
+        second write is retried on the next one."""
         port = next_port()
         server = start_server(port)
         try:
             client, cnx_ptr = connect_client(port)
             try:
-                client.tx_send_stream(cnx_ptr, 0, b"x" * (1 << 20))
-                before = applied(client)
-                skipped = client.counters['tx_mark_active_skipped']
-                client.tx_send_stream(cnx_ptr, 0, b"more", chain=5, order=1)
-                assert client.counters['tx_mark_active_skipped'] == skipped + 1
-                assert wait_counter(client, 'set_chain_applied',
-                                    before + 1) == before + 1
+                for sid in range(0, 20, 4):
+                    client.tx_send_stream(cnx_ptr, sid, b"x" * (2 << 20))
+                    before = applied(client)
+                    skipped = client.counters['tx_mark_active_skipped']
+                    client.tx_send_stream(cnx_ptr, sid, b"more", chain=5,
+                                          order=1)
+                    active = (client.counters['tx_mark_active_skipped']
+                              == skipped + 1)
+                    assert wait_counter(client, 'set_chain_applied',
+                                        before + 1) == before + 1
+                    if active:
+                        break
+                else:
+                    pytest.fail("every stream drained before its second write")
             finally:
                 client.stop()
         finally:
@@ -277,24 +291,44 @@ class TestBinding:
 # --- Scheduling -------------------------------------------------------------
 
 
-def _first_sends(qlog_dir, sids, size=STREAM_BYTES):
-    """(stream id, new payload bytes) of each stream frame on `sids` that
-    carries new payload, in arrival order, for streams of `size` payload
-    bytes. A WT stream's header, which h3zero queues apart from the
-    payload, is not counted."""
+def _sent_frames(qlog_dir, sids):
+    """Stream frames on `sids` in the sender's qlog, in send order, or None
+    while picoquic has not closed the qlog."""
     paths = glob.glob(os.path.join(qlog_dir, "*.qlog"))
-    assert len(paths) == 1, paths
-    with open(paths[0]) as f:
-        events = json.load(f)["traces"][0]["events"]
-    frames = [fr for ev in events if ev[2] == "packet_received"
-              for fr in ev[3].get("frames") or []
-              if fr.get("frame_type") == "stream" and fr["id"] in sids]
-    total = {sid: 0 for sid in sids}
-    for fr in frames:
-        total[fr["id"]] = max(total[fr["id"]], fr["offset"] + fr["length"])
-    short = {sid: n for sid, n in total.items() if n < size}
-    assert not short, f"qlog misses stream bytes: {short}"
-    sent = {sid: n - size for sid, n in total.items()}
+    if len(paths) != 1:
+        return None
+    try:
+        with open(paths[0]) as f:
+            events = json.load(f)["traces"][0]["events"]
+    except (OSError, ValueError):
+        return None
+    return [fr for ev in events if ev[2] == "packet_sent"
+            for fr in ev[3].get("frames") or []
+            if fr.get("frame_type") == "stream" and fr["id"] in sids]
+
+
+async def _first_sends(qlog_dir, sids, size=STREAM_BYTES, timeout=10.0):
+    """(stream id, new payload bytes) of each stream frame on `sids` that
+    carries new payload, in send order, for streams of `size` payload
+    bytes (or {stream id: size}). A WT stream's header, which h3zero queues
+    apart from the payload, is not counted. Waits for the qlog to hold
+    every byte."""
+    sizes = size if isinstance(size, dict) else {sid: size for sid in sids}
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        frames = _sent_frames(qlog_dir, sids)
+        total = {sid: 0 for sid in sids}
+        for fr in frames or []:
+            total[fr["id"]] = max(total[fr["id"]], fr["offset"] + fr["length"])
+        short = {sid: n for sid, n in total.items() if n < sizes[sid]}
+        if frames is not None and not short:
+            break
+        assert loop.time() < deadline, (
+            f"qlog in {qlog_dir} misses stream bytes: "
+            f"{'no closed qlog' if frames is None else short}")
+        await asyncio.sleep(0.05)
+    sent = {sid: n - sizes[sid] for sid, n in total.items()}
     out = []
     for fr in frames:
         end = fr["offset"] + fr["length"]
@@ -373,19 +407,70 @@ def _chains(sids, streams):
     return [[sid for _, sid in sorted(c)] for _, c in sorted(chains.items())]
 
 
-def _client_cfg(alpn):
+def _client_cfg(alpn, qlog_dir=None):
     return QuicConfiguration(is_client=True, alpn_protocols=[alpn],
                              server_name=SNI, cafile=CA_FILE,
-                             congestion_control_algorithm="newreno")
+                             congestion_control_algorithm="newreno",
+                             qlog_dir=qlog_dir)
 
 
-def _server_cfg(qlog_dir, alpn=None):
+def _server_cfg(alpn=None):
     """Raw QUIC server configuration for `alpn`, else WebTransport's."""
     if alpn is None:
-        return QuicConfiguration(is_client=False, qlog_dir=qlog_dir)
-    cfg = QuicConfiguration(is_client=False, qlog_dir=qlog_dir, alpn_protocols=[alpn])
+        return QuicConfiguration(is_client=False)
+    cfg = QuicConfiguration(is_client=False, alpn_protocols=[alpn])
     cfg.load_cert_chain(CERT_FILE, KEY_FILE)
     return cfg
+
+
+@contextlib.contextmanager
+def _sender_log():
+    """Transports started inside log every packet: picoquic stops logging a
+    connection's packets after it has sent 100, unless a textlog raises
+    the log level."""
+    old = os.environ.get("AIOPQUIC_TEXTLOG_FILE")
+    os.environ["AIOPQUIC_TEXTLOG_FILE"] = os.devnull
+    try:
+        yield
+    finally:
+        if old is None:
+            del os.environ["AIOPQUIC_TEXTLOG_FILE"]
+        else:
+            os.environ["AIOPQUIC_TEXTLOG_FILE"] = old
+
+
+class _Unqueued(Exception):
+    """The blocker drained before every write reached the worker."""
+
+
+async def _check_queued(conn, blocker):
+    """Every write reached the worker while the blocker still had bytes to
+    send, so no other stream had sent yet; else raises _Unqueued."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5.0
+    while conn.tx_event_ring_fill() != 0:
+        assert loop.time() < deadline, "TX events not drained"
+        await asyncio.sleep(0.0002)
+    if conn.tx_data_ring_used(blocker) == 0:
+        raise _Unqueued
+
+
+def _queued(test, runs=5):
+    """Runs `test`, each time in a fresh directory, until a run queues every
+    write behind its blocker; fails after `runs` that do not."""
+    @functools.wraps(test)
+    async def run(tmp_path, **kwargs):
+        for i in range(runs):
+            path = tmp_path / f"run{i}"
+            path.mkdir()
+            try:
+                return await test(path, **kwargs)
+            except _Unqueued:
+                warnings.warn(f"{test.__name__}: the blocker drained before "
+                              f"every write was queued; run {i + 1} discarded")
+        pytest.fail(f"the blocker drained before every write was queued, "
+                    f"{runs} runs")
+    return run
 
 
 async def _until(pred, timeout=20.0):
@@ -409,22 +494,24 @@ async def _send_quic(qlog_dir, streams, size=STREAM_BYTES):
                 done.add(event.stream_id)
 
     port = next_port()
-    server = await serve("127.0.0.1", port, configuration=_server_cfg(qlog_dir, ALPN),
+    server = await serve("127.0.0.1", port, configuration=_server_cfg(ALPN),
                          create_protocol=_Receiver)
     try:
-        async with connect("127.0.0.1", port,
-                           configuration=_client_cfg(ALPN)) as client:
-            quic = client._quic
-            blocker = quic.get_next_available_stream_id(is_unidirectional=True)
-            quic.send_stream_data(blocker, BLOCKER, end_stream=True, priority=0)
-            sids = []
-            for priority, chain, order in streams:
-                sid = quic.get_next_available_stream_id(is_unidirectional=True)
-                quic.send_stream_data(sid, bytes(size), end_stream=True,
-                                      priority=priority, chain=chain,
-                                      order=order)
-                sids.append(sid)
-            assert await _until(lambda: done >= {blocker, *sids}), done
+        with _sender_log():
+            async with connect("127.0.0.1", port,
+                               configuration=_client_cfg(ALPN, qlog_dir)) as client:
+                quic = client._quic
+                blocker = quic.get_next_available_stream_id(is_unidirectional=True)
+                quic.send_stream_data(blocker, BLOCKER, end_stream=True, priority=0)
+                sids = []
+                for priority, chain, order in streams:
+                    sid = quic.get_next_available_stream_id(is_unidirectional=True)
+                    quic.send_stream_data(sid, bytes(size), end_stream=True,
+                                          priority=priority, chain=chain,
+                                          order=order)
+                    sids.append(sid)
+                await _check_queued(quic, blocker)
+                assert await _until(lambda: done >= {blocker, *sids}), done
     finally:
         server.close()
     return sids
@@ -450,19 +537,23 @@ async def _send_wt(qlog_dir, streams, size=STREAM_BYTES):
     port = next_port()
     server = await serve_webtransport(
         "127.0.0.1", port, "/wt", handler=handler, cert_file=CERT_FILE,
-        key_file=KEY_FILE, configuration=_server_cfg(qlog_dir))
+        key_file=KEY_FILE, configuration=_server_cfg())
     try:
-        async with connect_webtransport(
-                "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
-                configuration=_client_cfg("h3")) as wt:
-            blocker = await wt.create_stream(bidir=False, initial=BLOCKER,
-                                             end_stream=True, priority=0)
-            sids = []
-            for priority, chain, order in streams:
-                sids.append(await wt.create_stream(
-                    bidir=False, initial=bytes(size), end_stream=True,
-                    priority=priority, chain=chain, order=order))
-            assert await _until(lambda: done >= {blocker, *sids}), done
+        with _sender_log():
+            async with connect_webtransport(
+                    "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
+                    configuration=_client_cfg("h3", qlog_dir)) as wt:
+                blocker = await wt.create_stream(bidir=False, initial=BLOCKER,
+                                                 end_stream=True, priority=0)
+                # Concurrent creates post back to back, ids in this order.
+                sids = await asyncio.gather(*(
+                    wt.create_stream(bidir=False, initial=bytes(size),
+                                     end_stream=True, priority=priority,
+                                     chain=chain, order=order)
+                    for priority, chain, order in streams))
+                assert sids == sorted(sids), sids
+                await _check_queued(wt, blocker)
+                assert await _until(lambda: done >= {blocker, *sids}), done
     finally:
         server.close()
     return sids
@@ -472,34 +563,40 @@ SENDERS = {"quic": _send_quic, "wt": _send_wt}
 
 
 @pytest.mark.parametrize("transport", sorted(SENDERS))
+@_queued
 async def test_chains_share_and_keep_order(tmp_path, transport):
     """Round robin level: two chains take turns, each in chain order."""
     sids = await SENDERS[transport](str(tmp_path), TWO_CHAINS)
-    sends = _first_sends(str(tmp_path), sids)
+    sends = await _first_sends(str(tmp_path), sids)
     chains = _chains(sids, TWO_CHAINS)
     _check_chain_order(sends, chains)
     _check_sharing(sends, chains)
 
 
 @pytest.mark.parametrize("transport", sorted(SENDERS))
+@_queued
 async def test_chains_keep_order_at_fifo_level(tmp_path, transport):
     """FIFO level: each chain in chain order; heads go by stream id, so no sharing."""
     sids = await SENDERS[transport](str(tmp_path), TWO_CHAINS_ODD)
-    _check_chain_order(_first_sends(str(tmp_path), sids), _chains(sids, TWO_CHAINS_ODD))
+    _check_chain_order(await _first_sends(str(tmp_path), sids),
+                       _chains(sids, TWO_CHAINS_ODD))
 
 
 @pytest.mark.parametrize("transport", sorted(SENDERS))
+@_queued
 async def test_unchained_round_robin(tmp_path, transport):
     sids = await SENDERS[transport](str(tmp_path), UNCHAINED)
-    _check_round_robin(_first_sends(str(tmp_path), sids), sids)
+    _check_round_robin(await _first_sends(str(tmp_path), sids), sids)
 
 
 @pytest.mark.parametrize("transport", sorted(SENDERS))
+@_queued
 async def test_unchained_fifo(tmp_path, transport):
     sids = await SENDERS[transport](str(tmp_path), UNCHAINED_ODD)
-    _check_fifo(_first_sends(str(tmp_path), sids), sids)
+    _check_fifo(await _first_sends(str(tmp_path), sids), sids)
 
 
+@_queued
 async def test_quic_connection_set_stream_chain(tmp_path):
     """QuicConnection.set_stream_chain on open streams before their data."""
     qlog_dir = str(tmp_path)
@@ -511,29 +608,32 @@ async def test_quic_connection_set_stream_chain(tmp_path):
                 done.add(event.stream_id)
 
     port = next_port()
-    server = await serve("127.0.0.1", port, configuration=_server_cfg(qlog_dir, ALPN),
+    server = await serve("127.0.0.1", port, configuration=_server_cfg(ALPN),
                          create_protocol=_Receiver)
     try:
-        async with connect("127.0.0.1", port,
-                           configuration=_client_cfg(ALPN)) as client:
-            quic = client._quic
-            blocker = quic.get_next_available_stream_id(is_unidirectional=True)
-            quic.send_stream_data(blocker, BLOCKER, end_stream=True, priority=0)
-            sids = [quic.get_next_available_stream_id(is_unidirectional=True)
-                    for _ in range(4)]
-            # Chain order the reverse of stream id order.
-            for i, sid in enumerate(sids):
-                assert quic.set_stream_priority(sid, 9) == 0
-                assert quic.set_stream_chain(sid, 1, len(sids) - i) == 0
-            for sid in sids:
-                quic.send_stream_data(sid, bytes(STREAM_BYTES), end_stream=True)
-            assert await _until(lambda: done >= {blocker, *sids}), done
-            assert client._quic._transport.counters['set_chain_rejected'] == 0
+        with _sender_log():
+            async with connect("127.0.0.1", port,
+                               configuration=_client_cfg(ALPN, qlog_dir)) as client:
+                quic = client._quic
+                blocker = quic.get_next_available_stream_id(is_unidirectional=True)
+                quic.send_stream_data(blocker, BLOCKER, end_stream=True, priority=0)
+                sids = [quic.get_next_available_stream_id(is_unidirectional=True)
+                        for _ in range(4)]
+                # Chain order the reverse of stream id order.
+                for i, sid in enumerate(sids):
+                    assert quic.set_stream_priority(sid, 9) == 0
+                    assert quic.set_stream_chain(sid, 1, len(sids) - i) == 0
+                for sid in sids:
+                    quic.send_stream_data(sid, bytes(STREAM_BYTES), end_stream=True)
+                await _check_queued(quic, blocker)
+                assert await _until(lambda: done >= {blocker, *sids}), done
+                assert client._quic._transport.counters['set_chain_rejected'] == 0
     finally:
         server.close()
-    _check_fifo(_first_sends(str(tmp_path), sids), sids[::-1])
+    _check_fifo(await _first_sends(qlog_dir, sids), sids[::-1])
 
 
+@_queued
 async def test_wt_set_stream_chain(tmp_path):
     """WebTransportSession.set_stream_chain moves an open stream into a chain."""
     qlog_dir = str(tmp_path)
@@ -555,21 +655,23 @@ async def test_wt_set_stream_chain(tmp_path):
     port = next_port()
     server = await serve_webtransport(
         "127.0.0.1", port, "/wt", handler=handler, cert_file=CERT_FILE,
-        key_file=KEY_FILE, configuration=_server_cfg(qlog_dir))
+        key_file=KEY_FILE, configuration=_server_cfg())
     try:
-        async with connect_webtransport(
-                "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
-                configuration=_client_cfg("h3")) as wt:
-            blocker = await wt.create_stream(bidir=False, initial=BLOCKER,
-                                             end_stream=True, priority=0)
-            sids = [await wt.create_stream(bidir=False, priority=9)
-                    for _ in range(4)]
-            for i, sid in enumerate(sids):
-                assert wt.set_stream_chain(sid, 1, len(sids) - i) == 0
-            for sid in sids:
-                wt.send_stream_data(sid, bytes(STREAM_BYTES), end_stream=True)
-            assert await _until(lambda: done >= {blocker, *sids}), done
-            assert wt._transport.counters['set_chain_rejected'] == 0
+        with _sender_log():
+            async with connect_webtransport(
+                    "127.0.0.1", port, "/wt", sni=SNI, ca_file=CA_FILE,
+                    configuration=_client_cfg("h3", qlog_dir)) as wt:
+                blocker = await wt.create_stream(bidir=False, initial=BLOCKER,
+                                                 end_stream=True, priority=0)
+                sids = [await wt.create_stream(bidir=False, priority=9)
+                        for _ in range(4)]
+                for i, sid in enumerate(sids):
+                    assert wt.set_stream_chain(sid, 1, len(sids) - i) == 0
+                for sid in sids:
+                    wt.send_stream_data(sid, bytes(STREAM_BYTES), end_stream=True)
+                await _check_queued(wt, blocker)
+                assert await _until(lambda: done >= {blocker, *sids}), done
+                assert wt._transport.counters['set_chain_rejected'] == 0
     finally:
         server.close()
-    _check_fifo(_first_sends(str(tmp_path), sids), sids[::-1])
+    _check_fifo(await _first_sends(qlog_dir, sids), sids[::-1])
