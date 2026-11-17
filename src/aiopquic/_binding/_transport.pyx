@@ -135,7 +135,6 @@ cdef extern from "picoquic.h":
         picoquic_quic_t* quic, const void* alg, const char* alg_option_string)
     void picoquic_set_packet_train_mode(picoquic_quic_t* quic, int train_mode)
 
-    void picoquic_register_all_congestion_control_algorithms()
     const void* picoquic_get_congestion_algorithm(const char* alg_name)
 
     void picoquic_free(picoquic_quic_t* quic)
@@ -758,8 +757,15 @@ cdef extern from "c/h3wt_callback.h":
 DEF DEFAULT_RING_CAPACITY = 262144
 
 
+cdef extern from "c/cc_floor.h":
+    double AIOPQUIC_CC_FLOOR_K_DEFAULT
+    void aiopquic_register_cc_algorithms()
+    void aiopquic_cc_floor_parse_options(const char* x, double* k,
+                                         uint64_t* rate_bps)
+
+
 _CC_NAMES = ("newreno", "reno", "cubic", "dcubic", "fast", "bbr", "bbr1",
-             "prague", "c4")
+             "prague", "c4", "bbr1-floor")
 
 
 def check_congestion_control_algorithm(name):
@@ -1204,7 +1210,7 @@ cdef void _register_cc_algorithms():
     threads read it, so it is never rewritten."""
     global _cc_registered
     if not _cc_registered:
-        picoquic_register_all_congestion_control_algorithms()
+        aiopquic_register_cc_algorithms()
         _cc_registered = True
 
 
@@ -2025,7 +2031,12 @@ cdef class TransportContext:
         ProbeRTT), then the ack phase (bits 8-15) and the filled-pipe,
         recovery, PTO-recovery, packet-conservation and idle-restart
         flags (bits 16-20); the model bandwidth in bytes per second.
-        cubic: the state and W_max in packets.
+        cubic: the state and W_max in packets. bbr1-floor: cc_state holds
+        bbr1's state (bits 0-7), floor engaged (bit 8), released on a
+        standing queue (bit 9) or on loss (bit 10), and the media-rate
+        estimate (bits 32-63); cc_param holds bbr1's bottleneck bandwidth
+        (bits 0-31) and the floor rate (bits 32-63). Rates in bytes per
+        second, saturating at 2**32 - 1.
 
         Values are as of the last worker snapshot; each call asks for a
         fresh one. Returns an empty dict on NULL cnx_ptr (cnx torn down
@@ -4443,6 +4454,16 @@ def _wt_cc_options(WebTransportSessionState st):
     if st._wt is NULL:
         return None
     return _cnx_cc_options(st._wt.cnx)
+
+
+def _cc_floor_options(options):
+    """bbr1-floor's (K, pinned media rate in bits/s, 0 = estimate) for an
+    option string (test only)."""
+    cdef bytes b = options.encode()
+    cdef double k = AIOPQUIC_CC_FLOOR_K_DEFAULT
+    cdef uint64_t rate_bps = 0
+    aiopquic_cc_floor_parse_options(b, &k, &rate_bps)
+    return k, rate_bps
 
 
 def _packet_train_mode(uintptr_t cnx_ptr):
