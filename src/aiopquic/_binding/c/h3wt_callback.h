@@ -1096,7 +1096,8 @@ static int aiopquic_wt_path_callback(
             }
         }
         if (sc->chain != NULL) {
-            aiopquic_chain_pulled(s->bridge, sc, is_fin, still_active);
+            aiopquic_chain_pulled(s->bridge, sc, to_send > 0 || is_fin, is_fin,
+                                  still_active);
         }
         /* On FIN we don't free the link here — picoquic still owns
          * the stream until h3zero fires picohttp_callback_free. */
@@ -1255,6 +1256,9 @@ static int aiopquic_wt_path_callback(
         if (link && stream_ctx
                 && stream_ctx->path_callback_ctx == link) {
             stream_ctx->path_callback_ctx = NULL;
+            if (link->sc && link->sc->chain != NULL) {
+                (void)aiopquic_chain_leave(s->bridge, link->sc);
+            }
             /* Order: STREAM_DESTROY first (Python dict cleanup),
              * then LINK_RELEASE (link + sc ref drop). FIFO on the
              * SPSC ring preserves this ordering at the consumer.
@@ -1873,6 +1877,9 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                             (aiopquic_wt_stream_link_t*)
                                 st->path_callback_ctx;
                         if (lk->session == s) {
+                            if (lk->sc && lk->sc->chain != NULL) {
+                                (void)aiopquic_chain_leave(ctx, lk->sc);
+                            }
                             /* §6: reset the send side and abort reading on
                              * the receive side of every stream in the
                              * session, with WT_SESSION_GONE; a uni stream
@@ -1945,6 +1952,9 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                                 (aiopquic_wt_stream_link_t*)
                                     st->path_callback_ctx;
                             if (lk->session == s) {
+                                if (lk->sc && lk->sc->chain != NULL) {
+                                    (void)aiopquic_chain_leave(ctx, lk->sc);
+                                }
                                 st->path_callback = NULL;
                                 st->path_callback_ctx = NULL;
                                 aiopquic_stream_ctx_tx_abandon(lk->sc);

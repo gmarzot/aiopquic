@@ -1245,30 +1245,34 @@ class QuicConnection:
     def set_stream_chain(self, stream_id: int, chain: int, order: int) -> int:
         """Send a stream as part of `chain`, at rank `order` in it.
 
-        A chain is identified by `chain` and the stream's priority. Its
-        streams are sent one at a time, by increasing (order, stream id):
-        the first one with data to send is scheduled, the others wait.
-        The chain competes with the other streams of its priority level
-        as one stream: round robin at an even level, where it keeps its
-        turn when it moves to its next stream, lowest stream id at an odd
-        level. Typical use, at an even level: one chain per track, the
-        group number as order, so groups go in order and tracks share the
-        bandwidth.
-        Changing the stream's priority moves it to the chain with the
-        same id at the new level; chain 0 takes it out of its chain.
+        A chain is its id on this connection. Its streams are sent one at
+        a time, by increasing (order, stream id): the first one with data
+        to send is scheduled, the others wait; one beyond the peer's
+        stream limit waits while another can send. The chain competes
+        with the other streams of its priority level as one stream: round
+        robin at an even level, where it keeps its turn when it moves to
+        its next stream, lowest stream id at an odd level. Give a chain's
+        streams one priority: the scheduled stream competes at its own.
+        Typical use, at an even level: one chain per track, the group
+        number as order, so groups go in order and tracks share the
+        bandwidth. Chain 0 takes the stream out of its chain.
 
         Returns 0 when the event was posted, 1 when the TX event ring is
         full (nothing applied; wait on tx_event_ring_drain_event and
-        retry). picoquic's refusals are counted in the transport's
-        set_chain_rejected and set_chain_last_err counters.
+        retry). Refusals, such as a stream that has sent its FIN or is
+        resetting, are counted in the transport's set_chain_rejected and
+        set_chain_last_err counters.
 
         Raises:
             ConnectionError: no transport, or the cnx is not open.
         """
         if self._cnx_ptr == 0 or self._transport is None:
             raise ConnectionError("set_stream_chain: cnx not open")
+        sc = self._get_or_create_stream_ctx(stream_id)
+        if sc == 0:
+            raise ConnectionError("set_stream_chain: cnx not open")
         return self._transport.set_stream_chain(
-            self._cnx_ptr, stream_id, chain, order)
+            self._cnx_ptr, stream_id, chain, order, sc)
 
     def set_default_stream_priority(self, priority: int) -> None:
         """Priority that newly created streams start at.

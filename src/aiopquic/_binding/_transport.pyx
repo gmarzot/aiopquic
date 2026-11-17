@@ -428,6 +428,7 @@ cdef extern from "c/callback.h":
         uint64_t cnt_chain_holds
         uint64_t cnt_chain_promotes
         uint64_t cnt_chain_preempts
+        uint64_t cnt_chain_drops
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
                                           uint32_t rx_cap,
@@ -1499,6 +1500,8 @@ cdef class TransportContext:
             Ring drain alone cannot tell these from a dead-cnx drop
           set_chain_applied / set_chain_rejected / set_chain_last_err: the
             same for stream chains
+          chain_drops: chained streams whose connection went before they
+            left their chain
           tx_event_dropped_dead_cnx > 0: events whose cnx was freed between
             push and pop — silently discarded, every event type
           tx_wrong_direction_dropped > 0: RESET_STREAM / STOP_SENDING requested
@@ -1540,6 +1543,7 @@ cdef class TransportContext:
             'chain_holds': self._ctx.cnt_chain_holds,
             'chain_promotes': self._ctx.cnt_chain_promotes,
             'chain_preempts': self._ctx.cnt_chain_preempts,
+            'chain_drops': self._ctx.cnt_chain_drops,
             'set_dgram_priority_applied': self._ctx.worker_set_dgram_priority_applied,
             'tx_event_dropped_dead_cnx': self._ctx.cnt_tx_event_dropped_dead_cnx,
             'cnx_live_walks': self._ctx.cnt_cnx_live_walks,
@@ -2838,7 +2842,8 @@ cdef class TransportContext:
             if priority >= 0:
                 self.set_stream_priority(cnx_ptr, stream_id, priority)
             if chain_ptr is not NULL:
-                self._push_stream_chain(cnx_ptr, stream_id, &chain_arg)
+                self._push_stream_chain(cnx_ptr, stream_id, stream_ctx,
+                                        &chain_arg)
             return 0
 
         # Push MARK_ACTIVE event. Pre-check above guarantees room
@@ -2872,6 +2877,22 @@ cdef class TransportContext:
 
         return 0
 
+    cdef uintptr_t _test_stream_ctx(self, uintptr_t cnx_ptr,
+                                    uint64_t stream_id) except 0:
+        """tx_send_stream's context for (cnx_ptr, stream_id), created on
+        first use."""
+        cdef aiopquic_stream_ctx_t* sc
+        key = (cnx_ptr, stream_id)
+        cached = self._test_stream_ctxs.get(key)
+        if cached is not None:
+            return <uintptr_t>cached
+        sc = aiopquic_stream_ctx_create()
+        if sc is NULL:
+            raise MemoryError("aiopquic_stream_ctx_create returned NULL")
+        aiopquic_cnt_sc_create_python_helper_inc()
+        self._test_stream_ctxs[key] = <uintptr_t>sc
+        return <uintptr_t>sc
+
     def tx_send_stream(self, uintptr_t cnx_ptr, uint64_t stream_id,
                         bytes data, bint end_stream=False,
                         uint32_t stream_ring_cap=AIOPQUIC_TX_DATA_RING_CAP_DEFAULT,
@@ -2898,20 +2919,8 @@ cdef class TransportContext:
             MemoryError: per-stream send ring allocation failed, or
                 aiopquic_stream_ctx_create returned NULL on first use.
         """
-        cdef aiopquic_stream_ctx_t* sc
-        cdef uintptr_t sc_ptr
+        cdef uintptr_t sc_ptr = self._test_stream_ctx(cnx_ptr, stream_id)
         cdef int rc
-        key = (cnx_ptr, stream_id)
-        cached = self._test_stream_ctxs.get(key)
-        if cached is None:
-            sc = aiopquic_stream_ctx_create()
-            if sc is NULL:
-                raise MemoryError("aiopquic_stream_ctx_create returned NULL")
-            aiopquic_cnt_sc_create_python_helper_inc()
-            sc_ptr = <uintptr_t>sc
-            self._test_stream_ctxs[key] = sc_ptr
-        else:
-            sc_ptr = <uintptr_t>cached
         rc = self.tx_send_atomic(stream_id, data, end_stream,
                                   cnx_ptr, sc_ptr, stream_ring_cap, priority,
                                   chain, order)
@@ -3038,6 +3047,7 @@ cdef class TransportContext:
         return 0
 
     cdef int _push_stream_chain(self, uintptr_t cnx_ptr, uint64_t stream_id,
+                                uintptr_t stream_ctx,
                                 const aiopquic_stream_chain_arg_t* arg) except -1:
         cdef spsc_entry_t entry
         cdef int rc
@@ -3045,9 +3055,10 @@ cdef class TransportContext:
         entry.event_type = SPSC_EVT_TX_SET_STREAM_CHAIN
         entry.cnx = <void*>cnx_ptr
         entry.stream_id = stream_id
+        entry.stream_ctx = <void*>stream_ctx
         while True:
-            rc = spsc_ring_push(self._ctx.tx_event_ring, &entry,
-                                <const uint8_t*>arg, sizeof(aiopquic_stream_chain_arg_t))
+            rc = aiopquic_tx_push_sc(self._ctx, &entry, <const uint8_t*>arg,
+                                     sizeof(aiopquic_stream_chain_arg_t))
             if rc == 0:
                 break
             if rc == -2:
@@ -3061,14 +3072,18 @@ cdef class TransportContext:
         return 0
 
     def set_stream_chain(self, uintptr_t cnx_ptr, uint64_t stream_id,
-                         uint64_t chain, uint64_t order):
-        """Place a stream in chain `chain` of its priority level at rank
-        `order`; chain 0 takes it out. Returns
+                         uint64_t chain, uint64_t order,
+                         uintptr_t stream_ctx=0):
+        """Place a stream in chain `chain` of its connection at rank
+        `order`; chain 0 takes it out. `stream_ctx` is the stream's
+        context, as for tx_send_atomic; 0 takes tx_send_stream's. Returns
         0 posted, 1 TX event ring full (retry)."""
         cdef aiopquic_stream_chain_arg_t arg
         arg.chain_id = chain
         arg.chain_order = order
-        return self._push_stream_chain(cnx_ptr, stream_id, &arg)
+        if stream_ctx == 0:
+            stream_ctx = self._test_stream_ctx(cnx_ptr, stream_id)
+        return self._push_stream_chain(cnx_ptr, stream_id, stream_ctx, &arg)
 
     def set_default_stream_priority(self, uint8_t priority):
         """Priority newly created streams start at (picoquic default 9).
@@ -4497,6 +4512,7 @@ cdef extern from "c/test_access.h":
     int aiopquic_test_cnx_packet_train_mode(picoquic_cnx_t* cnx)
     void aiopquic_test_take_perflog(picoquic_quic_t* quic)
     int aiopquic_test_hold_tx_wake(aiopquic_ctx_t* ctx)
+    uint32_t aiopquic_test_stream_ctx_refs(aiopquic_stream_ctx_t* sc)
 
 
 def _datagram_priority(uintptr_t cnx_ptr):
@@ -4513,6 +4529,11 @@ def _hold_tx_wake(TransportContext t):
     """Take an idle worker's wake so TX pushes stay queued; True if the
     worker was idle (test only)."""
     return aiopquic_test_hold_tx_wake(t._ctx) != 0
+
+
+def _stream_ctx_refs(uintptr_t sc_ptr):
+    """References held on a stream context (test only)."""
+    return aiopquic_test_stream_ctx_refs(<aiopquic_stream_ctx_t*>sc_ptr)
 
 
 def _live_cnx_attach(TransportContext t):

@@ -211,8 +211,9 @@ typedef enum {
     SPSC_EVT_TX_SET_MAX_CONNECTIONS = 155,
 
     /* Stream chain (asyncio → picoquic worker): aiopquic_chain_join
-     * with the aiopquic_stream_chain_arg_t in data_buf. The WT twin
-     * carries a wt_session pointer in entry.cnx. */
+     * with the aiopquic_stream_chain_arg_t in data_buf and the stream's
+     * sc, referenced, in entry.stream_ctx. The WT twin carries a
+     * wt_session pointer in entry.cnx. */
     SPSC_EVT_TX_SET_STREAM_CHAIN = 156,
     SPSC_EVT_TX_WT_SET_STREAM_CHAIN = 157,
 

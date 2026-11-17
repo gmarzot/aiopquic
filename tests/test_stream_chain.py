@@ -18,7 +18,9 @@ import time
 
 import pytest
 
-from aiopquic._binding._transport import TransportContext
+from aiopquic._binding._transport import (
+    TransportContext, _stream_ctx_refs, stream_ctx_create, stream_ctx_destroy,
+)
 from aiopquic.asyncio.client import connect
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
 from aiopquic.asyncio.server import serve
@@ -31,13 +33,15 @@ from aiopquic.quic.events import (
 try:
     from .test_loopback import (
         ALPN, CA_FILE, CERT_FILE, KEY_FILE, SNI, SPSC_EVT_STREAM_DATA,
-        collect_stream_data, connect_client, drain_until, start_server,
+        SPSC_EVT_STREAM_FIN, SPSC_EVT_TX_CLOSE, collect_stream_data,
+        connect_client, drain_until, start_server,
     )
     from ._ports import next_port
 except ImportError:      # loaded bare, outside the package
     from test_loopback import (
         ALPN, CA_FILE, CERT_FILE, KEY_FILE, SNI, SPSC_EVT_STREAM_DATA,
-        collect_stream_data, connect_client, drain_until, start_server,
+        SPSC_EVT_STREAM_FIN, SPSC_EVT_TX_CLOSE, collect_stream_data,
+        connect_client, drain_until, start_server,
     )
     from _ports import next_port
 
@@ -48,6 +52,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 BOGUS_CNX = 0xDEADBEEF
+ERR_INVALID_STREAM_ID = 0x40E      # PICOQUIC_ERROR_INVALID_STREAM_ID
+ERR_STREAM_ALREADY_CLOSED = 0x40F  # PICOQUIC_ERROR_STREAM_ALREADY_CLOSED
+ERR_DISCONNECTED = 0x414           # PICOQUIC_ERROR_DISCONNECTED
 BLOCKER = b"\x00" * (2 * 1024 * 1024)
 STREAM_BYTES = 64 * 1024
 
@@ -97,7 +104,8 @@ class TestBinding:
             try:
                 assert client.set_stream_chain(cnx_ptr, 1, 7, 0) == 0
                 assert wait_counter(client, 'set_chain_rejected', 1) == 1
-                assert client.counters['set_chain_last_err'] != 0
+                assert (client.counters['set_chain_last_err']
+                        == ERR_INVALID_STREAM_ID)
             finally:
                 client.stop()
         finally:
@@ -199,6 +207,61 @@ class TestBinding:
         finally:
             server.stop()
 
+    def test_finished_stream_is_refused(self):
+        """A stream whose FIN has left joins no chain."""
+        port = next_port()
+        server = start_server(port)
+        try:
+            client, cnx_ptr = connect_client(port)
+            try:
+                client.tx_send_stream(cnx_ptr, 0, b"done", end_stream=True)
+                events = drain_until(server, SPSC_EVT_STREAM_FIN, timeout=5.0)
+                assert b"done" in collect_stream_data(events, 0)
+                before = applied(client)
+                assert client.set_stream_chain(cnx_ptr, 0, 1, 0) == 0
+                assert wait_counter(client, 'set_chain_rejected', 1) == 1
+                assert (client.counters['set_chain_last_err']
+                        == ERR_STREAM_ALREADY_CLOSED)
+                assert applied(client) == before
+            finally:
+                client.stop()
+        finally:
+            server.stop()
+
+    def test_closing_connection_refuses_it(self):
+        """A chain set behind the connection's close is not applied."""
+        port = next_port()
+        server = start_server(port)
+        try:
+            client, cnx_ptr = connect_client(port)
+            try:
+                client.tx_send_stream(cnx_ptr, 0, b"x")
+                drain_until(server, SPSC_EVT_STREAM_DATA, timeout=5.0)
+                before = applied(client)
+                # The close posts no wake: the chain's wakes the worker for both.
+                client.push_tx_event(SPSC_EVT_TX_CLOSE, 0, cnx_ptr=cnx_ptr)
+                assert client.set_stream_chain(cnx_ptr, 0, 1, 0) == 0
+                assert wait_counter(client, 'set_chain_rejected', 1) == 1
+                assert client.counters['set_chain_last_err'] == ERR_DISCONNECTED
+                assert applied(client) == before
+            finally:
+                client.stop()
+        finally:
+            server.stop()
+
+    def test_queued_chain_holds_its_stream_context(self):
+        """The event keeps the stream's context alive until the worker
+        takes it, whatever its owner drops meanwhile."""
+        ctx = TransportContext(tx_ring_cap=4)
+        sc = stream_ctx_create()
+        try:
+            assert ctx.set_stream_chain(BOGUS_CNX, 0, 1, 1, sc) == 0
+            assert _stream_ctx_refs(sc) == 2
+            ctx.stop()
+            assert _stream_ctx_refs(sc) == 1
+        finally:
+            stream_ctx_destroy(sc)
+
     def test_full_ring_returns_one_and_arms_the_drain(self):
         ctx = TransportContext(tx_ring_cap=2)
         posted = 0
@@ -214,10 +277,11 @@ class TestBinding:
 # --- Scheduling -------------------------------------------------------------
 
 
-def _first_sends(qlog_dir, sids):
+def _first_sends(qlog_dir, sids, size=STREAM_BYTES):
     """(stream id, new payload bytes) of each stream frame on `sids` that
-    carries new payload, in arrival order. A WT stream's header, which
-    h3zero queues apart from the payload, is not counted."""
+    carries new payload, in arrival order, for streams of `size` payload
+    bytes. A WT stream's header, which h3zero queues apart from the
+    payload, is not counted."""
     paths = glob.glob(os.path.join(qlog_dir, "*.qlog"))
     assert len(paths) == 1, paths
     with open(paths[0]) as f:
@@ -228,9 +292,9 @@ def _first_sends(qlog_dir, sids):
     total = {sid: 0 for sid in sids}
     for fr in frames:
         total[fr["id"]] = max(total[fr["id"]], fr["offset"] + fr["length"])
-    short = {sid: n for sid, n in total.items() if n < STREAM_BYTES}
+    short = {sid: n for sid, n in total.items() if n < size}
     assert not short, f"qlog misses stream bytes: {short}"
-    sent = {sid: n - STREAM_BYTES for sid, n in total.items()}
+    sent = {sid: n - size for sid, n in total.items()}
     out = []
     for fr in frames:
         end = fr["offset"] + fr["length"]
@@ -262,7 +326,7 @@ def _check_chain_order(sends, chains):
                 f"stream {b} started before stream {a} ended: {spans}")
 
 
-def _check_sharing(sends, chains):
+def _check_sharing(sends, chains, size=STREAM_BYTES):
     """When one chain has sent everything, the others have sent at least a
     quarter of theirs."""
     spans = _spans(sends)
@@ -272,7 +336,7 @@ def _check_sharing(sends, chains):
             if others is sids:
                 continue
             sent = _sent_before(sends, end, others)
-            assert sent >= len(others) * STREAM_BYTES // 4, (
+            assert sent >= len(others) * size // 4, (
                 f"chain {others} sent {sent} bytes while chain {sids} ran")
 
 
@@ -334,8 +398,8 @@ async def _until(pred, timeout=20.0):
     return True
 
 
-async def _send_quic(qlog_dir, streams):
-    """Send the blocker, then STREAM_BYTES on each stream, over raw QUIC.
+async def _send_quic(qlog_dir, streams, size=STREAM_BYTES):
+    """Send the blocker, then `size` bytes on each stream, over raw QUIC.
     Returns the stream ids, in the order of `streams`."""
     done = set()
 
@@ -356,7 +420,7 @@ async def _send_quic(qlog_dir, streams):
             sids = []
             for priority, chain, order in streams:
                 sid = quic.get_next_available_stream_id(is_unidirectional=True)
-                quic.send_stream_data(sid, bytes(STREAM_BYTES), end_stream=True,
+                quic.send_stream_data(sid, bytes(size), end_stream=True,
                                       priority=priority, chain=chain,
                                       order=order)
                 sids.append(sid)
@@ -366,7 +430,7 @@ async def _send_quic(qlog_dir, streams):
     return sids
 
 
-async def _send_wt(qlog_dir, streams):
+async def _send_wt(qlog_dir, streams, size=STREAM_BYTES):
     """As _send_quic, over WebTransport, with the bytes riding the creates."""
     done = set()
 
@@ -396,7 +460,7 @@ async def _send_wt(qlog_dir, streams):
             sids = []
             for priority, chain, order in streams:
                 sids.append(await wt.create_stream(
-                    bidir=False, initial=bytes(STREAM_BYTES), end_stream=True,
+                    bidir=False, initial=bytes(size), end_stream=True,
                     priority=priority, chain=chain, order=order))
             assert await _until(lambda: done >= {blocker, *sids}), done
     finally:

@@ -44,4 +44,8 @@ static inline int aiopquic_test_hold_tx_wake(aiopquic_ctx_t* ctx) {
     return __atomic_exchange_n(&ctx->tx_worker_idle, 0, __ATOMIC_ACQ_REL) != 0;
 }
 
+static inline uint32_t aiopquic_test_stream_ctx_refs(aiopquic_stream_ctx_t* sc) {
+    return atomic_load_explicit(&sc->refcount, memory_order_acquire);
+}
+
 #endif /* AIOPQUIC_TEST_ACCESS_H */
