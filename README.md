@@ -28,7 +28,7 @@
 - QUIC and WebTransport datagrams, TX + RX
 - Stream and datagram priority on one scale: `set_stream_priority`, `set_datagram_priority`
 - Congestion control by name: `bbr` (v3, default), `bbr1`, `cubic`, `dcubic`, `newreno`, `fast`,
-  `prague`, `c4`
+  `prague`, `c4`, and the prototype `bbr1-floor` (bbr1 with a media-rate floor)
 - Address validation with Retry (`serve(..., retry=True)`), QUIC v2 by compatible version
   negotiation (`supported_versions`), session resumption and 0-RTT (`session_ticket_file`)
 - TLS: certificate verification against certifi's roots or a private CA, post-quantum key exchange
