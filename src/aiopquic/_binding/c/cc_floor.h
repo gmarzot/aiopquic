@@ -44,6 +44,7 @@
 #define AIOPQUIC_CC_ALGO_NUMBER_BBR1_FLOOR 64
 #define AIOPQUIC_CC_FLOOR_K_DEFAULT 1.25
 #define AIOPQUIC_CC_FLOOR_K_MAX 16.0
+#define AIOPQUIC_CC_FLOOR_R_MAX 1000000000000ull  /* bits/s */
 #define AIOPQUIC_CC_FLOOR_BIN_US 1000000ull
 #define AIOPQUIC_CC_FLOOR_WINDOW_US 10000000ull
 #define AIOPQUIC_CC_FLOOR_NB_BINS 16
@@ -84,8 +85,8 @@ typedef struct {
     unsigned int engaged : 1;
 } aiopquic_cc_floor_t;
 
-/* K<ratio> and R<bits/s>; *k and *rate_bps keep their values when absent
- * or out of range. */
+/* K<ratio> (0 < K <= 16) and R<bits/s> (up to 1 Tb/s); *k and *rate_bps
+ * keep their values when absent or out of range. */
 static void aiopquic_cc_floor_parse_options(const char* x, double* k,
                                             uint64_t* rate_bps) {
     if (x == NULL) {
@@ -120,18 +121,14 @@ static void aiopquic_cc_floor_parse_options(const char* x, double* k,
         } else if (c == 'R') {
             uint64_t u = 0;
             int digits = 0;
-            int overflow = 0;
             while (*x >= '0' && *x <= '9') {
-                unsigned int v = (unsigned int)(*x - '0');
-                if (u > (UINT64_MAX - v) / 10) {
-                    overflow = 1;
-                } else {
-                    u = u * 10 + v;
+                if (u <= AIOPQUIC_CC_FLOOR_R_MAX) {
+                    u = u * 10 + (uint64_t)(*x - '0');
                 }
                 digits++;
                 x++;
             }
-            if (digits > 0 && !overflow) {
+            if (digits > 0 && u <= AIOPQUIC_CC_FLOOR_R_MAX) {
                 *rate_bps = u;
             }
         }

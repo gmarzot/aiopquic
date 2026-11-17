@@ -46,6 +46,8 @@ pytestmark = pytest.mark.skipif(not os.path.exists(CERT_FILE),
     ("R", (1.25, 0)),
     ("R-5", (1.25, 0)),
     ("R" + "9" * 30, (1.25, 0)),
+    ("R1000000000000", (1.25, 1_000_000_000_000)),
+    ("R1000000000001", (1.25, 0)),
     ("K1.5R", (1.5, 0)),
 ])
 def test_option_string(opts, expected):
