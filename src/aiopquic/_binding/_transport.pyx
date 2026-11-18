@@ -758,14 +758,16 @@ DEF DEFAULT_RING_CAPACITY = 262144
 
 
 cdef extern from "c/cc_floor.h":
-    double AIOPQUIC_CC_FLOOR_K_DEFAULT
     void aiopquic_register_cc_algorithms()
     void aiopquic_cc_floor_parse_options(const char* x, double* k,
                                          uint64_t* rate_bps)
+    uint64_t aiopquic_cc_floor_rate(uint64_t media, double k, double loss,
+                                    double loss_min, uint64_t bw_max)
+    int aiopquic_cc_floor_queue_guard(int held, uint64_t base, uint64_t wmin)
 
 
 _CC_NAMES = ("newreno", "reno", "cubic", "dcubic", "fast", "bbr", "bbr1",
-             "prague", "c4", "bbr1-floor")
+             "prague", "c4", "bbr1-floor", "bbr-floor")
 
 
 def check_congestion_control_algorithm(name):
@@ -2031,12 +2033,12 @@ cdef class TransportContext:
         ProbeRTT), then the ack phase (bits 8-15) and the filled-pipe,
         recovery, PTO-recovery, packet-conservation and idle-restart
         flags (bits 16-20); the model bandwidth in bytes per second.
-        cubic: the state and W_max in packets. bbr1-floor: cc_state holds
-        bbr1's state (bits 0-7), floor engaged (bit 8), released on a
-        standing queue (bit 9) or on loss (bit 10), and the media-rate
-        estimate (bits 32-63); cc_param holds bbr1's bottleneck bandwidth
-        (bits 0-31) and the floor rate (bits 32-63). Rates in bytes per
-        second, saturating at 2**32 - 1.
+        cubic: the state and W_max in packets. bbr1-floor and bbr-floor:
+        cc_state holds the inner bbr1 or bbr state (bits 0-7), floor
+        engaged (bit 8), released on RTT growth (bit 9) or on loss (bit
+        10), and the media-rate estimate (bits 32-63); cc_param holds the
+        inner algorithm's bandwidth (bits 0-31) and the floor rate (bits
+        32-63). Rates in bytes per second, saturating at 2**32 - 1.
 
         Values are as of the last worker snapshot; each call asks for a
         fresh one. Returns an empty dict on NULL cnx_ptr (cnx torn down
@@ -4457,13 +4459,23 @@ def _wt_cc_options(WebTransportSessionState st):
 
 
 def _cc_floor_options(options):
-    """bbr1-floor's (K, pinned media rate in bits/s, 0 = estimate) for an
-    option string (test only)."""
+    """The floor controllers' (K, 0 = headroom from loss; pinned media rate
+    in bits/s, 0 = estimate) for an option string (test only)."""
     cdef bytes b = options.encode()
-    cdef double k = AIOPQUIC_CC_FLOOR_K_DEFAULT
+    cdef double k = 0.0
     cdef uint64_t rate_bps = 0
     aiopquic_cc_floor_parse_options(b, &k, &rate_bps)
     return k, rate_bps
+
+
+def _cc_floor_rate(media, k, loss, loss_min, bw_max):
+    """The floor rate in bytes/s for those inputs (test only)."""
+    return aiopquic_cc_floor_rate(media, k, loss, loss_min, bw_max)
+
+
+def _cc_floor_queue_guard(held, base, wmin):
+    """The queue guard's next state, RTTs in microseconds (test only)."""
+    return bool(aiopquic_cc_floor_queue_guard(1 if held else 0, base, wmin))
 
 
 def _packet_train_mode(uintptr_t cnx_ptr):

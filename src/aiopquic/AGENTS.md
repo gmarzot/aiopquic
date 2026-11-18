@@ -72,8 +72,9 @@ CA: `QuicConfiguration.cafile` or `connect_webtransport(ca_file=)`. Accept anyth
 
 **Congestion control.** Default `"bbr"` (v3); `None` is picoquic's `newreno`. Names, matched exactly:
 `newreno` (alias `reno`), `cubic`, `dcubic`, `fast`, `bbr` (v3), `bbr1`, `prague`, `c4`, and
-`bbr1-floor` (prototype: bbr1 that keeps pacing at 1.25x the measured app-limited rate through loss;
-options `K<ratio>`, `R<bits/s>` pins the rate). An unknown name (`"BBR1"` among them) raises
+`bbr1-floor` and `bbr-floor` (prototypes: bbr1 or bbr that keeps pacing above the measured
+app-limited rate through loss, by the loss rate and below the bottleneck; options `K<ratio>` fixes
+the ratio, `R<bits/s>` pins the rate). An unknown name (`"BBR1"` among them) raises
 `ValueError` from `QuicConfiguration` and at transport start.
 
 **Datagrams** are on by default. `send_datagram_frame(data)` returns `len(data)`, or 0 when the
@@ -110,7 +111,7 @@ has left the ring once it is exceeded.
 | `src/aiopquic/asyncio/` | `connect`, `serve`, the protocol class, `dispatch.py` (one-port dual stack), `webtransport.py` |
 | `src/aiopquic/buffer.py`, `streamchain.py` | re-exports of the Cython codecs: varint, draft-18 vi64, MoQT subgroup objects |
 | `src/aiopquic/_binding/_transport.pyx` | `TransportContext`, `StreamChunk`, `WebTransportSessionState`, the RX drain loops |
-| `src/aiopquic/_binding/c/` | worker-thread C: `client_loop.h` (client loop with many sockets), `callback.h` (raw callback, TX dispatch), `h3wt_callback.h` (WebTransport), `cc_floor.h` (bbr1-floor, the CC table), ring and stream-context headers |
+| `src/aiopquic/_binding/c/` | worker-thread C: `client_loop.h` (client loop with many sockets), `callback.h` (raw callback, TX dispatch), `h3wt_callback.h` (WebTransport), `cc_floor.h` (bbr1-floor, bbr-floor, the CC table), ring and stream-context headers |
 | `third_party/`, `patches/` | submodules picoquic, picotls, liburing; picoquic patches |
 | `tests/` | pytest suite; `interop/` peer stacks; `bench/` opt-in |
 | `DATAFLOW.md`, `PERFORMANCE.md` | TX/RX/flow-control model, counters; numbers, build flags, tuning |

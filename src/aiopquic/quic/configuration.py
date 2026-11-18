@@ -102,15 +102,17 @@ class QuicConfiguration:
     # where loss-based algorithms fall behind, and has none of bbr1's
     # 10 s ProbeRTT stalls on low-RTT paths. Other values: "bbr1",
     # "newreno", "cubic", "prague" (L4S/ECN), "dcubic", "fast", "c4",
-    # "reno" (= newreno), "bbr1-floor" (prototype: bbr1 that keeps pacing
-    # at K x the app-limited media rate through loss, c/cc_floor.h).
+    # "reno" (= newreno), "bbr1-floor" and "bbr-floor" (prototypes: bbr1
+    # or bbr that keeps pacing above the app-limited media rate through
+    # loss, c/cc_floor.h).
     # Matched exactly; an unknown name raises ValueError here and at
     # transport start. None defers to picoquic's compile-time default
     # (newreno).
     congestion_control_algorithm: str | None = "bbr"
     # Option string for that algorithm, passed to picoquic as is. bbr:
     # "Q0.02" sends bursts of 20 ms of pacing rate (default 1 ms).
-    # bbr1-floor: "K1.5" sets K (default 1.25), "R20000000" pins the media
+    # bbr1-floor, bbr-floor: "K1.5" fixes the floor at 1.5 x the media rate
+    # (default: headroom from measured loss), "R20000000" pins the media
     # rate in bits/s instead of measuring it.
     congestion_control_options: str | None = None
     # When pacing holds a connection back, wait for up to 10 packets of

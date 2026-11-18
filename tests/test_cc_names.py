@@ -8,10 +8,11 @@ from aiopquic.asyncio.webtransport import connect_webtransport
 from aiopquic.quic.configuration import QuicConfiguration
 
 KNOWN = ["newreno", "reno", "cubic", "dcubic", "fast", "bbr", "bbr1",
-         "prague", "c4", "bbr1-floor"]
+         "prague", "c4", "bbr1-floor", "bbr-floor"]
 
 
-@pytest.mark.parametrize("name", ["BBR1", "Reno", "bbr2", "", "bbr1 ", "bbr1-Floor"])
+@pytest.mark.parametrize("name", ["BBR1", "Reno", "bbr2", "", "bbr1 ", "bbr1-Floor",
+                                  "bbr-Floor", "bbr3-floor"])
 def test_configuration_rejects_unknown(name):
     with pytest.raises(ValueError):
         QuicConfiguration(congestion_control_algorithm=name)
