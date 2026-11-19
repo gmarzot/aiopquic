@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.8.0 (unreleased)
+
+- `stream_released(stream_id)` on `QuicConnection` and `WebTransportSession`: True once a stream this endpoint opened has nothing left to reset, i.e. the peer acknowledged its data and FIN or its reset (on WebTransport, also once either side reset or stopped it), or the connection or session closed.
+
 ## v0.8.0rc2
 
 - Stream chains on stock picoquic: `set_stream_chain(stream_id, chain, order)` on `QuicConnection` and `WebTransportSession`, and `chain=`/`order=` on `send_stream_data`, `send_stream_data_drained` and `create_stream`, send a chain's streams one at a time by (order, stream id) while the chain shares its priority level with other streams, e.g. one chain per track with the group as order. Only a chain's lowest stream with data is active; the next takes over when it drains, ends or resets, and keeps the chain's round-robin turn; a stream beyond the peer's stream limit does not hold the streams that can send. `counters` gains `set_chain_applied`, `set_chain_rejected`, `set_chain_last_err`, `chain_holds`, `chain_promotes`, `chain_preempts` and `chain_drops`.
