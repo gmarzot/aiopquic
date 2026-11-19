@@ -79,6 +79,30 @@ _EVT_WT_CNX_CLOSED = 77
 WT_SESSION_GONE = 0x170d7b68
 
 
+class _NoWait:
+    """A create nobody awaits: the reply goes to on_created."""
+
+    __slots__ = ("on_created", "_done")
+
+    def __init__(self, on_created) -> None:
+        self.on_created = on_created
+        self._done = False
+
+    def done(self) -> bool:
+        return self._done
+
+    def cancelled(self) -> bool:
+        return False
+
+    def set_result(self, sid) -> None:
+        self._done = True
+        if self.on_created is not None:
+            self.on_created(sid)
+
+    def set_exception(self, _exc) -> None:
+        self.set_result(0)
+
+
 class _Inbox(asyncio.Queue):
     """A stream's received events; `destroyed` once its native stream is gone."""
     destroyed = False
@@ -353,6 +377,40 @@ class WebTransportSession:
         if sid == 0:
             raise WebTransportError("WT stream create rejected")
         return sid
+
+    def create_stream_nowait(self, bidir: bool = False, *,
+                             initial: bytes = b"", end_stream: bool = False,
+                             priority: int | None = None,
+                             chain: int | None = None,
+                             order: int | None = None,
+                             on_created=None) -> bool:
+        """create_stream() without waiting for the stream id: True once
+        the create is submitted, False, with nothing submitted, when it
+        would have to wait. on_created(stream_id) runs when the id
+        arrives, with 0 for a refused create."""
+        if self.session_closed or not self.session_ready:
+            return False
+        if len(initial) > self.stream_ring_cap:
+            return False
+        if priority is not None and not 0 <= priority <= 255:
+            raise ValueError(f"priority {priority} outside 0-255")
+        if chain is None and order is not None:
+            raise ValueError("order without chain")
+        if self._orphan_cleanup_task is not None:
+            return False
+        cap = self.tx_max_queued_bytes
+        if (cap and tx_data_bytes_queued() + self._tx_reserved > cap
+                and self._tx_backlog() > cap):
+            return False
+        try:
+            self._state.push_create_stream(
+                bidir, initial, end_stream, self.stream_ring_cap,
+                -1 if priority is None else priority, chain, order)
+        except BufferError:
+            return False
+        self._pending_creates.append((_NoWait(on_created), len(initial)))
+        self._tx_reserved += len(initial)
+        return True
 
     def _retire_orphan_stream(self, stream_id: int) -> None:
         """Retire an allocated stream whose create caller has gone away."""
