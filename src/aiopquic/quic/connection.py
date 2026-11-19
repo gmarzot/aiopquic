@@ -1199,6 +1199,16 @@ class QuicConnection:
             return False
         return self._transport.reset_stream_at_negotiated(self._cnx_ptr)
 
+    def stream_released(self, stream_id: int) -> bool:
+        """True once nothing is left to reset on a stream this endpoint
+        opened: picoquic has released it (all data and FIN acknowledged,
+        or its reset acknowledged; a bidi stream also needs the peer's
+        direction ended), or the connection is closed.
+
+        Ask only about streams written to, e.g. after FIN: a stream is
+        not tracked until its first write, so asking earlier reads True."""
+        return self._closed or stream_id not in self._stream_ctxs
+
     def stop_stream(self, stream_id: int, error_code: int) -> None:
         """Send STOP_SENDING on a stream. On a stream we only send on, the
         request is dropped and counted in tx_wrong_direction_dropped."""
