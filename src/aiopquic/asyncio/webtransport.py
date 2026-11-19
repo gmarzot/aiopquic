@@ -668,6 +668,15 @@ class WebTransportSession:
             return False
         return self._transport.reset_stream_at_negotiated(cnx)
 
+    def stream_released(self, stream_id: int) -> bool:
+        """True once nothing is left to reset on a WT stream this endpoint
+        opened: picoquic has released it (all data and FIN acknowledged,
+        or its reset acknowledged; a bidi stream also needs the peer's
+        direction ended), either side reset or stopped it, or the session
+        is closed. Ask only about streams written to, e.g. after FIN."""
+        return (self._session_closed.is_set()
+                or stream_id not in self._stream_tx_ctxs)
+
     def stop_stream(self, stream_id: int, error_code: int = 0) -> None:
         """Send STOP_SENDING on a WT stream we receive on (the peer should
         reset it). On our own uni stream, the request is dropped and
