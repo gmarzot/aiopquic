@@ -279,6 +279,10 @@ class WebTransportSession:
     # when a configuration is supplied.
     stream_ring_cap: int = 4 * 1024 * 1024
 
+    # Queue a WebTransportNewStream per peer-opened stream for events();
+    # a subclass that never reads events() sets this False.
+    queue_new_streams: bool = True
+
     async def _await_tx_data_capacity(self) -> None:
         """Park while this session's TX-queued bytes exceed the budget.
 
@@ -1246,8 +1250,9 @@ class WebTransportSession:
             # so stash the sc pointer here too.
             if sc_ptr:
                 self._stream_tx_ctxs[sid] = sc_ptr
-            self._event_queue.put_nowait(
-                WebTransportNewStream(stream_id=sid))
+            if self.queue_new_streams:
+                self._event_queue.put_nowait(
+                    WebTransportNewStream(stream_id=sid))
         elif evt_type == _EVT_STREAM_DESTROY:
             # Universal raw-QUIC STREAM_DESTROY — fired for raw-QUIC
             # streams that share this transport. WT data streams use
