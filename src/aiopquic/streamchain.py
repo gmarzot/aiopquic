@@ -5,6 +5,6 @@ The binding lives in aiopquic._binding._streamchain (Cython); this
 shim keeps the import path stable.
 """
 
-from aiopquic._binding._streamchain import StreamChain
+from aiopquic._binding._streamchain import LengthFieldError, StreamChain
 
-__all__ = ["StreamChain"]
+__all__ = ["LengthFieldError", "StreamChain"]

@@ -37,6 +37,15 @@ from cpython.buffer cimport (
 )
 from libc.stdint cimport uint8_t, uint64_t
 from libc.string cimport memcpy
+from cpython.pyport cimport PY_SSIZE_T_MAX
+
+from aiopquic.exceptions import LengthFieldError
+
+# Largest length a field may declare: a QUIC stream carries at most
+# 2^62-1 bytes (RFC 9000 §4.5), and the result must fit Py_ssize_t.
+cdef uint64_t _MAX_FIELD_LEN = (
+    0x3FFFFFFFFFFFFFFF if PY_SSIZE_T_MAX > 0x3FFFFFFFFFFFFFFF
+    else PY_SSIZE_T_MAX)
 
 
 cdef class _Chunk:
@@ -434,7 +443,8 @@ cdef class StreamChain:
         Returns tuple (object_id_delta, exts_or_None, status, payload).
         Underflow propagates StreamUnderflow; caller's chain.save() /
         rollback() at the outer level resets the cursor. Framer desync
-        (ext_len > exts_len_limit) raises RuntimeError.
+        (ext_len > exts_len_limit) raises RuntimeError; a KVP value
+        past its block raises LengthFieldError.
         """
         cdef object delta = self.pull_uint_var()
         cdef object exts = None
@@ -448,10 +458,13 @@ cdef class StreamChain:
         cdef Py_ssize_t value_len
         cdef object payload_len_obj
         cdef Py_ssize_t payload_len
+        cdef Py_ssize_t field_off
         cdef object status
         cdef object payload
 
         if extensions_present:
+            # RFC 9000 varints stop at 2^62-1: the length casts cannot
+            # overflow.
             exts_len_obj = self.pull_uint_var()
             exts_len = <Py_ssize_t>exts_len_obj
             if exts_len > exts_len_limit:
@@ -478,14 +491,17 @@ cdef class StreamChain:
                     if not (ext_id & 1):
                         ext_value = self.pull_uint_var()
                     else:
+                        field_off = self._pos
                         value_len_obj = self.pull_uint_var()
                         value_len = <Py_ssize_t>value_len_obj
                         if value_len > exts_end - self._pos or value_len > 0xFFFF:
                             # Checked before the pull: waiting for bytes the
                             # block cannot hold would stall the stream.
-                            raise OverflowError(
-                                f"KVP value length {value_len} exceeds its "
-                                f"block at type 0x{ext_id:x}")
+                            raise LengthFieldError(
+                                "kvp_value_len", value_len_obj,
+                                max(0, min(exts_end - self._pos, 0xFFFF)),
+                                field_off,
+                                f"exceeds its block at type 0x{ext_id:x}")
                         ext_value = self.pull_bytes(value_len)
                     if self._pos > exts_end:
                         # §1.4.3 bounds the sequence by the block's
@@ -517,7 +533,8 @@ cdef class StreamChain:
         """draft-18 twin of parse_object_subgroup: identical body shape,
         vi64 codec (§1.4.1) instead of the RFC 9000 varint. Kept separate
         so the d14/d16 hot path is untouched. Returns
-        (object_id_delta, exts_or_None, status, payload)."""
+        (object_id_delta, exts_or_None, status, payload). A block or
+        payload length no stream can carry raises LengthFieldError."""
         cdef object delta = self.pull_uint_vi64()
         cdef object exts = None
         cdef object prev_id
@@ -530,17 +547,24 @@ cdef class StreamChain:
         cdef Py_ssize_t value_len
         cdef object payload_len_obj
         cdef Py_ssize_t payload_len
+        cdef uint64_t len_u
+        cdef Py_ssize_t field_off
         cdef object status
         cdef object payload
 
         if extensions_present:
+            field_off = self._pos
             exts_len_obj = self.pull_uint_vi64()
-            exts_len = <Py_ssize_t>exts_len_obj
-            if exts_len > exts_len_limit:
+            len_u = exts_len_obj
+            if len_u > <uint64_t>exts_len_limit:
+                if len_u > _MAX_FIELD_LEN:
+                    raise LengthFieldError("ext_block_len", exts_len_obj,
+                                           exts_len_limit, field_off)
                 raise RuntimeError(
-                    f"framer desync: ext_len={exts_len} exceeds "
+                    f"framer desync: ext_len={exts_len_obj} exceeds "
                     f"limit {exts_len_limit}"
                 )
+            exts_len = <Py_ssize_t>len_u
             if exts_len > 0:
                 exts_end = self._pos + exts_len
                 exts = {}
@@ -560,14 +584,19 @@ cdef class StreamChain:
                     if not (ext_id & 1):
                         ext_value = self.pull_uint_vi64()
                     else:
+                        field_off = self._pos
                         value_len_obj = self.pull_uint_vi64()
-                        value_len = <Py_ssize_t>value_len_obj
-                        if value_len > exts_end - self._pos or value_len > 0xFFFF:
-                            # Checked before the pull: waiting for bytes the
-                            # block cannot hold would stall the stream.
-                            raise OverflowError(
-                                f"KVP value length {value_len} exceeds its "
-                                f"block at type 0x{ext_id:x}")
+                        len_u = value_len_obj
+                        # Checked before the pull: waiting for bytes the
+                        # block cannot hold would stall the stream.
+                        if (len_u > 0xFFFF
+                                or <Py_ssize_t>len_u > exts_end - self._pos):
+                            raise LengthFieldError(
+                                "kvp_value_len", value_len_obj,
+                                max(0, min(exts_end - self._pos, 0xFFFF)),
+                                field_off,
+                                f"exceeds its block at type 0x{ext_id:x}")
+                        value_len = <Py_ssize_t>len_u
                         ext_value = self.pull_bytes(value_len)
                     if self._pos > exts_end:
                         # §1.4.3 bounds the sequence by the block's
@@ -582,8 +611,13 @@ cdef class StreamChain:
                 if not exts:
                     exts = None
 
+        field_off = self._pos
         payload_len_obj = self.pull_uint_vi64()
-        payload_len = <Py_ssize_t>payload_len_obj
+        len_u = payload_len_obj
+        if len_u > _MAX_FIELD_LEN:
+            raise LengthFieldError("payload_len", payload_len_obj,
+                                   _MAX_FIELD_LEN, field_off)
+        payload_len = <Py_ssize_t>len_u
         if payload_len == 0:
             status = self.pull_uint_vi64()
             payload = b""
