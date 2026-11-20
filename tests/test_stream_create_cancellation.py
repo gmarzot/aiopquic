@@ -5,7 +5,11 @@ from contextlib import suppress
 
 import pytest
 
+from aiopquic._binding._transport import stream_ctx_create
 from aiopquic.asyncio import webtransport as wt
+
+# A real stream context: the session may mark the one a reply carries.
+SC = stream_ctx_create()
 
 
 class Transport:
@@ -80,7 +84,7 @@ async def submitted(s, *, bidir=True, timeout=5):
 
 def reply(s, sid, error=0):
     s._on_event((wt._EVT_WT_STREAM_CREATED, sid, None, False, error,
-                 0, 0, 123 if not error else 0))
+                 0, 0, SC if not error else 0))
 
 
 async def retired(s):
@@ -107,7 +111,7 @@ async def test_abandoned_create_keeps_exactly_one_reply_slot(cancel):
     assert await second == 6
     await retired(s)
     assert s._state.commands == [('reset', 4, 0), ('stop', 4, 0)]
-    assert s._stream_tx_ctxs == {6: 123}
+    assert s._stream_tx_ctxs == {6: SC}
     assert not s._pending_creates
 
 

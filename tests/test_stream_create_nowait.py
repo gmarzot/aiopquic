@@ -5,7 +5,7 @@ import asyncio
 
 import pytest
 
-from tests.test_stream_create_cancellation import reply, session, submitted
+from tests.test_stream_create_cancellation import SC, reply, session, submitted
 
 
 def nowait(s, ids, **kw):
@@ -22,7 +22,7 @@ async def test_the_reply_reports_the_stream_id():
     assert s._tx_reserved == len(b"hdr+obj")
     reply(s, 6)
     assert ids == [6]
-    assert s._stream_tx_ctxs == {6: 123}
+    assert s._stream_tx_ctxs == {6: SC}
     assert not s._pending_creates
     assert s._tx_reserved == 0
 

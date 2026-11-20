@@ -111,7 +111,9 @@ typedef struct {
      * in sc->rx) becomes structurally impossible for the dominant
      * event type. FIN/RESET events are never coalesced. */
     _Atomic(uint32_t) rx_event_pending;
-    /* fin/reset arrived; free wrapper after final drain. */
+    /* The stream takes no more writes (reset, stopped, retired, or its
+     * connection or session closed); fanout() refuses it. Set and read
+     * on the asyncio thread only. */
     uint8_t  pending_destroy;
     /* RESET_STREAM_AT waiting for its reliable bytes (worker only):
      * sends stop at tx_reliable_size, then the reset goes out. */

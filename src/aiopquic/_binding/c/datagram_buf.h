@@ -49,6 +49,9 @@ typedef struct {
      * a full push sets 1; the worker takes it after a pop and emits one
      * SPSC_EVT_DATAGRAM_TX_DRAINED so a blocked writer can retry. */
     _Atomic(uint32_t) drain_pending;
+    /* Set by the asyncio thread when the owner releases the ring;
+     * fanout_datagram() refuses a closed ring. Asyncio thread only. */
+    uint8_t closed;
     /* Counters, single-writer each (producer / worker). */
     uint64_t records_pushed;    /* producer */
     uint64_t push_full;         /* producer: rejected, ring full */

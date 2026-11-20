@@ -2,6 +2,7 @@
 
 ## v0.8.0 (unreleased)
 
+- `TransportContext.fanout(dests, data, end_stream)` writes one object to every stream in a `DestSet` (raw QUIC and WebTransport, one transport) in one call: all or nothing per destination, `(index, FANOUT_*)` refusals, a rotated start and at most one worker wake. `fanout_datagram()` does the same for datagrams; `fanout_dest()` / `fanout_datagram_dest()` on `QuicConnection` and `WebTransportSession` give the entries.
 - WebTransport: `WebTransportSession.queue_new_streams` (default True) queues a `WebTransportNewStream` for `events()` per peer-opened stream; a subclass that never reads `events()` sets it False, so the queue no longer grows by one event per stream for the session's life.
 - `stream_released(stream_id)` on `QuicConnection` and `WebTransportSession`: True once a stream this endpoint opened has nothing left to reset, i.e. the peer acknowledged its data and FIN or its reset (on WebTransport, also once either side reset or stopped it), or the connection or session closed.
 - WebTransport: `create_stream_nowait(..., on_created=)` submits a create without waiting for the stream id, and returns False with nothing submitted when it would have to wait (session TX budget, full TX event ring, streams being retired). The reply passes the id, or 0 for a refused create, to `on_created`.

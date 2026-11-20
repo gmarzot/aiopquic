@@ -40,6 +40,8 @@ from .events import (
 )
 from aiopquic._binding._transport import (
     TransportContext,
+    FANOUT_QUIC_DATAGRAM, FANOUT_QUIC_STREAM,
+    dgram_ring_mark_closed, stream_ctx_mark_gone,
     tx_data_bytes_queued,
     stream_buf_create, stream_buf_destroy,
     stream_buf_push, stream_buf_used, stream_buf_free, stream_buf_set_fin,
@@ -446,6 +448,7 @@ class QuicConnection:
             ))
         elif evt_type == _EVT_STOP_SENDING:
             self._adopt_stream_ctx(stream_id, _stream_ctx_ptr)
+            stream_ctx_mark_gone(_stream_ctx_ptr)
             self._events.append(StopSendingReceived(
                 stream_id=stream_id,
                 error_code=error_code,
@@ -528,7 +531,8 @@ class QuicConnection:
             # Stream fully retired by picoquic — drop our cached
             # pointer so the dict doesn't accumulate stale entries.
             # The drain drops the stream reference of the context named
-            # here; don't deref.
+            # here after this batch.
+            stream_ctx_mark_gone(_stream_ctx_ptr)
             self._sc_owned.discard(_stream_ctx_ptr)
             # Wake any producer parked in await sc_event.wait() with
             # the about-to-be-popped Event still in hand. Without this
@@ -751,6 +755,7 @@ class QuicConnection:
             ))
         elif evt_type == _EVT_STOP_SENDING:
             self._adopt_stream_ctx(stream_id, stream_ctx_ptr)
+            stream_ctx_mark_gone(stream_ctx_ptr)
             self._events.append(StopSendingReceived(
                 stream_id=stream_id, error_code=error_code,
             ))
@@ -805,6 +810,7 @@ class QuicConnection:
         elif evt_type == _EVT_DATAGRAM_LOST:
             self._datagrams_lost += 1
         elif evt_type == _EVT_STREAM_DESTROY:
+            stream_ctx_mark_gone(stream_ctx_ptr)
             self._sc_owned.discard(stream_ctx_ptr)
             # Wake a producer parked on this stream before dropping the
             # Event it holds; see the client-path branch.
@@ -843,6 +849,7 @@ class QuicConnection:
         self._stream_ctxs_dropped = True
         self._stream_ctxs.clear()
         for sc in self._sc_owned:
+            stream_ctx_mark_gone(sc)
             stream_ctx_destroy(sc)
         self._sc_owned.clear()
 
@@ -1064,10 +1071,7 @@ class QuicConnection:
                 "send_datagram_frame: connection not ready or closed")
         if not data:
             raise ValueError("send_datagram_frame: empty payload")
-        if self._dgram_ring == 0:
-            cfg = self._configuration
-            self._dgram_ring = self._transport.dgram_ring_create(
-                cfg.datagram_ring_bytes, cfg.datagram_max_payload)
+        self._ensure_dgram_ring()
         if self._dgram_mark_owed:
             if self._transport.dgram_mark_ready(
                     self._cnx_ptr, self._dgram_ring) == 0:
@@ -1135,8 +1139,39 @@ class QuicConnection:
             self._remote_max_datagram_frame_size = cap
         return cap
 
+    def _ensure_dgram_ring(self) -> int:
+        if self._dgram_ring == 0:
+            cfg = self._configuration
+            self._dgram_ring = self._transport.dgram_ring_create(
+                cfg.datagram_ring_bytes, cfg.datagram_max_payload)
+        return self._dgram_ring
+
+    def fanout_dest(self, stream_id: int):
+        """This stream as a destination for DestSet.add() and
+        TransportContext.fanout(). None when the connection is closed or
+        the stream has not been written to yet."""
+        if self._closed or self._cnx_ptr == 0:
+            return None
+        sc = self._stream_ctxs.get(stream_id)
+        if not sc:
+            return None
+        return (self._transport, FANOUT_QUIC_STREAM, self._cnx_ptr,
+                stream_id, sc,
+                getattr(self._configuration, 'stream_ring_cap',
+                        _STREAM_RING_CAP),
+                None)
+
+    def fanout_datagram_dest(self):
+        """This connection as a destination for a datagram DestSet and
+        TransportContext.fanout_datagram(). None when not ready or closed."""
+        if self._closed or self._cnx_ptr == 0:
+            return None
+        return (self._transport, FANOUT_QUIC_DATAGRAM, self._cnx_ptr, 0,
+                self._ensure_dgram_ring(), 0, None)
+
     def _release_dgram_ring(self) -> None:
         if self._dgram_ring:
+            dgram_ring_mark_closed(self._dgram_ring)
             self._transport.dgram_ring_release(self._dgram_ring,
                                                self._cnx_ptr)
             self._dgram_ring = 0
@@ -1184,10 +1219,12 @@ class QuicConnection:
         """
         if not 0 <= reliable_size <= 0xFFFFFFFF:
             raise ValueError("reset_stream: reliable_size out of range")
+        sc = self._stream_ctxs.get(stream_id, 0)
+        stream_ctx_mark_gone(sc)
         self._transport.push_tx_event(
             _TX_STREAM_RESET, stream_id,
             error_code=error_code, cnx_ptr=self._cnx_ptr,
-            stream_ctx=self._stream_ctxs.get(stream_id, 0),
+            stream_ctx=sc,
             aux=reliable_size,
         )
         self._transport.wake_up()

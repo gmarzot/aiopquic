@@ -526,6 +526,7 @@ cdef extern from "c/datagram_buf.h":
     ctypedef struct aiopquic_dgram_buf_t:
         uint32_t capacity
         uint32_t max_record
+        uint8_t closed
         uint64_t records_pushed
         uint64_t push_full
         uint64_t push_oversize
@@ -1285,6 +1286,176 @@ def _bind_preflight(addrs, int port, bint shared=False):
                 s.bind((address, port))
 
 
+# ---------------------------------------------------------------------------
+# Fanout: one write to many destinations of one TransportContext.
+# ---------------------------------------------------------------------------
+
+cdef enum:
+    # Destination kinds, as the fanout_dest() accessors report them.
+    _FO_QUIC_STREAM = 0
+    _FO_WT_STREAM = 1
+    _FO_QUIC_DATAGRAM = 2
+    _FO_WT_DATAGRAM = 3
+    # Per-destination refusal codes from fanout() and fanout_datagram().
+    _FO_EVENT_RING_FULL = 1  # TX event ring full; its drain signal is armed
+    _FO_RING_FULL = 2        # stream or datagram ring full; drain armed
+    _FO_TOO_LARGE = 3        # over the destination's ring or record cap
+    _FO_GONE = 4             # stream ended or connection/session closed
+    _FO_NO_MEMORY = 5        # the stream's TX ring could not be allocated
+
+FANOUT_QUIC_STREAM = _FO_QUIC_STREAM
+FANOUT_WT_STREAM = _FO_WT_STREAM
+FANOUT_QUIC_DATAGRAM = _FO_QUIC_DATAGRAM
+FANOUT_WT_DATAGRAM = _FO_WT_DATAGRAM
+FANOUT_EVENT_RING_FULL = _FO_EVENT_RING_FULL
+FANOUT_RING_FULL = _FO_RING_FULL
+FANOUT_TOO_LARGE = _FO_TOO_LARGE
+FANOUT_GONE = _FO_GONE
+FANOUT_NO_MEMORY = _FO_NO_MEMORY
+
+ctypedef struct fanout_dest_t:
+    void* cnx           # picoquic cnx; the WT session for FANOUT_WT_DATAGRAM
+    void* ptr           # aiopquic_stream_ctx_t* or aiopquic_dgram_buf_t*
+    uint64_t stream_id
+    uint32_t ring_cap
+    uint8_t kind
+    uint8_t live
+
+
+cdef class DestSet:
+    """Destinations of one TransportContext that fanout() (or, with
+    datagram=True, fanout_datagram()) writes in one call.
+
+    add() takes what QuicConnection / WebTransportSession fanout_dest()
+    (or fanout_datagram_dest()) returns, holds a reference on its stream
+    context or datagram ring, and returns the entry's index. remove()
+    drops it; indexes are reused. Asyncio thread only.
+    """
+    cdef object _transport
+    cdef bint _datagram
+    cdef fanout_dest_t* _ents
+    cdef uint32_t _n            # slots in use, live or free
+    cdef uint32_t _cap
+    cdef uint32_t* _free
+    cdef uint32_t _nfree
+    cdef uint32_t _live
+    cdef uint32_t _rot
+    cdef list _owners           # per slot: object kept alive, or None
+
+    def __cinit__(self, transport, bint datagram=False):
+        if not isinstance(transport, TransportContext):
+            raise TypeError("DestSet needs a TransportContext")
+        self._transport = transport
+        self._datagram = datagram
+        self._ents = NULL
+        self._free = NULL
+        self._n = self._cap = self._nfree = self._live = self._rot = 0
+        self._owners = []
+
+    def __dealloc__(self):
+        cdef uint32_t i
+        if self._ents is not NULL:
+            for i in range(self._n):
+                if self._ents[i].live:
+                    _fanout_unref(&self._ents[i])
+            free(self._ents)
+            self._ents = NULL
+        if self._free is not NULL:
+            free(self._free)
+            self._free = NULL
+
+    def __len__(self):
+        return self._live
+
+    @property
+    def datagram(self):
+        return self._datagram
+
+    @property
+    def start(self):
+        """Slot the next fanout call starts at."""
+        return self._rot % self._n if self._n else 0
+
+    def add(self, dest):
+        """Add a destination; returns its index.
+
+        Raises ValueError for None (closed connection or unknown stream),
+        a destination of another TransportContext, or one of the wrong
+        kind for this set."""
+        cdef fanout_dest_t* e
+        cdef uint32_t i, cap
+        cdef void* grown
+        if dest is None:
+            raise ValueError("no destination (closed or unknown stream)")
+        transport, kind, cnx, stream_id, ptr, ring_cap, owner = dest
+        if transport is not self._transport:
+            raise ValueError("destination belongs to another TransportContext")
+        if self._datagram != (kind in (FANOUT_QUIC_DATAGRAM,
+                                       FANOUT_WT_DATAGRAM)):
+            raise ValueError(f"destination kind {kind} does not fit this set")
+        if kind not in (FANOUT_QUIC_STREAM, FANOUT_WT_STREAM,
+                        FANOUT_QUIC_DATAGRAM, FANOUT_WT_DATAGRAM):
+            raise ValueError(f"unknown destination kind {kind}")
+        if not cnx or not ptr:
+            raise ValueError("destination has no connection or context")
+        if self._nfree:
+            self._nfree -= 1
+            i = self._free[self._nfree]
+        else:
+            if self._n == self._cap:
+                cap = self._cap * 2 if self._cap else 16
+                grown = realloc(self._ents, cap * sizeof(fanout_dest_t))
+                if grown is NULL:
+                    raise MemoryError()
+                self._ents = <fanout_dest_t*>grown
+                grown = realloc(self._free, cap * sizeof(uint32_t))
+                if grown is NULL:
+                    raise MemoryError()
+                self._free = <uint32_t*>grown
+                self._cap = cap
+            i = self._n
+            self._n += 1
+            self._owners.append(None)
+        e = &self._ents[i]
+        e.cnx = <void*><uintptr_t>cnx
+        e.ptr = <void*><uintptr_t>ptr
+        e.stream_id = stream_id
+        e.ring_cap = ring_cap
+        e.kind = kind
+        e.live = 1
+        if self._datagram:
+            aiopquic_dgram_buf_addref(<aiopquic_dgram_buf_t*>e.ptr)
+        else:
+            aiopquic_stream_ctx_ref(<aiopquic_stream_ctx_t*>e.ptr)
+        self._owners[i] = owner
+        self._live += 1
+        return i
+
+    def remove(self, uint32_t index):
+        """Drop the destination at index; later calls skip it."""
+        if index >= self._n or not self._ents[index].live:
+            raise IndexError(f"no destination at {index}")
+        _fanout_unref(&self._ents[index])
+        self._ents[index].live = 0
+        self._owners[index] = None
+        self._free[self._nfree] = index
+        self._nfree += 1
+        self._live -= 1
+
+    def stream_id(self, uint32_t index):
+        """Stream id of the destination at index (0 for a datagram)."""
+        if index >= self._n or not self._ents[index].live:
+            raise IndexError(f"no destination at {index}")
+        return self._ents[index].stream_id
+
+
+cdef inline void _fanout_unref(fanout_dest_t* e) noexcept:
+    if e.kind == _FO_QUIC_DATAGRAM or e.kind == _FO_WT_DATAGRAM:
+        aiopquic_dgram_buf_unref(<aiopquic_dgram_buf_t*>e.ptr)
+    else:
+        aiopquic_stream_ctx_destroy(<aiopquic_stream_ctx_t*>e.ptr)
+
+
 cdef class TransportContext:
     """
     Manages the picoquic context and network thread.
@@ -1338,6 +1509,12 @@ cdef class TransportContext:
     cdef uint64_t _send_busy_event_ring
     cdef uint64_t _send_busy_stream_ring
     cdef uint64_t _send_alloc_fail
+    cdef uint64_t _fanout_calls
+    cdef uint64_t _fanout_writes
+    cdef uint64_t _fanout_refusals
+    cdef uint64_t _fanout_dgram_calls
+    cdef uint64_t _fanout_dgram_writes
+    cdef uint64_t _fanout_dgram_refusals
     # Connection-global TX-ring drain wakeup. Lazy-allocated on first
     # access (needs a running event loop); see tx_event_ring_drain_event.
     cdef object _tx_event_ring_drain_event
@@ -1386,6 +1563,9 @@ cdef class TransportContext:
         self._send_busy_event_ring = 0
         self._send_busy_stream_ring = 0
         self._send_alloc_fail = 0
+        self._fanout_calls = self._fanout_writes = self._fanout_refusals = 0
+        self._fanout_dgram_calls = self._fanout_dgram_writes = 0
+        self._fanout_dgram_refusals = 0
         self._tx_event_ring_drain_event = None
         self._dgram_mark_owers = set()
         self._test_stream_ctxs = {}
@@ -2877,6 +3057,231 @@ cdef class TransportContext:
 
         return 0
 
+    cdef inline bint _fanout_event_room(self, uint32_t* ev_free) noexcept:
+        """Room for one more TX event. ev_free is a lower bound on free
+        entries (the worker only adds room); re-read when it hits 0."""
+        cdef spsc_ring_t* ring = self._ctx.tx_event_ring
+        if ev_free[0] == 0:
+            ev_free[0] = ring.capacity - spsc_ring_count(ring)
+            if ev_free[0] == 0:
+                # Armed before refusing, so the caller can await
+                # tx_event_ring_drain_event; an arm that finds the ring
+                # drained re-reads it.
+                if aiopquic_arm_tx_event_ring_drain_pending(self._ctx):
+                    return False
+                ev_free[0] = ring.capacity - spsc_ring_count(ring)
+                if ev_free[0] == 0:
+                    return False
+        return True
+
+    cdef inline int _fanout_mark_active(self, fanout_dest_t* e,
+                                        aiopquic_stream_ctx_t* sc,
+                                        spsc_entry_t* entry,
+                                        uint32_t* ev_free,
+                                        bint* marked) noexcept:
+        """After a commit: MARK_ACTIVE on the stream's 0->1 arm edge."""
+        cdef int rc
+        if not aiopquic_stream_ctx_tx_arm(sc):
+            self._ctx.cnt_tx_mark_active_skipped += 1
+            return 0
+        entry.stream_id = e.stream_id
+        entry.cnx = e.cnx
+        if e.kind == _FO_WT_STREAM:
+            # h3zero owns the WT stream's app context.
+            entry.stream_ctx = NULL
+            rc = spsc_ring_push(self._ctx.tx_event_ring, entry, NULL, 0)
+        else:
+            entry.stream_ctx = <void*>sc
+            rc = aiopquic_tx_push_sc(self._ctx, entry, NULL, 0)
+        if rc != 0:
+            # Unreachable while the asyncio thread is the only producer:
+            # the room was counted before the commit.
+            aiopquic_stream_ctx_tx_disarm(sc)
+            aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
+            return _FO_EVENT_RING_FULL
+        self._ctx.cnt_tx_event_ring_pushes += 1
+        ev_free[0] -= 1
+        marked[0] = True
+        return 0
+
+    def fanout(self, DestSet dests not None, bytes data, bint end_stream=False):
+        """Write data (and FIN with end_stream) to every stream in dests.
+
+        Each destination takes all of data or none of it, as with
+        tx_send_atomic. The first destination visited rotates per call.
+        At most one worker wake per call.
+
+        Returns None when every live destination took the write, else a
+        list of (index, code) for those that did not, code one of
+        FANOUT_EVENT_RING_FULL, FANOUT_RING_FULL, FANOUT_TOO_LARGE,
+        FANOUT_GONE, FANOUT_NO_MEMORY. A refused destination has nothing
+        of this write committed. After its FIN a destination is GONE.
+        """
+        cdef fanout_dest_t* e
+        cdef aiopquic_stream_ctx_t* sc
+        cdef const uint8_t* data_ptr = NULL
+        cdef uint32_t data_len = 0
+        cdef uint32_t n = dests._n
+        cdef uint32_t i, k, start
+        cdef uint32_t ev_free = 0
+        cdef uint64_t written = 0
+        cdef spsc_entry_t entry
+        cdef int rc, code
+        cdef bint marked = False
+        cdef list refused = None
+
+        if dests._transport is not self:
+            raise ValueError("DestSet belongs to another TransportContext")
+        if dests._datagram:
+            raise ValueError("fanout() on a datagram DestSet")
+        self._fanout_calls += 1
+        if n == 0:
+            return None
+        if data is not None:
+            data_ptr = <const uint8_t*>data
+            data_len = <uint32_t>len(data)
+        start = dests._rot % n
+        dests._rot = start + 1
+        memset(&entry, 0, sizeof(entry))
+        entry.event_type = SPSC_EVT_TX_MARK_ACTIVE
+
+        for k in range(n):
+            i = start + k
+            if i >= n:
+                i -= n
+            e = &dests._ents[i]
+            if not e.live:
+                continue
+            sc = <aiopquic_stream_ctx_t*>e.ptr
+            code = 0
+            if sc.pending_destroy:
+                code = _FO_GONE
+            elif not self._fanout_event_room(&ev_free):
+                code = _FO_EVENT_RING_FULL
+            else:
+                rc = aiopquic_stream_ctx_send_data(
+                    sc, data_ptr, data_len, e.ring_cap, end_stream)
+                if rc == -2:
+                    code = _FO_TOO_LARGE
+                elif rc == 0:
+                    code = _FO_RING_FULL
+                elif rc < 0:
+                    code = _FO_NO_MEMORY
+                else:
+                    if end_stream:
+                        sc.pending_destroy = 1
+                    code = self._fanout_mark_active(e, sc, &entry, &ev_free,
+                                                    &marked)
+            if code:
+                if refused is None:
+                    refused = []
+                refused.append((i, code))
+            else:
+                written += 1
+
+        if written and data_len:
+            aiopquic_tx_data_bytes_pushed_add(written * data_len)
+        self._fanout_writes += written
+        if refused is not None:
+            self._fanout_refusals += len(refused)
+        if marked and self._thread_ctx is not NULL:
+            if aiopquic_tx_wake_needed(self._ctx):
+                picoquic_wake_up_network_thread(self._thread_ctx)
+        return refused
+
+    def fanout_datagram(self, DestSet dests not None, bytes data):
+        """Queue one datagram to every connection or WT session in dests.
+
+        Each destination takes the whole record or nothing. Returns None
+        or a list of (index, code) as fanout(): FANOUT_EVENT_RING_FULL,
+        FANOUT_RING_FULL (record ring full; drain event armed),
+        FANOUT_TOO_LARGE (over that ring's payload cap) or FANOUT_GONE.
+
+        Raises ValueError for an empty payload.
+        """
+        cdef fanout_dest_t* e
+        cdef aiopquic_dgram_buf_t* db
+        cdef const uint8_t* data_ptr
+        cdef uint32_t data_len
+        cdef uint32_t n = dests._n
+        cdef uint32_t i, k, start
+        cdef uint32_t ev_free = 0
+        cdef uint64_t written = 0
+        cdef spsc_entry_t entry
+        cdef int rc, code
+        cdef bint marked = False
+        cdef list refused = None
+
+        if dests._transport is not self:
+            raise ValueError("DestSet belongs to another TransportContext")
+        if not dests._datagram:
+            raise ValueError("fanout_datagram() on a stream DestSet")
+        if not data:
+            raise ValueError("fanout_datagram: empty payload")
+        self._fanout_dgram_calls += 1
+        if n == 0:
+            return None
+        data_ptr = <const uint8_t*>data
+        data_len = <uint32_t>len(data)
+        start = dests._rot % n
+        dests._rot = start + 1
+        memset(&entry, 0, sizeof(entry))
+
+        for k in range(n):
+            i = start + k
+            if i >= n:
+                i -= n
+            e = &dests._ents[i]
+            if not e.live:
+                continue
+            db = <aiopquic_dgram_buf_t*>e.ptr
+            code = 0
+            if db.closed:
+                code = _FO_GONE
+            elif not self._fanout_event_room(&ev_free):
+                code = _FO_EVENT_RING_FULL
+            else:
+                rc = aiopquic_dgram_buf_push_record(db, data_ptr, data_len)
+                if rc == 0:
+                    code = _FO_RING_FULL
+                elif rc < 0:
+                    code = _FO_TOO_LARGE
+                else:
+                    if e.kind == _FO_WT_DATAGRAM:
+                        entry.event_type = SPSC_EVT_TX_MARK_WT_DATAGRAM_READY
+                        entry.cnx = e.cnx
+                        entry.stream_ctx = e.cnx
+                        entry.error_code = <uint64_t><uintptr_t>db
+                    else:
+                        entry.event_type = SPSC_EVT_TX_MARK_DATAGRAM_READY
+                        entry.cnx = e.cnx
+                        entry.stream_ctx = <void*>db
+                        entry.error_code = 0
+                    if spsc_ring_push(self._ctx.tx_event_ring,
+                                      &entry, NULL, 0) == 0:
+                        self._ctx.cnt_tx_event_ring_pushes += 1
+                        ev_free -= 1
+                        marked = True
+                    else:
+                        # Unreachable with one producer; the record waits
+                        # for this destination's next mark.
+                        aiopquic_arm_tx_event_ring_drain_pending(self._ctx)
+                        code = _FO_EVENT_RING_FULL
+            if code:
+                if refused is None:
+                    refused = []
+                refused.append((i, code))
+            else:
+                written += 1
+
+        self._fanout_dgram_writes += written
+        if refused is not None:
+            self._fanout_dgram_refusals += len(refused)
+        if marked and self._thread_ctx is not NULL:
+            if aiopquic_tx_wake_needed(self._ctx):
+                picoquic_wake_up_network_thread(self._thread_ctx)
+        return refused
+
     cdef uintptr_t _test_stream_ctx(self, uintptr_t cnx_ptr,
                                     uint64_t stream_id) except 0:
         """tx_send_stream's context for (cnx_ptr, stream_id), created on
@@ -3247,6 +3652,36 @@ cdef class TransportContext:
     def send_alloc_fail(self):
         """Times tx_send_atomic returned -1 (allocation failure)."""
         return self._send_alloc_fail
+
+    @property
+    def fanout_calls(self):
+        """fanout() calls."""
+        return self._fanout_calls
+
+    @property
+    def fanout_writes(self):
+        """Destinations fanout() wrote to."""
+        return self._fanout_writes
+
+    @property
+    def fanout_refusals(self):
+        """Destinations fanout() refused."""
+        return self._fanout_refusals
+
+    @property
+    def fanout_datagram_calls(self):
+        """fanout_datagram() calls."""
+        return self._fanout_dgram_calls
+
+    @property
+    def fanout_datagram_writes(self):
+        """Datagrams fanout_datagram() queued."""
+        return self._fanout_dgram_writes
+
+    @property
+    def fanout_datagram_refusals(self):
+        """Destinations fanout_datagram() refused."""
+        return self._fanout_dgram_refusals
 
     @property
     def worker_mark_active_processed(self):
@@ -4746,6 +5181,20 @@ def stream_ctx_destroy(uintptr_t sc_ptr):
         return
     aiopquic_cnt_sc_destroy_python_helper_inc()
     aiopquic_stream_ctx_destroy(<aiopquic_stream_ctx_t*>sc_ptr)
+
+
+def stream_ctx_mark_gone(uintptr_t sc_ptr):
+    """Mark a stream context as taking no more writes: fanout() refuses
+    it with FANOUT_GONE. Asyncio thread, while it holds a reference."""
+    if sc_ptr != 0:
+        (<aiopquic_stream_ctx_t*>sc_ptr).pending_destroy = 1
+
+
+def dgram_ring_mark_closed(uintptr_t db_ptr):
+    """Mark a datagram ring as closed: fanout_datagram() refuses it with
+    FANOUT_GONE. Asyncio thread, while it holds a reference."""
+    if db_ptr != 0:
+        (<aiopquic_dgram_buf_t*>db_ptr).closed = 1
 
 
 def stream_ctx_ensure_tx(uintptr_t sc_ptr, uint32_t capacity):
