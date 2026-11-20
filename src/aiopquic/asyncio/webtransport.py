@@ -34,6 +34,8 @@ from aiopquic.asyncio._workers import shared_port_args, worker_count
 from aiopquic.quic.connection import drain_and_route
 from aiopquic._binding._transport import (
     TransportContext, WebTransportSessionState,
+    FANOUT_WT_DATAGRAM, FANOUT_WT_STREAM,
+    dgram_ring_mark_closed, stream_ctx_mark_gone,
     tx_data_bytes_queued,
 )
 from aiopquic.quic.events import (
@@ -833,16 +835,9 @@ class WebTransportSession:
             raise ConnectionError("send_datagram_frame: session closed")
         if not data:
             raise ValueError("send_datagram_frame: empty payload")
-        if self._dgram_ring == 0:
-            # Records cap at the framed ceiling, so every one fits a
-            # fresh packet with its stream-ID prefix.
-            cap = self.max_datagram_payload()
-            if cap == 0:
-                raise ValueError(
-                    "send_datagram_frame: datagrams not negotiated")
-            self._dgram_max_payload = cap
-            self._dgram_ring = self._transport.dgram_ring_create(
-                self._dgram_ring_bytes, cap)
+        if self._ensure_dgram_ring() == 0:
+            raise ValueError(
+                "send_datagram_frame: datagrams not negotiated")
         if self._dgram_mark_owed:
             if self._state.push_dgram_ready(self._dgram_ring) == 0:
                 self._dgram_mark_owed = False
@@ -860,6 +855,46 @@ class WebTransportSession:
             self._dgram_mark_owed = True
             self._transport._owe_dgram_mark(self)
         return len(data)
+
+    def _ensure_dgram_ring(self) -> int:
+        """The datagram record ring, created on first use; 0 when
+        datagrams are not negotiated."""
+        if self._dgram_ring == 0:
+            # Records cap at the framed ceiling, so every one fits a
+            # fresh packet with its stream-ID prefix.
+            cap = self.max_datagram_payload()
+            if cap == 0:
+                return 0
+            self._dgram_max_payload = cap
+            self._dgram_ring = self._transport.dgram_ring_create(
+                self._dgram_ring_bytes, cap)
+        return self._dgram_ring
+
+    def fanout_dest(self, stream_id: int):
+        """This stream as a destination for DestSet.add() and
+        TransportContext.fanout(). None when the session is closed or not
+        open, or the stream is unknown, ended, reset or stopped."""
+        if self.session_closed or not self.session_ready:
+            return None
+        sc_ptr = self._stream_tx_ctxs.get(stream_id, 0)
+        cnx = self._state.cnx_ptr
+        if not sc_ptr or not cnx:
+            return None
+        return (self._transport, FANOUT_WT_STREAM, cnx, stream_id, sc_ptr,
+                self.stream_ring_cap, None)
+
+    def fanout_datagram_dest(self):
+        """This session as a destination for a datagram DestSet and
+        TransportContext.fanout_datagram(). None when the session is
+        closed or not open, or datagrams were not negotiated."""
+        if self._state is None or self.session_closed or not self.session_ready:
+            return None
+        db = self._ensure_dgram_ring()
+        if db == 0:
+            return None
+        # The set keeps the session state, and so its C session, alive.
+        return (self._transport, FANOUT_WT_DATAGRAM, self._state.session_ptr,
+                0, db, 0, self._state)
 
     def _repost_dgram_mark(self) -> None:
         if not (self._dgram_mark_owed and self._dgram_ring
@@ -925,11 +960,15 @@ class WebTransportSession:
             # The worker's session holds its own reference until the
             # session struct is freed; ours is dropped behind any queued
             # MARK naming the ring.
+            dgram_ring_mark_closed(self._dgram_ring)
             self._transport.dgram_ring_release(self._dgram_ring)
             self._dgram_ring = 0
         # One worker-thread walk (TX_WT_SESSION_CLEANUP) sends the §6
         # resets and stop-sendings and releases the session's wt_link
         # sc's; the release does not wait on the wire. O(1) ring cost.
+        # Their links still hold them until LINK_RELEASE drains here.
+        for sc_ptr in self._stream_tx_ctxs.values():
+            stream_ctx_mark_gone(sc_ptr)
         self._push_or_retry(self._state.push_session_cleanup, "cleanup")
         self._stream_tx_ctxs.clear()
         if self._orphan_cleanup_task is not None or self._ring_parked_creates:
@@ -1076,7 +1115,7 @@ class WebTransportSession:
         ev = self._stream_tx_drain_events.get(sid)
         if ev is not None:
             ev.set()
-        self._stream_tx_ctxs.pop(sid, None)
+        stream_ctx_mark_gone(self._stream_tx_ctxs.pop(sid, 0))
         self._stream_tx_drain_events.pop(sid, None)
 
     def _on_session_closed(self, error_code, data,
