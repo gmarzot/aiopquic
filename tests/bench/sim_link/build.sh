@@ -50,8 +50,6 @@ build_one() {
         "${PQ}/build/libpicoquic-core.a" \
         "${PQ}/build/picotls-build/libpicotls-openssl.a" \
         "${PQ}/build/picotls-build/libpicotls-minicrypto.a" \
-        $([ -f "${PQ}/build/picotls-build/libpicotls-fusion.a" ] && \
-            echo "${PQ}/build/picotls-build/libpicotls-fusion.a") \
         "${PQ}/build/picotls-build/libpicotls-core.a" \
         ${EXTRA_LDFLAGS} \
         -lssl -lcrypto -lpthread -lm \

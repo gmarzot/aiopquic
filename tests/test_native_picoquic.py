@@ -12,8 +12,7 @@ Slow categories are excluded via `-x`: stress/fuzz, cnx_stress,
 cnx_ddos, satellite_*, ddos_amplification_*, key_rotation_stress,
 eccf_corrupted_fuzz (picoquic_ct); http_stress, h3zero_*_fuzz,
 h3zero_satellite, picowt_baton_long (picohttp_ct). Run those
-directly with picoquic_ct/picohttp_ct when you want them. The
-QMUX tests are excluded for a different reason, see PICOQUIC_EXCLUDED.
+directly with picoquic_ct/picohttp_ct when you want them.
 
 Drivers run with cwd = picoquic source dir so relative cert paths
 (./certs/cert.pem) resolve.
@@ -67,16 +66,6 @@ PICOHTTP_SLOW = [
     "picowt_baton_long",
 ]
 
-# QMUX (QUIC over TCP) TLS records fail with the fusion AES-GCM this
-# build links (bad_record_mac); QMUX is not bound by aiopquic.
-PICOQUIC_EXCLUDED = [
-    "sockloop_qmux",
-    "sockloop_qmux_close",
-    "qmux_loop_tls",
-    "qmux_loop_tls_close",
-]
-
-
 def _run(driver: Path, exclude: list[str]) -> subprocess.CompletedProcess:
     args = [str(driver)]
     for name in exclude:
@@ -102,7 +91,7 @@ class TestNativePicoquic:
         reason="picoquic_ct not built; run ./build.sh",
     )
     def test_picoquic_ct(self):
-        result = _run(PICOQUIC_CT, PICOQUIC_SLOW + PICOQUIC_EXCLUDED)
+        result = _run(PICOQUIC_CT, PICOQUIC_SLOW)
         last = result.stdout.strip().splitlines()[-3:]
         assert result.returncode == 0, (
             f"picoquic_ct failed (rc={result.returncode}):\n"

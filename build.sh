@@ -18,7 +18,7 @@
 #                         test drivers); no reconcile, no relink. CI,
 #                         cibuildwheel, and update_submodules.sh use this.
 #   ./build.sh --install  only relink the extension + verify.
-#   ./build.sh --verify   only check imported == this source tree + Fusion.
+#   ./build.sh --verify   only check imported == this source tree.
 #   ./build.sh --patches  only apply patches/*.patch to picoquic. CI runs it
 #                         when a cached native build skips --native: the
 #                         extension compiles against the patched headers.
@@ -205,19 +205,12 @@ install_extension() {
 }
 
 # Verify the imported aiopquic resolves to THIS source tree (not a
-# site-packages wheel) and, when a host-tuned x86_64 build is expected,
-# that Fusion AES-GCM is actually linked into the extension. Returns
-# nonzero on any mismatch. Prints one status line per check.
+# site-packages wheel). Returns nonzero on a mismatch. Prints one status
+# line per check.
 verify_imported() {
-    local expect_fusion=0 flavor arch
-    flavor="$(build_flavor)"
-    arch="$(uname -m)"
-    if [[ "${flavor}" == perf* ]] && { [ "${arch}" = "x86_64" ] || [ "${arch}" = "amd64" ]; }; then
-        expect_fusion=1
-    fi
-    "${PYTHON}" - "${SCRIPT_DIR}" "${expect_fusion}" <<'PY'
-import sys, os, glob, subprocess
-script_dir, expect_fusion = sys.argv[1], sys.argv[2] == "1"
+    "${PYTHON}" - "${SCRIPT_DIR}" <<'PY'
+import sys, os
+script_dir = sys.argv[1]
 ok = True
 try:
     import aiopquic
@@ -233,23 +226,6 @@ else:
     print("               ^ NOT this source tree (%s)" % src)
     print("               (a portable wheel likely clobbered the editable install)")
     ok = False
-if expect_fusion:
-    so = glob.glob(d + "/_binding/_transport*.so")
-    if not so:
-        print("  fusion     : FAIL - no _transport extension found")
-        ok = False
-    else:
-        try:
-            syms = subprocess.run(["nm", so[0]], capture_output=True, text=True).stdout
-        except FileNotFoundError:
-            print("  fusion     : SKIP - 'nm' not available to inspect symbols")
-            syms = ""
-        if syms:
-            if "ptls_fusion_aes128gcm" in syms:
-                print("  fusion     : host-tuned OK (Fusion AES-GCM linked)")
-            else:
-                print("  fusion     : FAIL - Fusion not linked (portable / PERF=0 build)")
-                ok = False
 # Report the runtime-linked OpenSSL — the real "am I on the fast path?"
 # signal (OpenSSL version dominates throughput; may differ from Python's
 # ssl module). Best-effort; never fails the verify.
@@ -269,6 +245,10 @@ try:
     lib.OpenSSL_version.restype = ctypes.c_char_p
     ver = lib.OpenSSL_version(0).decode()
     print("  openssl    : %s%s" % (ver, (" (%s)" % ossl_path) if ossl_path else ""))
+    lib.OpenSSL_version_num.restype = ctypes.c_ulong
+    if lib.OpenSSL_version_num() < 0x30500000:
+        print("  openssl    : WARNING - older than 3.5: per-packet AES-GCM calls cost ~8% more"
+              " relay CPU; set OPENSSL_ROOT_DIR to a 3.5+ build")
 except Exception:
     pass
 sys.exit(0 if ok else 4)
@@ -399,9 +379,6 @@ build_native() {
 
     # Host-tuned performance flags. Enabled by DEFAULT for source builds:
     #   - DISABLE_DEBUG_PRINTF (every platform; strips dbg branches)
-    #   - PTLS Fusion AES-GCM (x86_64 only; picotls runtime-CPUIDs
-    #     AES-NI + PCLMULQDQ so the lib is safe to bake in even on
-    #     hosts that lack them — runtime falls back to picotls openssl)
     #   - -O3 -march=native -flto (every platform; host-tuned ISA)
     #
     # Knobs:
@@ -412,18 +389,12 @@ build_native() {
     #                             the build. cibuildwheel sets this in
     #                             pyproject.toml so wheels stay portable.
     PICOQUIC_PERF_ARGS=()
-    PICOTLS_PERF_ARGS=()
     if [ "${AIOPQUIC_WHEEL_BUILD:-0}" = "1" ]; then
         echo -e "${COLOR_GREEN}AIOPQUIC_WHEEL_BUILD=1: portable build, host-tuned flags suppressed (caller drives PICOQUIC_C_FLAGS / CMAKE_ARGS)${COLOR_OFF}"
     elif [ "${AIOPQUIC_PERF:-1}" = "1" ]; then
-        echo -e "${COLOR_GREEN}AIOPQUIC_PERF=1 (default): host-tuned perf flags enabled (Fusion if x86_64, DISABLE_DEBUG_PRINTF, -O3 -march=native -flto)${COLOR_OFF}"
+        echo -e "${COLOR_GREEN}AIOPQUIC_PERF=1 (default): host-tuned perf flags enabled (DISABLE_DEBUG_PRINTF, -O3 -march=native -flto)${COLOR_OFF}"
         PICOQUIC_PERF_ARGS+=("-DDISABLE_DEBUG_PRINTF=ON")
         PERF_ARCH="$(uname -m)"
-        if [ "${PERF_ARCH}" = "x86_64" ] || [ "${PERF_ARCH}" = "amd64" ]; then
-            PICOQUIC_PERF_ARGS+=("-DPTLS_WITH_FUSION=ON")
-            PICOTLS_PERF_ARGS+=("-DWITH_FUSION=ON")
-            WANT_FUSION=1
-        fi
         if [ "$(uname -s)" = "Darwin" ]; then
             # ld64's LTO drops the definition of picoquicdemo's bundled
             # getopt.c that the demo references.
@@ -448,8 +419,7 @@ build_native() {
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DWITH_FUSION=OFF \
         ${CMAKE_FLAG_ARGS[@]+"${CMAKE_FLAG_ARGS[@]}"} \
-        ${CMAKE_OPENSSL_ARGS[@]+"${CMAKE_OPENSSL_ARGS[@]}"} \
-        ${PICOTLS_PERF_ARGS[@]+"${PICOTLS_PERF_ARGS[@]}"}
+        ${CMAKE_OPENSSL_ARGS[@]+"${CMAKE_OPENSSL_ARGS[@]}"}
     cmake --build "${PTLS_BUILD_DIR}" -j "${NPROC}"
     echo -e "${COLOR_GREEN}picotls build complete.${COLOR_OFF}"
 
@@ -467,20 +437,6 @@ build_native() {
         fi
     done
 
-    # Fusion lives in its own static lib (picotls ADD_LIBRARY(picotls-fusion)).
-    # picoquic's FindPTLS only auto-locates it via find_library HINTS that don't
-    # cover our out-of-tree picotls build dir, so hand it the explicit path;
-    # otherwise picoquic compiles the fusion refs but links nothing that defines
-    # ptls_fusion_* (undefined-reference link failure on hosts without a system
-    # picotls-fusion).
-    if [ "${WANT_FUSION:-0}" = "1" ]; then
-        PTLS_FUSION_LIB="${PTLS_BUILD_DIR}/libpicotls-fusion.a"
-        if [ ! -f "${PTLS_FUSION_LIB}" ]; then
-            echo -e "${COLOR_RED}ERROR: expected ${PTLS_FUSION_LIB} after picotls build (WITH_FUSION=ON)${COLOR_OFF}" >&2
-            exit 1
-        fi
-        PICOQUIC_PERF_ARGS+=("-DPTLS_FUSION_LIBRARY=${PTLS_FUSION_LIB}")
-    fi
 
     # --- Step 2: Build picoquic against our picotls ---
     echo -e "${COLOR_GREEN}Building picoquic in ${BUILD_DIR}...${COLOR_OFF}"
@@ -499,7 +455,6 @@ build_native() {
         -DBUILD_LOGREADER=OFF \
         -DBUILD_HTTP=ON \
         -DBUILD_LOGLIB=ON \
-        -DPTLS_WITH_FUSION=OFF \
         -DPTLS_INCLUDE_DIR="${PICOTLS_DIR}/include" \
         -DPTLS_CORE_LIBRARY="${PTLS_CORE_LIB}" \
         -DPTLS_OPENSSL_LIBRARY="${PTLS_OPENSSL_LIB}" \

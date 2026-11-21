@@ -94,8 +94,8 @@ portable across hosts. An opt-in env var layers on host-tuned
 optimizations for local benching — not enabled in PyPI wheels:
 
 ```bash
-# Host-tuned: Fusion AES-GCM (x86_64), DISABLE_DEBUG_PRINTF,
-# -O3 -march=native -flto. Binary becomes machine-specific.
+# Host-tuned: DISABLE_DEBUG_PRINTF, -O3 -march=native -flto.
+# Binary becomes machine-specific.
 AIOPQUIC_PERF=1 ./build.sh   # PERF=1 is the default; shown for clarity
 ```
 
@@ -105,8 +105,11 @@ Per-platform behavior:
 |-------------------------------|:------------:|:-----------:|:-----------:|:------------:|
 | `-O3 -DNDEBUG` (always on)    |      ✓       |      ✓      |      ✓      |      ✓       |
 | `DISABLE_DEBUG_PRINTF`        |      ✓       |      ✓      |      ✓      |      ✓       |
-| Fusion AES-GCM (CPUID-dispatched) | ✓        |      –      |      –      |      ✓       |
 | `-march=native` / `-mcpu=native` + `-flto` | ✓ | ✓     |      ✓      |      ✓       |
+
+AES-GCM comes from the linked OpenSSL. Use 3.5 or newer (`OPENSSL_ROOT_DIR=...`): on x86, a relay
+runs about 8% more instructions per packet on OpenSSL 3.0, whose per-call overhead is higher.
+`build.sh` warns when it links an older one.
 
 ### Experimental: `AIOPQUIC_IO_URING=1` (DORMANT)
 

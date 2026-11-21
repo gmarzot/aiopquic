@@ -3,7 +3,7 @@ and exchange stream data."""
 
 import os
 import time
-from aiopquic._binding._transport import TransportContext
+from aiopquic._binding._transport import TransportContext, _hold_tx_wake
 
 # Event type constants (must match spsc_ring.h)
 SPSC_EVT_STREAM_DATA = 0
@@ -849,15 +849,21 @@ class TestLoopback:
         assert wait_for_ready(client), "Client not ready"
         try:
             import builtins
-            # Push until the ring overflows: the network thread drains
-            # it concurrently, so a fixed count can fall short.
-            err = None
+            # Take the idle worker's wake so nothing drains the ring. Only a
+            # stream's first write posts a MARK_ACTIVE, so each write opens a
+            # new stream.
             deadline = time.monotonic() + 2.0
-            while err is None and time.monotonic() < deadline:
+            while not _hold_tx_wake(client):
+                assert time.monotonic() < deadline, "worker never went idle"
+                time.sleep(0.001)
+            err = None
+            for i in range(64):
                 try:
-                    client.tx_send_stream(0, 0, b"x" * 256)
+                    client.tx_send_stream(0, 4 * i, b"x" * 256,
+                                          stream_ring_cap=4096)
                 except builtins.BufferError as e:
                     err = e
+                    break
             assert err is not None, "TX ring overflow did not surface BufferError"
             assert "TX event ring full" in str(err), err
         finally:

@@ -1046,6 +1046,11 @@ static int aiopquic_wt_path_callback(
         int is_fin = (fin_after && !sc->tx_reset_pending
                       && to_send == avail) ? 1 : 0;
         int still_active = (sendable > to_send) ? 1 : 0;
+        if (!still_active && !is_fin
+                && aiopquic_stream_ctx_tx_park(sc, to_send, fin_after)) {
+            still_active = 1;
+            s->bridge->cnt_tx_park_kept_active++;
+        }
         uint8_t* buf = picoquic_provide_stream_data_buffer(
             bytes, to_send, is_fin, still_active);
         if (buf && to_send > 0) {
@@ -1089,6 +1094,10 @@ static int aiopquic_wt_path_callback(
                         memory_order_release);
                 }
             }
+        }
+        if (sc->chain != NULL) {
+            aiopquic_chain_pulled(s->bridge, sc, to_send > 0 || is_fin, is_fin,
+                                  still_active);
         }
         /* On FIN we don't free the link here — picoquic still owns
          * the stream until h3zero fires picohttp_callback_free. */
@@ -1247,6 +1256,9 @@ static int aiopquic_wt_path_callback(
         if (link && stream_ctx
                 && stream_ctx->path_callback_ctx == link) {
             stream_ctx->path_callback_ctx = NULL;
+            if (link->sc && link->sc->chain != NULL) {
+                (void)aiopquic_chain_leave(s->bridge, link->sc);
+            }
             /* Order: STREAM_DESTROY first (Python dict cleanup),
              * then LINK_RELEASE (link + sc ref drop). FIFO on the
              * SPSC ring preserves this ordering at the consumer.
@@ -1406,6 +1418,18 @@ static int aiopquic_wt_reset_stream(picoquic_cnx_t* cnx,
 static void aiopquic_wt_stream_reattach(picoquic_cnx_t* cnx,
                                         h3zero_stream_ctx_t* st) {
     (void)picoquic_set_app_stream_ctx(cnx, st->stream_id, st);
+}
+
+static aiopquic_stream_ctx_t* aiopquic_wt_sc_of_stream(picoquic_cnx_t* cnx,
+                                                       uint64_t sid) {
+    h3zero_callback_ctx_t* h3_ctx =
+        (h3zero_callback_ctx_t*)picoquic_get_callback_context(cnx);
+    h3zero_stream_ctx_t* st = h3_ctx ? h3zero_find_stream(h3_ctx, sid) : NULL;
+    if (st != NULL && st->path_callback_ctx != NULL
+            && *(uint32_t*)st->path_callback_ctx == AIOPQUIC_WT_CTX_LINK) {
+        return ((aiopquic_wt_stream_link_t*)st->path_callback_ctx)->sc;
+    }
+    return NULL;
 }
 
 /* The sc of session s behind h3zero stream st, or NULL. */
@@ -1572,7 +1596,7 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
             aiopquic_wt_push_stream_created(s, 0, NULL, 1);
             return 1;
         }
-        int is_bidir = entry->is_fin;
+        int is_bidir = (entry->is_fin & AIOPQUIC_WT_CREATE_BIDIR) != 0;
         h3zero_stream_ctx_t* new_stream = picowt_create_local_stream(
             s->cnx, is_bidir, s->h3_ctx, s->control_stream_id);
         if (!new_stream) {
@@ -1591,6 +1615,45 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         }
         new_stream->path_callback = aiopquic_wt_path_callback;
         new_stream->path_callback_ctx = link;
+        if (entry->error_code != 0) {
+            int pri_ret = picoquic_set_stream_priority(
+                s->cnx, new_stream->stream_id, (uint8_t)(entry->error_code - 1));
+            if (pri_ret == 0) {
+                ctx->worker_set_priority_applied++;
+            } else {
+                ctx->worker_set_priority_rejected++;
+                ctx->worker_set_priority_last_err = (uint64_t)pri_ret;
+            }
+        }
+        const uint8_t* data = (const uint8_t*)entry->data_buf;
+        uint32_t data_length = entry->data_length;
+        if ((entry->is_fin & AIOPQUIC_WT_CREATE_CHAIN) != 0
+                && data_length >= sizeof(aiopquic_stream_chain_arg_t)) {
+            aiopquic_stream_chain_arg_t chain;
+            memcpy(&chain, data, sizeof(chain));
+            aiopquic_apply_stream_chain(ctx, s->cnx, new_stream->stream_id,
+                                        link->sc, 1, &chain);
+            data += sizeof(chain);
+            data_length -= (uint32_t)sizeof(chain);
+        }
+        /* The first bytes queue behind the stream header, so one send
+         * carries both. */
+        uint8_t fin = (entry->is_fin & AIOPQUIC_WT_CREATE_FIN) != 0;
+        if (data_length > 0 || fin) {
+            if (aiopquic_stream_ctx_send_data(
+                    link->sc, data, data_length, entry->aux, fin) != 1) {
+                /* A nonzero code makes Python retire the stream. */
+                aiopquic_wt_push_stream_created(s, new_stream->stream_id,
+                                                  NULL, 3);
+                return 1;
+            }
+            aiopquic_tx_data_bytes_pushed_add(data_length);
+            if (link->sc->chain != NULL) {
+                aiopquic_chain_ready(ctx, link->sc, 0);
+            } else {
+                picoquic_mark_active_stream_v2(s->cnx, new_stream->stream_id, 1);
+            }
+        }
         aiopquic_wt_push_stream_created(s, new_stream->stream_id,
                                           link->sc, 0);
         return 1;
@@ -1670,6 +1733,9 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (sc && sc->tx_reset_pending) {
             return 1;   /* already resetting */
         }
+        if (sc && sc->chain != NULL) {
+            (void)aiopquic_chain_leave(ctx, sc);
+        }
         uint64_t reliable = aiopquic_reset_reliable_size(s->cnx, sc, entry->aux);
         int rr;
         if (reliable == 0) {
@@ -1729,6 +1795,24 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         } else {
             ctx->worker_set_priority_rejected++;
             ctx->worker_set_priority_last_err = (uint64_t)pri_ret;
+        }
+        return 1;
+    }
+
+    case SPSC_EVT_TX_WT_SET_STREAM_CHAIN: {
+        if (!s || !s->cnx) {
+            ctx->cnt_tx_event_dropped_dead_cnx++;
+            return 1;
+        }
+        const aiopquic_stream_chain_arg_t* chain = aiopquic_tx_chain_arg(entry);
+        if (chain != NULL) {
+            h3zero_callback_ctx_t* h3_ctx =
+                (h3zero_callback_ctx_t*)picoquic_get_callback_context(s->cnx);
+            h3zero_stream_ctx_t* st = h3_ctx
+                ? h3zero_find_stream(h3_ctx, entry->stream_id) : NULL;
+            aiopquic_apply_stream_chain(ctx, s->cnx, entry->stream_id,
+                                        st ? aiopquic_wt_stream_sc(s, st) : NULL,
+                                        1, chain);
         }
         return 1;
     }
@@ -1793,6 +1877,9 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                             (aiopquic_wt_stream_link_t*)
                                 st->path_callback_ctx;
                         if (lk->session == s) {
+                            if (lk->sc && lk->sc->chain != NULL) {
+                                (void)aiopquic_chain_leave(ctx, lk->sc);
+                            }
                             /* §6: reset the send side and abort reading on
                              * the receive side of every stream in the
                              * session, with WT_SESSION_GONE; a uni stream
@@ -1865,6 +1952,9 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                                 (aiopquic_wt_stream_link_t*)
                                     st->path_callback_ctx;
                             if (lk->session == s) {
+                                if (lk->sc && lk->sc->chain != NULL) {
+                                    (void)aiopquic_chain_leave(ctx, lk->sc);
+                                }
                                 st->path_callback = NULL;
                                 st->path_callback_ctx = NULL;
                                 aiopquic_stream_ctx_tx_abandon(lk->sc);

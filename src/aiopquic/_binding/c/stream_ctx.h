@@ -14,11 +14,11 @@
  *     wrapper to the stream slot.
  *   - aiopquic_stream_ctx_ensure_tx / _ensure_rx allocate the side ring
  *     on demand (idempotent).
- *   - On stream_reset / stop_sending: mark pending_destroy; the TX ring
- *     can be freed immediately (sender abandoned), RX waits for Python
- *     to drain.
- *   - On stream_fin: same; mark pending_destroy and let drain complete.
- *   - aiopquic_stream_ctx_destroy frees both rings + wrapper.
+ *   - The asyncio thread sets pending_destroy once the stream takes no
+ *     more writes (reset, stop_sending, retired, or its connection or
+ *     session closed). A FIN shows as sc->tx->fin_pending instead.
+ *   - aiopquic_stream_ctx_destroy drops a reference; the last one frees
+ *     both rings and the wrapper.
  *
  * All ring access remains single-producer/single-consumer per direction:
  *   TX: Python pushes, picoquic worker pops in prepare_to_send.
@@ -96,6 +96,10 @@ typedef struct {
      * blocked Python writer wakes and retries. Only one event fires
      * per fill->drain cycle. */
     _Atomic(uint32_t) tx_drain_pending;
+    /* 1 while picoquic holds the stream active or a MARK_ACTIVE for it is
+     * queued. Python posts MARK_ACTIVE only on its 0->1 edge; the worker
+     * clears it when it parks the stream. */
+    _Atomic(uint32_t) tx_armed;
     /* RX data-event coalescing: 1 while a STREAM_DATA notification for
      * this stream is outstanding on the rx_event_ring. The worker
      * CAS-arms 0->1 before pushing; losers skip the push (the
@@ -107,12 +111,23 @@ typedef struct {
      * in sc->rx) becomes structurally impossible for the dominant
      * event type. FIN/RESET events are never coalesced. */
     _Atomic(uint32_t) rx_event_pending;
-    /* fin/reset arrived; free wrapper after final drain. */
+    /* The stream takes no more writes (reset, stopped, retired, or its
+     * connection or session closed); fanout() refuses it, as it does a
+     * set sc->tx->fin_pending. Asyncio thread only. */
     uint8_t  pending_destroy;
     /* RESET_STREAM_AT waiting for its reliable bytes (worker only):
      * sends stop at tx_reliable_size, then the reset goes out. */
     uint8_t  tx_reset_pending;
     uint64_t tx_reliable_size;
+    /* Stream chain membership (worker only): the chain, the next member
+     * in (order, stream id) order, and whether this stream has data held
+     * inactive behind the chain's active stream. */
+    void*    chain;
+    void*    chain_next;
+    uint64_t chain_order;
+    uint64_t chain_sid;
+    uint8_t  chain_wt;
+    uint8_t  chain_waiting;
     /* Observability counters (single-writer; relaxed semantics).
      * Aligned with the connection-global ring_event counters in
      * aiopquic_ctx_t so the SIGUSR2 dump can correlate per-stream
@@ -350,6 +365,20 @@ static inline int aiopquic_stream_ctx_tx_drain_take(aiopquic_stream_ctx_t* sc) {
                                     memory_order_acq_rel) == 1;
 }
 
+/* Producer, after committing bytes or a FIN: 1 when the stream was parked
+ * and needs a MARK_ACTIVE. The fence orders the commit before the load of
+ * tx_armed (pairs with aiopquic_stream_ctx_tx_park). */
+static inline int aiopquic_stream_ctx_tx_arm(aiopquic_stream_ctx_t* sc) {
+    atomic_thread_fence(memory_order_seq_cst);
+    return atomic_exchange_explicit(&sc->tx_armed, 1,
+                                    memory_order_seq_cst) == 0;
+}
+
+/* Producer, when its MARK_ACTIVE did not post: the next commit posts one. */
+static inline void aiopquic_stream_ctx_tx_disarm(aiopquic_stream_ctx_t* sc) {
+    atomic_store_explicit(&sc->tx_armed, 0, memory_order_seq_cst);
+}
+
 static inline int aiopquic_stream_ctx_ensure_tx(aiopquic_stream_ctx_t* sc,
                                                  uint32_t capacity) {
     if (!sc) return -1;
@@ -427,6 +456,24 @@ static inline uint32_t aiopquic_stream_ctx_tx_sendable(
     uint64_t head = atomic_load_explicit(&sc->tx->head, memory_order_relaxed);
     uint64_t left = sc->tx_reliable_size > head ? sc->tx_reliable_size - head : 0;
     return left < avail ? (uint32_t)left : avail;
+}
+
+/* Worker, about to park the stream after offering to_send bytes: clears
+ * tx_armed, then 1 when bytes or a FIN the offer missed have arrived and
+ * the stream must stay active. A commit after the clear sees 0 and posts
+ * a MARK_ACTIVE instead. */
+static inline int aiopquic_stream_ctx_tx_park(aiopquic_stream_ctx_t* sc,
+                                              uint32_t to_send, int fin_seen) {
+    atomic_store_explicit(&sc->tx_armed, 0, memory_order_seq_cst);
+    atomic_thread_fence(memory_order_seq_cst);
+    int fin_now = aiopquic_stream_buf_fin_pending(sc->tx);
+    uint32_t avail = aiopquic_stream_buf_used(sc->tx);
+    if (aiopquic_stream_ctx_tx_sendable(sc, avail) > to_send
+            || (fin_now && !fin_seen && !sc->tx_reset_pending)) {
+        atomic_store_explicit(&sc->tx_armed, 1, memory_order_relaxed);
+        return 1;
+    }
+    return 0;
 }
 
 /* Atomic accessors for cross-thread fields. Cython sees plain uint64_t
