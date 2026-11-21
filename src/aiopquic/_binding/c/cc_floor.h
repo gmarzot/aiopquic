@@ -26,8 +26,9 @@
  * growth.
  *
  * Options: K<ratio> fixes the ratio; R<bits/s> pins the media rate;
- * L<ms> is the latency budget. Other characters are ignored; the string
- * also reaches the inner algorithm.
+ * L<ms> is the latency budget. Other characters are ignored, and reach the
+ * inner algorithm with these three removed: bbr reads R and L as its own
+ * experiment switches.
  *
  * Network thread only: state is per path and picoquic calls a connection's
  * controller from its context's one thread.
@@ -184,6 +185,28 @@ static void aiopquic_cc_floor_parse_options(const char* x, double* k,
             }
         }
     }
+}
+
+/* option_string without the floor's K, R and L fields, for the inner
+ * algorithm; out holds at most n - 1 characters. */
+static void aiopquic_cc_floor_inner_options(const char* x, char* out, size_t n) {
+    size_t i = 0;
+    if (n == 0) {
+        return;
+    }
+    while (x != NULL && *x != 0) {
+        char c = *x++;
+        if (c == 'K' || c == 'R' || c == 'L') {
+            while ((*x >= '0' && *x <= '9') || (c == 'K' && *x == '.')) {
+                x++;
+            }
+            continue;
+        }
+        if (i + 1 < n) {
+            out[i++] = c;
+        }
+    }
+    out[i] = 0;
 }
 
 /* Floor rate in bytes/s. Above the media rate it is capped at the
@@ -446,7 +469,9 @@ static void aiopquic_cc_floor_init(picoquic_path_t* path_x, char const* option_s
     if (f == NULL) {
         return;
     }
-    inner->alg_init(path_x, option_string, current_time);
+    char inner_options[256];
+    aiopquic_cc_floor_inner_options(option_string, inner_options, sizeof(inner_options));
+    inner->alg_init(path_x, inner_options, current_time);
     if (path_x->congestion_alg_state == NULL) {
         free(f);
         return;

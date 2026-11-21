@@ -766,6 +766,7 @@ cdef extern from "c/cc_floor.h":
                                     double loss_min, uint64_t bw_max)
     int aiopquic_cc_floor_queue_guard(int held, uint64_t base, uint64_t wmin,
                                       uint64_t budget)
+    void aiopquic_cc_floor_inner_options(const char* x, char* out, size_t n)
 
 
 _CC_NAMES = ("newreno", "reno", "cubic", "dcubic", "fast", "bbr", "bbr1",
@@ -4475,6 +4476,14 @@ def _cc_floor_options(options):
 def _cc_floor_rate(media, k, loss, loss_min, bw_max):
     """The floor rate in bytes/s for those inputs (test only)."""
     return aiopquic_cc_floor_rate(media, k, loss, loss_min, bw_max)
+
+
+def _cc_floor_inner_options(options):
+    """The option string the floor hands its inner algorithm (test only)."""
+    cdef bytes b = options.encode()
+    cdef char out[256]
+    aiopquic_cc_floor_inner_options(b, out, sizeof(out))
+    return out.decode()
 
 
 def _cc_floor_queue_guard(held, base, wmin, budget=0):

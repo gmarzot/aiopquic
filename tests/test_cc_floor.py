@@ -10,7 +10,8 @@ import time
 import pytest
 
 from aiopquic._binding._transport import (
-    _cc_floor_options, _cc_floor_queue_guard, _cc_floor_rate)
+    _cc_floor_inner_options, _cc_floor_options, _cc_floor_queue_guard,
+    _cc_floor_rate)
 from aiopquic.asyncio import QuicConnectionProtocol, connect, serve
 from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.events import StreamDataReceived
@@ -62,6 +63,16 @@ def test_option_string(opts, expected):
     k, rate_bps, budget_ms = _cc_floor_options(opts)
     want = expected if len(expected) == 3 else (*expected, 0)
     assert (k, rate_bps, budget_ms) == (pytest.approx(want[0]), want[1], want[2])
+
+
+@pytest.mark.parametrize("opts,expected", [
+    ("K1.5R20000000L320", ""),
+    ("T50000Q0.02K1.1", "T50000Q0.02"),
+    ("K1.2T5R4000000Q0.5L600x", "T5Q0.5x"),
+    ("", ""),
+])
+def test_inner_options_drop_the_floor_fields(opts, expected):
+    assert _cc_floor_inner_options(opts) == expected
 
 
 BIG = 10**12
