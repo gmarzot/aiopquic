@@ -51,10 +51,17 @@ pytestmark = pytest.mark.skipif(not os.path.exists(CERT_FILE),
     ("R1000000000000", (0.0, 1_000_000_000_000)),
     ("R1000000000001", (0.0, 0)),
     ("K1.5R", (1.5, 0)),
+    ("L600", (0.0, 0, 600)),
+    ("K1.2R20000000L320", (1.2, 20_000_000, 320)),
+    ("L0", (0.0, 0, 0)),
+    ("L", (0.0, 0, 0)),
+    ("L600000", (0.0, 0, 600_000)),
+    ("L600001", (0.0, 0, 0)),
 ])
 def test_option_string(opts, expected):
-    k, rate_bps = _cc_floor_options(opts)
-    assert (k, rate_bps) == (pytest.approx(expected[0]), expected[1])
+    k, rate_bps, budget_ms = _cc_floor_options(opts)
+    want = expected if len(expected) == 3 else (*expected, 0)
+    assert (k, rate_bps, budget_ms) == (pytest.approx(want[0]), want[1], want[2])
 
 
 BIG = 10**12
@@ -105,6 +112,24 @@ def test_floor_rate(args, expected):
 ])
 def test_queue_guard(held, base, wmin, expected):
     assert _cc_floor_queue_guard(held, base, wmin) is expected
+
+
+@pytest.mark.parametrize("held,base,wmin,budget,expected", [
+    # 30 ms baseline, 600 ms budget: growth allowed up to 540 ms.
+    (False, 30_000, 560_000, 600_000, False),
+    (False, 30_000, 570_001, 600_000, True),
+    (True, 30_000, 300_001, 600_000, True),
+    (True, 30_000, 300_000, 600_000, False),
+    # 80 ms baseline, 320 ms budget: 160 ms.
+    (False, 80_000, 240_000, 320_000, False),
+    (False, 80_000, 240_001, 320_000, True),
+    # A budget under the default limit leaves it: max(base / 4, 10 ms).
+    (False, 400_000, 500_001, 900_000, True),
+    (False, 40_000, 50_001, 60_000, True),
+    (False, 40_000, 50_001, 0, True),
+])
+def test_queue_guard_follows_the_latency_budget(held, base, wmin, budget, expected):
+    assert _cc_floor_queue_guard(held, base, wmin, budget) is expected
 
 
 @pytest.mark.parametrize("algo", ALGOS)

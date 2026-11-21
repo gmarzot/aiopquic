@@ -21,10 +21,13 @@
  * has grown past baseline + max(baseline / 4, 10 ms), baseline being the
  * lowest windowed min RTT since the floor first engaged, until growth is
  * back under half that; or while more than half the bytes of the last
- * 1-2 RTTs were lost.
+ * 1-2 RTTs were lost. With a latency budget L, queueing delay up to
+ * L - 2 x baseline still arrives in time, so the guard allows that much
+ * growth.
  *
- * Options: K<ratio> fixes the ratio; R<bits/s> pins the media rate. Other
- * characters are ignored; the string also reaches the inner algorithm.
+ * Options: K<ratio> fixes the ratio; R<bits/s> pins the media rate;
+ * L<ms> is the latency budget. Other characters are ignored; the string
+ * also reaches the inner algorithm.
  *
  * Network thread only: state is per path and picoquic calls a connection's
  * controller from its context's one thread.
@@ -64,6 +67,7 @@
 #define AIOPQUIC_CC_FLOOR_RTT_WIN_US 500000ull
 #define AIOPQUIC_CC_FLOOR_GROWTH_DIV 4
 #define AIOPQUIC_CC_FLOOR_GROWTH_MIN_US 10000ull
+#define AIOPQUIC_CC_FLOOR_L_MAX_MS 600000ull
 
 /* cc_state bits above the inner algorithm's state byte. */
 #define AIOPQUIC_CC_FLOOR_ENGAGED 0x100u
@@ -83,6 +87,7 @@ typedef struct {
     void* inner_state;
     double k;                       /* 0 = headroom from loss */
     uint64_t pinned_rate;           /* bytes/s; 0 = estimate */
+    uint64_t budget_us;             /* latency budget; 0 = none */
     uint64_t estimate;              /* bytes/s */
     uint64_t floor_rate;            /* bytes/s */
 
@@ -117,10 +122,11 @@ typedef struct {
     unsigned int engaged : 1;
 } aiopquic_cc_floor_t;
 
-/* K<ratio> (0 < K <= 16) and R<bits/s> (up to 1 Tb/s); *k and *rate_bps
- * keep their values when absent or out of range. */
+/* K<ratio> (0 < K <= 16), R<bits/s> (up to 1 Tb/s) and L<ms> (1 ms to
+ * 10 min); each output keeps its value when absent or out of range. */
 static void aiopquic_cc_floor_parse_options(const char* x, double* k,
-                                            uint64_t* rate_bps) {
+                                            uint64_t* rate_bps,
+                                            uint64_t* budget_ms) {
     if (x == NULL) {
         return;
     }
@@ -163,6 +169,19 @@ static void aiopquic_cc_floor_parse_options(const char* x, double* k,
             if (digits > 0 && u <= AIOPQUIC_CC_FLOOR_R_MAX) {
                 *rate_bps = u;
             }
+        } else if (c == 'L') {
+            uint64_t u = 0;
+            int digits = 0;
+            while (*x >= '0' && *x <= '9') {
+                if (u <= AIOPQUIC_CC_FLOOR_L_MAX_MS) {
+                    u = u * 10 + (uint64_t)(*x - '0');
+                }
+                digits++;
+                x++;
+            }
+            if (digits > 0 && u > 0 && u <= AIOPQUIC_CC_FLOOR_L_MAX_MS) {
+                *budget_ms = u;
+            }
         }
     }
 }
@@ -197,15 +216,20 @@ static uint64_t aiopquic_cc_floor_rate(uint64_t media, double k, double loss,
     return (uint64_t)rate;
 }
 
-/* Queue guard with hysteresis: set past base + max(base / 4, 10 ms) of
- * windowed min RTT, cleared at or under half that growth. */
-static int aiopquic_cc_floor_queue_guard(int held, uint64_t base, uint64_t wmin) {
+/* Queue guard with hysteresis: set past base + max(base / 4, 10 ms,
+ * budget - 2 x base) of windowed min RTT, cleared at or under half that
+ * growth. */
+static int aiopquic_cc_floor_queue_guard(int held, uint64_t base, uint64_t wmin,
+                                         uint64_t budget) {
     if (base == 0 || wmin == UINT64_MAX) {
         return held;
     }
     uint64_t limit = base / AIOPQUIC_CC_FLOOR_GROWTH_DIV;
     if (limit < AIOPQUIC_CC_FLOOR_GROWTH_MIN_US) {
         limit = AIOPQUIC_CC_FLOOR_GROWTH_MIN_US;
+    }
+    if (budget > 2 * base && budget - 2 * base > limit) {
+        limit = budget - 2 * base;
     }
     uint64_t growth = wmin > base ? wmin - base : 0;
     return held ? growth > limit / 2 : growth > limit;
@@ -365,7 +389,8 @@ static void aiopquic_cc_floor_update_guards(aiopquic_cc_floor_t* f,
     if (f->rtt_base != 0 && wmin < f->rtt_base) {
         f->rtt_base = wmin;
     }
-    f->queue_guard = aiopquic_cc_floor_queue_guard(f->queue_guard, f->rtt_base, wmin);
+    f->queue_guard = aiopquic_cc_floor_queue_guard(f->queue_guard, f->rtt_base, wmin,
+                                                   f->budget_us);
 
     if (path_x->total_bytes_lost < f->lost_mark) {
         f->lost_mark = path_x->total_bytes_lost;
@@ -429,8 +454,10 @@ static void aiopquic_cc_floor_init(picoquic_path_t* path_x, char const* option_s
     f->inner = inner;
     f->inner_state = path_x->congestion_alg_state;
     uint64_t rate_bps = 0;
-    aiopquic_cc_floor_parse_options(option_string, &f->k, &rate_bps);
+    uint64_t budget_ms = 0;
+    aiopquic_cc_floor_parse_options(option_string, &f->k, &rate_bps, &budget_ms);
     f->pinned_rate = rate_bps / 8;
+    f->budget_us = budget_ms * 1000;
     aiopquic_cc_floor_reset_guards(f, path_x, current_time);
     path_x->congestion_alg_state = f;
 }

@@ -760,10 +760,12 @@ DEF DEFAULT_RING_CAPACITY = 262144
 cdef extern from "c/cc_floor.h":
     void aiopquic_register_cc_algorithms()
     void aiopquic_cc_floor_parse_options(const char* x, double* k,
-                                         uint64_t* rate_bps)
+                                         uint64_t* rate_bps,
+                                         uint64_t* budget_ms)
     uint64_t aiopquic_cc_floor_rate(uint64_t media, double k, double loss,
                                     double loss_min, uint64_t bw_max)
-    int aiopquic_cc_floor_queue_guard(int held, uint64_t base, uint64_t wmin)
+    int aiopquic_cc_floor_queue_guard(int held, uint64_t base, uint64_t wmin,
+                                      uint64_t budget)
 
 
 _CC_NAMES = ("newreno", "reno", "cubic", "dcubic", "fast", "bbr", "bbr1",
@@ -4460,12 +4462,14 @@ def _wt_cc_options(WebTransportSessionState st):
 
 def _cc_floor_options(options):
     """The floor controllers' (K, 0 = headroom from loss; pinned media rate
-    in bits/s, 0 = estimate) for an option string (test only)."""
+    in bits/s, 0 = estimate; latency budget in ms, 0 = none) for an option
+    string (test only)."""
     cdef bytes b = options.encode()
     cdef double k = 0.0
     cdef uint64_t rate_bps = 0
-    aiopquic_cc_floor_parse_options(b, &k, &rate_bps)
-    return k, rate_bps
+    cdef uint64_t budget_ms = 0
+    aiopquic_cc_floor_parse_options(b, &k, &rate_bps, &budget_ms)
+    return k, rate_bps, budget_ms
 
 
 def _cc_floor_rate(media, k, loss, loss_min, bw_max):
@@ -4473,9 +4477,11 @@ def _cc_floor_rate(media, k, loss, loss_min, bw_max):
     return aiopquic_cc_floor_rate(media, k, loss, loss_min, bw_max)
 
 
-def _cc_floor_queue_guard(held, base, wmin):
-    """The queue guard's next state, RTTs in microseconds (test only)."""
-    return bool(aiopquic_cc_floor_queue_guard(1 if held else 0, base, wmin))
+def _cc_floor_queue_guard(held, base, wmin, budget=0):
+    """The queue guard's next state, RTTs and budget in microseconds (test
+    only)."""
+    return bool(aiopquic_cc_floor_queue_guard(1 if held else 0, base, wmin,
+                                              budget))
 
 
 def _packet_train_mode(uintptr_t cnx_ptr):
