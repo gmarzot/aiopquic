@@ -386,6 +386,21 @@ async def test_add_by_connection():
 
 
 @pytest.mark.asyncio
+async def test_transport_keys_the_set():
+    async with _rig(n_quic=1, n_wt=1) as (t, peers):
+        for p in peers:
+            assert p.srv.transport is t, p.kind
+            sid = await p.open_stream()
+            ds = DestSet(p.srv.transport)
+            assert ds.add(p.srv, sid) is not None, p.kind
+            assert DestSet(p.srv.transport, datagram=True).add_datagram(
+                p.srv) is not None, p.kind
+            assert t.fanout(ds, b"t", True) is None
+            assert await _until(lambda: sid in p.rx.fins), p.kind
+            assert p.rx.data(sid) == b"Ht", p.kind
+
+
+@pytest.mark.asyncio
 async def test_owed_marks_post_on_next_call():
     async with _rig() as (t, peers):
         ds, sids, idxs = await _fanout_dests(t, peers)

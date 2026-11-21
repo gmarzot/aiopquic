@@ -870,6 +870,12 @@ class WebTransportSession:
                 self._dgram_ring_bytes, cap)
         return self._dgram_ring
 
+    @property
+    def transport(self) -> TransportContext:
+        """The TransportContext (shard) this session runs on; a DestSet
+        holding its destinations is bound to it."""
+        return self._transport
+
     def _fanout_dest(self, stream_id: int):
         """This stream as a DestSet.add() entry. None when the session is
         closed or not open, or the stream is unknown, ended, reset or

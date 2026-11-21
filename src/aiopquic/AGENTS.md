@@ -114,7 +114,8 @@ index names one add: `remove(index)` returns False, and changes nothing, once it
 Each destination takes all of a write or none; the return is None or `[(index, code)]` with
 `FANOUT_EVENT_RING_FULL`, `FANOUT_RING_FULL`, `FANOUT_TOO_LARGE`, `FANOUT_GONE` (FIN'd by any writer,
 reset, stopped, or closed) or `FANOUT_NO_MEMORY`. A refused destination must be served another way
-or removed; the set never drops one itself.
+or removed; the set never drops one itself. `conn.transport` is the TransportContext (shard) a
+connection or session runs on: key per-shard sets by it, `DestSet(conn.transport)`.
 
 ## Layout
 

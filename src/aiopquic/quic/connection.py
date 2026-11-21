@@ -1146,6 +1146,12 @@ class QuicConnection:
                 cfg.datagram_ring_bytes, cfg.datagram_max_payload)
         return self._dgram_ring
 
+    @property
+    def transport(self) -> TransportContext:
+        """The TransportContext (shard) this connection runs on; a DestSet
+        holding its destinations is bound to it."""
+        return self._transport
+
     def _fanout_dest(self, stream_id: int):
         """This stream as a DestSet.add() entry. None when the connection
         is closed or the stream has not been written to yet."""
