@@ -870,10 +870,10 @@ class WebTransportSession:
                 self._dgram_ring_bytes, cap)
         return self._dgram_ring
 
-    def fanout_dest(self, stream_id: int):
-        """This stream as a destination for DestSet.add() and
-        TransportContext.fanout(). None when the session is closed or not
-        open, or the stream is unknown, ended, reset or stopped."""
+    def _fanout_dest(self, stream_id: int):
+        """This stream as a DestSet.add() entry. None when the session is
+        closed or not open, or the stream is unknown, ended, reset or
+        stopped."""
         if self.session_closed or not self.session_ready:
             return None
         sc_ptr = self._stream_tx_ctxs.get(stream_id, 0)
@@ -883,10 +883,9 @@ class WebTransportSession:
         return (self._transport, FANOUT_WT_STREAM, cnx, stream_id, sc_ptr,
                 self.stream_ring_cap, None)
 
-    def fanout_datagram_dest(self):
-        """This session as a destination for a datagram DestSet and
-        TransportContext.fanout_datagram(). None when the session is
-        closed or not open, or datagrams were not negotiated."""
+    def _fanout_datagram_dest(self):
+        """This session as a DestSet.add_datagram() entry. None when the
+        session is closed or not open, or datagrams were not negotiated."""
         if self._state is None or self.session_closed or not self.session_ready:
             return None
         db = self._ensure_dgram_ring()

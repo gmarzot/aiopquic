@@ -32,7 +32,7 @@ def bench(n, size, calls, rounds):
     per = [stream_ctx_create() for _ in range(n)]
     ds = DestSet(t)
     for i, sc in enumerate(fan):
-        ds.add((t, FANOUT_QUIC_STREAM, FAKE_CNX, 4 * i + 3, sc, RING_CAP, None))
+        ds._add((t, FANOUT_QUIC_STREAM, FAKE_CNX, 4 * i + 3, sc, RING_CAP, None))
     dests = [(4 * i + 3, sc) for i, sc in enumerate(per)]
     send = t.tx_send_atomic
     # Warm-up arms every stream (one MARK each).
