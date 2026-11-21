@@ -14,11 +14,11 @@
  *     wrapper to the stream slot.
  *   - aiopquic_stream_ctx_ensure_tx / _ensure_rx allocate the side ring
  *     on demand (idempotent).
- *   - On stream_reset / stop_sending: mark pending_destroy; the TX ring
- *     can be freed immediately (sender abandoned), RX waits for Python
- *     to drain.
- *   - On stream_fin: same; mark pending_destroy and let drain complete.
- *   - aiopquic_stream_ctx_destroy frees both rings + wrapper.
+ *   - The asyncio thread sets pending_destroy once the stream takes no
+ *     more writes (reset, stop_sending, retired, or its connection or
+ *     session closed). A FIN shows as sc->tx->fin_pending instead.
+ *   - aiopquic_stream_ctx_destroy drops a reference; the last one frees
+ *     both rings and the wrapper.
  *
  * All ring access remains single-producer/single-consumer per direction:
  *   TX: Python pushes, picoquic worker pops in prepare_to_send.
@@ -112,8 +112,8 @@ typedef struct {
      * event type. FIN/RESET events are never coalesced. */
     _Atomic(uint32_t) rx_event_pending;
     /* The stream takes no more writes (reset, stopped, retired, or its
-     * connection or session closed); fanout() refuses it. Set and read
-     * on the asyncio thread only. */
+     * connection or session closed); fanout() refuses it, as it does a
+     * set sc->tx->fin_pending. Asyncio thread only. */
     uint8_t  pending_destroy;
     /* RESET_STREAM_AT waiting for its reliable bytes (worker only):
      * sends stop at tx_reliable_size, then the reset goes out. */

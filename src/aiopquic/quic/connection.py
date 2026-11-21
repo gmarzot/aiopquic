@@ -1146,10 +1146,15 @@ class QuicConnection:
                 cfg.datagram_ring_bytes, cfg.datagram_max_payload)
         return self._dgram_ring
 
-    def fanout_dest(self, stream_id: int):
-        """This stream as a destination for DestSet.add() and
-        TransportContext.fanout(). None when the connection is closed or
-        the stream has not been written to yet."""
+    @property
+    def transport(self) -> TransportContext:
+        """The TransportContext (shard) this connection runs on; a DestSet
+        holding its destinations is bound to it."""
+        return self._transport
+
+    def _fanout_dest(self, stream_id: int):
+        """This stream as a DestSet.add() entry. None when the connection
+        is closed or the stream has not been written to yet."""
         if self._closed or self._cnx_ptr == 0:
             return None
         sc = self._stream_ctxs.get(stream_id)
@@ -1161,9 +1166,9 @@ class QuicConnection:
                         _STREAM_RING_CAP),
                 None)
 
-    def fanout_datagram_dest(self):
-        """This connection as a destination for a datagram DestSet and
-        TransportContext.fanout_datagram(). None when not ready or closed."""
+    def _fanout_datagram_dest(self):
+        """This connection as a DestSet.add_datagram() entry. None when not
+        ready or closed."""
         if self._closed or self._cnx_ptr == 0:
             return None
         return (self._transport, FANOUT_QUIC_DATAGRAM, self._cnx_ptr, 0,

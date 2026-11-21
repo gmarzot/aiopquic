@@ -104,14 +104,18 @@ resend the same buffer; `ValueError` means one write exceeds `stream_ring_cap` (
 `tx_sent_bytes(sid)` is the stream's cumulative bytes picoquic has taken into packets: an offset
 has left the ring once it is exceeded.
 
-**Fanout.** `TransportContext.fanout(dests, data, end_stream)` writes the same bytes to every stream
-of a `DestSet(transport)` in one call; `fanout_datagram(dests, data)` queues one datagram per entry
-of a `DestSet(transport, datagram=True)`. Entries come from `fanout_dest(sid)` (after the stream's
-first write) or `fanout_datagram_dest()` on `QuicConnection` / `WebTransportSession` of that
-transport; `add()` returns an index, `remove(index)` drops it. Each destination takes all of a write
-or none; the return is None or `[(index, code)]` with `FANOUT_EVENT_RING_FULL`, `FANOUT_RING_FULL`,
-`FANOUT_TOO_LARGE`, `FANOUT_GONE` (reset, stopped, FIN'd, or closed) or `FANOUT_NO_MEMORY`. A
-refused destination must be served another way or removed; the set never drops one itself.
+**Fanout.** `from aiopquic.fanout import DestSet, FANOUT_*`. `TransportContext.fanout(dests, data,
+end_stream)` writes the same bytes to every stream of a `DestSet(transport)` in one call;
+`fanout_datagram(dests, data)` queues one datagram per entry of a `DestSet(transport, datagram=True)`.
+`add(conn, sid)` (after the stream's first write) or `add_datagram(conn)` takes a `QuicConnection` or
+`WebTransportSession` of that transport and returns an index, or None for a closed session or an
+unknown or ended stream; a conn of another transport or the wrong set kind raises `ValueError`. An
+index names one add: `remove(index)` returns False, and changes nothing, once its slot was reused.
+Each destination takes all of a write or none; the return is None or `[(index, code)]` with
+`FANOUT_EVENT_RING_FULL`, `FANOUT_RING_FULL`, `FANOUT_TOO_LARGE`, `FANOUT_GONE` (FIN'd by any writer,
+reset, stopped, or closed) or `FANOUT_NO_MEMORY`. A refused destination must be served another way
+or removed; the set never drops one itself. `conn.transport` is the TransportContext (shard) a
+connection or session runs on: key per-shard sets by it, `DestSet(conn.transport)`.
 
 ## Layout
 
