@@ -269,6 +269,10 @@ try:
     lib.OpenSSL_version.restype = ctypes.c_char_p
     ver = lib.OpenSSL_version(0).decode()
     print("  openssl    : %s%s" % (ver, (" (%s)" % ossl_path) if ossl_path else ""))
+    lib.OpenSSL_version_num.restype = ctypes.c_ulong
+    if lib.OpenSSL_version_num() < 0x30500000:
+        print("  openssl    : WARNING - older than 3.5: per-packet AES-GCM calls cost ~8% more"
+              " relay CPU; set OPENSSL_ROOT_DIR to a 3.5+ build")
 except Exception:
     pass
 sys.exit(0 if ok else 4)
@@ -415,6 +419,14 @@ build_native() {
     PICOTLS_PERF_ARGS=()
     if [ "${AIOPQUIC_WHEEL_BUILD:-0}" = "1" ]; then
         echo -e "${COLOR_GREEN}AIOPQUIC_WHEEL_BUILD=1: portable build, host-tuned flags suppressed (caller drives PICOQUIC_C_FLAGS / CMAKE_ARGS)${COLOR_OFF}"
+        # Fusion is CPUID-dispatched, so portable x86_64 wheels carry it too.
+        case "$(uname -m)" in
+            x86_64|amd64)
+                PICOQUIC_PERF_ARGS+=("-DPTLS_WITH_FUSION=ON")
+                PICOTLS_PERF_ARGS+=("-DWITH_FUSION=ON")
+                WANT_FUSION=1
+                ;;
+        esac
     elif [ "${AIOPQUIC_PERF:-1}" = "1" ]; then
         echo -e "${COLOR_GREEN}AIOPQUIC_PERF=1 (default): host-tuned perf flags enabled (Fusion if x86_64, DISABLE_DEBUG_PRINTF, -O3 -march=native -flto)${COLOR_OFF}"
         PICOQUIC_PERF_ARGS+=("-DDISABLE_DEBUG_PRINTF=ON")

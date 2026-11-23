@@ -266,7 +266,7 @@ Counter signature: `*_arms = 0`, `rx_event_drops = 0`,
 
 | Parameter | Default | Bounds |
 |---|---|---|
-| `QuicConfiguration.max_data` | 16 MiB | cnx-level inbound FC (initial; picoquic auto-extends) |
+| `QuicConfiguration.max_data` | 16 MiB | cnx-level inbound FC: a sliding window past bytes received; bounds reorder memory (~6x) |
 | `QuicConfiguration.max_stream_data` | 16 MiB | per-stream inbound window AND `sc->rx` size |
 | `QuicConfiguration.stream_ring_cap` | 4 MiB | per-stream `sc->tx` hard cap |
 | `QuicConfiguration.tx_max_queued_bytes` | 4 MiB (0/None off) | outbound queue per connection (WT: per session) |

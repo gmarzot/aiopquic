@@ -231,7 +231,7 @@ async def test_stream_destroy_releases_a_parked_drained_writer():
     quic._transport = _IdleTransport()
     sends = []
 
-    def ring_full(stream_id, data, end_stream=False):
+    def ring_full(stream_id, data, end_stream=False, **_kw):
         sends.append(stream_id)
         raise BufferError("per-stream send ring full")
 

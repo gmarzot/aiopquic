@@ -40,6 +40,8 @@ from .events import (
 )
 from aiopquic._binding._transport import (
     TransportContext,
+    FANOUT_QUIC_DATAGRAM, FANOUT_QUIC_STREAM,
+    dgram_ring_mark_closed, stream_ctx_mark_gone,
     tx_data_bytes_queued,
     stream_buf_create, stream_buf_destroy,
     stream_buf_push, stream_buf_used, stream_buf_free, stream_buf_set_fin,
@@ -124,13 +126,16 @@ class QuicConnection:
     Presents the same public API as qh3.quic.connection.QuicConnection
     so that higher layers (H3Connection, aiomoqt) can use it unchanged.
 
-    Two construction modes:
+    Three construction modes:
     - Client / standalone: QuicConnection(configuration=cfg). Owns its
       own TransportContext; calls _start_transport() then connect().
     - Engine-spawned (server side): QuicConnection(configuration=cfg,
       engine=engine, cnx_ptr=cnx). Shares engine's transport; cnx_ptr
       is the picoquic cnx pointer for this peer. Engine routes events
       to this connection's _events queue; no own drain.
+    - Client on a shared engine: QuicConnection(configuration=cfg,
+      engine=engine), then connect(). As above, but it learns its cnx
+      from the first event routed to it.
     """
 
     def __init__(self, *, configuration: QuicConfiguration,
@@ -142,7 +147,7 @@ class QuicConnection:
             # Engine-spawned: share engine's transport, no own drain
             self._transport = engine._transport
             self._cnx_ptr = cnx_ptr
-            self._connected = True
+            self._connected = cnx_ptr != 0
             self._closed = False
         else:
             self._transport: TransportContext | None = None
@@ -198,9 +203,11 @@ class QuicConnection:
         # awaited by aiomoqt's stream_write_drain on BufferError.
         # Lazy-created on first reference from either side.
         self._stream_tx_drain_events: dict[int, asyncio.Event] = {}
-        # Set once the worker has created the picoquic cnx (ALMOST_READY).
+        # Set once the worker has answered connect() (ALMOST_READY);
+        # _create_failed when it could not create the cnx.
         self._created = asyncio.Event()
-        if engine is not None:
+        self._create_failed = False
+        if cnx_ptr != 0:
             self._created.set()
 
     @property
@@ -263,6 +270,7 @@ class QuicConnection:
             rx_data_ring_cap=cfg.max_stream_data,
             congestion_control_algorithm=cfg.congestion_control_algorithm,
             congestion_control_options=cfg.congestion_control_options,
+            packet_train_mode=cfg.packet_train_mode,
             initial_max_data=cfg.max_data,
             initial_max_streams_uni=getattr(cfg, 'max_streams_uni', 0) or 0,
             initial_max_streams_bidi=getattr(cfg, 'max_streams_bidi', 0) or 0,
@@ -440,6 +448,7 @@ class QuicConnection:
             ))
         elif evt_type == _EVT_STOP_SENDING:
             self._adopt_stream_ctx(stream_id, _stream_ctx_ptr)
+            stream_ctx_mark_gone(_stream_ctx_ptr)
             self._events.append(StopSendingReceived(
                 stream_id=stream_id,
                 error_code=error_code,
@@ -492,6 +501,8 @@ class QuicConnection:
             if cnx_ptr != 0:
                 self._cnx_ptr = cnx_ptr
                 self._created.set()
+            elif not self._created.is_set():
+                self._fail_create("connection not created")
         elif evt_type == _EVT_DATAGRAM:
             self._events.append(DatagramFrameReceived(
                 data=data if data is not None else memoryview(b""),
@@ -520,7 +531,8 @@ class QuicConnection:
             # Stream fully retired by picoquic — drop our cached
             # pointer so the dict doesn't accumulate stale entries.
             # The drain drops the stream reference of the context named
-            # here; don't deref.
+            # here after this batch.
+            stream_ctx_mark_gone(_stream_ctx_ptr)
             self._sc_owned.discard(_stream_ctx_ptr)
             # Wake any producer parked in await sc_event.wait() with
             # the about-to-be-popped Event still in hand. Without this
@@ -655,6 +667,26 @@ class QuicConnection:
             return 0.0
         return self._transport.tx_event_ring_count / cap
 
+    def _engine_closed(self) -> None:
+        """The engine stopped under this connection: end it as a local
+        close and wake parked writers. The worker is already joined."""
+        self._closed = True
+        self._append_terminated(_EVT_CLOSE, 0, b"engine closed", _CLOSE_LOCAL)
+        for ev in self._stream_tx_drain_events.values():
+            ev.set()
+        self._dgram_tx_drain_event.set()
+        self._destroy_stream_ctxs()
+        self._release_dgram_ring()
+        self._cnx_ptr = 0
+
+    def _fail_create(self, reason: str) -> None:
+        """The cnx was never created: end the connection as a local close."""
+        self._create_failed = True
+        self._closed = True
+        self._append_terminated(_EVT_CLOSE, QuicErrorCode.INTERNAL_ERROR,
+                                reason.encode(), _CLOSE_LOCAL)
+        self._created.set()
+
     def _append_terminated(self, evt_type: int, error_code: int, data,
                            flags: int = 0) -> None:
         """frame_type None for an application close, else 0."""
@@ -723,6 +755,7 @@ class QuicConnection:
             ))
         elif evt_type == _EVT_STOP_SENDING:
             self._adopt_stream_ctx(stream_id, stream_ctx_ptr)
+            stream_ctx_mark_gone(stream_ctx_ptr)
             self._events.append(StopSendingReceived(
                 stream_id=stream_id, error_code=error_code,
             ))
@@ -777,6 +810,7 @@ class QuicConnection:
         elif evt_type == _EVT_DATAGRAM_LOST:
             self._datagrams_lost += 1
         elif evt_type == _EVT_STREAM_DESTROY:
+            stream_ctx_mark_gone(stream_ctx_ptr)
             self._sc_owned.discard(stream_ctx_ptr)
             # Wake a producer parked on this stream before dropping the
             # Event it holds; see the client-path branch.
@@ -815,11 +849,15 @@ class QuicConnection:
         self._stream_ctxs_dropped = True
         self._stream_ctxs.clear()
         for sc in self._sc_owned:
+            stream_ctx_mark_gone(sc)
             stream_ctx_destroy(sc)
         self._sc_owned.clear()
 
     def send_stream_data(self, stream_id: int, data: bytes,
-                         end_stream: bool = False) -> None:
+                         end_stream: bool = False,
+                         priority: int | None = None,
+                         chain: int | None = None,
+                         order: int | None = None) -> None:
         """Send data on a stream — PULL-model with real backpressure.
 
         Calls the atomic Cython send primitive that bundles per-stream-
@@ -830,7 +868,9 @@ class QuicConnection:
 
         Raises BufferError on any retryable backpressure (TX event ring
         full or per-stream send ring full); raises MemoryError on
-        allocation failure.
+        allocation failure. `priority` is set_stream_priority() and
+        `chain` (with `order`, default 0) set_stream_chain() ahead of
+        these bytes, in one event on a stream's first write.
 
         Post-close: returns cleanly without committing or raising.
         Mirrors the WT-side self-protective gate so producers racing
@@ -849,6 +889,9 @@ class QuicConnection:
             sc,
             getattr(self._configuration, 'stream_ring_cap',
                     _STREAM_RING_CAP),
+            -1 if priority is None else priority,
+            chain,
+            order,
         )
         if rc == 1:
             raise BufferError(
@@ -868,7 +911,10 @@ class QuicConnection:
                                          end_stream: bool = False,
                                          *,
                                          soft_yield_at: float = 0.5,
-                                         hard_wait_at: float = 0.9) -> None:
+                                         hard_wait_at: float = 0.9,
+                                         priority: int | None = None,
+                                         chain: int | None = None,
+                                         order: int | None = None) -> None:
         """Send with built-in TX-ring backpressure for raw QUIC.
 
         Composes send_stream_data + get_tx_data_drain_event + tx_event_ring_fill
@@ -978,7 +1024,9 @@ class QuicConnection:
             sc_event.clear()
             ring_event.clear()
             try:
-                self.send_stream_data(stream_id, data, end_stream=end_stream)
+                self.send_stream_data(stream_id, data, end_stream=end_stream,
+                                      priority=priority, chain=chain,
+                                      order=order)
                 if self.tx_event_ring_fill() > soft_yield_at:
                     await asyncio.sleep(0)
                 return
@@ -1023,10 +1071,7 @@ class QuicConnection:
                 "send_datagram_frame: connection not ready or closed")
         if not data:
             raise ValueError("send_datagram_frame: empty payload")
-        if self._dgram_ring == 0:
-            cfg = self._configuration
-            self._dgram_ring = self._transport.dgram_ring_create(
-                cfg.datagram_ring_bytes, cfg.datagram_max_payload)
+        self._ensure_dgram_ring()
         if self._dgram_mark_owed:
             if self._transport.dgram_mark_ready(
                     self._cnx_ptr, self._dgram_ring) == 0:
@@ -1046,9 +1091,18 @@ class QuicConnection:
             return 0
         if rc == 2:
             # Record committed but the mark didn't post (TX event ring
-            # full). Re-posted at the next send or drained-ring event.
+            # full). Re-posted at the next send or ring drain.
             self._dgram_mark_owed = True
+            self._transport._owe_dgram_mark(self)
         return len(data)
+
+    def _repost_dgram_mark(self) -> None:
+        if not (self._dgram_mark_owed and self._dgram_ring and self._cnx_ptr):
+            return
+        if self._transport.dgram_mark_ready(self._cnx_ptr, self._dgram_ring) == 0:
+            self._dgram_mark_owed = False
+        else:
+            self._transport._owe_dgram_mark(self)
 
     def get_datagram_tx_drain_event(self) -> asyncio.Event:
         """Event set when the worker drains room in the datagram record
@@ -1085,8 +1139,44 @@ class QuicConnection:
             self._remote_max_datagram_frame_size = cap
         return cap
 
+    def _ensure_dgram_ring(self) -> int:
+        if self._dgram_ring == 0:
+            cfg = self._configuration
+            self._dgram_ring = self._transport.dgram_ring_create(
+                cfg.datagram_ring_bytes, cfg.datagram_max_payload)
+        return self._dgram_ring
+
+    @property
+    def transport(self) -> TransportContext:
+        """The TransportContext (shard) this connection runs on; a DestSet
+        holding its destinations is bound to it."""
+        return self._transport
+
+    def _fanout_dest(self, stream_id: int):
+        """This stream as a DestSet.add() entry. None when the connection
+        is closed or the stream has not been written to yet."""
+        if self._closed or self._cnx_ptr == 0:
+            return None
+        sc = self._stream_ctxs.get(stream_id)
+        if not sc:
+            return None
+        return (self._transport, FANOUT_QUIC_STREAM, self._cnx_ptr,
+                stream_id, sc,
+                getattr(self._configuration, 'stream_ring_cap',
+                        _STREAM_RING_CAP),
+                None)
+
+    def _fanout_datagram_dest(self):
+        """This connection as a DestSet.add_datagram() entry. None when not
+        ready or closed."""
+        if self._closed or self._cnx_ptr == 0:
+            return None
+        return (self._transport, FANOUT_QUIC_DATAGRAM, self._cnx_ptr, 0,
+                self._ensure_dgram_ring(), 0, None)
+
     def _release_dgram_ring(self) -> None:
         if self._dgram_ring:
+            dgram_ring_mark_closed(self._dgram_ring)
             self._transport.dgram_ring_release(self._dgram_ring,
                                                self._cnx_ptr)
             self._dgram_ring = 0
@@ -1134,10 +1224,12 @@ class QuicConnection:
         """
         if not 0 <= reliable_size <= 0xFFFFFFFF:
             raise ValueError("reset_stream: reliable_size out of range")
+        sc = self._stream_ctxs.get(stream_id, 0)
+        stream_ctx_mark_gone(sc)
         self._transport.push_tx_event(
             _TX_STREAM_RESET, stream_id,
             error_code=error_code, cnx_ptr=self._cnx_ptr,
-            stream_ctx=self._stream_ctxs.get(stream_id, 0),
+            stream_ctx=sc,
             aux=reliable_size,
         )
         self._transport.wake_up()
@@ -1148,6 +1240,16 @@ class QuicConnection:
         if self._cnx_ptr == 0:
             return False
         return self._transport.reset_stream_at_negotiated(self._cnx_ptr)
+
+    def stream_released(self, stream_id: int) -> bool:
+        """True once nothing is left to reset on a stream this endpoint
+        opened: picoquic has released it (all data and FIN acknowledged,
+        or its reset acknowledged; a bidi stream also needs the peer's
+        direction ended), or the connection is closed.
+
+        Ask only about streams written to, e.g. after FIN: a stream is
+        not tracked until its first write, so asking earlier reads True."""
+        return self._closed or stream_id not in self._stream_ctxs
 
     def stop_stream(self, stream_id: int, error_code: int) -> None:
         """Send STOP_SENDING on a stream. On a stream we only send on, the
@@ -1191,6 +1293,38 @@ class QuicConnection:
             raise ConnectionError("set_stream_priority: cnx not open")
         return self._transport.set_stream_priority(
             self._cnx_ptr, stream_id, priority)
+
+    def set_stream_chain(self, stream_id: int, chain: int, order: int) -> int:
+        """Send a stream as part of `chain`, at rank `order` in it.
+
+        A chain is its id on this connection. Its streams are sent one at
+        a time, by increasing (order, stream id): the first one with data
+        to send is scheduled, the others wait; one beyond the peer's
+        stream limit waits while another can send. The chain competes
+        with the other streams of its priority level as one stream: round
+        robin at an even level, where it keeps its turn when it moves to
+        its next stream, lowest stream id at an odd level. Give a chain's
+        streams one priority: the scheduled stream competes at its own.
+        Typical use, at an even level: one chain per track, the group
+        number as order, so groups go in order and tracks share the
+        bandwidth. Chain 0 takes the stream out of its chain.
+
+        Returns 0 when the event was posted, 1 when the TX event ring is
+        full (nothing applied; wait on tx_event_ring_drain_event and
+        retry). Refusals, such as a stream that has sent its FIN or is
+        resetting, are counted in the transport's set_chain_rejected and
+        set_chain_last_err counters.
+
+        Raises:
+            ConnectionError: no transport, or the cnx is not open.
+        """
+        if self._cnx_ptr == 0 or self._transport is None:
+            raise ConnectionError("set_stream_chain: cnx not open")
+        sc = self._get_or_create_stream_ctx(stream_id)
+        if sc == 0:
+            raise ConnectionError("set_stream_chain: cnx not open")
+        return self._transport.set_stream_chain(
+            self._cnx_ptr, stream_id, chain, order, sc)
 
     def set_default_stream_priority(self, priority: int) -> None:
         """Priority that newly created streams start at.
@@ -1329,6 +1463,7 @@ class QuicEngine:
             rx_data_ring_cap=cfg.max_stream_data,
             congestion_control_algorithm=cfg.congestion_control_algorithm,
             congestion_control_options=cfg.congestion_control_options,
+            packet_train_mode=cfg.packet_train_mode,
             initial_max_data=cfg.max_data,
             initial_max_streams_uni=getattr(cfg, 'max_streams_uni', 0) or 0,
             initial_max_streams_bidi=getattr(cfg, 'max_streams_bidi', 0) or 0,
@@ -1339,6 +1474,7 @@ class QuicEngine:
             max_connections=getattr(cfg, 'max_connections', 256),
             cipher_suite=cfg.cipher_suite or 0,
             key_update_interval=cfg.key_update_interval or 0,
+            ticket_file=cfg.session_ticket_file if cfg.is_client else None,
             ip_family=-1 if cfg.ip_family is None else cfg.ip_family,
             pmtud_policy=cfg.pmtud,
             reset_stream_at=getattr(cfg, 'reset_stream_at', True),
@@ -1432,9 +1568,13 @@ class QuicEngine:
         if self._transport is not None:
             self._transport.stop()
             self._transport = None
-        # CLOSE events still queued are never routed; release their rings.
-        for conn in self._connections.values():
-            conn._release_dgram_ring()
+        # CLOSE events still queued are never routed: end each connection
+        # here, so its protocol sees ConnectionTerminated.
+        for cnx_ptr, conn in list(self._connections.items()):
+            conn._engine_closed()
+            proto = self._protocols.get(cnx_ptr)
+            if proto is not None:
+                proto._process_events()
         # Now safe to drop Python state; picoquic is fully torn down.
         self._connections.clear()
         self._protocols.clear()

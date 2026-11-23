@@ -133,6 +133,78 @@ class TestStreamPriority:
         finally:
             server.stop()
 
+    @pytest.mark.parametrize("priority", [0, 7, 255])
+    def test_first_write_carries_it(self, priority):
+        """A stream's first write applies its priority in the event that
+        activates the stream."""
+        port = next_port()
+        server = start_server(port)
+        try:
+            client, cnx_ptr = connect_client(port)
+            try:
+                before = applied(client)
+                pushes = client.counters['tx_event_ring_pushes']
+                client.tx_send_stream(cnx_ptr, 0, b"first", priority=priority)
+                assert (client.counters['tx_event_ring_pushes']
+                        == pushes + 1)
+                assert wait_counter(client, 'set_priority_applied',
+                                    before + 1) == before + 1
+                assert client.counters['set_priority_rejected'] == 0
+                events = drain_until(server, SPSC_EVT_STREAM_DATA, timeout=5.0)
+                assert b"first" in collect_stream_data(events, 0)
+            finally:
+                client.stop()
+        finally:
+            server.stop()
+
+    def test_write_without_priority_applies_none(self):
+        port = next_port()
+        server = start_server(port)
+        try:
+            client, cnx_ptr = connect_client(port)
+            try:
+                before = applied(client)
+                send_and_confirm(client, server, cnx_ptr, 0, b"plain")
+                assert applied(client) == before
+            finally:
+                client.stop()
+        finally:
+            server.stop()
+
+    def test_write_on_an_active_stream_applies_it(self):
+        """A write that activates nothing still applies its priority."""
+        port = next_port()
+        server = start_server(port)
+        try:
+            client, cnx_ptr = connect_client(port)
+            try:
+                big = b"x" * (1 << 20)
+                client.tx_send_stream(cnx_ptr, 0, big)
+                before = applied(client)
+                skipped = client.counters['tx_mark_active_skipped']
+                client.tx_send_stream(cnx_ptr, 0, b"more", priority=9)
+                assert client.counters['tx_mark_active_skipped'] == skipped + 1
+                assert wait_counter(client, 'set_priority_applied',
+                                    before + 1) == before + 1
+            finally:
+                client.stop()
+        finally:
+            server.stop()
+
+    @pytest.mark.parametrize("priority", [-2, 256])
+    def test_write_out_of_range_is_refused(self, priority):
+        port = next_port()
+        server = start_server(port)
+        try:
+            client, cnx_ptr = connect_client(port)
+            try:
+                with pytest.raises(OverflowError):
+                    client.tx_send_stream(cnx_ptr, 0, b"x", priority=priority)
+            finally:
+                client.stop()
+        finally:
+            server.stop()
+
     @pytest.mark.parametrize("priority", [-1, 256])
     def test_out_of_range_is_refused(self, priority):
         """Values outside uint8_t raise rather than wrapping — a wrapped

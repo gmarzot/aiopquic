@@ -315,12 +315,25 @@ with open(_build_info_path, "w") as _f:
     )
 
 
+def _final_tag_exists(base):
+    import subprocess
+    return subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", f"refs/tags/v{base}"],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        capture_output=True).returncode == 0
+
+
 def _version_scheme(version):
     """Pre-release tag: the next pre-release's dev (0.7.0rc2 -> 0.7.0rc3.devN).
-    Final tag: release-branch-semver (0.7.0 -> 0.8.0.devN)."""
+    Final tag: release-branch-semver (0.7.0 -> 0.8.0.devN). A pre-release whose
+    final is tagged counts as that final."""
+    import dataclasses
     from setuptools_scm.version import guess_next_dev_version, release_branch_semver_version
     if version.tag.is_prerelease:
-        return guess_next_dev_version(version)
+        base = version.tag.base_version
+        if version.exact or not _final_tag_exists(base):
+            return guess_next_dev_version(version)
+        version = dataclasses.replace(version, tag=version.config.version_cls(base))
     return release_branch_semver_version(version)
 
 

@@ -199,6 +199,9 @@ async def test_aioquic_client_aiopquic_server_sink(cert_paths, payload_bytes):
                     received["crc"] = zlib.crc32(
                         bytes(event.data), received["crc"]) & 0xFFFFFFFF
                 if event.end_stream:
+                    # FIN our half too: the peer client reads to EOF.
+                    self._quic.send_stream_data(event.stream_id, b"",
+                                                end_stream=True)
                     fin_event.set()
 
     server = await serve(
@@ -215,7 +218,8 @@ async def test_aioquic_client_aiopquic_server_sink(cert_paths, payload_bytes):
             "--object-size", "4096",
         ])
         try:
-            summary = _read_summary(client, timeout=30.0)
+            # In a thread: the in-process server must run to send its FIN.
+            summary = await asyncio.to_thread(_read_summary, client, 30.0)
             assert summary["ok"], summary
         finally:
             client.wait(timeout=5)

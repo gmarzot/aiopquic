@@ -9,6 +9,7 @@ minimal length. Test vectors are draft-18 Table 2.
 import pytest
 
 from aiopquic.buffer import Buffer, BufferReadError
+from aiopquic.exceptions import LengthFieldError, StreamUnderflow
 from aiopquic._binding._streamchain import (
     StreamChain, encode_object_subgroup_vi64,
 )
@@ -187,3 +188,81 @@ def test_obj_rfc9000_value_longer_than_its_block_is_refused_before_pulling():
     sc.extend(bytes.fromhex("0003013061"))
     with pytest.raises(OverflowError):
         sc.parse_object_subgroup(True, 1 << 20, False)
+
+
+# --- length fields past their bound -----------------------------------
+
+def _length_case(field, v):
+    """Object body with `v` in `field`; returns (raw, ext_present,
+    the field's offset)."""
+    if field == "ext_block_len":
+        return b"\x00" + _enc(v), True, 1
+    if field == "kvp_value_len":
+        # Block of 10 bytes: type 1 (odd), then the 9-byte length.
+        return b"\x00\x0a\x01" + _enc(v), True, 3
+    return b"\x00" + _enc(v), False, 1
+
+
+@pytest.mark.parametrize("v", [1 << 63, (1 << 64) - 1])
+@pytest.mark.parametrize("field",
+                         ["ext_block_len", "kvp_value_len", "payload_len"])
+def test_obj_vi64_unrepresentable_length_names_the_field(field, v):
+    raw, ext_present, offset = _length_case(field, v)
+    sc = StreamChain()
+    sc.extend(raw)
+    with pytest.raises(LengthFieldError) as e:
+        sc.parse_object_subgroup_vi64(ext_present, 1 << 20, True)
+    assert isinstance(e.value, OverflowError)
+    assert (e.value.field, e.value.value, e.value.offset) == (field, v, offset)
+    assert str(e.value).startswith(f"{field} {v} exceeds limit ")
+    assert f"at offset {offset}" in str(e.value)
+
+
+def test_obj_vi64_payload_length_bound_is_a_quic_stream():
+    sc = StreamChain()
+    sc.extend(b"\x00" + _enc(1 << 62))
+    with pytest.raises(LengthFieldError) as e:
+        sc.parse_object_subgroup_vi64(False, 1 << 20)
+    assert e.value.limit == (1 << 62) - 1
+    sc = StreamChain()
+    sc.extend(b"\x00" + _enc((1 << 62) - 1))
+    with pytest.raises(StreamUnderflow):
+        sc.parse_object_subgroup_vi64(False, 1 << 20)
+
+
+def test_obj_vi64_block_length_over_the_limit_stays_a_framer_desync():
+    sc = StreamChain()
+    sc.extend(b"\x00" + _enc((1 << 20) + 1) + b"\x01\x00")
+    with pytest.raises(RuntimeError, match="framer desync"):
+        sc.parse_object_subgroup_vi64(True, 1 << 20)
+
+
+@pytest.mark.parametrize("vi64", [False, True], ids=["rfc9000", "vi64"])
+def test_obj_value_past_its_block_names_the_field(vi64):
+    sc = StreamChain()
+    sc.extend(bytes.fromhex("0003013061"))
+    parse = sc.parse_object_subgroup_vi64 if vi64 else sc.parse_object_subgroup
+    with pytest.raises(LengthFieldError, match="exceeds its block") as e:
+        parse(True, 1 << 20, False)
+    assert (e.value.field, e.value.value, e.value.limit, e.value.offset) == (
+        "kvp_value_len", 0x30, 1, 3)
+
+
+def test_obj_vi64_valid_bytes_parse_unchanged():
+    # delta 3, block {2: 5, 3: b"abc"} (delta types), payload b"hi";
+    # then a status object: delta 0, no block, length 0, status 3.
+    raw = bytes.fromhex("03" "07" "0205" "0103616263" "02" "6869"
+                        "00" "00" "00" "03")
+    assert encode_object_subgroup_vi64(3, {2: 5, 3: b"abc"}, 0, b"hi",
+                                       True, True) == raw[:12]
+    sc = StreamChain()
+    sc.extend(raw)
+    assert sc.parse_object_subgroup_vi64(True, 1 << 20, True) == (
+        3, {2: 5, 3: b"abc"}, 0, b"hi")
+    assert sc.parse_object_subgroup_vi64(True, 1 << 20, True) == (
+        0, None, 3, b"")
+
+
+def test_length_field_error_is_exported():
+    from aiopquic import streamchain
+    assert streamchain.LengthFieldError is LengthFieldError

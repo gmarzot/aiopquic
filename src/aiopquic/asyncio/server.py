@@ -14,24 +14,37 @@ from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.quic.connection import QuicEngine
 from aiopquic.asyncio.protocol import QuicConnectionProtocol
 from aiopquic.asyncio._rxwatch import clear_reader, set_reader
+from aiopquic.asyncio._workers import shared_port_args, worker_count
 
 
 class QuicServer:
-    """QUIC server that accepts incoming connections via picoquic."""
+    """QUIC server that accepts incoming connections via picoquic.
+
+    With several workers, each engine owns its own picoquic context,
+    network thread and connections; they share one port.
+    """
 
     def __init__(
         self,
-        engine: QuicEngine,
+        engines: QuicEngine | list[QuicEngine],
         loop: asyncio.AbstractEventLoop,
     ):
-        self._engine = engine
+        self._engines = (list(engines) if isinstance(engines, (list, tuple))
+                         else [engines])
+        self._engine = self._engines[0]
         self._loop = loop
+
+    @property
+    def transports(self) -> list:
+        """Each worker's TransportContext."""
+        return [engine._transport for engine in self._engines]
 
     def close(self) -> None:
         """Stop the server and tear down all live connections."""
-        if self._loop is not None and self._engine._transport is not None:
-            clear_reader(self._loop, self._engine._transport, self._engine)
-        self._engine.close()
+        for engine in self._engines:
+            if self._loop is not None and engine._transport is not None:
+                clear_reader(self._loop, engine._transport, engine)
+            engine.close()
 
 
 async def serve(
@@ -42,6 +55,7 @@ async def serve(
     create_protocol: Callable | None = None,
     stream_handler=None,
     retry: bool = False,
+    workers: int = 1,
 ) -> QuicServer:
     """Start a QUIC server.
 
@@ -49,22 +63,34 @@ async def serve(
     per-cnx QuicConnection. Falls back to the default
     QuicConnectionProtocol if not supplied. retry=True answers each new
     connection's first Initial with a Retry to validate the client's
-    address.
+    address. workers > 1 (Linux) runs that many picoquic contexts on one
+    port; the kernel spreads connections across them.
     """
     if create_protocol is None:
         create_protocol = (
             lambda conn, stream_handler=None: QuicConnectionProtocol(
                 conn, stream_handler=stream_handler))
 
-    engine = QuicEngine(
-        configuration=configuration,
-        create_protocol=create_protocol,
-        stream_handler=stream_handler,
-    )
-    engine._start_transport(port=port, retry=retry, host=host)
+    workers = worker_count(workers, port)
+    shared = shared_port_args(workers)
+    engines = []
+    try:
+        for _ in range(workers):
+            engine = QuicEngine(
+                configuration=configuration,
+                create_protocol=create_protocol,
+                stream_handler=stream_handler,
+            )
+            engine._start_transport(port=port, retry=retry, host=host, **shared)
+            engines.append(engine)
+    except BaseException:
+        for engine in engines:
+            engine.close()
+        raise
 
     loop = asyncio.get_event_loop()
-    if engine.eventfd >= 0:
-        set_reader(loop, engine._transport, engine.drain_and_route, engine)
+    for engine in engines:
+        if engine.eventfd >= 0:
+            set_reader(loop, engine._transport, engine.drain_and_route, engine)
 
-    return QuicServer(engine, loop)
+    return QuicServer(engines, loop)

@@ -30,9 +30,12 @@ from typing import AsyncGenerator
 
 from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic.asyncio._rxwatch import clear_reader, set_reader
+from aiopquic.asyncio._workers import shared_port_args, worker_count
 from aiopquic.quic.connection import drain_and_route
 from aiopquic._binding._transport import (
     TransportContext, WebTransportSessionState,
+    FANOUT_WT_DATAGRAM, FANOUT_WT_STREAM,
+    dgram_ring_mark_closed, stream_ctx_mark_gone,
     tx_data_bytes_queued,
 )
 from aiopquic.quic.events import (
@@ -76,6 +79,30 @@ _EVT_WT_CNX_CLOSED = 77
 # Application-error code surfaced on RESET_STREAM for WT data streams when
 # the WT session itself terminates. Per draft-ietf-webtrans-http3 §6, §9.5.
 WT_SESSION_GONE = 0x170d7b68
+
+
+class _NoWait:
+    """A create nobody awaits: the reply goes to on_created."""
+
+    __slots__ = ("on_created", "_done")
+
+    def __init__(self, on_created) -> None:
+        self.on_created = on_created
+        self._done = False
+
+    def done(self) -> bool:
+        return self._done
+
+    def cancelled(self) -> bool:
+        return False
+
+    def set_result(self, sid) -> None:
+        self._done = True
+        if self.on_created is not None:
+            self.on_created(sid)
+
+    def set_exception(self, _exc) -> None:
+        self.set_result(0)
 
 
 class _Inbox(asyncio.Queue):
@@ -136,7 +163,10 @@ class WebTransportSession:
         # call appends a future; the WT_STREAM_CREATED handler popleft's
         # and resolves it. Picoquic processes the TX ring serially and
         # emits responses in the same order, so 1:1 pairing is correct.
-        self._pending_creates: deque[asyncio.Future] = deque()
+        # Submitted creates awaiting their reply, each with the initial
+        # bytes it reserves against the TX budget until then.
+        self._pending_creates: deque[tuple[asyncio.Future, int]] = deque()
+        self._tx_reserved = 0
         self._orphan_stream_commands: deque[tuple[int, bool]] = deque()
         self._orphan_cleanup_task: asyncio.Task | None = None
         self._ring_parked_creates = 0
@@ -251,6 +281,10 @@ class WebTransportSession:
     # when a configuration is supplied.
     stream_ring_cap: int = 4 * 1024 * 1024
 
+    # Queue a WebTransportNewStream per peer-opened stream for events();
+    # a subclass that never reads events() sets this False.
+    queue_new_streams: bool = True
+
     async def _await_tx_data_capacity(self) -> None:
         """Park while this session's TX-queued bytes exceed the budget.
 
@@ -262,7 +296,7 @@ class WebTransportSession:
         a 2 ms poll, since the producer is far ahead of the wire
         whenever this engages. Session close exits the park."""
         cap = self.tx_max_queued_bytes
-        if (not cap or tx_data_bytes_queued() <= cap
+        if (not cap or tx_data_bytes_queued() + self._tx_reserved <= cap
                 or self._tx_backlog() <= cap):
             return
         low = cap // 2
@@ -270,8 +304,17 @@ class WebTransportSession:
             await asyncio.sleep(0.002)
 
     async def create_stream(self, bidir: bool = True,
-                              timeout: float = 5.0) -> int:
+                              timeout: float = 5.0, *,
+                              initial: bytes = b"", end_stream: bool = False,
+                              priority: int | None = None,
+                              chain: int | None = None,
+                              order: int | None = None) -> int:
         """Open a new WT stream. Returns the assigned stream_id.
+
+        initial and end_stream are the stream's first bytes and FIN: they
+        travel with the create and leave in the same send as the stream
+        header. priority, as in set_stream_priority, then chain and order
+        (default 0), as in set_stream_chain, apply before them.
 
         Round-trips to the picoquic thread because picowt allocates
         the id internally. Multiple concurrent callers are safe:
@@ -286,6 +329,14 @@ class WebTransportSession:
             raise WebTransportError("WT session closed")
         if not self.session_ready:
             raise WebTransportError("session not ready")
+        if len(initial) > self.stream_ring_cap:
+            raise ValueError(
+                f"initial write of {len(initial)} bytes exceeds the stream "
+                f"ring (cap={self.stream_ring_cap})")
+        if priority is not None and not 0 <= priority <= 255:
+            raise ValueError(f"priority {priority} outside 0-255")
+        if chain is None and order is not None:
+            raise ValueError("order without chain")
         await self._await_tx_data_capacity()
         # Do not submit more creates while abandoned streams await retirement.
         while self._orphan_cleanup_task is not None:
@@ -297,7 +348,9 @@ class WebTransportSession:
         while True:
             ring_event.clear()
             try:
-                self._state.push_create_stream(bidir)
+                self._state.push_create_stream(
+                    bidir, initial, end_stream, self.stream_ring_cap,
+                    -1 if priority is None else priority, chain, order)
                 break
             except BufferError:
                 if self._transport.arm_tx_event_ring_drain_pending():
@@ -313,7 +366,8 @@ class WebTransportSession:
                 raise WebTransportError("WT session closed")
         # No await between the push and the append: replies pair in order.
         fut = self._loop.create_future()
-        self._pending_creates.append(fut)
+        self._pending_creates.append((fut, len(initial)))
+        self._tx_reserved += len(initial)
         try:
             sid = await asyncio.wait_for(
                 fut, timeout=max(deadline - self._loop.time(), 0))
@@ -329,6 +383,40 @@ class WebTransportSession:
         if sid == 0:
             raise WebTransportError("WT stream create rejected")
         return sid
+
+    def create_stream_nowait(self, bidir: bool = False, *,
+                             initial: bytes = b"", end_stream: bool = False,
+                             priority: int | None = None,
+                             chain: int | None = None,
+                             order: int | None = None,
+                             on_created=None) -> bool:
+        """create_stream() without waiting for the stream id: True once
+        the create is submitted, False, with nothing submitted, when it
+        would have to wait. on_created(stream_id) runs when the id
+        arrives, with 0 for a refused create."""
+        if self.session_closed or not self.session_ready:
+            return False
+        if len(initial) > self.stream_ring_cap:
+            return False
+        if priority is not None and not 0 <= priority <= 255:
+            raise ValueError(f"priority {priority} outside 0-255")
+        if chain is None and order is not None:
+            raise ValueError("order without chain")
+        if self._orphan_cleanup_task is not None:
+            return False
+        cap = self.tx_max_queued_bytes
+        if (cap and tx_data_bytes_queued() + self._tx_reserved > cap
+                and self._tx_backlog() > cap):
+            return False
+        try:
+            self._state.push_create_stream(
+                bidir, initial, end_stream, self.stream_ring_cap,
+                -1 if priority is None else priority, chain, order)
+        except BufferError:
+            return False
+        self._pending_creates.append((_NoWait(on_created), len(initial)))
+        self._tx_reserved += len(initial)
+        return True
 
     def _retire_orphan_stream(self, stream_id: int) -> None:
         """Retire an allocated stream whose create caller has gone away."""
@@ -442,9 +530,19 @@ class WebTransportSession:
         return self._transport.tx_data_ring_sent(sc_ptr)
 
     def _tx_backlog(self) -> int:
-        """Bytes queued in this session's stream rings, not yet pulled."""
-        return sum(self._transport.tx_data_ring_used(sc_ptr)
-                   for sc_ptr in list(self._stream_tx_ctxs.values()))
+        """Bytes queued in this session's stream rings, not yet pulled,
+        plus the initial bytes of creates not yet answered."""
+        return self._tx_reserved + sum(
+            self._transport.tx_data_ring_used(sc_ptr)
+            for sc_ptr in list(self._stream_tx_ctxs.values()))
+
+    def _pop_pending_create(self) -> asyncio.Future | None:
+        """Take the oldest submitted create, releasing its reservation."""
+        if not self._pending_creates:
+            return None
+        fut, reserved = self._pending_creates.popleft()
+        self._tx_reserved -= reserved
+        return fut
 
     def set_tx_data_drain_pending(self, stream_id: int) -> None:
         """Arm the per-stream sc->tx_drain_pending flag so the next
@@ -634,6 +732,15 @@ class WebTransportSession:
             return False
         return self._transport.reset_stream_at_negotiated(cnx)
 
+    def stream_released(self, stream_id: int) -> bool:
+        """True once nothing is left to reset on a WT stream this endpoint
+        opened: picoquic has released it (all data and FIN acknowledged,
+        or its reset acknowledged; a bidi stream also needs the peer's
+        direction ended), either side reset or stopped it, or the session
+        is closed. Ask only about streams written to, e.g. after FIN."""
+        return (self._session_closed.is_set()
+                or stream_id not in self._stream_tx_ctxs)
+
     def stop_stream(self, stream_id: int, error_code: int = 0) -> None:
         """Send STOP_SENDING on a WT stream we receive on (the peer should
         reset it). On our own uni stream, the request is dropped and
@@ -664,6 +771,21 @@ class WebTransportSession:
         if self._state is None or self._session_closed.is_set():
             raise ConnectionError("set_stream_priority: session closed")
         return self._state.push_stream_priority(stream_id, priority)
+
+    def set_stream_chain(self, stream_id: int, chain: int, order: int) -> int:
+        """Send a WT stream as part of `chain`, at rank `order` in it.
+
+        Same rules and return as QuicConnection.set_stream_chain(): the
+        chain's streams go one at a time by (order, stream id), and the
+        chain shares its priority level with other streams as one stream.
+        Chain ids are per connection, shared by the sessions on it.
+
+        Raises:
+            ConnectionError: session closed.
+        """
+        if self._state is None or self._session_closed.is_set():
+            raise ConnectionError("set_stream_chain: session closed")
+        return self._state.push_stream_chain(stream_id, chain, order)
 
     def set_datagram_priority(self, priority: int) -> int:
         """Send priority of this session's datagrams against its streams.
@@ -713,16 +835,9 @@ class WebTransportSession:
             raise ConnectionError("send_datagram_frame: session closed")
         if not data:
             raise ValueError("send_datagram_frame: empty payload")
-        if self._dgram_ring == 0:
-            # Records cap at the framed ceiling, so every one fits a
-            # fresh packet with its stream-ID prefix.
-            cap = self.max_datagram_payload()
-            if cap == 0:
-                raise ValueError(
-                    "send_datagram_frame: datagrams not negotiated")
-            self._dgram_max_payload = cap
-            self._dgram_ring = self._transport.dgram_ring_create(
-                self._dgram_ring_bytes, cap)
+        if self._ensure_dgram_ring() == 0:
+            raise ValueError(
+                "send_datagram_frame: datagrams not negotiated")
         if self._dgram_mark_owed:
             if self._state.push_dgram_ready(self._dgram_ring) == 0:
                 self._dgram_mark_owed = False
@@ -735,10 +850,65 @@ class WebTransportSession:
                 f"datagram payload {len(data)} exceeds "
                 f"max_datagram_payload() = {self._dgram_max_payload}")
         # Records are committed. A full TX event ring leaves the mark
-        # owed; it is re-posted at the next send or drain.
+        # owed; it is re-posted at the next send or ring drain.
         if self._state.push_dgram_ready(self._dgram_ring) != 0:
             self._dgram_mark_owed = True
+            self._transport._owe_dgram_mark(self)
         return len(data)
+
+    def _ensure_dgram_ring(self) -> int:
+        """The datagram record ring, created on first use; 0 when
+        datagrams are not negotiated."""
+        if self._dgram_ring == 0:
+            # Records cap at the framed ceiling, so every one fits a
+            # fresh packet with its stream-ID prefix.
+            cap = self.max_datagram_payload()
+            if cap == 0:
+                return 0
+            self._dgram_max_payload = cap
+            self._dgram_ring = self._transport.dgram_ring_create(
+                self._dgram_ring_bytes, cap)
+        return self._dgram_ring
+
+    @property
+    def transport(self) -> TransportContext:
+        """The TransportContext (shard) this session runs on; a DestSet
+        holding its destinations is bound to it."""
+        return self._transport
+
+    def _fanout_dest(self, stream_id: int):
+        """This stream as a DestSet.add() entry. None when the session is
+        closed or not open, or the stream is unknown, ended, reset or
+        stopped."""
+        if self.session_closed or not self.session_ready:
+            return None
+        sc_ptr = self._stream_tx_ctxs.get(stream_id, 0)
+        cnx = self._state.cnx_ptr
+        if not sc_ptr or not cnx:
+            return None
+        return (self._transport, FANOUT_WT_STREAM, cnx, stream_id, sc_ptr,
+                self.stream_ring_cap, None)
+
+    def _fanout_datagram_dest(self):
+        """This session as a DestSet.add_datagram() entry. None when the
+        session is closed or not open, or datagrams were not negotiated."""
+        if self._state is None or self.session_closed or not self.session_ready:
+            return None
+        db = self._ensure_dgram_ring()
+        if db == 0:
+            return None
+        # The set keeps the session state, and so its C session, alive.
+        return (self._transport, FANOUT_WT_DATAGRAM, self._state.session_ptr,
+                0, db, 0, self._state)
+
+    def _repost_dgram_mark(self) -> None:
+        if not (self._dgram_mark_owed and self._dgram_ring
+                and not self._session_closed.is_set()):
+            return
+        if self._state.push_dgram_ready(self._dgram_ring) == 0:
+            self._dgram_mark_owed = False
+        else:
+            self._transport._owe_dgram_mark(self)
 
     def get_datagram_tx_drain_event(self) -> asyncio.Event:
         """Event set when the worker drains room in the datagram record
@@ -795,18 +965,21 @@ class WebTransportSession:
             # The worker's session holds its own reference until the
             # session struct is freed; ours is dropped behind any queued
             # MARK naming the ring.
+            dgram_ring_mark_closed(self._dgram_ring)
             self._transport.dgram_ring_release(self._dgram_ring)
             self._dgram_ring = 0
         # One worker-thread walk (TX_WT_SESSION_CLEANUP) sends the §6
         # resets and stop-sendings and releases the session's wt_link
         # sc's; the release does not wait on the wire. O(1) ring cost.
+        # Their links still hold them until LINK_RELEASE drains here.
+        for sc_ptr in self._stream_tx_ctxs.values():
+            stream_ctx_mark_gone(sc_ptr)
         self._push_or_retry(self._state.push_session_cleanup, "cleanup")
         self._stream_tx_ctxs.clear()
         if self._orphan_cleanup_task is not None or self._ring_parked_creates:
             self._transport.tx_event_ring_drain_event.set()
         self._orphan_stream_commands.clear()
-        while self._pending_creates:
-            fut = self._pending_creates.popleft()
+        while (fut := self._pop_pending_create()) is not None:
             if not fut.done():
                 fut.set_exception(WebTransportError("WT session closed"))
         # Wake any producer parked in send_stream_data_drained awaiting a
@@ -947,7 +1120,7 @@ class WebTransportSession:
         ev = self._stream_tx_drain_events.get(sid)
         if ev is not None:
             ev.set()
-        self._stream_tx_ctxs.pop(sid, None)
+        stream_ctx_mark_gone(self._stream_tx_ctxs.pop(sid, 0))
         self._stream_tx_drain_events.pop(sid, None)
 
     def _on_session_closed(self, error_code, data,
@@ -1064,7 +1237,8 @@ class WebTransportSession:
                         pass
                 return
             # Every native reply consumes exactly one submitted request.
-            fut = self._pending_creates.popleft() if self._pending_creates else None
+            # The reply's ring, registered below, takes over the reservation.
+            fut = self._pop_pending_create()
             if error_code != 0 or fut is None or fut.done():
                 if sid:
                     self._retire_orphan_stream(sid)
@@ -1120,8 +1294,9 @@ class WebTransportSession:
             # so stash the sc pointer here too.
             if sc_ptr:
                 self._stream_tx_ctxs[sid] = sc_ptr
-            self._event_queue.put_nowait(
-                WebTransportNewStream(stream_id=sid))
+            if self.queue_new_streams:
+                self._event_queue.put_nowait(
+                    WebTransportNewStream(stream_id=sid))
         elif evt_type == _EVT_STREAM_DESTROY:
             # Universal raw-QUIC STREAM_DESTROY — fired for raw-QUIC
             # streams that share this transport. WT data streams use
@@ -1509,6 +1684,7 @@ async def connect_webtransport(
                     configuration.congestion_control_algorithm),
                 congestion_control_options=(
                     configuration.congestion_control_options),
+                packet_train_mode=configuration.packet_train_mode,
                 keep_alive_interval_ms=int(
                     (configuration.keep_alive_interval or 0) * 1000),
                 socket_buffer_size=(
@@ -1559,6 +1735,10 @@ class WebTransportServer:
         self._dispatcher = dispatcher
         self._own_transport = own_transport
 
+    @property
+    def transports(self) -> list:
+        return [self._transport]
+
     async def aclose(self) -> None:
         """Close every live session, then the server."""
         for session in list(self._dispatcher._sessions.values()):
@@ -1580,6 +1760,28 @@ class WebTransportServer:
                 pass
 
 
+class WebTransportServerGroup:
+    """Handle returned by serve_webtransport(workers > 1): one server per
+    worker on the shared port."""
+
+    def __init__(self, servers: list):
+        self._servers = servers
+        self._transport = servers[0]._transport
+        self._dispatcher = servers[0]._dispatcher
+
+    @property
+    def transports(self) -> list:
+        return [server._transport for server in self._servers]
+
+    async def aclose(self) -> None:
+        for server in self._servers:
+            await server.aclose()
+
+    def close(self) -> None:
+        for server in self._servers:
+            server.close()
+
+
 async def serve_webtransport(
         host: str, port: int, path: str,
         *, handler,
@@ -1589,6 +1791,8 @@ async def serve_webtransport(
         configuration: QuicConfiguration | None = None,
         wt_supported_protocols: list[str] | None = None,
         web_folder: str | None = None,
+        workers: int = 1,
+        _start_extra: dict | None = None,
 ) -> WebTransportServer:
     """Start a WebTransport server listening on (host, port) at path.
 
@@ -1602,10 +1806,33 @@ async def serve_webtransport(
     server registered with "" never matches a root-path CONNECT.
 
     web_folder serves files from that directory to HTTP/3 GET requests
-    for paths other than `path`.
+    for paths other than `path`. workers > 1 (Linux) runs that many
+    picoquic contexts on the port.
     """
     if path == "":
         path = "/"
+    if workers != 1:
+        if transport is not None:
+            raise ValueError("workers > 1 needs serve_webtransport to own "
+                             "its transports")
+        workers = worker_count(workers, port)
+    if workers > 1:
+        shared = shared_port_args(workers)
+        servers = []
+        try:
+            for _ in range(workers):
+                servers.append(await serve_webtransport(
+                    host, port, path, handler=handler,
+                    cert_file=cert_file, key_file=key_file,
+                    session_factory=session_factory,
+                    configuration=configuration,
+                    wt_supported_protocols=wt_supported_protocols,
+                    web_folder=web_folder, _start_extra=shared))
+        except BaseException:
+            for server in servers:
+                server.close()
+            raise
+        return WebTransportServerGroup(servers)
     own_transport = transport is None
     if own_transport:
         if (configuration is not None
@@ -1640,6 +1867,7 @@ async def serve_webtransport(
                     configuration.congestion_control_algorithm),
                 congestion_control_options=(
                     configuration.congestion_control_options),
+                packet_train_mode=configuration.packet_train_mode,
                 keep_alive_interval_ms=int(
                     (configuration.keep_alive_interval or 0) * 1000),
                 socket_buffer_size=(
@@ -1661,6 +1889,8 @@ async def serve_webtransport(
             start_kwargs["wt_supported_protocols"] = ", ".join(
                 wt_supported_protocols)
         start_kwargs["keylog_filename"] = _keylog_file(configuration)
+        if _start_extra:
+            start_kwargs.update(_start_extra)
         transport.start(**start_kwargs)
 
     loop = asyncio.get_event_loop()
