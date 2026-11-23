@@ -36,9 +36,9 @@
   caches its first buffered segment (#2349).
 - picoquic 36e1418c: a crafted version-upgrade request no longer hangs the network thread (picoquic
   #2331), and the lost-feedback signal no longer drops BBR's or C4's window on an app-limited path (#2337).
-- picoquic dropped fusion AES-GCM (#2326), so AES-GCM always comes from the linked OpenSSL. On 3.5 a relay
-  runs about 2% fewer instructions per send than with fusion, on 3.0 about 8% more; `build.sh` warns
-  below 3.5.
+- x86_64 keeps fusion AES-GCM: `patches/picoquic-fusion-aes-gcm.patch` restores what picoquic #2326 removed,
+  and x86_64 wheels now carry it too (picotls gates it on AES-NI, PCLMULQDQ and AVX2 at run time). Elsewhere
+  AES-GCM comes from the linked OpenSSL; `build.sh` warns below 3.5.
 - picoquic b9893f28: wake scheduling uses a uint64 splay tree (picoquic #2328) and packet setup no longer
   clears the payload buffer (#2327).
 - A stream write posts a TX event only when picoquic has parked the stream, and a TX event checks its
