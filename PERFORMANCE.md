@@ -91,11 +91,11 @@ Tests pass on Linux and macOS. The interop suite is opt-in
 
 Default builds use `CMAKE_BUILD_TYPE=Release` (`-O3 -DNDEBUG`),
 portable across hosts. An opt-in env var layers on host-tuned
-optimizations for local benching — not enabled in PyPI wheels:
+optimizations for local benching — not in PyPI wheels, except Fusion on x86_64:
 
 ```bash
-# Host-tuned: DISABLE_DEBUG_PRINTF, -O3 -march=native -flto.
-# Binary becomes machine-specific.
+# Host-tuned: Fusion AES-GCM (x86_64), DISABLE_DEBUG_PRINTF,
+# -O3 -march=native -flto. Binary becomes machine-specific.
 AIOPQUIC_PERF=1 ./build.sh   # PERF=1 is the default; shown for clarity
 ```
 
@@ -105,9 +105,12 @@ Per-platform behavior:
 |-------------------------------|:------------:|:-----------:|:-----------:|:------------:|
 | `-O3 -DNDEBUG` (always on)    |      ✓       |      ✓      |      ✓      |      ✓       |
 | `DISABLE_DEBUG_PRINTF`        |      ✓       |      ✓      |      ✓      |      ✓       |
+| Fusion AES-GCM (CPUID-dispatched) | ✓        |      –      |      –      |      ✓       |
 | `-march=native` / `-mcpu=native` + `-flto` | ✓ | ✓     |      ✓      |      ✓       |
 
-AES-GCM comes from the linked OpenSSL. Use 3.5 or newer (`OPENSSL_ROOT_DIR=...`): on x86, a relay
+On x86_64, AES-GCM comes from picotls Fusion (`patches/picoquic-fusion-aes-gcm.patch` restores what
+picoquic #2326 removed); elsewhere, and on x86_64 CPUs without AES-NI, PCLMULQDQ and AVX2, from the
+linked OpenSSL. Use OpenSSL 3.5 or newer (`OPENSSL_ROOT_DIR=...`): on x86, a relay
 runs about 8% more instructions per packet on OpenSSL 3.0, whose per-call overhead is higher.
 `build.sh` warns when it links an older one.
 

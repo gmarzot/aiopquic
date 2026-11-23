@@ -146,7 +146,8 @@ connection or session runs on: key per-shard sets by it, `DestSet(conn.transport
   (CI, wheels).
 - The Cython extensions add `-O3` after `$CFLAGS`, because setuptools replaces Python's CFLAGS
   with the environment's; `AIOPQUIC_PERF=0` leaves the caller's flags alone.
-- OpenSSL is the main performance variable. Linux wheels bundle 3.5; for parity build with
+- AES-GCM is the main performance variable. x86_64 builds and wheels use picotls Fusion (CPUID-gated);
+  elsewhere it is the linked OpenSSL. Linux wheels bundle 3.5; for parity build with
   `OPENSSL_ROOT_DIR=<3.5 prefix> ./build.sh`.
 - Submodules are `ignore = dirty` because the build patches picoquic in place.
   `./update_submodules.sh` reports drift; `--advance` moves picoquic behind a rebuild and tests.
